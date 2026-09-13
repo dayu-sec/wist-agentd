@@ -39,27 +39,9 @@ pub(crate) fn temp_dir(name: &str) -> PathBuf {
 }
 
 #[cfg(unix)]
-pub(crate) fn test_exec_bin(root: &Path) -> PathBuf {
-    // wist-exec 仍位于 warp-insight workspace（与本 crate 同级），从那里构建并运行。
-    let warp_insight_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crate dir parent")
-        .join("warp-insight");
-    let wrapper = root.join("wist-exec-wrapper.sh");
-    fs::write(
-        &wrapper,
-        format!(
-            "#!/bin/sh\ncd \"{}\"\nexec cargo run -q -p wist-exec -- \"$@\"\n",
-            warp_insight_root.display()
-        ),
-    )
-    .expect("write wrapper");
-    let mut perms = fs::metadata(&wrapper)
-        .expect("wrapper metadata")
-        .permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&wrapper, perms).expect("set wrapper permissions");
-    wrapper
+pub(crate) fn test_exec_bin(_root: &Path) -> PathBuf {
+    // wist-exec 是 wist-agentd 的同仓二进制，cargo test 会直接构建它。
+    PathBuf::from(env!("CARGO_BIN_EXE_wist-exec"))
 }
 
 #[cfg(unix)]

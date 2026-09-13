@@ -27,3 +27,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "wist-agentd"
 path = "src/main.rs"
+
+[[bin]]
+name = "wist-exec"
+path = "src/bin/wist-exec/main.rs"
