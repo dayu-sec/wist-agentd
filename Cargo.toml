@@ -1,0 +1,29 @@
+[package]
+name = "wist-agentd"
+version = "0.1.1"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[dependencies]
+libc = "0.2"
+sysinfo = { version = "0.36", default-features = false, features = ["system", "disk"] }
+jumo-derive = "0.1"
+orion-error = { version = "0.8", features = ["derive", "serde_json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
+toml = "0.8"
+tokio = { version = "1.48", features = ["full"] }
+wist-contracts = { version = "0.1.1", path = "../wist-contracts" }
+wist-metrics = { version = "0.1.1", path = "../wist-metrics" }
+wist-shared = { version = "0.1.1", path = "../wist-shared" }
+wist-validate = { version = "0.1.1", path = "../wist-validate" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "wist-agentd"
+path = "src/main.rs"
