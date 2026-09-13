@@ -170,7 +170,7 @@ pub(crate) fn standalone_config_with_file_input(
                 file: LogsFileOutputSection {
                     path: root
                         .join("log")
-                        .join("warp-parse-records.ndjson")
+                        .join("wist-records.ndjson")
                         .display()
                         .to_string(),
                 },
@@ -205,7 +205,7 @@ pub(crate) fn standalone_config_with_file_inputs(
                 file: LogsFileOutputSection {
                     path: root
                         .join("log")
-                        .join("warp-parse-records.ndjson")
+                        .join("wist-records.ndjson")
                         .display()
                         .to_string(),
                 },

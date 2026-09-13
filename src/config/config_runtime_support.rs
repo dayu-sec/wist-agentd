@@ -17,7 +17,7 @@ spool_dir = "state/spool/logs"
 kind = "file"
 
 [telemetry.logs.output.file]
-path = "log/warp-parse-records.ndjson"
+path = "log/wist-records.ndjson"
 
 [discovery]
 # 默认保留 host + network + endpoint + process discovery，便于本地 metrics / action target 建模。
@@ -105,7 +105,7 @@ container_enabled = false
 # startup_position = "tail"
 # multiline_mode = "none"
 #
-# 示例：把日志通过 TCP 发到本机 WarpParse 的 tcp_src。
+# 示例：把日志通过 TCP 发到本机数据面的 tcp_src。
 # [telemetry.logs.output]
 # kind = "tcp"
 #

@@ -93,7 +93,7 @@ fn daemon_run_once_processes_configured_file_input() {
     })
     .expect("daemon run once");
 
-    let output_path = root.join("log").join("warp-parse-records.ndjson");
+    let output_path = root.join("log").join("wist-records.ndjson");
     let output = fs::read_to_string(&output_path).expect("read output");
     let records: Vec<wist_contracts::telemetry_record::TelemetryRecordContract> = output
         .lines()
@@ -430,7 +430,7 @@ fn daemon_run_once_continues_when_discovery_cache_store_fails() {
     })
     .expect("daemon run once with discovery store failure");
 
-    let output_path = root.join("log").join("warp-parse-records.ndjson");
+    let output_path = root.join("log").join("wist-records.ndjson");
     let output = fs::read_to_string(&output_path).expect("read output");
     let records: Vec<wist_contracts::telemetry_record::TelemetryRecordContract> = output
         .lines()
@@ -477,7 +477,7 @@ fn daemon_run_once_rebuilds_when_discovery_cache_is_corrupt() {
     })
     .expect("daemon run once after corrupt cache");
 
-    let output_path = root.join("log").join("warp-parse-records.ndjson");
+    let output_path = root.join("log").join("wist-records.ndjson");
     let output = fs::read_to_string(&output_path).expect("read output");
     let records: Vec<wist_contracts::telemetry_record::TelemetryRecordContract> = output
         .lines()
@@ -545,7 +545,7 @@ fn daemon_run_once_uses_cached_metrics_snapshot_when_target_view_is_missing() {
 
     let runtime_snapshot: TestMetricsRuntimeSnapshot =
         read_json(&runtime_snapshot_path).expect("read runtime snapshot after fallback");
-    let output_path = root.join("log").join("warp-parse-records.ndjson");
+    let output_path = root.join("log").join("wist-records.ndjson");
     let output = fs::read_to_string(&output_path).expect("read output");
     let records: Vec<wist_contracts::telemetry_record::TelemetryRecordContract> = output
         .lines()
@@ -676,7 +676,7 @@ fn daemon_run_once_continues_when_one_file_input_fails() {
     })
     .expect("daemon run once");
 
-    let output_path = root.join("log").join("warp-parse-records.ndjson");
+    let output_path = root.join("log").join("wist-records.ndjson");
     let output = fs::read_to_string(&output_path).expect("read output");
     let records: Vec<wist_contracts::telemetry_record::TelemetryRecordContract> = output
         .lines()
@@ -732,7 +732,7 @@ fn daemon_run_once_assigns_globally_monotonic_seq_across_inputs() {
     })
     .expect("daemon run once");
 
-    let output_path = root.join("log").join("warp-parse-records.ndjson");
+    let output_path = root.join("log").join("wist-records.ndjson");
     let output = fs::read_to_string(&output_path).expect("read output");
     let records: Vec<TelemetryRecordContract> = output
         .lines()
@@ -777,7 +777,7 @@ fn daemon_run_once_marks_active_when_only_file_input_fails() {
         snapshot.state,
         wist_agentd::self_observability::HealthState::Active
     );
-    assert!(!root.join("log").join("warp-parse-records.ndjson").exists());
+    assert!(!root.join("log").join("wist-records.ndjson").exists());
 }
 
 #[cfg(unix)]
@@ -809,7 +809,7 @@ fn daemon_run_once_marks_active_when_configured_file_is_missing() {
         snapshot.state,
         wist_agentd::self_observability::HealthState::Active
     );
-    assert!(!root.join("log").join("warp-parse-records.ndjson").exists());
+    assert!(!root.join("log").join("wist-records.ndjson").exists());
     assert!(!wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "missing").exists());
 }
 
@@ -868,7 +868,7 @@ fn daemon_run_once_replays_existing_spool_even_when_source_file_is_missing() {
     })
     .expect("daemon run once");
 
-    let output_path = root.join("log").join("warp-parse-records.ndjson");
+    let output_path = root.join("log").join("wist-records.ndjson");
     let output = fs::read_to_string(&output_path).expect("read output");
     let records: Vec<wist_contracts::telemetry_record::TelemetryRecordContract> = output
         .lines()
@@ -961,7 +961,7 @@ fn daemon_run_once_sends_raw_log_lines_to_tcp_output() {
         checkpoint.files[0].checkpoint_offset,
         "alpha\nbeta\n".len() as u64
     );
-    assert!(!root.join("log").join("warp-parse-records.ndjson").exists());
+    assert!(!root.join("log").join("wist-records.ndjson").exists());
 }
 
 #[cfg(unix)]
@@ -1173,7 +1173,7 @@ fn daemon_restart_recovers_checkpoint_without_loss_or_duplication() {
     daemon::run_once(&daemon_loop).expect("restart run");
 
     // 不丢不重：四行各恰好一次、顺序正确。
-    let output_path = root.join("log").join("warp-parse-records.ndjson");
+    let output_path = root.join("log").join("wist-records.ndjson");
     let output = fs::read_to_string(&output_path).expect("read output");
     let bodies: Vec<String> = output
         .lines()

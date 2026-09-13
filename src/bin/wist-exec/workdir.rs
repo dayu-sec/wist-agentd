@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use wist_contracts::action_plan::ActionPlanContract;
 use wist_contracts::action_result::ActionResultContract;
-pub use wist_contracts::state_exec::{ExecProgressState, ExecRuntimeContext};
+pub use wist_contracts::execution_state::{ExecProgressState, ExecRuntimeContext};
 use wist_shared::fs::{read_json, write_json_atomic};
 use wist_shared::paths::{
     WORKDIR_PLAN_FILE, WORKDIR_RESULT_FILE, WORKDIR_RUNTIME_FILE, WORKDIR_STATE_FILE,

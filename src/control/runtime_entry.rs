@@ -359,7 +359,7 @@ fn validate_exec_bin(path: PathBuf, origin: &str) -> io::Result<PathBuf> {
 }
 
 fn sync_runtime_identity(
-    runtime_state: &mut wist_contracts::state_exec::AgentRuntimeState,
+    runtime_state: &mut wist_contracts::agent_state::AgentRuntimeState,
     config: &wist_contracts::agent_config::AgentConfigContract,
 ) -> io::Result<()> {
     if let Some(agent_id) = config

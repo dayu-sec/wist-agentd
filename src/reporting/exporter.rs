@@ -1,5 +1,5 @@
 //! Exporter: reads internal pipeline state and writes JSONL outputs optimized
-//! for downstream WarpParse rules.
+//! for downstream data plane rules.
 //!
 //! Discovery output is split by probe kind (host / process / container) so that
 //! consumers can track each probe's revision independently and file sizes stay
@@ -148,7 +148,7 @@ fn build_disc_row(
     let mut row = serde_json::Map::new();
     row.insert(
         "api_version".to_string(),
-        serde_json::Value::String("warp-insight/v1".to_string()),
+        serde_json::Value::String("wist/v1".to_string()),
     );
     row.insert(
         "kind".to_string(),
@@ -396,7 +396,7 @@ pub async fn export_metrics_async(state_dir: &Path, source: &ExporterSource) -> 
             for group in &samples_snapshot.groups {
                 for sample in &group.samples {
                     rows.push(serde_json::json!({
-                        "api_version": "warp-insight/v1",
+                        "api_version": "wist/v1",
                         "kind": "metrics_sample",
                         "output_id": output_id,
                         "seq": seq,

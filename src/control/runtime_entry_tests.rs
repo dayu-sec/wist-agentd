@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use wist_contracts::agent_config::{
     AgentConfigContract, AgentSection, ControlPlaneSection, ExecutionSection, PathsSection,
 };
-use wist_contracts::state_exec::{AgentRuntimeState, RuntimeMode};
+use wist_contracts::agent_state::{AgentRuntimeState, RuntimeMode};
 
 fn temp_dir(name: &str) -> PathBuf {
     let suffix = SystemTime::now()

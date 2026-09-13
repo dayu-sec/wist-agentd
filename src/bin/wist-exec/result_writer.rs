@@ -3,7 +3,7 @@
 use std::io;
 
 use wist_contracts::action_result::ActionResultContract;
-use wist_contracts::state_exec::ExecProgressState;
+use wist_contracts::execution_state::ExecProgressState;
 use wist_shared::time::now_rfc3339;
 
 use crate::workdir::ExecutionWorkdir;

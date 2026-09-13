@@ -10,7 +10,7 @@ use tokio::fs::File;
 use tokio::process::Command;
 use wist_contracts::action_plan::ActionPlanContract;
 use wist_contracts::action_result::{ActionResultContract, FinalStatus};
-use wist_contracts::state_exec::ExecRuntimeContext;
+use wist_contracts::execution_state::ExecRuntimeContext;
 use wist_shared::paths::{
     ACTIONS_DIR, WORKDIR_PLAN_FILE, WORKDIR_RESULT_FILE, WORKDIR_RUNTIME_FILE,
 };

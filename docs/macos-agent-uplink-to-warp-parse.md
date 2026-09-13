@@ -44,7 +44,7 @@
   带本地缓冲（`state/spool/logs`）与 checkpoint（见 log-file-input-spec）；
 - `[telemetry.logs.output] kind = "file" | "tcp"`；
   - `tcp`：`addr / port / framing="line"`（行帧 NDJSON 发送已现成）；
-  - `file`：`log/warp-parse-records.ndjson`（本地落盘/回放）。
+  - `file`：`log/wist-records.ndjson`（本地落盘/回放）。
 
 ### 3.2 Gateway 数据平面已就绪
 

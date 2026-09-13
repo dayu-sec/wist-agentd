@@ -12,7 +12,7 @@ use wist_contracts::enrollment::{
     AgentCredentialRenewed, AgentEnrollmentResult, AgentEnrollmentResultReturned,
     AgentEnrollmentResultStatus, AgentHostProfile, RenewAgentCredential, SubmitEnrollmentRequest,
 };
-use wist_contracts::state_exec::{AgentRuntimeState, RuntimeMode};
+use wist_contracts::agent_state::{AgentRuntimeState, RuntimeMode};
 use wist_shared::fs::write_bytes_private_atomic;
 use wist_shared::time::now_rfc3339;
 
@@ -735,11 +735,11 @@ mod tests {
     async fn renew_credential_rotates_bearer_and_updates_state() {
         let state_dir = temp_dir("renew-credential");
         let runtime_path = crate::state_store::agent_runtime::path_for(&state_dir);
-        let mut runtime = wist_contracts::state_exec::AgentRuntimeState::new(
+        let mut runtime = wist_contracts::agent_state::AgentRuntimeState::new(
             "agent-x".to_string(),
             "instance-x".to_string(),
             "0.1.0".to_string(),
-            wist_contracts::state_exec::RuntimeMode::Normal,
+            wist_contracts::agent_state::RuntimeMode::Normal,
             "2026-07-01T00:00:00Z".to_string(),
         );
         runtime.credential_id = Some("cred-old".to_string());
@@ -813,11 +813,11 @@ mod tests {
         let runtime_path = crate::state_store::agent_runtime::path_for(&state_dir);
         crate::state_store::agent_runtime::store(
             &runtime_path,
-            &wist_contracts::state_exec::AgentRuntimeState::new(
+            &wist_contracts::agent_state::AgentRuntimeState::new(
                 "agent-state".to_string(),
                 "instance-state".to_string(),
                 "0.1.0".to_string(),
-                wist_contracts::state_exec::RuntimeMode::Normal,
+                wist_contracts::agent_state::RuntimeMode::Normal,
                 "2026-07-27T00:00:00Z".to_string(),
             ),
         )
@@ -836,11 +836,11 @@ mod tests {
     async fn ensure_enrolled_restores_existing_state_credential() {
         let state_dir = temp_dir("existing-state-credential");
         let runtime_path = crate::state_store::agent_runtime::path_for(&state_dir);
-        let mut runtime = wist_contracts::state_exec::AgentRuntimeState::new(
+        let mut runtime = wist_contracts::agent_state::AgentRuntimeState::new(
             "agent-state".to_string(),
             "instance-state".to_string(),
             "0.1.0".to_string(),
-            wist_contracts::state_exec::RuntimeMode::Normal,
+            wist_contracts::agent_state::RuntimeMode::Normal,
             "2026-07-27T00:00:00Z".to_string(),
         );
         runtime.credential_id = Some("cred-state".to_string());
@@ -1088,11 +1088,11 @@ credential_request = "bearer"
     async fn ensure_enrolled_state_restore_scrubs_leftover_token_from_config() {
         let state_dir = temp_dir("state-restore-scrub");
         let runtime_path = crate::state_store::agent_runtime::path_for(&state_dir);
-        let mut runtime = wist_contracts::state_exec::AgentRuntimeState::new(
+        let mut runtime = wist_contracts::agent_state::AgentRuntimeState::new(
             "agent-state".to_string(),
             "instance-state".to_string(),
             "0.1.0".to_string(),
-            wist_contracts::state_exec::RuntimeMode::Normal,
+            wist_contracts::agent_state::RuntimeMode::Normal,
             "2026-07-27T00:00:00Z".to_string(),
         );
         runtime.credential_id = Some("cred-state".to_string());

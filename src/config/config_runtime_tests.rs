@@ -74,7 +74,7 @@ fn default_config_template_contains_file_input_example() {
     assert!(template.contains("# [[telemetry.logs.file_inputs]]"));
     assert!(template.contains("input_id = \"macos_install_log\""));
     assert!(template.contains("input_id = \"macos_launchd\""));
-    assert!(template.contains("path = \"log/warp-parse-records.ndjson\""));
+    assert!(template.contains("path = \"log/wist-records.ndjson\""));
     assert!(template.contains("# kind = \"tcp\""));
     assert!(!template.contains("max_running_actions = 1"));
     assert!(!template.contains("instance_name = \"local\""));

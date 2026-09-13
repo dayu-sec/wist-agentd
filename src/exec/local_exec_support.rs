@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 use wist_contracts::action_result::{
     ActionOutputs, ActionResultContract, FinalStatus, StepActionRecord, StepStatus,
 };
-use wist_contracts::state_exec::ExecProgressState;
+use wist_contracts::execution_state::ExecProgressState;
 use crate::fs_async::write_json_atomic_async;
 use wist_shared::paths::WORKDIR_STATE_FILE;
 use wist_shared::time::now_rfc3339;

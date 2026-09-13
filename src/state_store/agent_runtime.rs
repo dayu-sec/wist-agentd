@@ -3,8 +3,8 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use wist_contracts::state_exec::AgentRuntimeState;
-use wist_contracts::state_exec::RuntimeMode;
+use wist_contracts::agent_state::AgentRuntimeState;
+use wist_contracts::agent_state::RuntimeMode;
 use wist_shared::fs::{read_json, write_json_private_atomic};
 
 use crate::fs_async::{read_json_async, write_json_private_atomic_async};
@@ -90,7 +90,7 @@ mod tests {
         default_instance_id_from_sources, load_or_default_async, path_for, store, store_async,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
-    use wist_contracts::state_exec::{AgentRuntimeState, RuntimeMode};
+    use wist_contracts::agent_state::{AgentRuntimeState, RuntimeMode};
 
     #[test]
     fn default_instance_id_prefers_hostname_env() {
