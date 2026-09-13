@@ -1,6 +1,6 @@
 //! Conversion from folded lines into structured telemetry records.
 
-use wist_contracts::telemetry_record::TelemetryRecordContract;
+use wist_contracts::telemetry_record::TelemetryRecord;
 
 use super::multiline::FoldedLine;
 
@@ -11,13 +11,13 @@ pub fn parse_folded_lines(
     source_path: &str,
     lines: Vec<FoldedLine>,
     next_seq: &mut u64,
-) -> Vec<TelemetryRecordContract> {
+) -> Vec<TelemetryRecord> {
     lines
         .into_iter()
         .map(|line| {
             let seq = *next_seq;
             *next_seq += 1;
-            TelemetryRecordContract::new_log(
+            TelemetryRecord::new_log(
                 agent_id.to_string(),
                 observed_at.to_string(),
                 input_id.to_string(),

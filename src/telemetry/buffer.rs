@@ -1,12 +1,12 @@
 //! In-memory staging for telemetry records before sink or spool.
 
-use wist_contracts::telemetry_record::TelemetryRecordContract;
+use wist_contracts::telemetry_record::TelemetryRecord;
 
 #[derive(Debug, Clone, PartialEq, Eq, ::jumo_derive::Jumo)]
 #[jumo(kind = "struct", domain = "Discovery", module = "Discovery.Collect")]
 pub struct StageResult {
-    pub staged: Vec<TelemetryRecordContract>,
-    pub overflowed: Vec<TelemetryRecordContract>,
+    pub staged: Vec<TelemetryRecord>,
+    pub overflowed: Vec<TelemetryRecord>,
 }
 
 #[derive(Debug, Clone, ::jumo_derive::Jumo)]
@@ -14,7 +14,7 @@ pub struct StageResult {
 pub struct TelemetryBuffer {
     max_bytes: usize,
     used_bytes: usize,
-    staged: Vec<TelemetryRecordContract>,
+    staged: Vec<TelemetryRecord>,
 }
 
 impl TelemetryBuffer {
@@ -30,7 +30,7 @@ impl TelemetryBuffer {
     ///
     /// Records that do not fit are returned in `overflowed`; callers are
     /// responsible for spooling or otherwise handling them.
-    pub fn stage_all(&mut self, records: Vec<TelemetryRecordContract>) -> StageResult {
+    pub fn stage_all(&mut self, records: Vec<TelemetryRecord>) -> StageResult {
         let mut overflowed = Vec::new();
         for record in records {
             let record_size = estimate_record_size(&record);
@@ -48,7 +48,7 @@ impl TelemetryBuffer {
     }
 }
 
-fn estimate_record_size(record: &TelemetryRecordContract) -> usize {
+fn estimate_record_size(record: &TelemetryRecord) -> usize {
     record.body.len()
         + record.input_id.len()
         + record.source_path.len()
@@ -59,10 +59,10 @@ fn estimate_record_size(record: &TelemetryRecordContract) -> usize {
 #[cfg(test)]
 mod tests {
     use super::TelemetryBuffer;
-    use wist_contracts::telemetry_record::TelemetryRecordContract;
+    use wist_contracts::telemetry_record::TelemetryRecord;
 
-    fn record(body: &str) -> TelemetryRecordContract {
-        TelemetryRecordContract::new_log(
+    fn record(body: &str) -> TelemetryRecord {
+        TelemetryRecord::new_log(
             "agent-a".to_string(),
             "2026-04-13T00:00:00Z".to_string(),
             "input-a".to_string(),

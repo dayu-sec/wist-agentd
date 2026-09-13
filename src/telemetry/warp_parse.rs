@@ -9,20 +9,20 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout};
 use wist_contracts::agent_config::LogsOutputSection;
-use wist_contracts::telemetry_record::{DataFrame, TelemetryRecordContract};
+use wist_contracts::telemetry_record::{DataFrame, TelemetryRecord};
 use wist_shared::fs::ensure_parent;
 
 use crate::telemetry::metrics::samples::VmMetricLine;
 
 pub(crate) trait RecordSink {
-    async fn write_records(&mut self, records: &[TelemetryRecordContract]) -> io::Result<()>;
+    async fn write_records(&mut self, records: &[TelemetryRecord]) -> io::Result<()>;
 }
 
 impl<T> RecordSink for &mut T
 where
     T: RecordSink + ?Sized,
 {
-    async fn write_records(&mut self, records: &[TelemetryRecordContract]) -> io::Result<()> {
+    async fn write_records(&mut self, records: &[TelemetryRecord]) -> io::Result<()> {
         (**self).write_records(records).await
     }
 }
@@ -34,7 +34,7 @@ pub(crate) enum TelemetryRecordSink {
 }
 
 impl RecordSink for TelemetryRecordSink {
-    async fn write_records(&mut self, records: &[TelemetryRecordContract]) -> io::Result<()> {
+    async fn write_records(&mut self, records: &[TelemetryRecord]) -> io::Result<()> {
         match self {
             Self::File(sink) => sink.write_records(records).await,
             Self::Tcp(sink) => sink.write_records(records).await,
@@ -87,7 +87,7 @@ impl FileRecordSink {
 }
 
 impl RecordSink for FileRecordSink {
-    async fn write_records(&mut self, records: &[TelemetryRecordContract]) -> io::Result<()> {
+    async fn write_records(&mut self, records: &[TelemetryRecord]) -> io::Result<()> {
         if records.is_empty() {
             return Ok(());
         }
@@ -245,7 +245,7 @@ impl TcpRecordSink {
 }
 
 impl RecordSink for TcpRecordSink {
-    async fn write_records(&mut self, records: &[TelemetryRecordContract]) -> io::Result<()> {
+    async fn write_records(&mut self, records: &[TelemetryRecord]) -> io::Result<()> {
         if records.is_empty() {
             return Ok(());
         }
@@ -264,7 +264,7 @@ impl RecordSink for TcpRecordSink {
 ///
 /// `{envelope} RAW: <body>`，其中 envelope 只承载通用字段（`schema`/`agent`/`ts`/`seq`，短名），
 /// body 保持原文、不转义，供数据面审计核对与回放。来源细节（`input`/路径/偏移）不进帧。
-fn build_record_frame(record: &TelemetryRecordContract) -> io::Result<Vec<u8>> {
+fn build_record_frame(record: &TelemetryRecord) -> io::Result<Vec<u8>> {
     let envelope = DataFrame::from(record);
     let mut frame = serde_json::to_vec(&envelope)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
@@ -325,10 +325,10 @@ mod tests {
     };
 
     use crate::telemetry::metrics::samples::{VmMetricLabels, VmMetricLine};
-    use wist_contracts::telemetry_record::{DataFrame, TelemetryRecordContract};
+    use wist_contracts::telemetry_record::{DataFrame, TelemetryRecord};
 
-    fn record(body: &str) -> TelemetryRecordContract {
-        TelemetryRecordContract::new_log(
+    fn record(body: &str) -> TelemetryRecord {
+        TelemetryRecord::new_log(
             "agent-a".to_string(),
             "2026-04-14T00:00:00Z".to_string(),
             "input-a".to_string(),

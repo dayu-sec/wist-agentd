@@ -7,7 +7,7 @@ use orion_error::prelude::*;
 
 use crate::error::{DiscoveryReason, DiscoveryResult};
 use crate::fs_async::{read_json_async, write_json_atomic_async};
-use wist_contracts::discovery::{DiscoveryCacheMeta, DiscoverySnapshotContract};
+use wist_contracts::discovery::{DiscoveryCacheMeta, DiscoverySnapshot};
 use wist_shared::fs::{read_json, write_json_atomic};
 
 pub const DISCOVERY_STATE_DIR: &str = "discovery";
@@ -46,7 +46,7 @@ pub struct DiscoveryCacheLoadFailure {
 pub fn load_snapshot(
     paths: &DiscoveryCachePaths,
 ) -> (
-    Option<DiscoverySnapshotContract>,
+    Option<DiscoverySnapshot>,
     Option<DiscoveryCacheLoadFailure>,
 ) {
     if !paths.meta.exists() || !paths.resources.exists() || !paths.targets.exists() {
@@ -90,7 +90,7 @@ pub fn load_snapshot(
         }
     };
     (
-        Some(DiscoverySnapshotContract {
+        Some(DiscoverySnapshot {
             schema_version: meta.schema_version,
             snapshot_id: meta.snapshot_id,
             revision: meta.revision,
@@ -126,7 +126,7 @@ pub fn load_meta(
 
 pub fn store_snapshot(
     paths: &DiscoveryCachePaths,
-    snapshot: &DiscoverySnapshotContract,
+    snapshot: &DiscoverySnapshot,
     last_success_at: Option<&str>,
     last_error: Option<String>,
 ) -> DiscoveryResult<()> {
@@ -149,7 +149,7 @@ pub fn store_snapshot(
 pub async fn load_snapshot_async(
     paths: &DiscoveryCachePaths,
 ) -> (
-    Option<DiscoverySnapshotContract>,
+    Option<DiscoverySnapshot>,
     Option<DiscoveryCacheLoadFailure>,
 ) {
     let (meta_exists, meta_err) = metadata_exists(&paths.meta, "cache_load_meta").await;
@@ -206,7 +206,7 @@ pub async fn load_snapshot_async(
         }
     };
     (
-        Some(DiscoverySnapshotContract {
+        Some(DiscoverySnapshot {
             schema_version: meta.schema_version,
             snapshot_id: meta.snapshot_id,
             revision: meta.revision,
@@ -246,7 +246,7 @@ pub async fn load_meta_async(
 
 pub async fn store_snapshot_async(
     paths: &DiscoveryCachePaths,
-    snapshot: &DiscoverySnapshotContract,
+    snapshot: &DiscoverySnapshot,
     last_success_at: Option<&str>,
     last_error: Option<String>,
 ) -> DiscoveryResult<()> {
@@ -292,7 +292,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use wist_contracts::discovery::{DiscoveryCacheMeta, DiscoverySnapshotContract};
+    use wist_contracts::discovery::{DiscoveryCacheMeta, DiscoverySnapshot};
 
     use super::{DiscoveryCachePaths, load_meta, load_snapshot, store_snapshot};
 
@@ -311,7 +311,7 @@ mod tests {
     fn store_and_load_snapshot_round_trip() {
         let state_dir = temp_dir("round-trip");
         let paths = DiscoveryCachePaths::under_state_dir(&state_dir);
-        let snapshot = DiscoverySnapshotContract::new(
+        let snapshot = DiscoverySnapshot::new(
             "snapshot-1".to_string(),
             1,
             "2026-04-19T00:00:00Z".to_string(),

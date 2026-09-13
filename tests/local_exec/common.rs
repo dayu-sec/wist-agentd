@@ -9,11 +9,11 @@ use time::Duration as TimeDuration;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use wist_contracts::action_plan::{
-    ActionPlanConstraints, ActionPlanContract, ActionPlanMeta, ActionPlanProgram, ActionPlanStep,
+    ActionPlanConstraints, ActionPlan, ActionPlanMeta, ActionPlanProgram, ActionPlanStep,
     ActionPlanTarget, ApprovalMode, RiskLevel,
 };
 use wist_contracts::agent_config::{
-    AgentConfigContract, AgentSection, ControlPlaneSection, ExecutionSection, LogFileInputSection,
+    AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, LogFileInputSection,
     LogsFileOutputSection, LogsOutputSection, LogsSection, LogsTcpOutputSection, PathsSection,
     TelemetrySection,
 };
@@ -56,8 +56,8 @@ pub(crate) fn write_exec_wrapper(root: &Path, body: &str) -> PathBuf {
     wrapper
 }
 
-pub(crate) fn sample_plan() -> ActionPlanContract {
-    ActionPlanContract::new(
+pub(crate) fn sample_plan() -> ActionPlan {
+    ActionPlan::new(
         ActionPlanMeta {
             action_id: "act_001".to_string(),
             request_id: "req_001".to_string(),
@@ -99,15 +99,15 @@ pub(crate) fn sample_plan() -> ActionPlanContract {
     )
 }
 
-pub(crate) fn sample_plan_with_ids(action_id: &str, request_id: &str) -> ActionPlanContract {
+pub(crate) fn sample_plan_with_ids(action_id: &str, request_id: &str) -> ActionPlan {
     let mut plan = sample_plan();
     plan.meta.action_id = action_id.to_string();
     plan.meta.request_id = request_id.to_string();
     plan
 }
 
-pub(crate) fn standalone_config(root: &std::path::Path) -> AgentConfigContract {
-    AgentConfigContract::new(
+pub(crate) fn standalone_config(root: &std::path::Path) -> AgentConfig {
+    AgentConfig::new(
         AgentSection {
             agent_id: Some("agent-001".to_string()),
             environment_id: Some("prod-cn".to_string()),
@@ -143,7 +143,7 @@ pub(crate) fn standalone_config(root: &std::path::Path) -> AgentConfigContract {
 pub(crate) fn standalone_config_with_file_input(
     root: &std::path::Path,
     input_path: &std::path::Path,
-) -> AgentConfigContract {
+) -> AgentConfig {
     standalone_config(root).with_telemetry(TelemetrySection {
         logs: LogsSection {
             file_inputs: vec![LogFileInputSection {
@@ -183,7 +183,7 @@ pub(crate) fn standalone_config_with_file_input(
 pub(crate) fn standalone_config_with_file_inputs(
     root: &std::path::Path,
     file_inputs: Vec<LogFileInputSection>,
-) -> AgentConfigContract {
+) -> AgentConfig {
     standalone_config(root).with_telemetry(TelemetrySection {
         logs: LogsSection {
             file_inputs,
@@ -221,7 +221,7 @@ pub(crate) fn standalone_config_with_tcp_file_input(
     addr: &str,
     port: u16,
     framing: &str,
-) -> AgentConfigContract {
+) -> AgentConfig {
     standalone_config(root).with_telemetry(TelemetrySection {
         logs: LogsSection {
             file_inputs: vec![LogFileInputSection {

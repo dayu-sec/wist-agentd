@@ -4,13 +4,13 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use wist_contracts::action_result::ActionResultContract;
+use wist_contracts::action_result::ActionResult;
 use wist_shared::paths::REPORT_ENVELOPE_SUFFIX;
 
 use crate::state_store::execution_queue::{self, ExecutionQueueItem};
 use crate::state_store::{history, reporting, running};
 
-pub fn final_state_name(result: &ActionResultContract) -> &'static str {
+pub fn final_state_name(result: &ActionResult) -> &'static str {
     result.final_status.as_state_name()
 }
 

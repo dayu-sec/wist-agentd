@@ -7,12 +7,12 @@ use std::time::Duration;
 
 use orion_error::{conversion::ToStructError, prelude::*};
 
-use wist_contracts::agent_config::AgentConfigContract;
-use wist_contracts::enrollment::{
-    AgentCredentialRenewed, AgentEnrollmentResult, EnrollmentEnvelope,
-    AgentEnrollmentResultStatus, AgentHostProfile, RenewAgentCredential, SubmitEnrollmentRequest,
-};
+use wist_contracts::agent_config::AgentConfig;
 use wist_contracts::agent_state::{AgentRuntimeState, RuntimeMode};
+use wist_contracts::enrollment::{
+    CredentialRenewal, CredentialRenewed, EnrollmentEnvelope, EnrollmentOutcome, EnrollmentRequest,
+    EnrollmentStatus, HostProfile,
+};
 use wist_shared::fs::write_bytes_private_atomic;
 use wist_shared::time::now_rfc3339;
 
@@ -35,14 +35,14 @@ pub enum EnrollmentDecision {
 pub use crate::error::{EnrollmentError, EnrollmentReason, EnrollmentResult};
 
 pub async fn ensure_enrolled(
-    config: &mut AgentConfigContract,
+    config: &mut AgentConfig,
     state_dir: &Path,
 ) -> Result<EnrollmentDecision, EnrollmentError> {
     ensure_enrolled_with_optional_config_path(config, state_dir, None).await
 }
 
 pub async fn ensure_enrolled_with_config_path(
-    config: &mut AgentConfigContract,
+    config: &mut AgentConfig,
     state_dir: &Path,
     config_path: &Path,
 ) -> Result<EnrollmentDecision, EnrollmentError> {
@@ -50,7 +50,7 @@ pub async fn ensure_enrolled_with_config_path(
 }
 
 async fn ensure_enrolled_with_optional_config_path(
-    config: &mut AgentConfigContract,
+    config: &mut AgentConfig,
     state_dir: &Path,
     config_path: Option<&Path>,
 ) -> Result<EnrollmentDecision, EnrollmentError> {
@@ -94,12 +94,12 @@ async fn ensure_enrolled_with_optional_config_path(
     Ok(EnrollmentDecision::Enrolled)
 }
 
-fn has_config_identity(config: &AgentConfigContract) -> bool {
+fn has_config_identity(config: &AgentConfig) -> bool {
     required_option(config.agent.agent_id.as_deref()).is_some()
 }
 
 fn load_state_identity(
-    config: &mut AgentConfigContract,
+    config: &mut AgentConfig,
     state_dir: &Path,
 ) -> Result<bool, EnrollmentError> {
     let runtime_path = state_store::agent_runtime::path_for(state_dir);
@@ -137,11 +137,8 @@ fn load_state_identity(
     Ok(true)
 }
 
-fn build_enrollment_request(
-    config: &AgentConfigContract,
-    token: String,
-) -> SubmitEnrollmentRequest {
-    SubmitEnrollmentRequest::new(
+fn build_enrollment_request(config: &AgentConfig, token: String) -> EnrollmentRequest {
+    EnrollmentRequest::new(
         token,
         config
             .control_plane
@@ -154,7 +151,7 @@ fn build_enrollment_request(
     )
 }
 
-fn build_host_profile(config: &AgentConfigContract) -> AgentHostProfile {
+fn build_host_profile(config: &AgentConfig) -> HostProfile {
     let hostname = hostname_from_sources(
         std::env::var("HOSTNAME").ok().as_deref(),
         std::env::var("COMPUTERNAME").ok().as_deref(),
@@ -169,7 +166,7 @@ fn build_host_profile(config: &AgentConfigContract) -> AgentHostProfile {
     .unwrap_or("local-node")
     .to_string();
 
-    AgentHostProfile {
+    HostProfile {
         node_id,
         hostname,
         os: std::env::consts::OS.to_string(),
@@ -182,9 +179,9 @@ fn build_host_profile(config: &AgentConfigContract) -> AgentHostProfile {
 }
 
 async fn post_enrollment(
-    config: &AgentConfigContract,
+    config: &AgentConfig,
     endpoint: &str,
-    request: &SubmitEnrollmentRequest,
+    request: &EnrollmentRequest,
 ) -> Result<EnrollmentEnvelope, EnrollmentError> {
     let url = format!("{}/api/v1/agent/enroll", endpoint.trim_end_matches('/'));
     let client = enrollment_http_client(config)?;
@@ -229,7 +226,7 @@ fn retry_backoff(attempt: u32) -> Duration {
 /// Best-effort credential rotation when the restored credential is expired or
 /// within [`CREDENTIAL_RENEWAL_WINDOW`] of expiry. Failures are logged and the
 /// existing credential is kept so the daemon still starts.
-async fn renew_state_credential_if_needed(config: &mut AgentConfigContract, state_dir: &Path) {
+async fn renew_state_credential_if_needed(config: &mut AgentConfig, state_dir: &Path) {
     let Some(expires_at) = config.control_plane.credential_expires_at.as_deref() else {
         return;
     };
@@ -249,7 +246,7 @@ async fn renew_state_credential_if_needed(config: &mut AgentConfigContract, stat
 }
 
 async fn renew_credential(
-    config: &mut AgentConfigContract,
+    config: &mut AgentConfig,
     state_dir: &Path,
 ) -> Result<(), EnrollmentError> {
     let Some(endpoint) = required_option(config.control_plane.endpoint.as_deref()) else {
@@ -266,7 +263,7 @@ async fn renew_credential(
     let instance_id = required_option(config.agent.instance_name.as_deref())
         .unwrap_or_default()
         .to_string();
-    let request = RenewAgentCredential::new(
+    let request = CredentialRenewal::new(
         agent_id.to_string(),
         instance_id,
         config
@@ -288,7 +285,7 @@ async fn renew_credential(
     let response = response
         .error_for_status()
         .source_raw_err(EnrollmentReason::Http, "renewal http error")?;
-    let renewed: AgentCredentialRenewed = response
+    let renewed: CredentialRenewed = response
         .json()
         .await
         .source_raw_err(EnrollmentReason::Http, "decode renewal response")?;
@@ -307,7 +304,7 @@ async fn renew_credential(
 }
 
 pub(crate) fn enrollment_http_client(
-    config: &AgentConfigContract,
+    config: &AgentConfig,
 ) -> Result<reqwest::Client, EnrollmentError> {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(ENROLLMENT_CONNECT_TIMEOUT)
@@ -363,11 +360,11 @@ pub(crate) fn enrollment_http_client(
 }
 
 fn apply_enrollment_result(
-    config: &mut AgentConfigContract,
+    config: &mut AgentConfig,
     state_dir: &Path,
-    result: AgentEnrollmentResult,
+    result: EnrollmentOutcome,
 ) -> Result<(), EnrollmentError> {
-    if result.status != AgentEnrollmentResultStatus::Accepted {
+    if result.status != EnrollmentStatus::Accepted {
         return Err(EnrollmentReason::Rejected.to_err().with_detail(format!(
             "enrollment rejected with status {:?} reason {}",
             result.status,
@@ -434,8 +431,8 @@ fn apply_enrollment_result(
 /// enrollment and renewal paths share this so the auth_scheme handling stays
 /// consistent.
 fn apply_credential_to_config(
-    config: &mut AgentConfigContract,
-    credential: &wist_contracts::enrollment::AgentCredentialBundle,
+    config: &mut AgentConfig,
+    credential: &wist_contracts::enrollment::CredentialBundle,
 ) -> Result<(), EnrollmentError> {
     config.control_plane.credential_id = Some(credential.credential_id.clone());
     match credential.auth_scheme.as_deref() {
@@ -470,7 +467,7 @@ fn apply_credential_to_config(
 
 fn apply_credential_to_runtime_state(
     runtime_state: &mut AgentRuntimeState,
-    credential: wist_contracts::enrollment::AgentCredentialBundle,
+    credential: wist_contracts::enrollment::CredentialBundle,
 ) {
     runtime_state.credential_id = Some(credential.credential_id);
     match credential.auth_scheme.as_deref() {
@@ -582,11 +579,10 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use wist_contracts::agent_config::{
-        AgentConfigContract, AgentSection, ControlPlaneSection, ExecutionSection, PathsSection,
+        AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, PathsSection,
     };
     use wist_contracts::enrollment::{
-        AgentCredentialBundle, AgentEnrollmentResult, AgentEnrollmentResultStatus, AgentIdentity,
-        AgentIdentityStatus,
+        AgentIdentity, AgentIdentityStatus, CredentialBundle, EnrollmentOutcome, EnrollmentStatus,
     };
 
     use super::{
@@ -595,8 +591,8 @@ mod tests {
         renew_credential,
     };
 
-    fn config() -> AgentConfigContract {
-        AgentConfigContract::new(
+    fn config() -> AgentConfig {
+        AgentConfig::new(
             AgentSection {
                 agent_id: None,
                 environment_id: None,
@@ -1018,8 +1014,8 @@ credential_request = "bearer"
     fn accepted_result_updates_config_and_runtime_state() {
         let state_dir = temp_dir("accepted-result");
         let mut config = config();
-        let result = AgentEnrollmentResult {
-            status: AgentEnrollmentResultStatus::Accepted,
+        let result = EnrollmentOutcome {
+            status: EnrollmentStatus::Accepted,
             reason_code: None,
             agent_id: None,
             instance_id: None,
@@ -1033,7 +1029,7 @@ credential_request = "bearer"
                 expires_at: None,
                 status: AgentIdentityStatus::Active,
             }),
-            credential_bundle: Some(AgentCredentialBundle {
+            credential_bundle: Some(CredentialBundle {
                 credential_id: "cred-issued".to_string(),
                 agent_id: "agent-issued".to_string(),
                 instance_id: "instance-issued".to_string(),
@@ -1163,13 +1159,13 @@ auth_mode = "enrollment_token"
     fn accepted_result_rejects_unsupported_credential_scheme() {
         let state_dir = temp_dir("unsupported-scheme");
         let mut config = config();
-        let result = AgentEnrollmentResult {
-            status: AgentEnrollmentResultStatus::Accepted,
+        let result = EnrollmentOutcome {
+            status: EnrollmentStatus::Accepted,
             reason_code: None,
             agent_id: Some("agent-x".to_string()),
             instance_id: Some("instance-x".to_string()),
             issued_identity: None,
-            credential_bundle: Some(AgentCredentialBundle {
+            credential_bundle: Some(CredentialBundle {
                 credential_id: "cred-x".to_string(),
                 agent_id: "agent-x".to_string(),
                 instance_id: "instance-x".to_string(),

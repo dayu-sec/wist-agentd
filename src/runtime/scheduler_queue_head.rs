@@ -1,7 +1,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use wist_contracts::action_plan::ActionPlanContract;
+use wist_contracts::action_plan::ActionPlan;
 use wist_shared::paths::ACTIONS_DIR;
 
 use crate::error::RuntimeResult;
@@ -27,7 +27,7 @@ use reporting_support::{
 pub(super) struct QueueHeadContext {
     workdir: PathBuf,
     running_path: PathBuf,
-    plan: ActionPlanContract,
+    plan: ActionPlan,
 }
 
 pub(super) enum QueueHeadDisposition {

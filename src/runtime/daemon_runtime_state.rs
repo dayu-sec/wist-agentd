@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::io;
 use std::path::Path;
 
-use wist_contracts::agent_config::AgentConfigContract;
+use wist_contracts::agent_config::AgentConfig;
 use wist_shared::paths::REPORT_ENVELOPE_SUFFIX;
 use wist_shared::time::now_rfc3339;
 
@@ -151,7 +151,7 @@ pub(super) async fn count_reporting_entries_async(state_dir: &Path) -> io::Resul
     Ok(count)
 }
 
-pub(super) fn instance_id(config: &AgentConfigContract) -> String {
+pub(super) fn instance_id(config: &AgentConfig) -> String {
     config
         .agent
         .instance_name

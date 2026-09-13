@@ -3,9 +3,9 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use wist_contracts::action_plan::ActionPlanContract;
-use wist_contracts::action_result::ActionResultContract;
-pub use wist_contracts::execution_state::{ExecutionProgressState, ExecutionRuntimeContext};
+use wist_contracts::action_plan::ActionPlan;
+use wist_contracts::action_result::ActionResult;
+pub use wist_contracts::execution_state::{ProgressState, RuntimeContext};
 use wist_shared::fs::{read_json, write_json_atomic};
 use wist_shared::paths::{
     WORKDIR_PLAN_FILE, WORKDIR_RESULT_FILE, WORKDIR_RUNTIME_FILE, WORKDIR_STATE_FILE,
@@ -38,19 +38,19 @@ impl ExecutionWorkdir {
         })
     }
 
-    pub fn read_plan(&self) -> io::Result<ActionPlanContract> {
+    pub fn read_plan(&self) -> io::Result<ActionPlan> {
         read_json(&self.plan_path)
     }
 
-    pub fn read_runtime(&self) -> io::Result<ExecutionRuntimeContext> {
+    pub fn read_runtime(&self) -> io::Result<RuntimeContext> {
         read_json(&self.runtime_path)
     }
 
-    pub fn write_state(&self, state: &ExecutionProgressState) -> io::Result<()> {
+    pub fn write_state(&self, state: &ProgressState) -> io::Result<()> {
         write_json_atomic(&self.state_path, state)
     }
 
-    pub fn write_result(&self, result: &ActionResultContract) -> io::Result<()> {
+    pub fn write_result(&self, result: &ActionResult) -> io::Result<()> {
         write_json_atomic(&self.result_path, result)
     }
 }

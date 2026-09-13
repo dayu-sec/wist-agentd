@@ -1,7 +1,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use wist_contracts::agent_config::{AgentConfigContract, LogFileInputSection};
+use wist_contracts::agent_config::{AgentConfig, LogFileInputSection};
 
 use crate::telemetry::logs::files::file_reader::ReadLimits;
 use crate::telemetry::logs::files::file_watcher::StartupPosition;
@@ -14,12 +14,12 @@ use super::{TelemetryFailure, TelemetryFailureKind};
 
 pub(super) const SPOOL_REPLAY_BATCH_SIZE: usize = 128;
 
-pub(super) fn build_record_sink(config: &AgentConfigContract) -> io::Result<TelemetryRecordSink> {
+pub(super) fn build_record_sink(config: &AgentConfig) -> io::Result<TelemetryRecordSink> {
     TelemetryRecordSink::from_logs_output(&config.telemetry.logs.output)
 }
 
 pub(super) async fn replay_spool_only<S: RecordSink>(
-    config: &AgentConfigContract,
+    config: &AgentConfig,
     input: &LogFileInputSection,
     sink: &mut S,
 ) -> io::Result<Option<ProcessOutcome>> {
@@ -33,7 +33,7 @@ pub(super) async fn replay_spool_only<S: RecordSink>(
 }
 
 pub(super) fn build_file_input_config(
-    config: &AgentConfigContract,
+    config: &AgentConfig,
     input: &LogFileInputSection,
     source_path: PathBuf,
 ) -> FileInputConfig {
@@ -93,7 +93,7 @@ pub(super) fn spool_paused_reason(spool_bytes: u64) -> String {
     format!("spool over limit ({spool_bytes} bytes); source read paused")
 }
 
-fn spool_path_for(config: &AgentConfigContract, input: &LogFileInputSection) -> PathBuf {
+fn spool_path_for(config: &AgentConfig, input: &LogFileInputSection) -> PathBuf {
     Path::new(&config.telemetry.logs.spool_dir).join(format!("{}.ndjson", input.input_id))
 }
 
@@ -116,12 +116,12 @@ mod tests {
     use super::build_file_input_config;
     use std::path::PathBuf;
     use wist_contracts::agent_config::{
-        AgentConfigContract, AgentSection, ControlPlaneSection, ExecutionSection,
+        AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection,
         LogFileInputSection, PathsSection,
     };
 
-    fn config_with_agent(agent_id: Option<&str>) -> AgentConfigContract {
-        AgentConfigContract::new(
+    fn config_with_agent(agent_id: Option<&str>) -> AgentConfig {
+        AgentConfig::new(
             AgentSection {
                 agent_id: agent_id.map(str::to_string),
                 environment_id: None,

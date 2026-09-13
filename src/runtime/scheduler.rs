@@ -3,7 +3,7 @@
 use std::io;
 use std::path::PathBuf;
 
-use wist_contracts::action_plan::{ActionPlanContract, RiskLevel};
+use wist_contracts::action_plan::{ActionPlan, RiskLevel};
 use wist_shared::integrity::digest_json;
 use wist_shared::paths::{ACTIONS_DIR, WORKDIR_PLAN_FILE};
 use wist_shared::time::{after_millis_rfc3339, now_rfc3339};
@@ -23,7 +23,7 @@ use queue_head_support::{QueueHeadDisposition, handle_queue_head_async};
 pub struct SchedulerRequest {
     pub run_dir: PathBuf,
     pub state_dir: PathBuf,
-    pub plan: ActionPlanContract,
+    pub plan: ActionPlan,
 }
 
 #[derive(Debug, Clone, ::jumo_derive::Jumo)]

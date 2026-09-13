@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use wist_contracts::agent_config::{
-    AgentConfigContract, AgentSection, ControlPlaneSection, ExecutionSection, PathsSection,
+    AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, PathsSection,
 };
 use wist_contracts::agent_state::{AgentRuntimeState, RuntimeMode};
 
@@ -408,7 +408,7 @@ fn sync_runtime_identity_prefers_config_identity_when_present() {
         RuntimeMode::Normal,
         "2026-04-12T10:00:00Z".to_string(),
     );
-    let config = AgentConfigContract::new(
+    let config = AgentConfig::new(
         AgentSection {
             agent_id: Some("agent-from-config".to_string()),
             environment_id: Some("prod".to_string()),
@@ -455,7 +455,7 @@ fn sync_runtime_identity_rejects_config_agent_id_conflicting_with_enrolled_ident
         RuntimeMode::Normal,
         "2026-04-12T10:00:00Z".to_string(),
     );
-    let config = AgentConfigContract::new(
+    let config = AgentConfig::new(
         AgentSection {
             agent_id: Some("agent-b".to_string()),
             environment_id: None,

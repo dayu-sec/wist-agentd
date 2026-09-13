@@ -132,7 +132,7 @@ async fn execution_is_still_running_async(
 
 async fn read_queued_plan_async(
     workdir: &Path,
-) -> RuntimeResult<wist_contracts::action_plan::ActionPlanContract> {
+) -> RuntimeResult<wist_contracts::action_plan::ActionPlan> {
     Ok(read_json_async(&workdir.join(WORKDIR_PLAN_FILE)).await?)
 }
 

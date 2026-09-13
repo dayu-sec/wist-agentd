@@ -5,7 +5,7 @@ use std::io;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use wist_contracts::agent_config::AgentConfigContract;
+use wist_contracts::agent_config::AgentConfig;
 use wist_contracts::gateway::{AgentHello, AgentWorkState, AgentWorkStateChange};
 use wist_shared::time::now_rfc3339;
 
@@ -145,7 +145,7 @@ fn cpu_percent_since(previous: &CpuSample, now: Instant, ticks_per_sec: u64) -> 
 /// Best-effort status heartbeat to the admin control plane. Returns the measured
 /// round-trip latency in milliseconds when the report succeeded.
 async fn report_status_to_control_plane(
-    config: &AgentConfigContract,
+    config: &AgentConfig,
     cpu_percent: Option<f64>,
     last_latency_ms: Option<u64>,
     work_state_changes: Option<Vec<AgentWorkStateChange>>,
@@ -238,7 +238,7 @@ fn to_agent_work_state_changes(changes: &[TelemetryWorkState]) -> Vec<AgentWorkS
 #[derive(::jumo_derive::Jumo)]
 #[jumo(kind = "struct", domain = "Reporting", module = "Reporting.Pipeline")]
 pub struct DaemonLoop<'a> {
-    pub config: &'a AgentConfigContract,
+    pub config: &'a AgentConfig,
     pub exec_bin: &'a Path,
 }
 
@@ -431,7 +431,7 @@ struct DiscoveryHealth {
 }
 
 async fn refresh_discovery_snapshot(
-    config: &AgentConfigContract,
+    config: &AgentConfig,
     state_dir: &Path,
 ) -> DiscoveryHealth {
     let mut runtime = DiscoveryRuntime::new(discovery_probes(config));
@@ -534,7 +534,7 @@ async fn refresh_discovery_snapshot(
     }
 }
 
-fn discovery_probes(config: &AgentConfigContract) -> Vec<Box<dyn DiscoveryProbe + Send + Sync>> {
+fn discovery_probes(config: &AgentConfig) -> Vec<Box<dyn DiscoveryProbe + Send + Sync>> {
     let mut probes: Vec<Box<dyn DiscoveryProbe + Send + Sync>> = Vec::new();
     if config.discovery.host_enabled {
         probes.push(Box::new(HostDiscoveryProbe));
@@ -693,8 +693,8 @@ mod tests {
         AgentSection, ControlPlaneSection, ExecutionSection, PathsSection,
     };
 
-    fn test_config() -> AgentConfigContract {
-        AgentConfigContract::new(
+    fn test_config() -> AgentConfig {
+        AgentConfig::new(
             AgentSection {
                 agent_id: Some("agent-x".to_string()),
                 environment_id: None,

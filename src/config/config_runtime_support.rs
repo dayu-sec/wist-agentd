@@ -2,7 +2,7 @@ use std::env;
 use std::path::{Component, Path, PathBuf};
 
 use orion_error::conversion::ToStructError;
-use wist_contracts::agent_config::AgentConfigContract;
+use wist_contracts::agent_config::AgentConfig;
 
 use crate::config_runtime::{ConfigError, ConfigReason};
 
@@ -118,8 +118,8 @@ container_enabled = false
 }
 
 pub(super) fn expand_env_contract(
-    mut config: AgentConfigContract,
-) -> Result<AgentConfigContract, ConfigError> {
+    mut config: AgentConfig,
+) -> Result<AgentConfig, ConfigError> {
     config.agent.agent_id = expand_optional(config.agent.agent_id)?;
     config.agent.environment_id = expand_optional(config.agent.environment_id)?;
     config.agent.instance_name = expand_optional(config.agent.instance_name)?;
@@ -154,9 +154,9 @@ pub(super) fn expand_env_contract(
 }
 
 pub(super) fn resolve_paths(
-    mut config: AgentConfigContract,
+    mut config: AgentConfig,
     config_path: &Path,
-) -> AgentConfigContract {
+) -> AgentConfig {
     let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
     let root_dir = absolutize(config_dir, &config.paths.root_dir);
 

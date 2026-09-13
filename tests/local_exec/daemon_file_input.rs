@@ -12,7 +12,7 @@ use wist_contracts::agent_config::{DiscoverySection, LogFileInputSection};
 use wist_contracts::discovery::{
     CollectionCandidate, DiscoveredResource, DiscoveredTarget, DiscoveryCacheMeta,
 };
-use wist_contracts::telemetry_record::TelemetryRecordContract;
+use wist_contracts::telemetry_record::TelemetryRecord;
 use wist_shared::fs::read_json;
 
 use super::common::{
@@ -95,7 +95,7 @@ fn daemon_run_once_processes_configured_file_input() {
 
     let output_path = root.join("log").join("wist-records.ndjson");
     let output = fs::read_to_string(&output_path).expect("read output");
-    let records: Vec<wist_contracts::telemetry_record::TelemetryRecordContract> = output
+    let records: Vec<wist_contracts::telemetry_record::TelemetryRecord> = output
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("parse telemetry record"))
@@ -432,7 +432,7 @@ fn daemon_run_once_continues_when_discovery_cache_store_fails() {
 
     let output_path = root.join("log").join("wist-records.ndjson");
     let output = fs::read_to_string(&output_path).expect("read output");
-    let records: Vec<wist_contracts::telemetry_record::TelemetryRecordContract> = output
+    let records: Vec<wist_contracts::telemetry_record::TelemetryRecord> = output
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("parse telemetry record"))
@@ -479,7 +479,7 @@ fn daemon_run_once_rebuilds_when_discovery_cache_is_corrupt() {
 
     let output_path = root.join("log").join("wist-records.ndjson");
     let output = fs::read_to_string(&output_path).expect("read output");
-    let records: Vec<wist_contracts::telemetry_record::TelemetryRecordContract> = output
+    let records: Vec<wist_contracts::telemetry_record::TelemetryRecord> = output
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("parse telemetry record"))
@@ -547,7 +547,7 @@ fn daemon_run_once_uses_cached_metrics_snapshot_when_target_view_is_missing() {
         read_json(&runtime_snapshot_path).expect("read runtime snapshot after fallback");
     let output_path = root.join("log").join("wist-records.ndjson");
     let output = fs::read_to_string(&output_path).expect("read output");
-    let records: Vec<wist_contracts::telemetry_record::TelemetryRecordContract> = output
+    let records: Vec<wist_contracts::telemetry_record::TelemetryRecord> = output
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("parse telemetry record"))
@@ -678,7 +678,7 @@ fn daemon_run_once_continues_when_one_file_input_fails() {
 
     let output_path = root.join("log").join("wist-records.ndjson");
     let output = fs::read_to_string(&output_path).expect("read output");
-    let records: Vec<wist_contracts::telemetry_record::TelemetryRecordContract> = output
+    let records: Vec<wist_contracts::telemetry_record::TelemetryRecord> = output
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("parse telemetry record"))
@@ -734,7 +734,7 @@ fn daemon_run_once_assigns_globally_monotonic_seq_across_inputs() {
 
     let output_path = root.join("log").join("wist-records.ndjson");
     let output = fs::read_to_string(&output_path).expect("read output");
-    let records: Vec<TelemetryRecordContract> = output
+    let records: Vec<TelemetryRecord> = output
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("parse telemetry record"))
@@ -829,7 +829,7 @@ fn daemon_run_once_replays_existing_spool_even_when_source_file_is_missing() {
         .join("logs")
         .join("missing.ndjson");
     fs::create_dir_all(spool_path.parent().expect("spool dir")).expect("create spool dir");
-    let first = serde_json::to_string(&TelemetryRecordContract::new_log(
+    let first = serde_json::to_string(&TelemetryRecord::new_log(
         "agent-test".to_string(),
         "2026-04-14T00:00:00Z".to_string(),
         "missing".to_string(),
@@ -840,7 +840,7 @@ fn daemon_run_once_replays_existing_spool_even_when_source_file_is_missing() {
         0,
     ))
     .expect("encode first");
-    let second = serde_json::to_string(&TelemetryRecordContract::new_log(
+    let second = serde_json::to_string(&TelemetryRecord::new_log(
         "agent-test".to_string(),
         "2026-04-14T00:00:01Z".to_string(),
         "missing".to_string(),
@@ -870,7 +870,7 @@ fn daemon_run_once_replays_existing_spool_even_when_source_file_is_missing() {
 
     let output_path = root.join("log").join("wist-records.ndjson");
     let output = fs::read_to_string(&output_path).expect("read output");
-    let records: Vec<wist_contracts::telemetry_record::TelemetryRecordContract> = output
+    let records: Vec<wist_contracts::telemetry_record::TelemetryRecord> = output
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("parse telemetry record"))
@@ -1179,7 +1179,7 @@ fn daemon_restart_recovers_checkpoint_without_loss_or_duplication() {
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
-            let record: TelemetryRecordContract = serde_json::from_str(line).expect("parse record");
+            let record: TelemetryRecord = serde_json::from_str(line).expect("parse record");
             record.body
         })
         .collect();

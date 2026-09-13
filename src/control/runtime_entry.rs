@@ -281,7 +281,7 @@ fn config_file_exists(config_root: &Path) -> bool {
 
 async fn initialize_runtime_state_async(
     state_dir: &Path,
-    config: &wist_contracts::agent_config::AgentConfigContract,
+    config: &wist_contracts::agent_config::AgentConfig,
 ) -> io::Result<()> {
     let runtime_path = state_store::agent_runtime::path_for(state_dir);
     let mut runtime_state =
@@ -360,7 +360,7 @@ fn validate_exec_bin(path: PathBuf, origin: &str) -> io::Result<PathBuf> {
 
 fn sync_runtime_identity(
     runtime_state: &mut wist_contracts::agent_state::AgentRuntimeState,
-    config: &wist_contracts::agent_config::AgentConfigContract,
+    config: &wist_contracts::agent_config::AgentConfig,
 ) -> io::Result<()> {
     if let Some(agent_id) = config
         .agent

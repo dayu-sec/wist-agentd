@@ -1,11 +1,11 @@
 //! Discovery snapshot to collection candidate mapping.
 
 use wist_contracts::discovery::{
-    CollectionCandidate, DiscoverySnapshotContract, StringKeyValue,
+    CollectionCandidate, DiscoverySnapshot, StringKeyValue,
 };
 
 pub fn build_collection_candidates(
-    snapshot: &DiscoverySnapshotContract,
+    snapshot: &DiscoverySnapshot,
 ) -> Vec<CollectionCandidate> {
     let mut candidates = Vec::new();
 
@@ -82,13 +82,13 @@ pub fn build_collection_candidates(
 mod tests {
     use std::collections::BTreeMap;
 
-    use wist_contracts::discovery::{DiscoveredTarget, DiscoverySnapshotContract};
+    use wist_contracts::discovery::{DiscoveredTarget, DiscoverySnapshot};
 
     use super::build_collection_candidates;
 
     #[test]
     fn build_collection_candidates_maps_batch_a_targets() {
-        let mut snapshot = DiscoverySnapshotContract::new(
+        let mut snapshot = DiscoverySnapshot::new(
             "snapshot-1".to_string(),
             1,
             "2026-04-19T00:00:00Z".to_string(),

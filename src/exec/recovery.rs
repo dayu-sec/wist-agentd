@@ -1,7 +1,7 @@
 //! Shared recovery helpers for incomplete executions.
 
 use wist_contracts::action_result::{
-    ActionOutputs, ActionResultContract, FinalStatus, StepRecord, StepStatus,
+    ActionOutputs, ActionResult, FinalStatus, StepRecord, StepStatus,
 };
 use wist_shared::time::now_rfc3339;
 
@@ -9,9 +9,9 @@ use crate::state_store::running;
 
 pub(crate) fn synthesize_recovery_result(
     state: &running::RunningExecutionState,
-) -> ActionResultContract {
+) -> ActionResult {
     let timestamp = now_rfc3339();
-    ActionResultContract {
+    ActionResult {
         request_id: Some(state.request_id.clone()),
         exit_reason: Some("agentd_recovered_incomplete_execution".to_string()),
         step_records: vec![StepRecord {
@@ -33,7 +33,7 @@ pub(crate) fn synthesize_recovery_result(
         outputs: ActionOutputs::default(),
         started_at: Some(state.started_at.clone()),
         finished_at: Some(timestamp),
-        ..ActionResultContract::new(
+        ..ActionResult::new(
             state.action_id.clone(),
             state.execution_id.clone(),
             FinalStatus::Failed,

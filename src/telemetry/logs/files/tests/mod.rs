@@ -35,14 +35,14 @@ fn temp_dir(name: &str) -> PathBuf {
 
 #[derive(Default)]
 struct TestSink {
-    records: Vec<wist_contracts::telemetry_record::TelemetryRecordContract>,
+    records: Vec<wist_contracts::telemetry_record::TelemetryRecord>,
     fail_writes: bool,
 }
 
 impl RecordSink for TestSink {
     async fn write_records(
         &mut self,
-        records: &[wist_contracts::telemetry_record::TelemetryRecordContract],
+        records: &[wist_contracts::telemetry_record::TelemetryRecord],
     ) -> io::Result<()> {
         if self.fail_writes {
             return Err(io::Error::other("sink unavailable"));
@@ -69,7 +69,7 @@ fn config(root: &Path, source_path: &Path) -> FileInputConfig {
 
 fn read_output_records(
     path: &Path,
-) -> Vec<wist_contracts::telemetry_record::TelemetryRecordContract> {
+) -> Vec<wist_contracts::telemetry_record::TelemetryRecord> {
     fs::read_to_string(path)
         .expect("read output")
         .lines()

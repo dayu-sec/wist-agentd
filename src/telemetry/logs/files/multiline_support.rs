@@ -2,7 +2,7 @@ use std::path::Path;
 
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use wist_contracts::telemetry_record::TelemetryRecordContract;
+use wist_contracts::telemetry_record::TelemetryRecord;
 
 use crate::state_store::log_checkpoint_state::PendingMultilineState;
 use crate::telemetry::logs::files::file_reader::RawFileLine;
@@ -12,7 +12,7 @@ use crate::telemetry::logs::parser::parse_folded_lines;
 const MULTILINE_IDLE_FLUSH_MS: i64 = 1000;
 
 pub(super) fn records_from_read(
-    records: &mut Vec<TelemetryRecordContract>,
+    records: &mut Vec<TelemetryRecord>,
     agent_id: &str,
     observed_at: &str,
     input_id: &str,
@@ -41,7 +41,7 @@ pub(super) fn records_from_pending(
     input_id: &str,
     pending: Option<PendingMultilineState>,
     next_seq: &mut u64,
-) -> Vec<TelemetryRecordContract> {
+) -> Vec<TelemetryRecord> {
     let Some(pending) = pending else {
         return Vec::new();
     };
@@ -57,7 +57,7 @@ pub(super) fn records_from_pending(
 }
 
 pub(super) fn flush_pending_if_source_changes(
-    records: &mut Vec<TelemetryRecordContract>,
+    records: &mut Vec<TelemetryRecord>,
     pending: &mut Option<PendingMultilineState>,
     agent_id: &str,
     observed_at: &str,

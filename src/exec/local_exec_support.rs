@@ -8,9 +8,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Child;
 use tokio::task::JoinHandle;
 use wist_contracts::action_result::{
-    ActionOutputs, ActionResultContract, FinalStatus, StepRecord, StepStatus,
+    ActionOutputs, ActionResult, FinalStatus, StepRecord, StepStatus,
 };
-use wist_contracts::execution_state::ExecutionProgressState;
+use wist_contracts::execution_state::ProgressState;
 use crate::fs_async::write_json_atomic_async;
 use wist_shared::paths::WORKDIR_STATE_FILE;
 use wist_shared::time::now_rfc3339;
@@ -31,7 +31,7 @@ pub(super) async fn write_timed_out_result_async(
     request: &LocalExecRequest,
     workdir: &Path,
     result_path: &Path,
-) -> io::Result<ActionResultContract> {
+) -> io::Result<ActionResult> {
     let result = synthesize_result(
         request,
         FinalStatus::TimedOut,
@@ -167,14 +167,14 @@ pub(super) fn synthesize_result(
     final_status: FinalStatus,
     error_code: &str,
     step_status: &str,
-) -> ActionResultContract {
+) -> ActionResult {
     let finished_at = now_rfc3339();
     let step_status = match step_status {
         "timed_out" => StepStatus::TimedOut,
         "cancelled" => StepStatus::Cancelled,
         _ => StepStatus::Failed,
     };
-    ActionResultContract {
+    ActionResult {
         request_id: Some(request.request_id.clone()),
         exit_reason: Some(error_code.to_string()),
         step_records: vec![StepRecord {
@@ -199,7 +199,7 @@ pub(super) fn synthesize_result(
         outputs: ActionOutputs::default(),
         started_at: Some(finished_at.clone()),
         finished_at: Some(finished_at),
-        ..ActionResultContract::new(
+        ..ActionResult::new(
             request.plan.meta.action_id.clone(),
             request.execution_id.clone(),
             final_status,
@@ -218,7 +218,7 @@ pub(super) async fn write_exec_state_async(
     let state_path = workdir.join(WORKDIR_STATE_FILE);
     write_json_atomic_async(
         &state_path,
-        &ExecutionProgressState {
+        &ProgressState {
             execution_id: execution_id.to_string(),
             action_id: action_id.to_string(),
             state: state.to_string(),

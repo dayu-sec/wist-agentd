@@ -2,15 +2,15 @@
 
 use std::collections::BTreeSet;
 
-use wist_contracts::agent_config::AgentConfigContract;
+use wist_contracts::agent_config::AgentConfig;
 use wist_contracts::capability_report::{
-    CapabilityLimits, CapabilityReportContract, CapabilityReportSections, ExecCapabilities,
+    CapabilityLimits, CapabilityReport, CapabilityReportSections, ExecCapabilities,
     LogsCapabilities, MetricsCapabilities, UpgradeCapabilities,
 };
 use wist_shared::time::now_rfc3339;
 
-pub fn build_capability_report(config: &AgentConfigContract) -> CapabilityReportContract {
-    CapabilityReportContract::new(CapabilityReportSections {
+pub fn build_capability_report(config: &AgentConfig) -> CapabilityReport {
+    CapabilityReport::new(CapabilityReportSections {
         agent_id: config
             .agent
             .agent_id
@@ -59,7 +59,7 @@ fn metrics_capabilities() -> MetricsCapabilities {
     }
 }
 
-fn logs_capabilities(config: &AgentConfigContract) -> Option<LogsCapabilities> {
+fn logs_capabilities(config: &AgentConfig) -> Option<LogsCapabilities> {
     if config.telemetry.logs.file_inputs.is_empty() {
         return None;
     }
@@ -91,7 +91,7 @@ fn upgrade_capabilities() -> UpgradeCapabilities {
     }
 }
 
-fn limits(config: &AgentConfigContract) -> CapabilityLimits {
+fn limits(config: &AgentConfig) -> CapabilityLimits {
     CapabilityLimits {
         max_running_actions: Some(config.execution.max_running_actions),
         max_stdout_bytes: Some(config.execution.default_stdout_limit_bytes),
@@ -105,13 +105,13 @@ fn limits(config: &AgentConfigContract) -> CapabilityLimits {
 mod tests {
     use super::build_capability_report;
     use wist_contracts::agent_config::{
-        AgentConfigContract, AgentSection, ControlPlaneSection, ExecutionSection,
+        AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection,
         LogFileInputSection, LogsFileOutputSection, LogsOutputSection, LogsSection, PathsSection,
         TelemetrySection,
     };
 
-    fn config_with_logs() -> AgentConfigContract {
-        AgentConfigContract::new(
+    fn config_with_logs() -> AgentConfig {
+        AgentConfig::new(
             AgentSection {
                 agent_id: Some("agent-001".to_string()),
                 environment_id: Some("prod".to_string()),
@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn build_capability_report_omits_logs_when_no_file_inputs_are_enabled() {
-        let report = build_capability_report(&AgentConfigContract::new(
+        let report = build_capability_report(&AgentConfig::new(
             AgentSection {
                 agent_id: Some("agent-001".to_string()),
                 environment_id: None,

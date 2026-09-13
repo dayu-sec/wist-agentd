@@ -7,14 +7,14 @@ use std::path::Path;
 
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use wist_contracts::telemetry_record::TelemetryRecordContract;
+use wist_contracts::telemetry_record::TelemetryRecord;
 use wist_shared::fs::ensure_parent;
 
 use crate::telemetry::warp_parse::RecordSink;
 
 pub async fn append_records_async(
     path: &Path,
-    records: &[TelemetryRecordContract],
+    records: &[TelemetryRecord],
 ) -> io::Result<()> {
     if records.is_empty() {
         return Ok(());
@@ -36,12 +36,12 @@ pub async fn append_records_async(
 }
 
 #[cfg(test)]
-pub fn append_records(path: &Path, records: &[TelemetryRecordContract]) -> io::Result<()> {
+pub fn append_records(path: &Path, records: &[TelemetryRecord]) -> io::Result<()> {
     block_on_io(append_records_async(path, records))
 }
 
 #[cfg(test)]
-pub fn load_records(path: &Path) -> io::Result<Vec<TelemetryRecordContract>> {
+pub fn load_records(path: &Path) -> io::Result<Vec<TelemetryRecord>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -144,9 +144,9 @@ pub fn clear(path: &Path) -> io::Result<()> {
     block_on_io(clear_async(path))
 }
 
-fn parse_record_line(line: &str) -> io::Result<TelemetryRecordContract> {
+fn parse_record_line(line: &str) -> io::Result<TelemetryRecord> {
     let trimmed = line.trim_end_matches(['\r', '\n']);
-    serde_json::from_str::<TelemetryRecordContract>(trimmed).map_err(io::Error::other)
+    serde_json::from_str::<TelemetryRecord>(trimmed).map_err(io::Error::other)
 }
 
 #[cfg(test)]
@@ -169,7 +169,7 @@ mod tests {
         replay_records, replay_records_async, size,
     };
     use crate::telemetry::warp_parse::RecordSink;
-    use wist_contracts::telemetry_record::TelemetryRecordContract;
+    use wist_contracts::telemetry_record::TelemetryRecord;
 
     fn temp_file(name: &str) -> PathBuf {
         let suffix = SystemTime::now()
@@ -179,8 +179,8 @@ mod tests {
         std::env::temp_dir().join(format!("wist-agentd-spool-{name}-{suffix}.ndjson"))
     }
 
-    fn record(body: &str) -> TelemetryRecordContract {
-        TelemetryRecordContract::new_log(
+    fn record(body: &str) -> TelemetryRecord {
+        TelemetryRecord::new_log(
             "agent-a".to_string(),
             "2026-04-13T00:00:00Z".to_string(),
             "input-a".to_string(),
@@ -229,13 +229,13 @@ mod tests {
 
     #[derive(Default)]
     struct TestSink {
-        records: Vec<TelemetryRecordContract>,
+        records: Vec<TelemetryRecord>,
         fail_after_batches: Option<usize>,
         batches: usize,
     }
 
     impl RecordSink for TestSink {
-        async fn write_records(&mut self, records: &[TelemetryRecordContract]) -> io::Result<()> {
+        async fn write_records(&mut self, records: &[TelemetryRecord]) -> io::Result<()> {
             self.batches += 1;
             if self
                 .fail_after_batches

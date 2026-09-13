@@ -46,7 +46,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use wist_contracts::action_plan::{
-        ActionPlanConstraints, ActionPlanContract, ActionPlanMeta, ActionPlanProgram,
+        ActionPlanConstraints, ActionPlan, ActionPlanMeta, ActionPlanProgram,
         ActionPlanStep, ActionPlanTarget, ApprovalMode, RiskLevel,
     };
     use wist_contracts::action_result::FinalStatus;
@@ -56,7 +56,7 @@ mod tests {
     use crate::parse_cli_args;
     use crate::result_writer;
     use crate::runtime;
-    use crate::workdir::{ExecutionRuntimeContext, ExecutionWorkdir};
+    use crate::workdir::{RuntimeContext, ExecutionWorkdir};
 
     fn temp_dir(name: &str) -> PathBuf {
         let suffix = SystemTime::now()
@@ -70,7 +70,7 @@ mod tests {
 
     fn write_fixture_workdir(dir: &std::path::Path) {
         let workdir = ExecutionWorkdir::open(dir).expect("open workdir");
-        let plan = ActionPlanContract::new(
+        let plan = ActionPlan::new(
             ActionPlanMeta {
                 action_id: "act_001".to_string(),
                 request_id: "req_001".to_string(),
@@ -110,7 +110,7 @@ mod tests {
                 }],
             },
         );
-        let runtime = ExecutionRuntimeContext {
+        let runtime = RuntimeContext {
             execution_id: "exec_001".to_string(),
             spawned_at: now_rfc3339(),
             deadline_at: None,
@@ -132,9 +132,9 @@ mod tests {
         let result = runtime::execute(&workdir).expect("execute");
         result_writer::write(&workdir, &result).expect("write result");
 
-        let stored_result: wist_contracts::action_result::ActionResultContract =
+        let stored_result: wist_contracts::action_result::ActionResult =
             read_json(&workdir.result_path).expect("read result");
-        let stored_state: crate::workdir::ExecutionProgressState =
+        let stored_state: crate::workdir::ProgressState =
             read_json(&workdir.state_path).expect("read state");
 
         assert_eq!(stored_result.final_status, FinalStatus::Succeeded);

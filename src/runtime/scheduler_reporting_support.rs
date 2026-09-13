@@ -3,8 +3,8 @@ use std::path::Path;
 
 use crate::error::RuntimeResult;
 use crate::fs_async::{read_json_async, write_json_atomic_async};
-use wist_contracts::action_plan::ActionPlanContract;
-use wist_contracts::action_result::ActionResultContract;
+use wist_contracts::action_plan::ActionPlan;
+use wist_contracts::action_result::ActionResult;
 use wist_contracts::gateway::ReportActionResult;
 use wist_shared::paths::{WORKDIR_PLAN_FILE, WORKDIR_RESULT_FILE};
 
@@ -21,14 +21,14 @@ use crate::state_store::running;
 
 use super::QueueHeadContext;
 
-pub(super) async fn read_queued_plan_async(workdir: &Path) -> RuntimeResult<ActionPlanContract> {
+pub(super) async fn read_queued_plan_async(workdir: &Path) -> RuntimeResult<ActionPlan> {
     Ok(read_json_async(&workdir.join(WORKDIR_PLAN_FILE)).await?)
 }
 
 pub(super) async fn prepare_queue_head_report_async(
     request: &DrainRequest,
     item: &ExecutionQueueItem,
-    plan: &ActionPlanContract,
+    plan: &ActionPlan,
     local_result: &LocalExecOutcome,
 ) -> RuntimeResult<PreparedReport> {
     prepare_local_report_async(ReportingRequest {
@@ -74,7 +74,7 @@ pub(super) async fn recover_stale_execution_async(
 pub(super) async fn reconcile_completed_execution_async(
     request: &DrainRequest,
     item: &ExecutionQueueItem,
-    plan: &ActionPlanContract,
+    plan: &ActionPlan,
     workdir: &Path,
 ) -> RuntimeResult<Option<DrainOutcome>> {
     let result_path = workdir.join(WORKDIR_RESULT_FILE);
@@ -90,7 +90,7 @@ pub(super) async fn reconcile_completed_execution_async(
         Err(err) => return Err(err.into()),
     }
 
-    let result: ActionResultContract = read_json_async(&result_path).await?;
+    let result: ActionResult = read_json_async(&result_path).await?;
     let final_state = final_state_name(&result);
     let prepared = ensure_local_report_async(ReportingRequest {
         state_dir: &request.state_dir,

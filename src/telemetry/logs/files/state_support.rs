@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use wist_contracts::telemetry_record::TelemetryRecordContract;
+use wist_contracts::telemetry_record::TelemetryRecord;
 
 use crate::state_store::log_checkpoint_state::{LogCheckpointState, PendingMultilineState};
 use crate::telemetry::logs::files::file_reader::ObservedFileIdentity;
@@ -27,7 +27,7 @@ pub(super) struct RuntimeState {
 #[derive(::jumo_derive::Jumo)]
 #[jumo(kind = "struct", domain = "Discovery", module = "Discovery.Collect")]
 pub(super) struct CollectedReadBatch {
-    pub(super) records: Vec<TelemetryRecordContract>,
+    pub(super) records: Vec<TelemetryRecord>,
     pub(super) pending_multiline: Option<PendingMultilineState>,
     pub(super) checkpoints: Vec<PendingCheckpoint>,
     pub(super) checkpoint_offset: u64,

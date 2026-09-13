@@ -1,7 +1,7 @@
 use std::io;
 use std::path::Path;
 
-use wist_contracts::telemetry_record::TelemetryRecordContract;
+use wist_contracts::telemetry_record::TelemetryRecord;
 
 use crate::telemetry::buffer::TelemetryBuffer;
 use crate::telemetry::spool;
@@ -13,7 +13,7 @@ pub(super) async fn deliver_records<S: RecordSink>(
     sink: &mut S,
     spool_path: &Path,
     in_memory_budget_bytes: usize,
-    records: Vec<TelemetryRecordContract>,
+    records: Vec<TelemetryRecord>,
 ) -> io::Result<DeliveryOutcome> {
     let records_processed = records.len();
     let mut buffer = TelemetryBuffer::new(in_memory_budget_bytes);
@@ -36,8 +36,8 @@ pub(super) async fn deliver_records<S: RecordSink>(
 /// 已有积压 spool 时：为保序，本批 staged 与 overflowed 全部追加到 spool，不直发。
 async fn spool_pending(
     spool_path: &Path,
-    staged: Vec<TelemetryRecordContract>,
-    overflowed: Vec<TelemetryRecordContract>,
+    staged: Vec<TelemetryRecord>,
+    overflowed: Vec<TelemetryRecord>,
 ) -> io::Result<usize> {
     let mut to_spool = staged;
     to_spool.extend(overflowed);
@@ -50,8 +50,8 @@ async fn spool_pending(
 async fn deliver_fresh<S: RecordSink>(
     sink: &mut S,
     spool_path: &Path,
-    staged: Vec<TelemetryRecordContract>,
-    overflowed: Vec<TelemetryRecordContract>,
+    staged: Vec<TelemetryRecord>,
+    overflowed: Vec<TelemetryRecord>,
 ) -> io::Result<(usize, usize)> {
     let mut emitted_directly = 0usize;
     let mut spooled = 0usize;
@@ -94,16 +94,16 @@ mod tests {
     use std::io;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use wist_contracts::telemetry_record::TelemetryRecordContract;
+    use wist_contracts::telemetry_record::TelemetryRecord;
 
     #[derive(Default)]
     struct TestSink {
-        records: Vec<TelemetryRecordContract>,
+        records: Vec<TelemetryRecord>,
         fail_writes: bool,
     }
 
     impl RecordSink for TestSink {
-        async fn write_records(&mut self, records: &[TelemetryRecordContract]) -> io::Result<()> {
+        async fn write_records(&mut self, records: &[TelemetryRecord]) -> io::Result<()> {
             if self.fail_writes {
                 return Err(io::Error::other("sink unavailable"));
             }
@@ -112,8 +112,8 @@ mod tests {
         }
     }
 
-    fn record(body: &str) -> TelemetryRecordContract {
-        TelemetryRecordContract::new_log(
+    fn record(body: &str) -> TelemetryRecord {
+        TelemetryRecord::new_log(
             "agent-a".to_string(),
             "2026-04-13T00:00:00Z".to_string(),
             "input-a".to_string(),

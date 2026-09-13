@@ -1,7 +1,7 @@
 use std::io;
 use std::path::PathBuf;
 
-use wist_contracts::agent_config::{AgentConfigContract, LogFileInputSection};
+use wist_contracts::agent_config::{AgentConfig, LogFileInputSection};
 use wist_shared::time::now_rfc3339;
 
 use crate::telemetry::logs::files::{FileInputProcessor, ProcessOutcome};
@@ -69,13 +69,13 @@ impl TelemetryTick {
 
 /// 构建共享的遥测上送 sink（日志与指标共用同一连接）。
 pub(super) fn build_telemetry_sink(
-    config: &AgentConfigContract,
+    config: &AgentConfig,
 ) -> io::Result<TelemetryRecordSink> {
     build_record_sink(config)
 }
 
 /// 当 sink 无法构建（非法输出配置）时，为每个输入生成一条 `InvalidOutput` 失败。
-pub(super) fn invalid_output_tick(config: &AgentConfigContract, detail: String) -> TelemetryTick {
+pub(super) fn invalid_output_tick(config: &AgentConfig, detail: String) -> TelemetryTick {
     let failures = config
         .telemetry
         .logs
@@ -91,7 +91,7 @@ pub(super) fn invalid_output_tick(config: &AgentConfigContract, detail: String) 
 }
 
 pub(super) async fn process_telemetry_inputs(
-    config: &AgentConfigContract,
+    config: &AgentConfig,
     sink: &mut TelemetryRecordSink,
     next_seq: &mut u64,
 ) -> TelemetryTick {
@@ -120,7 +120,7 @@ pub(super) async fn process_telemetry_inputs(
 }
 
 async fn process_telemetry_input<S: RecordSink>(
-    config: &AgentConfigContract,
+    config: &AgentConfig,
     input: &LogFileInputSection,
     sink: &mut S,
     outcomes: &mut Vec<ProcessOutcome>,
@@ -159,7 +159,7 @@ async fn process_telemetry_input<S: RecordSink>(
 }
 
 async fn process_input_with_sink<S: RecordSink>(
-    config: &AgentConfigContract,
+    config: &AgentConfig,
     input: &LogFileInputSection,
     source_path: PathBuf,
     sink: &mut S,

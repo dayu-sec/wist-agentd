@@ -3,7 +3,7 @@
 use std::io;
 use std::path::PathBuf;
 
-use wist_contracts::telemetry_record::TelemetryRecordContract;
+use wist_contracts::telemetry_record::TelemetryRecord;
 use wist_shared::time::now_rfc3339;
 
 use crate::state_store::log_checkpoint_state::{PendingMultilineState, TrackedFileCheckpoint};
@@ -381,7 +381,7 @@ where
 
     async fn deliver_records_async(
         &mut self,
-        records: Vec<TelemetryRecordContract>,
+        records: Vec<TelemetryRecord>,
     ) -> io::Result<DeliveryOutcome> {
         deliver_records(
             &mut self.sink,

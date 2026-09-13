@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use orion_error::{conversion::ToStructError, prelude::*};
 
 use crate::fs_async::write_bytes_atomic_async;
-use wist_contracts::agent_config::{AgentConfigContract, LogFileInputsFile};
+use wist_contracts::agent_config::{AgentConfig, LogFileInputsFile};
 use wist_shared::fs::write_bytes_atomic;
 use wist_shared::paths::{AGENTD_CONFIG_FILE, LEGACY_AGENT_CONFIG_FILE};
 use wist_validate::config::validate_config;
@@ -28,7 +28,7 @@ pub struct EnsuredConfigFile {
 
 pub use crate::error::{ConfigError, ConfigReason};
 
-pub fn load_or_init(config_root: &Path) -> Result<AgentConfigContract, ConfigError> {
+pub fn load_or_init(config_root: &Path) -> Result<AgentConfig, ConfigError> {
     let ensured = ensure_default_config(config_root)?;
     load_from_path(&ensured.path)
 }
@@ -59,12 +59,12 @@ pub fn default_config_template() -> String {
     default_file_config_text()
 }
 
-pub fn load_from_path(config_path: &Path) -> Result<AgentConfigContract, ConfigError> {
+pub fn load_from_path(config_path: &Path) -> Result<AgentConfig, ConfigError> {
     let text = fs::read_to_string(config_path).source_err(
         ConfigReason::Io,
         format!("read config {}", config_path.display()),
     )?;
-    let mut parsed = toml::from_str::<AgentConfigContract>(&text)
+    let mut parsed = toml::from_str::<AgentConfig>(&text)
         .source_raw_err(ConfigReason::ParseToml, "parse config")?;
     load_file_inputs_from_task_file(&mut parsed, config_path)?;
     let env_resolved = expand_env_contract(parsed)?;
@@ -79,7 +79,7 @@ pub fn load_from_path(config_path: &Path) -> Result<AgentConfigContract, ConfigE
 /// 任务清单路径相对本配置文件解析（支持 `${ENV}` 展开），与内联
 /// `[[telemetry.logs.file_inputs]]` 互斥：同时出现时拒绝加载，避免来源不明。
 fn load_file_inputs_from_task_file(
-    config: &mut AgentConfigContract,
+    config: &mut AgentConfig,
     config_path: &Path,
 ) -> Result<(), ConfigError> {
     let Some(raw_path) = config.telemetry.logs.file_inputs_file.take() else {
@@ -119,7 +119,7 @@ pub fn resolve_config_path(config_root: &Path) -> PathBuf {
     preferred
 }
 
-pub async fn load_or_init_async(config_root: &Path) -> Result<AgentConfigContract, ConfigError> {
+pub async fn load_or_init_async(config_root: &Path) -> Result<AgentConfig, ConfigError> {
     let ensured = ensure_default_config_async(config_root).await?;
     load_from_path_async(&ensured.path).await
 }
@@ -157,12 +157,12 @@ pub async fn ensure_default_config_async(
     })
 }
 
-pub async fn load_from_path_async(config_path: &Path) -> Result<AgentConfigContract, ConfigError> {
+pub async fn load_from_path_async(config_path: &Path) -> Result<AgentConfig, ConfigError> {
     let text = tokio::fs::read_to_string(config_path).await.source_err(
         ConfigReason::Io,
         format!("read config {}", config_path.display()),
     )?;
-    let mut parsed = toml::from_str::<AgentConfigContract>(&text)
+    let mut parsed = toml::from_str::<AgentConfig>(&text)
         .source_raw_err(ConfigReason::ParseToml, "parse config")?;
     load_file_inputs_from_task_file_async(&mut parsed, config_path).await?;
     let env_resolved = expand_env_contract(parsed)?;
@@ -173,7 +173,7 @@ pub async fn load_from_path_async(config_path: &Path) -> Result<AgentConfigContr
 }
 
 async fn load_file_inputs_from_task_file_async(
-    config: &mut AgentConfigContract,
+    config: &mut AgentConfig,
     config_path: &Path,
 ) -> Result<(), ConfigError> {
     let Some(raw_path) = config.telemetry.logs.file_inputs_file.take() else {

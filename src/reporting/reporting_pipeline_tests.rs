@@ -7,7 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use wist_contracts::action_result::{
-    ActionResultContract, FinalStatus, StepRecord, StepStatus,
+    ActionResult, FinalStatus, StepRecord, StepStatus,
 };
 use wist_shared::fs::write_json_atomic;
 
@@ -21,8 +21,8 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
-fn sample_result() -> ActionResultContract {
-    let mut result = ActionResultContract::new(
+fn sample_result() -> ActionResult {
+    let mut result = ActionResult::new(
         "act_001".to_string(),
         "exec_001".to_string(),
         FinalStatus::Succeeded,
@@ -49,7 +49,7 @@ fn sample_result() -> ActionResultContract {
 fn sample_request<'a>(
     state_dir: &'a std::path::Path,
     result_path: &'a std::path::Path,
-    result: &'a ActionResultContract,
+    result: &'a ActionResult,
 ) -> ReportingRequest<'a> {
     ReportingRequest {
         state_dir,

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::RuntimeResult;
 use crate::fs_async::write_json_atomic_async;
-use wist_contracts::action_result::ActionResultContract;
+use wist_contracts::action_result::ActionResult;
 use wist_contracts::gateway::ReportActionResult;
 use wist_shared::fs::write_json_atomic;
 use wist_shared::paths::REPORT_ENVELOPE_SUFFIX;
@@ -33,7 +33,7 @@ pub struct ReportingRequest<'a> {
     pub instance_id: &'a str,
     pub final_state: &'a str,
     pub result_path: &'a Path,
-    pub result: &'a ActionResultContract,
+    pub result: &'a ActionResult,
 }
 
 #[derive(Debug, Clone, ::jumo_derive::Jumo)]

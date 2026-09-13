@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use wist_contracts::discovery::{DiscoveryCacheMeta, DiscoverySnapshotContract};
+use wist_contracts::discovery::{DiscoveryCacheMeta, DiscoverySnapshot};
 use wist_shared::time::now_rfc3339;
 
 use super::DiscoveryError;
@@ -16,7 +16,7 @@ use super::cache::{
 #[jumo(kind = "struct", domain = "Discovery", module = "Discovery.Probe")]
 pub struct DiscoveryRuntime {
     probes: Vec<Box<dyn DiscoveryProbe + Send + Sync>>,
-    latest_snapshot: Option<DiscoverySnapshotContract>,
+    latest_snapshot: Option<DiscoverySnapshot>,
 }
 
 impl DiscoveryRuntime {
@@ -31,11 +31,11 @@ impl DiscoveryRuntime {
         self.probes.len()
     }
 
-    pub fn latest_snapshot(&self) -> Option<&DiscoverySnapshotContract> {
+    pub fn latest_snapshot(&self) -> Option<&DiscoverySnapshot> {
         self.latest_snapshot.as_ref()
     }
 
-    pub fn set_latest_snapshot(&mut self, snapshot: DiscoverySnapshotContract) {
+    pub fn set_latest_snapshot(&mut self, snapshot: DiscoverySnapshot) {
         self.latest_snapshot = Some(snapshot);
     }
 
@@ -43,7 +43,7 @@ impl DiscoveryRuntime {
         &mut self,
         state_dir: &Path,
     ) -> (
-        Option<DiscoverySnapshotContract>,
+        Option<DiscoverySnapshot>,
         Option<DiscoveryCacheLoadFailure>,
     ) {
         let paths = DiscoveryCachePaths::under_state_dir(state_dir);
@@ -69,7 +69,7 @@ impl DiscoveryRuntime {
         &mut self,
         state_dir: &Path,
     ) -> (
-        Option<DiscoverySnapshotContract>,
+        Option<DiscoverySnapshot>,
         Option<DiscoveryCacheLoadFailure>,
     ) {
         let paths = DiscoveryCachePaths::under_state_dir(state_dir);
@@ -163,7 +163,7 @@ impl DiscoveryRuntime {
         let generated_at = now_rfc3339();
         let snapshot_id = format!("discovery:{revision}:{generated_at}");
         let mut refreshed_snapshot =
-            DiscoverySnapshotContract::new(snapshot_id, revision, generated_at.clone());
+            DiscoverySnapshot::new(snapshot_id, revision, generated_at.clone());
         refreshed_snapshot.origins = origins;
         refreshed_snapshot.resources = resources;
         refreshed_snapshot.targets = targets;
@@ -204,8 +204,8 @@ impl DiscoveryRuntime {
 #[derive(::jumo_derive::Jumo)]
 #[jumo(kind = "struct", domain = "Discovery", module = "Discovery.Probe")]
 pub struct DiscoveryRefreshResult {
-    pub refreshed_snapshot: DiscoverySnapshotContract,
-    pub persisted_snapshot: DiscoverySnapshotContract,
+    pub refreshed_snapshot: DiscoverySnapshot,
+    pub persisted_snapshot: DiscoverySnapshot,
     pub errors: Vec<super::DiscoveryError>,
     pub last_success_at: Option<String>,
     pub last_error: Option<String>,
@@ -249,7 +249,7 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use wist_contracts::discovery::{
-        DiscoveredResource, DiscoveryOrigin, DiscoverySnapshotContract,
+        DiscoveredResource, DiscoveryOrigin, DiscoverySnapshot,
     };
 
     use crate::discovery::{DiscoveryError, DiscoverySourceKind, ProbeOutput};
@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn refresh_all_keeps_last_successful_snapshot_when_all_probes_fail() {
-        let mut previous = DiscoverySnapshotContract::new(
+        let mut previous = DiscoverySnapshot::new(
             "snapshot-1".to_string(),
             1,
             "2026-04-19T00:00:00Z".to_string(),

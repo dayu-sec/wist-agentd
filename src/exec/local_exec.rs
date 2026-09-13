@@ -8,9 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::fs_async::{read_json_async, write_json_atomic_async};
 use tokio::fs::File;
 use tokio::process::Command;
-use wist_contracts::action_plan::ActionPlanContract;
-use wist_contracts::action_result::{ActionResultContract, FinalStatus};
-use wist_contracts::execution_state::ExecutionRuntimeContext;
+use wist_contracts::action_plan::ActionPlan;
+use wist_contracts::action_result::{ActionResult, FinalStatus};
+use wist_contracts::execution_state::RuntimeContext;
 use wist_shared::paths::{
     ACTIONS_DIR, WORKDIR_PLAN_FILE, WORKDIR_RESULT_FILE, WORKDIR_RUNTIME_FILE,
 };
@@ -40,7 +40,7 @@ pub struct LocalExecRequest {
     pub stderr_limit_bytes: u64,
     pub plan_digest: String,
     pub request_id: String,
-    pub plan: ActionPlanContract,
+    pub plan: ActionPlan,
 }
 
 #[derive(Debug, Clone, ::jumo_derive::Jumo)]
@@ -48,7 +48,7 @@ pub struct LocalExecRequest {
 pub struct LocalExecOutcome {
     pub execution_id: String,
     pub workdir: PathBuf,
-    pub result: ActionResultContract,
+    pub result: ActionResult,
 }
 
 pub async fn execute_async(request: &LocalExecRequest) -> io::Result<LocalExecOutcome> {
@@ -58,7 +58,7 @@ pub async fn execute_async(request: &LocalExecRequest) -> io::Result<LocalExecOu
         .join(&request.execution_id);
     tokio::fs::create_dir_all(&workdir).await?;
 
-    let runtime = ExecutionRuntimeContext {
+    let runtime = RuntimeContext {
         execution_id: request.execution_id.clone(),
         spawned_at: now_rfc3339(),
         deadline_at: Some(after_millis_rfc3339(
@@ -193,7 +193,7 @@ async fn load_or_synthesize_result_async(
     workdir: &std::path::Path,
     result_path: &std::path::Path,
     exit_status: ExitClassification,
-) -> io::Result<ActionResultContract> {
+) -> io::Result<ActionResult> {
     let result_exists = match tokio::fs::metadata(result_path).await {
         Ok(_) => true,
         Err(err) if err.kind() == io::ErrorKind::NotFound => false,
@@ -201,7 +201,7 @@ async fn load_or_synthesize_result_async(
     };
     match exit_status {
         ExitClassification::Completed(status) if result_exists => {
-            let result: ActionResultContract = read_json_async(result_path).await?;
+            let result: ActionResult = read_json_async(result_path).await?;
             if !status.success() && result.final_status == FinalStatus::Succeeded {
                 return Err(io::Error::other(
                     "exec process exited non-zero with succeeded result",
@@ -210,7 +210,7 @@ async fn load_or_synthesize_result_async(
             Ok(result)
         }
         ExitClassification::CompletedAfterTimeout(_) if result_exists => {
-            let result: ActionResultContract = read_json_async(result_path).await?;
+            let result: ActionResult = read_json_async(result_path).await?;
             if result.final_status == FinalStatus::Succeeded {
                 write_timed_out_result_async(request, workdir, result_path).await
             } else {
