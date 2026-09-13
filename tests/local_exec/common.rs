@@ -40,16 +40,17 @@ pub(crate) fn temp_dir(name: &str) -> PathBuf {
 
 #[cfg(unix)]
 pub(crate) fn test_exec_bin(root: &Path) -> PathBuf {
-    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+    // wist-exec 仍位于 warp-insight workspace（与本 crate 同级），从那里构建并运行。
+    let warp_insight_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .and_then(|p| p.parent())
-        .expect("workspace root");
+        .expect("crate dir parent")
+        .join("warp-insight");
     let wrapper = root.join("wist-exec-wrapper.sh");
     fs::write(
         &wrapper,
         format!(
             "#!/bin/sh\ncd \"{}\"\nexec cargo run -q -p wist-exec -- \"$@\"\n",
-            workspace_root.display()
+            warp_insight_root.display()
         ),
     )
     .expect("write wrapper");
