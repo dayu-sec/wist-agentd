@@ -3,18 +3,18 @@
 use std::io;
 
 use wist_contracts::action_result::{
-    ActionResultContract, FinalStatus, StepActionRecord, StepStatus,
+    ActionResultContract, FinalStatus, StepRecord, StepStatus,
 };
 use wist_shared::time::now_rfc3339;
 use wist_validate::action_plan::validate_action_plan;
 
-use crate::workdir::{ExecProgressState, ExecutionWorkdir};
+use crate::workdir::{ExecutionProgressState, ExecutionWorkdir};
 
 pub fn execute(workdir: &ExecutionWorkdir) -> io::Result<ActionResultContract> {
     let runtime = workdir.read_runtime()?;
     let plan = workdir.read_plan()?;
 
-    workdir.write_state(&ExecProgressState {
+    workdir.write_state(&ExecutionProgressState {
         execution_id: runtime.execution_id.clone(),
         action_id: plan.meta.action_id.clone(),
         state: "validating".to_string(),
@@ -30,7 +30,7 @@ pub fn execute(workdir: &ExecutionWorkdir) -> io::Result<ActionResultContract> {
         let result = ActionResultContract {
             request_id: Some(plan.meta.request_id.clone()),
             exit_reason: Some(err.code.to_string()),
-            step_records: vec![StepActionRecord {
+            step_records: vec![StepRecord {
                 step_id: plan.program.entry.clone(),
                 attempt: 1,
                 op: None,
@@ -51,7 +51,7 @@ pub fn execute(workdir: &ExecutionWorkdir) -> io::Result<ActionResultContract> {
                 FinalStatus::Rejected,
             )
         };
-        workdir.write_state(&ExecProgressState {
+        workdir.write_state(&ExecutionProgressState {
             execution_id: runtime.execution_id,
             action_id: plan.meta.action_id,
             state: "rejected".to_string(),
@@ -71,7 +71,7 @@ pub fn execute(workdir: &ExecutionWorkdir) -> io::Result<ActionResultContract> {
         .find(|step| step.id == plan.program.entry)
         .map(|step| step.id.clone());
 
-    workdir.write_state(&ExecProgressState {
+    workdir.write_state(&ExecutionProgressState {
         execution_id: runtime.execution_id.clone(),
         action_id: plan.meta.action_id.clone(),
         state: "running".to_string(),
@@ -88,7 +88,7 @@ pub fn execute(workdir: &ExecutionWorkdir) -> io::Result<ActionResultContract> {
         .program
         .steps
         .iter()
-        .map(|step| StepActionRecord {
+        .map(|step| StepRecord {
             step_id: step.id.clone(),
             attempt: 1,
             op: step.op.clone(),

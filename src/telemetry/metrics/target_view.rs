@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::fs_async::write_json_atomic_async;
 use serde::{Deserialize, Serialize};
-use wist_contracts::discovery::CandidateCollectionTarget;
+use wist_contracts::discovery::CollectionCandidate;
 
 use crate::state_store::planner_candidates;
 
@@ -76,7 +76,7 @@ pub async fn store_async(path: &Path, view: &MetricsTargetView) -> io::Result<()
     write_json_atomic_async(path, view).await
 }
 
-fn map_candidate(candidate: CandidateCollectionTarget) -> MetricsTargetViewEntry {
+fn map_candidate(candidate: CollectionCandidate) -> MetricsTargetViewEntry {
     MetricsTargetViewEntry {
         candidate_id: candidate.candidate_id,
         collection_kind: candidate.collection_kind,
@@ -92,7 +92,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use wist_contracts::discovery::{CandidateCollectionTarget, StringKeyValue};
+    use wist_contracts::discovery::{CollectionCandidate, StringKeyValue};
     use wist_shared::fs::read_json;
 
     use super::{build_metrics_target_view, path_for, store};
@@ -114,7 +114,7 @@ mod tests {
         let state_dir = temp_dir("view");
         planner_candidates::store(
             &planner_candidates::host_metrics_path_for(&state_dir),
-            &[CandidateCollectionTarget {
+            &[CollectionCandidate {
                 candidate_id: "host-1:host:host_metrics".to_string(),
                 target_ref: "host-1:host".to_string(),
                 collection_kind: "host_metrics".to_string(),
@@ -126,7 +126,7 @@ mod tests {
         .expect("store host candidates");
         planner_candidates::store(
             &planner_candidates::process_metrics_path_for(&state_dir),
-            &[CandidateCollectionTarget {
+            &[CollectionCandidate {
                 candidate_id: "proc-1:process_metrics".to_string(),
                 target_ref: "proc-1".to_string(),
                 collection_kind: "process_metrics".to_string(),

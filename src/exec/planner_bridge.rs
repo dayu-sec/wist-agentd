@@ -1,17 +1,17 @@
 //! Discovery snapshot to collection candidate mapping.
 
 use wist_contracts::discovery::{
-    CandidateCollectionTarget, DiscoverySnapshotContract, StringKeyValue,
+    CollectionCandidate, DiscoverySnapshotContract, StringKeyValue,
 };
 
 pub fn build_collection_candidates(
     snapshot: &DiscoverySnapshotContract,
-) -> Vec<CandidateCollectionTarget> {
+) -> Vec<CollectionCandidate> {
     let mut candidates = Vec::new();
 
     for target in &snapshot.targets {
         match target.kind.as_str() {
-            "host" => candidates.push(CandidateCollectionTarget {
+            "host" => candidates.push(CollectionCandidate {
                 candidate_id: format!("{}:host_metrics", target.target_id),
                 target_ref: target.target_id.clone(),
                 collection_kind: "host_metrics".to_string(),
@@ -36,7 +36,7 @@ pub fn build_collection_candidates(
                         _ => {}
                     }
                 }
-                candidates.push(CandidateCollectionTarget {
+                candidates.push(CollectionCandidate {
                     candidate_id: format!("{}:process_metrics", target.target_id),
                     target_ref: target.target_id.clone(),
                     collection_kind: "process_metrics".to_string(),
@@ -62,7 +62,7 @@ pub fn build_collection_candidates(
                         _ => {}
                     }
                 }
-                candidates.push(CandidateCollectionTarget {
+                candidates.push(CollectionCandidate {
                     candidate_id: format!("{}:container_metrics", target.target_id),
                     target_ref: target.target_id.clone(),
                     collection_kind: "container_metrics".to_string(),

@@ -9,7 +9,7 @@ use orion_error::{conversion::ToStructError, prelude::*};
 
 use wist_contracts::agent_config::AgentConfigContract;
 use wist_contracts::enrollment::{
-    AgentCredentialRenewed, AgentEnrollmentResult, AgentEnrollmentResultReturned,
+    AgentCredentialRenewed, AgentEnrollmentResult, EnrollmentEnvelope,
     AgentEnrollmentResultStatus, AgentHostProfile, RenewAgentCredential, SubmitEnrollmentRequest,
 };
 use wist_contracts::agent_state::{AgentRuntimeState, RuntimeMode};
@@ -185,7 +185,7 @@ async fn post_enrollment(
     config: &AgentConfigContract,
     endpoint: &str,
     request: &SubmitEnrollmentRequest,
-) -> Result<AgentEnrollmentResultReturned, EnrollmentError> {
+) -> Result<EnrollmentEnvelope, EnrollmentError> {
     let url = format!("{}/api/v1/agent/enroll", endpoint.trim_end_matches('/'));
     let client = enrollment_http_client(config)?;
     let response = send_with_retry(&client, |client| client.post(&url).json(request)).await?;
@@ -193,7 +193,7 @@ async fn post_enrollment(
         .error_for_status()
         .source_raw_err(EnrollmentReason::Http, "enrollment http error")?;
     response
-        .json::<AgentEnrollmentResultReturned>()
+        .json::<EnrollmentEnvelope>()
         .await
         .source_raw_err(EnrollmentReason::Http, "decode enrollment response")
 }

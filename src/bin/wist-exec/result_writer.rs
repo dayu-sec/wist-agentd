@@ -3,14 +3,14 @@
 use std::io;
 
 use wist_contracts::action_result::ActionResultContract;
-use wist_contracts::execution_state::ExecProgressState;
+use wist_contracts::execution_state::ExecutionProgressState;
 use wist_shared::time::now_rfc3339;
 
 use crate::workdir::ExecutionWorkdir;
 
 pub fn write(workdir: &ExecutionWorkdir, result: &ActionResultContract) -> io::Result<()> {
     workdir.write_result(result)?;
-    workdir.write_state(&ExecProgressState {
+    workdir.write_state(&ExecutionProgressState {
         execution_id: result.execution_id.clone(),
         action_id: result.action_id.clone(),
         state: result.final_status.as_state_name().to_string(),

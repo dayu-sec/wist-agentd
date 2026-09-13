@@ -8,9 +8,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Child;
 use tokio::task::JoinHandle;
 use wist_contracts::action_result::{
-    ActionOutputs, ActionResultContract, FinalStatus, StepActionRecord, StepStatus,
+    ActionOutputs, ActionResultContract, FinalStatus, StepRecord, StepStatus,
 };
-use wist_contracts::execution_state::ExecProgressState;
+use wist_contracts::execution_state::ExecutionProgressState;
 use crate::fs_async::write_json_atomic_async;
 use wist_shared::paths::WORKDIR_STATE_FILE;
 use wist_shared::time::now_rfc3339;
@@ -177,7 +177,7 @@ pub(super) fn synthesize_result(
     ActionResultContract {
         request_id: Some(request.request_id.clone()),
         exit_reason: Some(error_code.to_string()),
-        step_records: vec![StepActionRecord {
+        step_records: vec![StepRecord {
             step_id: request.plan.program.entry.clone(),
             attempt: 1,
             op: request
@@ -218,7 +218,7 @@ pub(super) async fn write_exec_state_async(
     let state_path = workdir.join(WORKDIR_STATE_FILE);
     write_json_atomic_async(
         &state_path,
-        &ExecProgressState {
+        &ExecutionProgressState {
             execution_id: execution_id.to_string(),
             action_id: action_id.to_string(),
             state: state.to_string(),

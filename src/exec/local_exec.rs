@@ -10,7 +10,7 @@ use tokio::fs::File;
 use tokio::process::Command;
 use wist_contracts::action_plan::ActionPlanContract;
 use wist_contracts::action_result::{ActionResultContract, FinalStatus};
-use wist_contracts::execution_state::ExecRuntimeContext;
+use wist_contracts::execution_state::ExecutionRuntimeContext;
 use wist_shared::paths::{
     ACTIONS_DIR, WORKDIR_PLAN_FILE, WORKDIR_RESULT_FILE, WORKDIR_RUNTIME_FILE,
 };
@@ -58,7 +58,7 @@ pub async fn execute_async(request: &LocalExecRequest) -> io::Result<LocalExecOu
         .join(&request.execution_id);
     tokio::fs::create_dir_all(&workdir).await?;
 
-    let runtime = ExecRuntimeContext {
+    let runtime = ExecutionRuntimeContext {
         execution_id: request.execution_id.clone(),
         spawned_at: now_rfc3339(),
         deadline_at: Some(after_millis_rfc3339(

@@ -7,7 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use wist_contracts::action_result::{
-    ActionResultContract, FinalStatus, StepActionRecord, StepStatus,
+    ActionResultContract, FinalStatus, StepRecord, StepStatus,
 };
 use wist_shared::fs::write_json_atomic;
 
@@ -28,7 +28,7 @@ fn sample_result() -> ActionResultContract {
         FinalStatus::Succeeded,
     );
     result.request_id = Some("req_001".to_string());
-    result.step_records = vec![StepActionRecord {
+    result.step_records = vec![StepRecord {
         step_id: "step_collect".to_string(),
         attempt: 1,
         op: Some("process.list".to_string()),

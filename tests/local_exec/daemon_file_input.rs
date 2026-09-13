@@ -10,7 +10,7 @@ use wist_agentd::daemon;
 use wist_agentd::self_observability::DiscoveryReadiness;
 use wist_contracts::agent_config::{DiscoverySection, LogFileInputSection};
 use wist_contracts::discovery::{
-    CandidateCollectionTarget, DiscoveredResource, DiscoveredTarget, DiscoveryCacheMeta,
+    CollectionCandidate, DiscoveredResource, DiscoveredTarget, DiscoveryCacheMeta,
 };
 use wist_contracts::telemetry_record::TelemetryRecordContract;
 use wist_shared::fs::read_json;
@@ -109,19 +109,19 @@ fn daemon_run_once_processes_configured_file_input() {
         read_json(&discovery_root.join("targets.json")).expect("read discovery targets");
     let discovery_meta: DiscoveryCacheMeta =
         read_json(&discovery_root.join("meta.json")).expect("read discovery meta");
-    let host_planner_candidates: Vec<CandidateCollectionTarget> = read_json(
+    let host_planner_candidates: Vec<CollectionCandidate> = read_json(
         &state_dir
             .join("planner")
             .join("host_metrics_candidates.json"),
     )
     .expect("read host planner candidates");
-    let process_planner_candidates: Vec<CandidateCollectionTarget> = read_json(
+    let process_planner_candidates: Vec<CollectionCandidate> = read_json(
         &state_dir
             .join("planner")
             .join("process_metrics_candidates.json"),
     )
     .expect("read process planner candidates");
-    let container_planner_candidates: Vec<CandidateCollectionTarget> = read_json(
+    let container_planner_candidates: Vec<CollectionCandidate> = read_json(
         &state_dir
             .join("planner")
             .join("container_metrics_candidates.json"),

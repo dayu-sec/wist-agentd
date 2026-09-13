@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::fs_async::{read_json_async, write_json_atomic_async};
-use wist_contracts::discovery::CandidateCollectionTarget;
+use wist_contracts::discovery::CollectionCandidate;
 use wist_shared::fs::{read_json, write_json_atomic};
 
 const PLANNER_DIR: &str = "planner";
@@ -30,18 +30,18 @@ pub fn container_metrics_path_for(state_dir: &Path) -> PathBuf {
         .join(CONTAINER_METRICS_CANDIDATES_FILE)
 }
 
-pub fn load_or_default(path: &Path) -> io::Result<Vec<CandidateCollectionTarget>> {
+pub fn load_or_default(path: &Path) -> io::Result<Vec<CollectionCandidate>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
     read_json(path)
 }
 
-pub fn store(path: &Path, candidates: &[CandidateCollectionTarget]) -> io::Result<()> {
+pub fn store(path: &Path, candidates: &[CollectionCandidate]) -> io::Result<()> {
     write_json_atomic(path, &candidates.to_vec())
 }
 
-pub async fn load_or_default_async(path: &Path) -> io::Result<Vec<CandidateCollectionTarget>> {
+pub async fn load_or_default_async(path: &Path) -> io::Result<Vec<CollectionCandidate>> {
     match tokio::fs::metadata(path).await {
         Ok(_) => read_json_async(path).await,
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -49,7 +49,7 @@ pub async fn load_or_default_async(path: &Path) -> io::Result<Vec<CandidateColle
     }
 }
 
-pub async fn store_async(path: &Path, candidates: &[CandidateCollectionTarget]) -> io::Result<()> {
+pub async fn store_async(path: &Path, candidates: &[CollectionCandidate]) -> io::Result<()> {
     write_json_atomic_async(path, &candidates.to_vec()).await
 }
 
@@ -59,7 +59,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use wist_contracts::discovery::CandidateCollectionTarget;
+    use wist_contracts::discovery::CollectionCandidate;
 
     use super::{host_metrics_path_for, load_or_default, process_metrics_path_for, store};
 
@@ -78,7 +78,7 @@ mod tests {
     fn store_and_load_candidates_round_trip() {
         let state_dir = temp_dir("round-trip");
         let path = host_metrics_path_for(&state_dir);
-        let candidates = vec![CandidateCollectionTarget {
+        let candidates = vec![CollectionCandidate {
             candidate_id: "host-1:host:host_metrics".to_string(),
             target_ref: "host-1:host".to_string(),
             collection_kind: "host_metrics".to_string(),
