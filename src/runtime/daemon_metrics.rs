@@ -398,9 +398,16 @@ mod tests {
         let port = listener.local_addr().expect("listener addr").port();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut body = Vec::new();
             let mut buf = vec![0u8; 2048];
-            let n = socket.read(&mut buf).await.expect("read");
-            String::from_utf8_lossy(&buf[..n]).into_owned()
+            loop {
+                let n = socket.read(&mut buf).await.expect("read");
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&buf[..n]);
+            }
+            String::from_utf8_lossy(&body).into_owned()
         });
         let mut sink = TelemetryRecordSink::Tcp(TcpRecordSink::new(
             "127.0.0.1".to_string(),
@@ -446,6 +453,7 @@ mod tests {
         )
         .await
         .expect("write metrics uplink");
+        drop(sink);
 
         let body = server.await.expect("join");
         assert!(body.contains(" METRICS: "), "frame: {body}");
@@ -466,9 +474,16 @@ mod tests {
         let port = listener.local_addr().expect("listener addr").port();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut body = Vec::new();
             let mut buf = vec![0u8; 4096];
-            let n = socket.read(&mut buf).await.expect("read");
-            String::from_utf8_lossy(&buf[..n]).into_owned()
+            loop {
+                let n = socket.read(&mut buf).await.expect("read");
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&buf[..n]);
+            }
+            String::from_utf8_lossy(&body).into_owned()
         });
         let state_dir = temp_dir("metrics-seq");
         let global_seq_path = crate::state_store::log_seq_state::path_for(&state_dir);
@@ -518,6 +533,7 @@ mod tests {
         )
         .await
         .expect("write metrics uplink");
+        drop(sink);
 
         // 取号递增 + 高水位持久化到独立全局 seq 文件。
         assert_eq!(next_seq, 7);
