@@ -4,7 +4,7 @@
 use std::fs;
 use std::io;
 use std::path::Path;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
