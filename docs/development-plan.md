@@ -66,20 +66,13 @@ flowchart LR
   （`paused` / `resumed`，非告警、非失败），进入/退出各产生并**上报**一次，对齐
   [`log-file-input-spec.md`](./log-file-input-spec.md) §7.5 第 3 条与 §7.6。
   - 现状（已实现）：暂停/恢复从 `TelemetryFailureKind` 移出为 `TelemetryTick.notifications`，
-    daemon 跨 tick 差值检测进入/退出，随 `AgentHello.work_state_changes` 上报，
+    daemon 跨 tick 差值检测进入/退出，随 `AgentStatusReport.work_state_changes` 上报，
     gateway 落库到 `StoredAgentRegistration.work_state_changes`。
-  - 通道（已定）：控制面 `/api/v1/agent/status`——在 `AgentHello` 上新增**可选**字段携带
+  - 通道（已定）：控制面 `/api/v1/agent/status`——在 `AgentStatusReport` 上新增**可选**字段携带
     “自上次上报以来的工作状态变化”，由 gateway 落库、center 展示（另开）。不采用数据平面上送：
     暂停恰恰因为 spool/上报不通，用被暂停的通道报“我暂停了”自相矛盾。
     - 契约：`AgentWorkStateChange { input_id, state: paused|resumed, reason, at }`，
       挂 `Option<Vec<AgentWorkStateChange>>` 并 `#[serde(default)]`。
-    - 注意 `AgentHello` 有**两处定义**，需同时改：
-      `wist_contracts::gateway::AgentHello`（agentd 序列化，`deny_unknown_fields`、
-      `memory_bytes: Option<u64>`）与 `insight_control::AgentHello`（gateway 反序列化、simulator 构造，
-      `memory_bytes: Option<i64>`）；只改一处会导致 gateway 收不到新字段。
-    - 兼容：老 agent→新 gateway 由 `#[serde(default)]` 兜住；新 agent→老 gateway 因 gateway 侧
-      `insight_control::AgentHello` 无 `deny_unknown_fields`，多余字段被忽略，不会拒绝。
-    - `insight-simulator/src/agentd.rs::build_agent_hello` 的 struct 字面量需同步补新字段（或派生 `Default`）。
   - 实现顺序（已按此落地）：通道无关部分（`TelemetryTick.notifications` + 进入/退出检测 + 健康快照
     `paused_inputs`）与契约/上报/gateway 落库均已接入。
   - 难点：`FileInputProcessor` 每 tick 重建，过渡检测需跨 tick（daemon 已有“上一 tick 集合 + 差值”

@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use wist_contracts::agent_config::AgentConfig;
-use wist_contracts::gateway::{AgentHello, AgentWorkState, AgentWorkStateChange};
+use wist_contracts::gateway::{AgentStatusReport, AgentWorkState, AgentWorkStateChange};
 use wist_shared::time::now_rfc3339;
 
 use crate::enrollment::enrollment_http_client;
@@ -154,7 +154,7 @@ async fn report_status_to_control_plane(
     let bearer_token = config.control_plane.bearer_token.as_deref()?;
     let agent_id = config.agent.agent_id.as_deref()?;
     let instance_id = config.agent.instance_name.as_deref().unwrap_or_default();
-    let hello = AgentHello {
+    let report = AgentStatusReport {
         agent_id: agent_id.to_string(),
         instance_id: instance_id.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -175,7 +175,7 @@ async fn report_status_to_control_plane(
     match client
         .post(&url)
         .bearer_auth(bearer_token)
-        .json(&hello)
+        .json(&report)
         .send()
         .await
     {
@@ -749,7 +749,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn report_status_posts_agent_hello_with_metrics() {
+    async fn report_status_posts_agent_status_report_with_metrics() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
         let server = tokio::spawn(async move {
