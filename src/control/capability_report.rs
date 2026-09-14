@@ -105,9 +105,8 @@ fn limits(config: &AgentConfig) -> CapabilityLimits {
 mod tests {
     use super::build_capability_report;
     use wist_contracts::agent_config::{
-        AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection,
-        LogFileInputSection, LogsFileOutputSection, LogsOutputSection, LogsSection, PathsSection,
-        TelemetrySection,
+        AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, LogFileInputSection,
+        LogsFileOutputSection, LogsOutputSection, LogsSection, PathsSection, TelemetrySection,
     };
 
     fn config_with_logs() -> AgentConfig {

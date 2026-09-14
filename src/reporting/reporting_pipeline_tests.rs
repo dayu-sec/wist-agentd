@@ -6,9 +6,7 @@ use crate::state_store::reporting;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use wist_contracts::action_result::{
-    ActionResult, FinalStatus, StepRecord, StepStatus,
-};
+use wist_contracts::action_result::{ActionResult, FinalStatus, StepRecord, StepStatus};
 use wist_shared::fs::write_json_atomic;
 
 fn temp_dir(name: &str) -> PathBuf {

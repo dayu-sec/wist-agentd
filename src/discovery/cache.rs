@@ -45,10 +45,7 @@ pub struct DiscoveryCacheLoadFailure {
 
 pub fn load_snapshot(
     paths: &DiscoveryCachePaths,
-) -> (
-    Option<DiscoverySnapshot>,
-    Option<DiscoveryCacheLoadFailure>,
-) {
+) -> (Option<DiscoverySnapshot>, Option<DiscoveryCacheLoadFailure>) {
     if !paths.meta.exists() || !paths.resources.exists() || !paths.targets.exists() {
         return (None, None);
     }
@@ -148,10 +145,7 @@ pub fn store_snapshot(
 
 pub async fn load_snapshot_async(
     paths: &DiscoveryCachePaths,
-) -> (
-    Option<DiscoverySnapshot>,
-    Option<DiscoveryCacheLoadFailure>,
-) {
+) -> (Option<DiscoverySnapshot>, Option<DiscoveryCacheLoadFailure>) {
     let (meta_exists, meta_err) = metadata_exists(&paths.meta, "cache_load_meta").await;
     if let Some(failure) = meta_err {
         return (None, Some(failure));

@@ -116,8 +116,8 @@ mod tests {
     use super::build_file_input_config;
     use std::path::PathBuf;
     use wist_contracts::agent_config::{
-        AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection,
-        LogFileInputSection, PathsSection,
+        AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, LogFileInputSection,
+        PathsSection,
     };
 
     fn config_with_agent(agent_id: Option<&str>) -> AgentConfig {

@@ -2,13 +2,11 @@
 
 use std::io;
 
-use wist_contracts::action_result::{
-    ActionResult, FinalStatus, StepRecord, StepStatus,
-};
+use wist_contracts::action_result::{ActionResult, FinalStatus, StepRecord, StepStatus};
 use wist_shared::time::now_rfc3339;
 use wist_validate::action_plan::validate_action_plan;
 
-use crate::workdir::{ProgressState, ExecutionWorkdir};
+use crate::workdir::{ExecutionWorkdir, ProgressState};
 
 pub fn execute(workdir: &ExecutionWorkdir) -> io::Result<ActionResult> {
     let runtime = workdir.read_runtime()?;

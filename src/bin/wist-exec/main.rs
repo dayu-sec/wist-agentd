@@ -46,8 +46,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use wist_contracts::action_plan::{
-        ActionPlanConstraints, ActionPlan, ActionPlanMeta, ActionPlanProgram,
-        ActionPlanStep, ActionPlanTarget, ApprovalMode, RiskLevel,
+        ActionPlan, ActionPlanConstraints, ActionPlanMeta, ActionPlanProgram, ActionPlanStep,
+        ActionPlanTarget, ApprovalMode, RiskLevel,
     };
     use wist_contracts::action_result::FinalStatus;
     use wist_shared::fs::read_json;
@@ -56,7 +56,7 @@ mod tests {
     use crate::parse_cli_args;
     use crate::result_writer;
     use crate::runtime;
-    use crate::workdir::{RuntimeContext, ExecutionWorkdir};
+    use crate::workdir::{ExecutionWorkdir, RuntimeContext};
 
     fn temp_dir(name: &str) -> PathBuf {
         let suffix = SystemTime::now()

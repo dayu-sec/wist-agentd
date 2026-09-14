@@ -11,6 +11,7 @@ use crate::telemetry::logs::parser::parse_folded_lines;
 
 const MULTILINE_IDLE_FLUSH_MS: i64 = 1000;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn records_from_read(
     records: &mut Vec<TelemetryRecord>,
     agent_id: &str,

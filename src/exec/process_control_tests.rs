@@ -3,11 +3,11 @@ use super::support::parse_linux_proc_state;
 #[cfg(all(unix, not(target_os = "linux")))]
 use super::support::process_is_zombie_via_ps;
 use super::support::{
-    classify_process_identity, derive_running_state_status, ProcessIdentityState,
+    ProcessIdentityState, classify_process_identity, derive_running_state_status,
 };
 #[cfg(unix)]
 use super::support::{process_exists, process_identity_state};
-use super::{inspect_running_state, RunningStateStatus};
+use super::{RunningStateStatus, inspect_running_state};
 use crate::state_store::running::RunningExecutionState;
 
 #[test]
@@ -121,13 +121,17 @@ fn parse_linux_proc_state_returns_none_for_invalid_input() {
 #[test]
 fn process_is_zombie_via_ps_treats_missing_command_as_not_zombie() {
     let missing = "wist-agentd-test-missing-ps-command";
-    assert!(!process_is_zombie_via_ps(std::process::id(), missing)
-        .expect("missing ps should be treated as a benign fallback"));
+    assert!(
+        !process_is_zombie_via_ps(std::process::id(), missing)
+            .expect("missing ps should be treated as a benign fallback")
+    );
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
 #[test]
 fn process_is_zombie_via_ps_sees_current_process_as_not_zombie() {
-    assert!(!process_is_zombie_via_ps(std::process::id(), "ps")
-        .expect("ps probe of the current process succeeds"));
+    assert!(
+        !process_is_zombie_via_ps(std::process::id(), "ps")
+            .expect("ps probe of the current process succeeds")
+    );
 }

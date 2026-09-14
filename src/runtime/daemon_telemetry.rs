@@ -68,9 +68,7 @@ impl TelemetryTick {
 }
 
 /// 构建共享的遥测上送 sink（日志与指标共用同一连接）。
-pub(super) fn build_telemetry_sink(
-    config: &AgentConfig,
-) -> io::Result<TelemetryRecordSink> {
+pub(super) fn build_telemetry_sink(config: &AgentConfig) -> io::Result<TelemetryRecordSink> {
     build_record_sink(config)
 }
 

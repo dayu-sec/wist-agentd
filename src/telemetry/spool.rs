@@ -12,10 +12,7 @@ use wist_shared::fs::ensure_parent;
 
 use crate::telemetry::warp_parse::RecordSink;
 
-pub async fn append_records_async(
-    path: &Path,
-    records: &[TelemetryRecord],
-) -> io::Result<()> {
+pub async fn append_records_async(path: &Path, records: &[TelemetryRecord]) -> io::Result<()> {
     if records.is_empty() {
         return Ok(());
     }

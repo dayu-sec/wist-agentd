@@ -210,9 +210,8 @@ where
     pub fn process_once(&mut self) -> io::Result<ProcessOutcome> {
         // 单 input 单测：从全局 `seq` 文件读取高水位作为起点（独立于 checkpoint）。
         let global_seq_path = log_seq_state::path_for(&self.config.state_dir);
-        let mut next_seq = block_on_io(async {
-            Ok::<u64, io::Error>(log_seq_state::load_or_default_async(&global_seq_path).await?)
-        })?;
+        let mut next_seq =
+            block_on_io(async { log_seq_state::load_or_default_async(&global_seq_path).await })?;
         block_on_io(self.process_once_async(&mut next_seq))
     }
 

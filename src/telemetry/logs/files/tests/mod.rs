@@ -67,9 +67,7 @@ fn config(root: &Path, source_path: &Path) -> FileInputConfig {
     }
 }
 
-fn read_output_records(
-    path: &Path,
-) -> Vec<wist_contracts::telemetry_record::TelemetryRecord> {
+fn read_output_records(path: &Path) -> Vec<wist_contracts::telemetry_record::TelemetryRecord> {
     fs::read_to_string(path)
         .expect("read output")
         .lines()

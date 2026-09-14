@@ -3,6 +3,7 @@ use std::path::Path;
 use std::process::ExitStatus;
 use std::time::Duration;
 
+use crate::fs_async::write_json_atomic_async;
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Child;
@@ -11,7 +12,6 @@ use wist_contracts::action_result::{
     ActionOutputs, ActionResult, FinalStatus, StepRecord, StepStatus,
 };
 use wist_contracts::execution_state::ProgressState;
-use crate::fs_async::write_json_atomic_async;
 use wist_shared::paths::WORKDIR_STATE_FILE;
 use wist_shared::time::now_rfc3339;
 
@@ -87,10 +87,11 @@ pub(super) async fn wait_for_child(
         Ok(status) => Ok(ExitClassification::CompletedAfterTimeout(status?)),
         Err(_) => {
             record_signal_request_async(running_path, SignalRequestKind::Kill).await?;
-            if let Err(err) = child.start_kill() {
-                if child.try_wait()?.is_none() && err.kind() != io::ErrorKind::InvalidInput {
-                    return Err(err);
-                }
+            if let Err(err) = child.start_kill()
+                && child.try_wait()?.is_none()
+                && err.kind() != io::ErrorKind::InvalidInput
+            {
+                return Err(err);
             }
             let _ = child.wait().await?;
             Ok(ExitClassification::TimedOut)

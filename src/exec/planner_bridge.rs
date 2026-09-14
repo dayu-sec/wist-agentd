@@ -1,12 +1,8 @@
 //! Discovery snapshot to collection candidate mapping.
 
-use wist_contracts::discovery::{
-    CollectionCandidate, DiscoverySnapshot, StringKeyValue,
-};
+use wist_contracts::discovery::{CollectionCandidate, DiscoverySnapshot, StringKeyValue};
 
-pub fn build_collection_candidates(
-    snapshot: &DiscoverySnapshot,
-) -> Vec<CollectionCandidate> {
+pub fn build_collection_candidates(snapshot: &DiscoverySnapshot) -> Vec<CollectionCandidate> {
     let mut candidates = Vec::new();
 
     for target in &snapshot.targets {

@@ -7,9 +7,7 @@ use wist_shared::time::now_rfc3339;
 
 use crate::state_store::running;
 
-pub(crate) fn synthesize_recovery_result(
-    state: &running::RunningExecutionState,
-) -> ActionResult {
+pub(crate) fn synthesize_recovery_result(state: &running::RunningExecutionState) -> ActionResult {
     let timestamp = now_rfc3339();
     ActionResult {
         request_id: Some(state.request_id.clone()),

@@ -63,13 +63,13 @@ fn fold_indented(
     let mut emitted = Vec::new();
     let mut current = pending.filter(|entry| entry.source_path == source_path);
     for line in lines {
-        if starts_with_indent(&line.text) {
-            if let Some(existing) = current.as_mut() {
-                existing.body.push_str(&line.text);
-                existing.end_offset = line.end_offset;
-                existing.last_updated_at = observed_at.to_string();
-                continue;
-            }
+        if starts_with_indent(&line.text)
+            && let Some(existing) = current.as_mut()
+        {
+            existing.body.push_str(&line.text);
+            existing.end_offset = line.end_offset;
+            existing.last_updated_at = observed_at.to_string();
+            continue;
         }
 
         if let Some(previous) = current.take() {

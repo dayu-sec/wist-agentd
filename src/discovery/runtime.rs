@@ -42,10 +42,7 @@ impl DiscoveryRuntime {
     pub fn load_from_state_dir(
         &mut self,
         state_dir: &Path,
-    ) -> (
-        Option<DiscoverySnapshot>,
-        Option<DiscoveryCacheLoadFailure>,
-    ) {
+    ) -> (Option<DiscoverySnapshot>, Option<DiscoveryCacheLoadFailure>) {
         let paths = DiscoveryCachePaths::under_state_dir(state_dir);
         let (snapshot, failure) = load_snapshot(&paths);
         if let Some(snapshot) = snapshot.as_ref() {
@@ -68,10 +65,7 @@ impl DiscoveryRuntime {
     pub async fn load_from_state_dir_async(
         &mut self,
         state_dir: &Path,
-    ) -> (
-        Option<DiscoverySnapshot>,
-        Option<DiscoveryCacheLoadFailure>,
-    ) {
+    ) -> (Option<DiscoverySnapshot>, Option<DiscoveryCacheLoadFailure>) {
         let paths = DiscoveryCachePaths::under_state_dir(state_dir);
         let (snapshot, failure) = load_snapshot_async(&paths).await;
         if let Some(snapshot) = snapshot.as_ref() {
@@ -248,9 +242,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
     use std::{fs, path::PathBuf};
 
-    use wist_contracts::discovery::{
-        DiscoveredResource, DiscoveryOrigin, DiscoverySnapshot,
-    };
+    use wist_contracts::discovery::{DiscoveredResource, DiscoveryOrigin, DiscoverySnapshot};
 
     use crate::discovery::{DiscoveryError, DiscoverySourceKind, ProbeOutput};
 

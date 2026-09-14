@@ -117,9 +117,7 @@ container_enabled = false
     .to_string()
 }
 
-pub(super) fn expand_env_contract(
-    mut config: AgentConfig,
-) -> Result<AgentConfig, ConfigError> {
+pub(super) fn expand_env_contract(mut config: AgentConfig) -> Result<AgentConfig, ConfigError> {
     config.agent.agent_id = expand_optional(config.agent.agent_id)?;
     config.agent.environment_id = expand_optional(config.agent.environment_id)?;
     config.agent.instance_name = expand_optional(config.agent.instance_name)?;
@@ -153,10 +151,7 @@ pub(super) fn expand_env_contract(
     Ok(config)
 }
 
-pub(super) fn resolve_paths(
-    mut config: AgentConfig,
-    config_path: &Path,
-) -> AgentConfig {
+pub(super) fn resolve_paths(mut config: AgentConfig, config_path: &Path) -> AgentConfig {
     let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
     let root_dir = absolutize(config_dir, &config.paths.root_dir);
 

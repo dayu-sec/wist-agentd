@@ -9,7 +9,7 @@ use time::Duration as TimeDuration;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use wist_contracts::action_plan::{
-    ActionPlanConstraints, ActionPlan, ActionPlanMeta, ActionPlanProgram, ActionPlanStep,
+    ActionPlan, ActionPlanConstraints, ActionPlanMeta, ActionPlanProgram, ActionPlanStep,
     ActionPlanTarget, ApprovalMode, RiskLevel,
 };
 use wist_contracts::agent_config::{

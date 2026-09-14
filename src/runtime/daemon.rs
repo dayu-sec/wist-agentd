@@ -150,15 +150,9 @@ async fn report_status_to_control_plane(
     last_latency_ms: Option<u64>,
     work_state_changes: Option<Vec<AgentWorkStateChange>>,
 ) -> Option<u64> {
-    let Some(endpoint) = config.control_plane.endpoint.as_deref() else {
-        return None;
-    };
-    let Some(bearer_token) = config.control_plane.bearer_token.as_deref() else {
-        return None;
-    };
-    let Some(agent_id) = config.agent.agent_id.as_deref() else {
-        return None;
-    };
+    let endpoint = config.control_plane.endpoint.as_deref()?;
+    let bearer_token = config.control_plane.bearer_token.as_deref()?;
+    let agent_id = config.agent.agent_id.as_deref()?;
     let instance_id = config.agent.instance_name.as_deref().unwrap_or_default();
     let hello = AgentHello {
         agent_id: agent_id.to_string(),
@@ -333,8 +327,8 @@ async fn run_once_with_failure_cache(
     let telemetry_tick = match build_telemetry_sink(loop_ctx.config) {
         Ok(mut sink) => {
             // 指标优先：先上送指标帧（与日志共用同一 sink/连接 + 同一个全局 seq），再处理日志。
-            if let Some(snapshot) = metrics_tick.snapshot.as_ref() {
-                if let Err(err) = write_metrics_uplink(
+            if let Some(snapshot) = metrics_tick.snapshot.as_ref()
+                && let Err(err) = write_metrics_uplink(
                     &mut sink,
                     agent_id,
                     snapshot,
@@ -342,9 +336,8 @@ async fn run_once_with_failure_cache(
                     &global_seq_path,
                 )
                 .await
-                {
-                    eprintln!("wist-agentd metrics uplink failed: {err}");
-                }
+            {
+                eprintln!("wist-agentd metrics uplink failed: {err}");
             }
             process_telemetry_inputs(loop_ctx.config, &mut sink, &mut next_seq).await
         }
@@ -430,10 +423,7 @@ struct DiscoveryHealth {
     snapshot: DiscoveryHealthSnapshot,
 }
 
-async fn refresh_discovery_snapshot(
-    config: &AgentConfig,
-    state_dir: &Path,
-) -> DiscoveryHealth {
+async fn refresh_discovery_snapshot(config: &AgentConfig, state_dir: &Path) -> DiscoveryHealth {
     let mut runtime = DiscoveryRuntime::new(discovery_probes(config));
     let (cached, cache_load_failure) = runtime.load_from_state_dir_async(state_dir).await;
     let (cached_meta, meta_load_failure) = runtime.load_meta_from_state_dir_async(state_dir).await;
