@@ -47,7 +47,7 @@ jobs:
           cp -av "target/${{ matrix.target }}/release/wist-exec" artifacts/
           tar -czf "${ARTIFACT}.tar.gz" artifacts
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: wist-agentd-${{ github.ref_name }}-${{ matrix.target }}
           path: wist-agentd-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
