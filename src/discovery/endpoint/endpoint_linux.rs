@@ -389,7 +389,7 @@ mod tests {
     fn parses_proc_addresses_and_socket_links() {
         assert_eq!(parse_proc_ipv4("0100007F"), Some("127.0.0.1".to_string()));
         assert_eq!(
-            parse_proc_ipv6("00000000000000000000000000000001"),
+            parse_proc_ipv6("00000000000000000000000001000000"),
             Some("::1".to_string())
         );
         assert_eq!(
