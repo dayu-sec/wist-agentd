@@ -6,7 +6,7 @@ license = "Apache-2.0"
 
 [dependencies]
 libc = "0.2"
-sysinfo = { version = "0.36", default-features = false, features = ["system", "disk"] }
+sysinfo = { version = "0.39", default-features = false, features = ["system", "disk"] }
 jumo-derive = "0.1"
 orion-error = { version = "0.8", features = ["derive", "serde_json"] }
 serde = { version = "1.0", features = ["derive"] }
