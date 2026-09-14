@@ -1,6 +1,6 @@
 [package]
 name = "wist-agentd"
-version = "0.1.1" #@gxl:set(version)
+version = "0.1.2" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
