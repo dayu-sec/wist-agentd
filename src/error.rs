@@ -94,6 +94,8 @@ pub enum AgentdReason {
     InvalidArgs,
     #[orion_error(identity = "biz.warp.agentd.runtime.identity_conflict")]
     IdentityConflict,
+    #[orion_error(identity = "biz.warp.agentd.runtime.already_running")]
+    AlreadyRunning,
     #[orion_error(identity = "sys.warp.agentd.exec_bin_unavailable")]
     ExecBinUnavailable,
     #[orion_error(identity = "biz.warp.agentd.config")]

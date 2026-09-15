@@ -184,6 +184,10 @@ async fn run_daemon(root: PathBuf, config_dir: Option<&Path>) -> AgentdResult<()
     let state_dir = PathBuf::from(&config.paths.state_dir);
     let log_dir = PathBuf::from(&config.paths.log_dir);
 
+    // 单实例锁：同一数据 home 下只允许一个 agentd 进程。
+    // 覆盖 start.sh / --foreground / 直接运行二进制等所有入口。
+    let _instance_lock = crate::single_instance::acquire(&state_dir)?;
+
     crate::bootstrap::initialize_async(&root_dir, &run_dir, &state_dir, &log_dir)
         .await
         .source_err(

@@ -9,6 +9,7 @@ pub mod exec;
 pub(crate) mod fs_async;
 pub mod reporting;
 pub mod runtime;
+pub(crate) mod single_instance;
 pub mod state_store;
 pub(crate) mod telemetry;
 
