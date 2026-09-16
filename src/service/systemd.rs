@@ -3,7 +3,8 @@
 //! 关键取舍：
 //! - `Type=simple` + 前台进程：agentd 不做 double-fork，PID 1 直接跟踪主进程。
 //! - `Restart=always`：常驻进程正常/异常退出都拉起；`systemctl stop` 不会触发重启。
-//! - `EnvironmentFile=-...`（前导 `-` 表示文件可缺失）：放 enrollment token 等敏感环境变量。
+//! - `EnvironmentFile=-...`（前导 `-` 表示文件可缺失）：只放长期环境变量；
+//!   一次性注册 token 走命令行（`service install --enrollment-token` / `enroll --token`），不落盘。
 //! - `KillMode=control-group`（systemd 默认）：stop 时连 `wist-exec` 子进程一起收走，
 //!   未完成的执行由下次启动的 crash recovery 重新排队。
 //! - `NoNewPrivileges=true`：只禁止提权，不降权；agent 仍需 root 读受限日志路径。

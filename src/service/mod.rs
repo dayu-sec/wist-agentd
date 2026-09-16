@@ -29,7 +29,8 @@ pub const SERVICE_NAME: &str = "wist-agentd";
 pub const LAUNCHD_LABEL: &str = "com.dayu-sec.wist-agentd";
 /// user 作用域默认配置目录的目录名（挂在 `$HOME` 下）。
 pub const USER_CONFIG_DIR_NAME: &str = ".wist-agentd";
-/// 可选的环境变量文件（systemd `EnvironmentFile`），用于放 enrollment token 等。
+/// 可选的环境变量文件（systemd `EnvironmentFile`），只放长期环境变量；
+/// 一次性注册 token 走命令行（`service install --enrollment-token` / `enroll --token`），不落盘。
 pub const ENV_FILE_NAME: &str = "agentd.env";
 /// 与 `wist-agentd` 同目录发布、由守护进程拉起的执行器。
 pub const EXEC_BIN_NAME: &str = "wist-exec";

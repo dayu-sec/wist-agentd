@@ -232,7 +232,7 @@ src/
   bin/wist-exec/    # bundled executor binary
   bootstrap/        # runtime directory initialization
   config/           # config loading and env expansion
-  control/          # daemon entry, enrollment, capability report
+  control/          # daemon entry and enrollment
   discovery/        # host / network / endpoint / process / container probes
   exec/             # execution controller, process control, quarantine, recovery
   reporting/        # result aggregation and upstream reporting
@@ -253,6 +253,7 @@ docs/               # design documentation
 - [`docs/agentd-architecture.md`](docs/agentd-architecture.md) — module boundaries and state model.
 - [`docs/agentd-exec-protocol.md`](docs/agentd-exec-protocol.md) — the `wist-exec` local protocol.
 - [`docs/agent-config-schema.md`](docs/agent-config-schema.md) — the `agentd.toml` schema.
+- [`CHANGELOG.md`](CHANGELOG.md) — release history.
 
 ## License
 
