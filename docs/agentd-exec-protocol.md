@@ -11,12 +11,6 @@
 - 取消、超时、异常退出如何处理
 - v1 应优先选用哪种本地协议，才能尽快落地并控制复杂度
 
-相关文档：
-
-- [`action-plan-ir.md`](../../../doc/design/execution/action-plan-ir.md)
-- [`architecture.md`](../../../doc/design/foundation/architecture.md)
-- [`roadmap.md`](../../../doc/design/foundation/roadmap.md)
-
 ---
 
 ## 2. 核心结论
@@ -121,7 +115,6 @@ v1 要求所有正式输入输出都落到工作目录中的结构化文件。
   result.json
   stdout.log
   stderr.log
-  meta.json
 ```
 
 建议约束：
@@ -176,18 +169,6 @@ v1 要求所有正式输入输出都落到工作目录中的结构化文件。
 
 仅用于诊断，不属于正式协议字段。
 
-### 4.6 `meta.json`
-
-由 `wist-agentd` 维护。
-
-用于记录本地调度元数据，例如：
-
-- `pid`
-- `spawn_attempt`
-- `started_by`
-- `cancel_requested_at`
-- `kill_requested_at`
-
 ---
 
 ## 5. 进程启动协议
@@ -211,9 +192,8 @@ wist-exec run --workdir <execution_workdir>
 1. 创建工作目录
 2. 写入 `plan.json`
 3. 写入 `runtime.json`
-4. 初始化 `meta.json`
-5. 打开 `stdout.log` / `stderr.log`
-6. spawn `wist-exec`
+4. 打开 `stdout.log` / `stderr.log`
+5. spawn `wist-exec`
 
 ### 5.2 `wist-exec` 启动后步骤
 
@@ -224,7 +204,7 @@ wist-exec run --workdir <execution_workdir>
 5. 校验 `ActionPlan`
 6. 进入执行阶段
 7. 最终写入 `result.json`
-8. 最终写入 `state.json = done|failed|timed_out|cancelled|rejected`
+8. 最终写入 `state.json = succeeded|failed|timed_out|cancelled|rejected`
 
 随后由 `wist-agentd`：
 
@@ -285,7 +265,7 @@ wist-exec run --workdir <execution_workdir>
 
 ## 7. 结果协议
 
-`result.json` 应使用 [`action-plan-ir.md`](../../../doc/design/execution/action-plan-ir.md) 中定义的 `ActionResult` 模型。
+`result.json` 使用 `wist-contracts` 中的 `action_result::ActionResult` 模型。
 
 建议 `wist-exec` 只在以下时机写入最终 `result.json`：
 

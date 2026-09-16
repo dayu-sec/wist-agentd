@@ -76,10 +76,37 @@ fn try_lock(_file: &File) -> io::Result<()> {
     Ok(())
 }
 
+/// 只读探测：`state_dir` 下的单实例锁当前是否已被某个进程持有。
+///
+/// 锁文件不存在时返回 `Ok(false)`（不创建任何目录/文件）；探测成功会立即释放锁，
+/// 因此不会影响真正的 daemon 启动。
+pub fn is_held(state_dir: &Path) -> io::Result<bool> {
+    let path = state_dir.join(LOCK_FILE_NAME);
+    if !path.exists() {
+        return Ok(false);
+    }
+    // 只读打开：`flock` 不要求写权限，这样非 root 用户也能探测 root 所属的锁文件
+    // （`service status --system` 不该因为读不到写权限就整个失败）。
+    let file = OpenOptions::new().read(true).open(&path)?;
+    match try_lock(&file) {
+        Ok(()) => Ok(false),
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(true),
+        Err(err) => Err(err),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("wist-agentd-lock-test-{nanos}"))
+    }
 
     #[cfg(unix)]
     #[test]
@@ -94,11 +121,34 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    fn temp_dir() -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos();
-        std::env::temp_dir().join(format!("wist-agentd-lock-test-{nanos}"))
+    #[cfg(unix)]
+    #[test]
+    fn is_held_does_not_require_write_permission_on_the_lock_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir();
+        let _lock = acquire(&dir).expect("acquire");
+        let lock_path = dir.join(LOCK_FILE_NAME);
+        // 模拟“锁文件属于别人”：只读权限也应当能探测（服务级安装以 root 运行时的常见情形）。
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o400)).expect("chmod 400");
+
+        assert!(is_held(&dir).expect("probe read-only lock"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_held_tracks_lock_ownership_without_creating_state() {
+        let dir = temp_dir();
+        // 目录/锁文件都不存在时不得产生副作用。
+        assert!(!is_held(&dir).expect("no lock file"));
+        assert!(!dir.exists());
+
+        let lock = acquire(&dir).expect("acquire");
+        assert!(is_held(&dir).expect("held"));
+
+        drop(lock);
+        assert!(!is_held(&dir).expect("released"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -178,6 +178,12 @@ pub(super) fn process_metrics_tick(state_dir: &Path) -> MetricsTick {
 
 pub(super) fn emit_metrics_tick(tick: &MetricsTick) {
     let health = tick.health_snapshot();
+    // 指标快照同样逐 tick 产生，走稳态收敛（内容变化立即打印，否则补心跳）。
+    if !crate::runtime::steady_log::should_emit_metrics(
+        &crate::self_observability::metrics_signature(&health),
+    ) {
+        return;
+    }
     eprintln!(
         "event=MetricsRuntimeUpdated target_view_loaded={} used_cached_snapshot={} total_targets={} host_targets={} process_targets={} container_targets={} attempted_targets={} succeeded_targets={} failed_targets={} failures={} updated_at={}",
         health.target_view_loaded,

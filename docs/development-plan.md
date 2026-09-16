@@ -1,14 +1,11 @@
 # wist-agentd 开发计划
 
-聚焦 `crates/wist-agentd` 的落地计划。当前主线是 **5 项**（W1–W5，按优先级排列）；
-架构约束见 [agentd-architecture.md](./agentd-architecture.md)，全仓里程碑/backlog 见
-[`doc/design/foundation/roadmap.md`](../../../doc/design/foundation/roadmap.md)、
-[`implementation-backlog.md`](../../../doc/design/foundation/implementation-backlog.md)。
+聚焦 `wist-agentd` 的落地计划。当前主线是 **5 项**（W1–W5，按优先级排列）；
+架构约束见 [agentd-architecture.md](./agentd-architecture.md)。
 
 ## 1. 当前基线（已实现/已验证）
 
 - 模块按职责域目录化：`bootstrap / config / control / discovery / exec / reporting / runtime / state_store / telemetry`；
-- `cargo test -p wist-agentd --lib` → **242 passed**；集成测试 `tests/local_exec` → **44 passed**；`wist-validate` → **32 passed**；
 - 文件日志输入已具备：tail/head、rotate（rename/copytruncate）、truncate 重读、多行折叠、
   checkpoint、spool 重放；上送帧 = JSON 信封 + `RAW:`；
 - `control/enrollment` 注册/续期已跑通（本机实测 agent 在线）；
@@ -22,7 +19,7 @@
 | W1 | **先收好日志** | 文件日志采集可靠：断连/崩溃/轮转/截断/权限异常下不丢行、不重复、有界积压 | 完成（截断计数/权限恢复/spool 背压/崩溃重启 e2e 已落地） |
 | W2 | **可以正确上报** | 采集与状态记录能正确上送：帧/批量/重试/顺序/去重正确，失败可恢复 | 进行中 |
 | W3 | **收到指标** | agent 能采集并上送指标（Batch A：host/process 等），数据面可查到 | 待收口 |
-| W4 | **指标扩展机制** | 新增一类指标/目标只需“加 spec + 映射（+ 可选 provider）”，不重编核心 | 基本落地（spec/映射/provider 三层已接，capability 协商已补；脚本型 opcode 后续） |
+| W4 | **指标扩展机制** | 新增一类指标/目标只需“加 spec + 映射（+ 可选 provider）”，不重编核心 | 基本落地（spec/映射/provider 三层已接；脚本型 opcode 后续） |
 | W5 | **完成可升级** | 升级闭环：计划接收→互斥→下载校验→拉起 `wist-upgrader`→结果/版本上报→失败回滚 | 待启动 |
 
 ```mermaid
@@ -47,16 +44,16 @@ flowchart LR
 - 验收：`logs::files` 现有 29 用例保持通过 + 新增覆盖 1–5；集成测试跑真实文件写入/轮转/重启。
 - 改动点：`telemetry/logs/files/*`、`telemetry/spool`、`state_store/log_checkpoint_state`。
 
-落地进展（本轮）：
+落地现状：
 
-- 3 超长行：`max_line_bytes` 截断提交 + `truncated_lines` 计数（`ReadLimits`，见 `log-file-input-spec.md` §7.3）；
+- 3 超长行：`max_line_bytes` 截断提交 + `truncated_lines` 计数（`ReadLimits`，见 `log-file-input-spec.md` §6.3）；
 - 3 权限：源不可读时失败且 checkpoint 不动，恢复后从 checkpoint 续读（`tests/permissions.rs`）；
 - 4 有界：spool 上限（`spool_max_bytes`）+ `pause` 背压（`spool_over_limit` 校验仅 `pause`），
   超限时停读停 checkpoint、回放至低水位自动恢复；暂停/恢复是**工作状态通知**（work-state notification，
   非告警、非失败），本地输出与随 `AgentHello.work_state_changes` 上报、gateway 落库均已落地（进入/退出各一次，见下方待办）；
 - 4 分块：单轮 `max_read_bytes_per_tick` / `max_lines_per_tick` 在行边界停读，保证下次从行首继续。
 - 5 边界语义：读取预算/截断/背压的精确语义与缺陷修复已由 5 轮 review 固化并沉淀到
-  [`log-file-input-spec.md`](./log-file-input-spec.md) §7.6（含缺陷→修复→用例对照表）。
+  [`log-file-input-spec.md`](./log-file-input-spec.md) §6.5（含缺陷→修复→用例对照表）。
 - 1 崩溃恢复：真实文件崩溃重启 e2e（`daemon_restart_recovers_checkpoint_without_loss_or_duplication`）
   验证首次运行持久化 checkpoint 后，重启从 checkpoint 续读新增行，不丢不重。
 
@@ -64,7 +61,7 @@ flowchart LR
 
 - [x] **工作状态通知（work-state notification）与上报**：把暂停/恢复统一为工作状态通知
   （`paused` / `resumed`，非告警、非失败），进入/退出各产生并**上报**一次，对齐
-  [`log-file-input-spec.md`](./log-file-input-spec.md) §7.5 第 3 条与 §7.6。
+  [`log-file-input-spec.md`](./log-file-input-spec.md) §6.4 第 3 条与 §6.5。
   - 现状（已实现）：暂停/恢复从 `TelemetryFailureKind` 移出为 `TelemetryTick.notifications`，
     daemon 跨 tick 差值检测进入/退出，随 `AgentStatusReport.work_state_changes` 上报，
     gateway 落库到 `StoredAgentRegistration.work_state_changes`。
@@ -80,27 +77,27 @@ flowchart LR
   - 验收：跨 tick 用例断言进入/退出各一次、中间 tick 不重复；上报端到端（gateway 可见）。
 - [x] **`drop_oldest` 收敛**：已将 `spool_over_limit` 校验收敛为只允许 `pause`
   （`wist-validate` 拒绝 `drop_oldest`，消除“可配置但不生效”的误导）；
-  按 input 优先级丢弃最旧 spool 记录留待后续按 §7.5/§12.2 落地。
+  按 input 优先级丢弃最旧 spool 记录留待后续按 §6.4/§11.2 落地。
 
 ### W2 可以正确上报
 
-- 范围：上送通道（`telemetry/warp_parse` 的 TCP sink、`telemetry/spool` 重放）、控制面状态/能力上报（`control/`、`runtime/daemon`）。
+- 范围：上送通道（`telemetry/warp_parse` 的 TCP sink、`telemetry/spool` 重放）、控制面状态上报（`control/`、`runtime/daemon`）。
 - 要补的正确性点：
   1. 断连→重连：指数退避、连接复用、批量与超时边界；
   2. **去重**：每条记录带 per-`agent` 全局 `seq`（与 checkpoint 同次原子写），下游按 `(agent, seq)` 去重；
-  3. 顺序与缺口：`seq` per-`agent` 全局单调不回退；缺口 = 被动丢失，接收端 watermark 检测（见 `data-loss-prevention.md` §8）；
+  3. 顺序与缺口：`seq` per-`agent` 全局单调不回退；缺口 = 被动丢失，接收端 watermark 检测；
   4. 失败语义：部分成功（已送部分推进 checkpoint）、失败落 spool、重放优先；
-  5. 状态/能力上报：心跳、失败计数、版本与模式上报可被网关正确解析。
+  5. 状态上报：心跳、失败计数、版本与模式上报可被网关正确解析。
 - 验收：mock TCP sink 的断连/重连/半写用例；重启/重放后数据面**去重后条数正确**；truncate/轮转后再采不被误判为重复；
   e2e：真实采集 → 数据面 `macos-agent.json` 内容与顺序正确、无重复；心跳在网关在线可见。
 - 决策点（已决）：信封引入 per-`agent` 全局 `seq`，去重键 `(agent, seq)`。
 
-落地进展（本轮）：
+落地现状：
 
 - 帧格式收敛：信封 `{schema, agent, ts, seq}` 短名，落成 `DataFrame` 结构体（`#[serde(rename)]`，见
-  `wist-contracts::telemetry_record::DataFrame`），`build_record_frame` 不再手写 `json!`；
-- 契约 `TelemetryRecordContract`：`+agent_id`、`-signal_kind`，`input_id`/来源字段留在契约内部（spool/路由用）、不进帧；
-- `seq` 语义固化：per-`agent` 全局、读入取号（非发送时）、spool 存原号、发送原样发（`data-loss-prevention.md` §5.3）；
+  `wist-contracts::telemetry_record::DataFrame`），`build_record_frame` 由该结构体构造，不手写 `json!`；
+- 契约 `TelemetryRecord`（`wist-contracts::telemetry_record`）：`+agent_id`、`-signal_kind`，`input_id`/来源字段留在契约内部（spool/路由用）、不进帧；
+- `seq` 语义固化：per-`agent` 全局、读入取号（非发送时）、spool 存原号、发送原样发；
 - `next_seq` 全局化：per-`agent` 全局高水位收进独立文件 `state/logs/seq.json`（`log_seq_state`），
   跨 input 共享同一个单调计数器（`&mut u64`）；每个 input 提交 checkpoint 前先把当时的全局值原子写回该文件
   （前移一位），重启后从该文件续号；误删单个 input 的 checkpoint 不回退号源。新增用例
@@ -111,14 +108,12 @@ flowchart LR
   主动过滤统一 `on_dropped_range`；
 - 断连→重连：`TcpRecordSink` 增加连接/写超时（各 5s）+ 指数退避（1s 起、翻倍、30s 封顶），
   退避窗口内返回 `WouldBlock` 快速失败交给 spool、成功重置退避；新增用例 `tcp_sink_backs_off_after_connect_failure`；
-- 下游 warp-parse 的 WPL/OML 已按新帧 `{schema, agent, ts, seq}` 改造（`models/wpl/macos_agent/parse.wpl` +
-  `models/oml/macos_agent_record.oml` 均解析新信封，日志/指标帧均已接）；
-- 测试：`wist-agentd` 248 lib + 45 integration、`wist-contracts` 16、`wist-delivery` 26 全绿。
+- 下游 warp-parse 的 WPL/OML 已按新帧 `{schema, agent, ts, seq}` 改造（日志/指标帧均已接）；
 
 待办（本主线内，未完成）：
 
 - Jumo 模型同步（`FileInputConfig.agent_id` 已入代码，`.mju` 待同步）；
-- 接收端（gateway/center）接入 `wist-delivery`（缺口检测 + 去重，见 `data-loss-prevention.md` §11 待落地）。
+- 接收端（gateway/center）接入 `wist-delivery`（缺口检测 + 去重）。
 
 ### W3 收到指标
 
@@ -130,7 +125,7 @@ flowchart LR
   4. 与日志共用 uplink 的互不影响（日志洪峰不挤掉指标，反之亦然）。
 - 验收：单测覆盖 target_view/samples 生成；集成：采集 → 上报 → 数据面查询可见；日志与指标并发压测无相互阻塞。
 
-落地进展（本轮）：
+落地现状：
 
 - 指标帧序列化 + uplink 接入：`TcpRecordSink::write_metrics`（` METRICS:` 帧）已接入 daemon 主循环——
   每 tick 在 `process_metrics_tick` 产出运行时快照后，经 `samples::build_samples_snapshot` 规范化，
@@ -140,9 +135,8 @@ flowchart LR
   指标先取号（前移持久化到 `state/logs/seq.json`）再发送、日志续号，消除 `batch_seq` 占位导致的日志/指标撞号。
   新增用例 `write_metrics_uplink_draws_from_global_seq_and_persists`；
 - **Batch A 采集补齐（host/process/disk，跨 Linux/macOS）**：
-  - 采集库：host + disk 用 [`sysinfo`](https://crates.io/crates/sysinfo) 0.36（MSRV 1.85 约束下能用的最高版；
-    0.39 需 rust 1.95，暂不升）；process 因 sysinfo 在 macOS 用 `proc_pidinfo` 读不到 root/他用户进程（`EPERM`），
-    保留手写（Linux `/proc` + macOS `ps`）。
+  - 采集库：host + disk 用 [`sysinfo`](https://crates.io/crates/sysinfo) 0.39；process 因 sysinfo 在 macOS 用
+    `proc_pidinfo` 读不到 root/他用户进程（`EPERM`），保留手写（Linux `/proc` + macOS `ps`）。
   - host：`system.target.count`、`system.load_average.{1m,5m,15m}`、`system.uptime`、
     `system.memory.{total,available}`、`system.disk.{usage,total,available}`（`System` + `Disks`）。
   - process：`process.memory.rss`、`process.state`；Linux 读 `/proc/<pid>/stat`，macOS 走 `ps -o state=,rss=,comm=`。
@@ -174,27 +168,22 @@ flowchart LR
     S --> U[uplink: 信封 + 通道]
 ```
 
-**协商**：`capability_report` 声明 agent 支持的 providers / discovery modes / metric 家族；
-中心只下发 agent 声明支持的计划（避免下发无法执行的指标）。
-
 **扩展步骤**（以新增“磁盘使用率”为例）
 
 1. 契约加 `MetricSpec{ name: disk.usage_ratio, target_selector: kind=host, provider: local_runtime }`；
 2. `planner_bridge` selector 命中 `kind=host` 目标 → 生成采集计划；
 3. 若现有 provider 覆盖不到 → 新增 provider（如 `fs_stat`）并注册，或在 `wist-exec` 增加采集 opcode（脚本型，无需重编 agent）；
-4. `capability_report` 声明 provider id；
-5. 测试：provider 单测 + 计划生成测试 + 上送 e2e。
+4. 测试：provider 单测 + 计划生成测试 + 上送 e2e。
 
 **边界纪律**：provider 只产出样本（不做上报决策）；uplink 不做采集选择；spec 不含实现细节
 （采集命令/路径属于 provider 或 opcode）。
 
-**落地顺序**：先固化 spec 契约与 `CollectionPlan`，再把现有 Batch A 采集改成“走 provider 接口”，
-最后补 capability 协商与脚本型 opcode。
+**落地顺序**：先固化 spec 契约与 `CollectionPlan`，再让 Batch A 采集走 provider 接口，
+最后补脚本型 opcode。
 
 **落地进展**：spec（`spec.rs` `MetricSpec` + `METRIC_SPECS`）、映射（`planner_bridge::build_collection_candidates`）、
-provider（`MetricProvider` + 静态注册表）三层已落地，Batch A 已走 provider 接口；capability 协商已把
-provider 的 collection_kind 声明进 `collectors`（`capability_report.rs::metrics_capabilities`）。
-脚本型 opcode 留待后续（§7 已记）。
+provider（`MetricProvider` + 静态注册表）三层已落地，Batch A 已走 provider 接口。
+脚本型 opcode 留待后续。
 
 **结构拆分**：采集契约（`MetricProvider` trait + outcome/sample/target-entry 类型 + spec 表）已下沉到
 共享 crate `wist-metrics`，`wist-agentd` 仅再导出（`telemetry/metrics/{runtime,target_view,spec}.rs`）。
@@ -250,15 +239,10 @@ jumo-code code-quality <repo>/warp-insight --coverage <repo>/warp-insight/covera
 
 ## 7. 待决策点
 
-1. ~~W1/W2：信封是否引入 `seq`~~ → **已决**：per-`agent` 全局 `seq`，`next_seq` 存独立文件 `state/logs/seq.json`（先于 checkpoint 前移原子写）；
-   下游按 `(agent, seq)` 去重（`input_id` 留在契约内部做 spool/路由、不进帧），见 `data-loss-prevention.md` §5.3/§7；
-2. ~~spool 上限与背压策略~~ → **已决**：“暂停采集 + 告警”（保完整），见 `log-file-input-spec.md` §7.5/§12；
-3. ~~**W4**：provider 的扩展方式~~ → **已决**：编译期注册（`MetricProvider` trait + 静态注册表）；脚本型指标统一走 `wist-exec` opcode 后续再议；
-4. ~~**W3**：指标与日志是否共用同一 uplink 通道~~ → **已决**：共用同一 TCP 连接，信封不动、靠帧标记 ` RAW:`/` METRICS:` 区分，指标优先 + 背压隔离（见 `metrics-integration-roadmap.md` §11）；
-5. **W5**：升级制品来源（网关/对象存储）与验签信任根——待定；
-6. **W1**：目录/新文件输入（L`/Library/Logs/DiagnosticReports/*.ips`）是否纳入 W1（建议划 Phase2）——待定；
-7. **W1**：长行上限默认值（1 MiB）是否合适（大日志平台上是否有更优默认）——待定。
-8. **下游水位回传（W2 后续，方案已定、落地待排期）**：本地号源（`state/logs/seq.json` 或单个 input checkpoint）误删后，
+1. **W5**：升级制品来源（网关/对象存储）与验签信任根——待定；
+2. **W1**：目录/新文件输入（L`/Library/Logs/DiagnosticReports/*.ips`）是否纳入 W1（建议划 Phase2）——待定；
+3. **W1**：长行上限默认值（1 MiB）是否合适（大日志平台上是否有更优默认）——待定。
+4. **下游水位回传（W2 后续，方案已定、落地待排期）**：本地号源（`state/logs/seq.json` 或单个 input checkpoint）误删后，
    agent 从下游对账恢复正确起点，根治 `(agent, seq)` 撞号丢数据：
    - 水位值 = `wist-delivery::QualityChannel::committed()`（已结算前缀）；agent 恢复取 `max(本地 next_seq, downstream committed)`；
    - 三段链路：数据面接收端（warp-parse 维护 `QualityChannel`）→ 控制面（`warp-gateway`）→ agent（状态响应回传）；
@@ -267,5 +251,5 @@ jumo-code code-quality <repo>/warp-insight --coverage <repo>/warp-insight/covera
    - 分阶段：P1 agent↔控制面打通（不含数据面）→ P2 数据面接入 `wist-delivery` 后上报水位 → P3 启动门控（可选）；
    - 待定：① 水位语义（`committed()` vs 最高已见 seq，建议前者）；② 数据面→控制面通道（代报 / 内部 RPC / 共享存储）；③ 是否做 P3。
 
-已决项（写入 `log-file-input-spec.md`）：超长行 = 截断提交 + 计数（§7.3）；spool 超限 = 暂停采集 + 告警（§7.5/§12）；
-源日志默认不清理（§15）。
+已决项（写入 `log-file-input-spec.md`）：超长行 = 截断提交 + 计数（§6.3）；spool 超限 = 暂停采集 + 工作状态通知（§6.4/§11）；
+源日志默认不清理（§13）。

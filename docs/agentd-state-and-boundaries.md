@@ -1,11 +1,11 @@
-# wist-agentd 本地状态与模块边界设计
+# wist-agentd 本地状态与边界设计
 
 ## 1. 文档目的
 
 本文档把 `wist-agentd` 的两件关键前置设计固定下来：
 
 - 本地状态模型
-- 模块实现边界
+- 状态边界（写入归属、并发互斥）；模块划分见 [`agentd-architecture.md`](agentd-architecture.md)
 
 它直接服务于：
 
@@ -17,8 +17,6 @@
 - [`agentd-architecture.md`](agentd-architecture.md)
 - [`agentd-failure-handling.md`](agentd-failure-handling.md)
 - [`agentd-exec-protocol.md`](agentd-exec-protocol.md)
-- [`action-plan-ir.md`](../../../doc/design/execution/action-plan-ir.md)
-- [`roadmap.md`](../../../doc/design/foundation/roadmap.md)
 - [`log-file-state-schema.md`](log-file-state-schema.md)
 
 ---
@@ -28,14 +26,15 @@
 `wist-agentd` 的实现必须建立在下面三个原则上：
 
 1. 本地状态必须分层
-2. 每类状态必须有唯一写入者
-3. 模块边界必须按“接收、校验、调度、执行管理、结果汇总”拆开
+2. 每类状态必须有唯一写入者（本地状态统一经由 `state_store` 落盘）
+3. 并发必须显式互斥
 
 一句话说：
 
 - 不允许多个模块抢写同一个状态对象
-- 不允许调度模块直接改执行结果
-- 不允许执行管理模块直接做校验结论
+- 不允许模块之间通过共享写文件协作（只能通过返回对象）
+- `scheduler` 每轮只处理一个队列项（`src/runtime/scheduler.rs` 的 `drain_next_with_report_async`）
+- action 执行固定单并发，upgrade 与 action 全互斥
 
 ---
 
@@ -66,9 +65,6 @@
 
 - agent 版本
 - instance id
-- boot id
-- 当前配置版本
-- 当前策略版本
 - 当前全局模式
 
 例如：
@@ -86,7 +82,7 @@
 
 - 已通过本地校验
 - 尚未拉起 `wist-exec`
-- 正在等待 `execution_scheduler` 调度
+- 正在等待 `scheduler` 调度
 
 它不是：
 
@@ -134,9 +130,6 @@
 
 主要内容：
 
-- 最近执行摘要
-- 最近拒绝摘要
-- 最近失败摘要
 - 最近已执行 `action_id + plan_digest` 索引
 
 第一版不要求长周期历史都在本地保留，但要有最小归档能力。
@@ -159,13 +152,11 @@
     reporting/
       <execution_id>.json
     history/
-      recent.json
     logs/
       file_inputs/
         <input_id>/
           checkpoints.json
   log/
-    agentd.log
 ```
 
 ### 4.1 `agent_runtime.json`
@@ -176,10 +167,7 @@
 
 - `agent_id`
 - `instance_id`
-- `boot_id`
 - `version`
-- `config_version`
-- `policy_version`
 - `mode`
 - `updated_at`
 
@@ -211,8 +199,8 @@
 - `state`
 - `workdir`
 - `pid?`
-- `started_at?`
-- `deadline_at`
+- `started_at`
+- `deadline_at?`
 - `cancel_requested_at?`
 - `kill_requested_at?`
 - `updated_at`
@@ -231,13 +219,7 @@
 - `last_report_at?`
 - `last_report_error?`
 
-### 4.5 `history/recent.json`
-
-保存最近执行摘要。
-
-第一版只需保留有限窗口，例如最近 N 条。
-
-### 4.6 `logs/file_inputs/<input_id>/checkpoints.json`
+### 4.5 `logs/file_inputs/<input_id>/checkpoints.json`
 
 保存文件日志输入的 checkpoint state。
 
@@ -245,7 +227,7 @@
 
 - 不属于 `execution_queue`
 - 不属于 `running` / `reporting`
-- 不由 `execution_scheduler` 持有
+- 不由 `scheduler` 持有
 
 其 schema 独立定义在：
 
@@ -283,229 +265,7 @@
 
 ---
 
-## 6. 模块唯一写入权
-
-这是实现边界里最重要的一条。
-
-建议唯一写入权如下：
-
-| 状态对象 | 唯一写入模块 | 其他模块权限 |
-|---|---|---|
-| `agent_runtime.json` | `bootstrap` / `config_runtime` | 只读 |
-| `execution_queue.json` | `execution_scheduler` | 只读 |
-| `running/<execution_id>.json` | `execution_scheduler` | `executor_manager` 通过事件回传，由 scheduler 落盘 |
-| `reporting/<execution_id>.json` | `result_aggregator` | 只读 |
-| `history/recent.json` | `audit_logger` | 只读 |
-| `logs/file_inputs/*/checkpoints.json` | `checkpoint_store` | `file reader` / `file watcher` 通过事件回传，由 `checkpoint_store` 落盘 |
-| `run/actions/*/meta.json` | `executor_manager` | 只读 |
-
-这里的核心原则是：
-
-- `executor_manager` 不直接写 scheduler 的状态文件
-- `result_aggregator` 不回写 queue 状态
-- `plan_validator` 不直接改 running 集合
-- `file reader` / `file watcher` 不直接写 `checkpoints.json`
-
-模块之间通过事件或返回对象传递，不通过“大家一起改文件”协作。
-
----
-
-## 7. 模块边界与调用关系
-
-第一版建议模块调用链固定为：
-
-```text
-control_receiver
-  -> plan_validator
-  -> execution_scheduler
-  -> executor_manager
-  -> result_aggregator
-  -> audit_logger / reporting adapter
-```
-
-### 7.1 `control_receiver`
-
-输入：
-
-- 中心侧下发对象
-
-输出：
-
-- `ReceivedPlan`
-
-它不做：
-
-- 排队
-- 状态落盘
-- spawn
-
-### 7.2 `plan_validator`
-
-输入：
-
-- `ReceivedPlan`
-
-输出：
-
-- `ValidatedPlan`
-- 或 `RejectedPlan`
-
-它不做：
-
-- 入队
-- 生成 execution workdir
-- 拉起进程
-
-### 7.3 `execution_scheduler`
-
-输入：
-
-- `ValidatedPlan`
-- cancel request
-- timeout tick
-- process exit event
-- result ready event
-
-输出：
-
-- queue 更新
-- running 状态更新
-- `SpawnRequest`
-- `CancelRequest`
-
-它是：
-
-- 本地状态机拥有者
-- queue/running 状态拥有者
-
-### 7.4 `executor_manager`
-
-输入：
-
-- `SpawnRequest`
-- `CancelRequest`
-
-输出：
-
-- `ProcessSpawned`
-- `ProcessExited`
-- `ProcessKillRequested`
-
-它不做：
-
-- 校验计划是否合法
-- 决定队列顺序
-- 解释 step 结果
-
-### 7.5 `result_aggregator`
-
-输入：
-
-- `ProcessExited`
-- workdir 路径
-
-输出：
-
-- `FinalExecutionResult`
-- `ReportReady`
-
-它拥有：
-
-- reporting 状态写入权
-
-它不做：
-
-- 调度重试
-- 排队
-- 修改 running 集合
-
-### 7.6 `audit_logger`
-
-输入：
-
-- 所有关键状态事件
-
-输出：
-
-- 本地审计记录
-- 最近历史摘要
-
----
-
-## 8. 事件驱动边界
-
-建议第一版在进程内采用显式事件对象，而不是模块之间相互直接改状态。
-
-建议最小事件集合：
-
-- `PlanReceived`
-- `PlanRejected`
-- `PlanQueued`
-- `SpawnRequested`
-- `ProcessSpawned`
-- `ProcessStarted`
-- `CancelRequested`
-- `ProcessExited`
-- `ResultReady`
-- `ReportSucceeded`
-- `ReportFailed`
-
-这样做的好处是：
-
-- 更容易做单测
-- 更容易做 crash 恢复
-- 更容易限制模块越权写状态
-
----
-
-## 9. 本地状态机细化
-
-建议把 `agentd-architecture.md` 中的状态机进一步固定为：
-
-```text
-received
-  -> validating
-  -> rejected | queued
-
-queued
-  -> dispatching_local
-  -> cancelled
-
-dispatching_local
-  -> running
-  -> failed
-
-running
-  -> succeeded | failed | cancelled | timed_out
-
-succeeded | failed | cancelled | timed_out
-  -> reporting
-  -> done
-```
-
-### 9.1 状态拥有者
-
-- `received` / `validating` / `rejected`：
-  `plan_validator`
-- `queued` / `dispatching_local` / `running` / `cancelling`：
-  `execution_scheduler`
-- `succeeded` / `failed` / `cancelled` / `timed_out`：
-  `result_aggregator` 形成最终判定，`execution_scheduler` 接收并更新运行态
-- `reporting` / `done`：
-  `result_aggregator`
-
-### 9.2 单 execution 不变量
-
-第一版建议固定以下不变量：
-
-- 一个 `execution_id` 只能出现在一个 queue item 中
-- 一个 `execution_id` 同时只能对应一个 running 文件
-- 一个 `execution_id` 最终只能产生一个 `result.json`
-- 一个 `execution_id` 进入 `done` 后不能重新回到 `running`
-
----
-
-## 10. crash 恢复最小算法
+## 6. crash 恢复最小算法
 
 `wist-agentd` 启动时至少执行以下恢复步骤：
 
@@ -519,7 +279,7 @@ succeeded | failed | cancelled | timed_out
    - `result.json` 是否已存在
 6. 形成恢复结论：
    - 若结果已存在，转入 reporting
-   - 若进程不存在且无结果，标记为 `failed` 或 `unknown`
+   - 若进程不存在且无结果，标记为 `failed`
    - 若进程仍存在，重新纳入 running 监控
 
 第一版不要求复杂断点续跑，但必须做到：
@@ -530,13 +290,11 @@ succeeded | failed | cancelled | timed_out
 
 ---
 
-## 11. 并发与互斥边界
+## 7. 并发与互斥边界
 
-建议 `execution_scheduler` 持有以下调度约束：
+建议 `scheduler` 持有以下调度约束：
 
 - 固定单并发 action 执行槽
-- `upgrade_mutex`
-- `high_risk_action_mutex`
 
 第一版建议最保守策略：
 
@@ -547,50 +305,11 @@ succeeded | failed | cancelled | timed_out
 
 ---
 
-## 12. 模块实现建议
-
-第一版建议把模块实现分成三类：
-
-### 12.1 纯状态模块
-
-- `state_store`
-- `audit_logger`
-
-特点：
-
-- 只做状态读写和归档
-
-### 12.2 纯决策模块
-
-- `plan_validator`
-- `execution_scheduler`
-
-特点：
-
-- 不直接操作外部进程
-- 输入对象，输出决策
-
-### 12.3 外部副作用模块
-
-- `control_receiver`
-- `executor_manager`
-- `result_aggregator`
-
-特点：
-
-- 负责 IO、进程、文件、上报
-
-这样拆分后，测试会更容易做。
-
----
-
-## 13. 当前决定
+## 8. 当前决定
 
 当前阶段固定以下结论：
 
 - `wist-agentd` 的本地状态必须分层
 - `execution_queue` / `running` / `reporting` / `history` 必须分开
 - 每类状态必须有唯一写入模块
-- 模块之间通过事件和返回对象协作，不通过共享写文件协作
-- `execution_scheduler` 是本地状态机拥有者
-- `executor_manager` 只管进程，不拥有调度状态
+- 模块之间通过返回对象协作，不通过共享写文件协作

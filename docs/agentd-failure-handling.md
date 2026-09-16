@@ -19,7 +19,6 @@
 - [`agentd-state-and-boundaries.md`](agentd-state-and-boundaries.md)
 - [`agentd-state-schema.md`](agentd-state-schema.md)
 - [`self-observability.md`](self-observability.md)
-- [`report-action-result-schema.md`](../../../doc/design/center/report-action-result-schema.md)
 
 ---
 
@@ -147,7 +146,7 @@
 
 ### 4.3 report envelope
 
-- `state/reporting/<execution_id>.envelope.json`
+- `state/reporting/<execution_id>.report.json`
   是对中心回报的传输工件
 
 它不是权威状态，只是可重建产物。
@@ -239,36 +238,12 @@
 - `running`
 - `reporting`
 
-### 7.1 active 判定
-
 满足任一条件时，health 应视为 `Active`：
 
 - `execution_queue` 非空
 - 存在 `running/*.json`
 - 存在 `reporting/*.json`
 - 当前 tick 刚完成一次 execution 或 reporting 推进
-
-### 7.2 最小指标
-
-第一版至少应暴露：
-
-- `agent_execution_queue_size`
-- `agent_running_executions`
-- `agent_reporting_executions`
-- `agent_plan_completed_total`
-- `agent_plan_failed_total`
-- `agent_plan_cancelled_total`
-- `agent_plan_timed_out_total`
-- `agent_execution_quarantined_total`
-
-### 7.3 降级反映
-
-如果出现以下情况，health 或事件中必须能体现：
-
-- process identity 不可读
-- reporting backlog 持续增长
-- 本地状态重建发生
-- execution 被 quarantine
 
 ---
 

@@ -1,6 +1,6 @@
 use super::{
-    init_config_message, parse_command, resolve_config_root, resolve_exec_bin_from,
-    resolve_requested_config_root, run_from_args, sync_runtime_identity, usage_message,
+    init_config_message, parse_command, resolve_config_dir_arg, resolve_exec_bin_from,
+    run_from_args, sync_runtime_identity, usage_message,
 };
 use std::fs;
 #[cfg(unix)]
@@ -20,6 +20,14 @@ fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("wist-agentd-lib-{name}-{suffix}"));
     fs::create_dir_all(&dir).expect("create temp dir");
     dir
+}
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime")
+        .block_on(future)
 }
 
 #[test]
@@ -210,7 +218,8 @@ fn parse_command_rejects_stdout_without_init_config() {
 fn run_from_args_init_config_creates_config_without_exec_bin() {
     let root = temp_dir("cli-init-config");
 
-    run_from_args(root.clone(), ["init-config"]).expect("init config command");
+    run_from_args(root.clone(), ["init-config", "--config-dir", "wist-agentd"])
+        .expect("init config command");
 
     assert!(root.join("wist-agentd").join("agentd.toml").exists());
 }
@@ -229,11 +238,25 @@ fn run_from_args_init_config_honors_custom_config_dir() {
 fn init_config_message_mentions_config_directory_when_created() {
     let path = Path::new("/tmp/project/wist-agentd/agentd.toml");
 
-    let message = init_config_message(path, true);
+    let message = init_config_message(path, true, None);
 
     assert!(message.contains("initialized config directory"));
     assert!(message.contains("/tmp/project/wist-agentd"));
     assert!(message.contains("/tmp/project/wist-agentd/agentd.toml"));
+    assert!(!message.contains("run/state/log/spool default to"));
+}
+
+#[test]
+fn init_config_message_explains_data_separation_for_system_config_dir() {
+    let path = Path::new("/etc/wist-agentd/agentd.toml");
+
+    let message = init_config_message(path, true, Some(Path::new("/var/lib/wist-agentd")));
+
+    assert!(message.contains(
+        "data (run/state/spool + collected output data/) defaults to /var/lib/wist-agentd"
+    ));
+    assert!(message.contains("logs to /var/log/wist-agentd"));
+    assert!(message.contains("declare [paths] to override"));
 }
 
 #[test]
@@ -242,15 +265,337 @@ fn usage_message_lists_supported_commands() {
 
     assert!(message.contains("wist-agentd init-config [--stdout]"));
     assert!(message.contains("wist-agentd help"));
+    assert!(message.contains("wist-agentd version"));
+    assert!(message.contains("wist-agentd service <print|install|uninstall|status>"));
     assert!(message.contains("Show this help message"));
     assert!(message.contains("--config-dir <path>"));
+}
+
+#[test]
+fn parse_command_accepts_version_variants() {
+    for arg in ["version", "--version", "-V"] {
+        assert_eq!(
+            parse_command([arg]).expect("parse"),
+            super::ParsedArgs {
+                command: super::Command::Version,
+                config_dir: None,
+            }
+        );
+    }
+}
+
+#[test]
+fn parse_command_accepts_service_action_and_defaults_to_system_scope() {
+    let parsed = parse_command(["service", "print"]).expect("parse");
+    assert_eq!(parsed.config_dir, None);
+    assert_eq!(
+        parsed.command,
+        super::Command::Service(super::ServiceRequest {
+            action: super::ServiceAction::Print,
+            scope: super::ServiceScope::System,
+            platform: None,
+            bin: None,
+            force: false,
+            activate: true,
+            enrollment_token: None,
+        })
+    );
+}
+
+#[test]
+fn parse_command_accepts_service_install_flags() {
+    let parsed = parse_command([
+        "service",
+        "install",
+        "--user",
+        "--bin",
+        "/opt/wist/bin/wist-agentd",
+        "--force",
+        "--no-activate",
+        "--config-dir",
+        "/etc/wist-agentd",
+    ])
+    .expect("parse");
+
+    assert_eq!(parsed.config_dir, Some(PathBuf::from("/etc/wist-agentd")));
+    assert_eq!(
+        parsed.command,
+        super::Command::Service(super::ServiceRequest {
+            action: super::ServiceAction::Install,
+            scope: super::ServiceScope::User,
+            platform: None,
+            bin: Some(PathBuf::from("/opt/wist/bin/wist-agentd")),
+            force: true,
+            activate: false,
+            enrollment_token: None,
+        })
+    );
+}
+
+#[test]
+fn parse_command_rejects_invalid_service_arguments() {
+    let err = parse_command(["service"]).expect_err("missing action");
+    assert!(err.to_string().contains("missing service action"));
+
+    let err = parse_command(["service", "restart"]).expect_err("unknown action");
+    assert!(err.to_string().contains("unknown service action"));
+
+    let err = parse_command(["service", "status", "--force"]).expect_err("flag misuse");
+    assert!(
+        err.to_string()
+            .contains("--force is only supported with `service install`")
+    );
+
+    let err = parse_command(["service", "install", "--bin", "--force"]).expect_err("no value");
+    assert!(err.to_string().contains("missing value for --bin"));
+}
+
+#[test]
+fn parse_command_accepts_service_flags_after_config_dir() {
+    // 真正的调用顺序（脚本/文档里）：子命令参数跟在 --config-dir 后面也必须能解析。
+    let parsed = parse_command([
+        "service",
+        "install",
+        "--bin",
+        "/usr/local/bin/wist-agentd",
+        "--config-dir",
+        "/etc/wist-agentd",
+        "--force",
+        "--enrollment-token",
+        "tok-7",
+    ])
+    .expect("parse");
+
+    assert_eq!(parsed.config_dir, Some(PathBuf::from("/etc/wist-agentd")));
+    assert_eq!(
+        parsed.command,
+        super::Command::Service(super::ServiceRequest {
+            action: super::ServiceAction::Install,
+            scope: super::ServiceScope::System,
+            platform: None,
+            bin: Some(PathBuf::from("/usr/local/bin/wist-agentd")),
+            force: true,
+            activate: true,
+            enrollment_token: Some("tok-7".to_string()),
+        })
+    );
+}
+
+#[test]
+fn parse_command_accepts_enroll_flags_after_config_dir() {
+    let parsed =
+        parse_command(["enroll", "--config-dir", "conf", "--token", "tok-1"]).expect("parse");
+    assert_eq!(parsed.config_dir, Some(PathBuf::from("conf")));
+    assert_eq!(
+        parsed.command,
+        super::Command::Enroll(super::EnrollRequest {
+            token: Some("tok-1".to_string()),
+            token_stdin: false,
+        })
+    );
+}
+
+#[test]
+fn parse_command_rejects_conflicting_config_dir_values() {
+    let err = parse_command(["service", "print", "--config-dir", "a", "--config-dir", "b"])
+        .expect_err("conflicting config dir");
+
+    assert!(
+        err.to_string().contains("conflicting --config-dir"),
+        "{err}"
+    );
+}
+
+#[test]
+fn parse_command_accepts_cross_platform_render_target() {
+    let parsed = parse_command(["service", "print", "--for", "launchd"]).expect("parse");
+    assert_eq!(
+        parsed.command,
+        super::Command::Service(super::ServiceRequest {
+            action: super::ServiceAction::Print,
+            scope: super::ServiceScope::System,
+            platform: Some(super::ServicePlatform::Launchd),
+            bin: None,
+            force: false,
+            activate: true,
+            enrollment_token: None,
+        })
+    );
+
+    let err = parse_command(["service", "status", "--for", "systemd"]).expect_err("flag misuse");
+    assert!(
+        err.to_string()
+            .contains("--for is only supported with `service print`")
+    );
+
+    let err = parse_command(["service", "print", "--for", "windows"]).expect_err("bad target");
+    assert!(err.to_string().contains("unknown platform for --for"));
+}
+
+#[test]
+fn parse_command_accepts_enroll_with_token_forms() {
+    let parsed = parse_command(["enroll", "--token", "tok-1"]).expect("parse");
+    assert_eq!(
+        parsed.command,
+        super::Command::Enroll(super::EnrollRequest {
+            token: Some("tok-1".to_string()),
+            token_stdin: false,
+        })
+    );
+
+    let parsed = parse_command([
+        "enroll",
+        "--token-stdin",
+        "--config-dir",
+        "/etc/wist-agentd",
+    ])
+    .expect("parse");
+    assert_eq!(parsed.config_dir, Some(PathBuf::from("/etc/wist-agentd")));
+    assert_eq!(
+        parsed.command,
+        super::Command::Enroll(super::EnrollRequest {
+            token: None,
+            token_stdin: true,
+        })
+    );
+
+    // 不给 token = 用配置/环境变量里的（等价于守护进程启动时的注册）。
+    assert_eq!(
+        parse_command(["enroll"]).expect("parse"),
+        super::ParsedArgs {
+            command: super::Command::Enroll(super::EnrollRequest {
+                token: None,
+                token_stdin: false,
+            }),
+            config_dir: None,
+        }
+    );
+}
+
+#[test]
+fn parse_command_rejects_bad_enroll_arguments() {
+    let err = parse_command(["enroll", "--token"]).expect_err("missing token value");
+    assert!(err.to_string().contains("missing value for --token"));
+
+    let err = parse_command(["enroll", "--token", "a", "--token-stdin"]).expect_err("both forms");
+    assert!(err.to_string().contains("mutually exclusive"));
+
+    let err = parse_command(["enroll", "--token", "   "]).expect_err("blank token");
+    assert!(err.to_string().contains("non-empty UTF-8"));
+}
+
+#[test]
+fn parse_command_accepts_service_install_enrollment_token() {
+    let parsed = parse_command([
+        "service",
+        "install",
+        "--enrollment-token",
+        "tok-9",
+        "--no-activate",
+    ])
+    .expect("parse");
+
+    assert_eq!(
+        parsed.command,
+        super::Command::Service(super::ServiceRequest {
+            action: super::ServiceAction::Install,
+            scope: super::ServiceScope::System,
+            platform: None,
+            bin: None,
+            force: false,
+            activate: false,
+            enrollment_token: Some("tok-9".to_string()),
+        })
+    );
+
+    let err = parse_command(["service", "status", "--enrollment-token", "tok-9"])
+        .expect_err("flag misuse");
+    assert!(
+        err.to_string()
+            .contains("--enrollment-token is only supported with `service install`")
+    );
+}
+
+#[test]
+fn run_service_install_does_not_write_a_definition_when_enrollment_fails() {
+    let root = temp_dir("cli-install-enroll-fail");
+    // 配置目录里没有 agentd.toml → 注册失败 → 不应留下服务定义。
+    let spec = crate::service::ServiceSpec::new(
+        super::ServiceScope::System,
+        root.join("bin/wist-agentd"),
+        root.join("missing-conf"),
+    );
+    let layout = crate::service::ServiceLayout::for_paths(
+        crate::service::ServicePlatform::Systemd,
+        super::ServiceScope::System,
+        root.join("wist-agentd.service"),
+        None,
+    );
+    let request = super::ServiceRequest {
+        action: super::ServiceAction::Install,
+        scope: super::ServiceScope::System,
+        platform: None,
+        bin: Some(spec.bin.clone()),
+        force: false,
+        activate: false,
+        enrollment_token: Some("tok-x".to_string()),
+    };
+
+    let result = block_on(super::run_service_install(&layout, &spec, &request));
+
+    assert!(result.is_err(), "enrollment failure must abort the install");
+    assert!(!layout.definition_path.exists());
+}
+
+#[test]
+fn parse_command_rejects_token_flags_outside_enroll() {
+    let err = parse_command(["init-config", "--token", "tok"]).expect_err("unknown argument");
+    assert!(err.to_string().contains("unknown argument or command"));
+
+    let err = parse_command(["service", "print", "--token", "tok"]).expect_err("unknown argument");
+    assert!(err.to_string().contains("unknown argument or command"));
+
+    let err =
+        parse_command(["service", "install", "--enrollment-token", "  "]).expect_err("blank token");
+    assert!(err.to_string().contains("non-empty UTF-8"));
+}
+
+#[test]
+fn run_service_print_renders_without_side_effects() {
+    let root = temp_dir("cli-service-print");
+    let config_dir = root.join("etc/wist-agentd");
+    let definition = crate::service::ServiceLayout::resolve(
+        crate::service::ServicePlatform::current().expect("linux or macos"),
+        super::ServiceScope::System,
+    )
+    .expect("layout")
+    .definition_path;
+
+    let result = block_on(super::run_service(
+        root.clone(),
+        Some(&config_dir),
+        super::ServiceRequest {
+            action: super::ServiceAction::Print,
+            scope: super::ServiceScope::System,
+            platform: None,
+            bin: Some(PathBuf::from("/usr/local/bin/wist-agentd")),
+            force: false,
+            activate: false,
+            enrollment_token: None,
+        },
+    ));
+
+    assert!(result.is_ok());
+    // print 只输出定义，既不改动真实定义文件，也不创建配置目录。
+    assert!(definition.is_absolute());
+    assert!(!config_dir.exists());
 }
 
 #[test]
 fn init_config_message_mentions_existing_config_file_and_directory() {
     let path = Path::new("/tmp/project/wist-agentd/agentd.toml");
 
-    let message = init_config_message(path, false);
+    let message = init_config_message(path, false, None);
 
     assert!(message.contains("config file already exists"));
     assert!(message.contains("/tmp/project/wist-agentd"));
@@ -267,103 +612,29 @@ fn run_from_args_init_config_stdout_does_not_create_config_file() {
 }
 
 #[test]
-fn resolve_config_root_prefers_visible_directory() {
-    let root = temp_dir("config-root-visible");
-    fs::create_dir_all(root.join("wist-agentd")).expect("create visible config dir");
-    fs::create_dir_all(root.join(".wist-agentd")).expect("create legacy config dir");
-    fs::write(
-        root.join("wist-agentd").join("agentd.toml"),
-        "schema_version = \"v1\"\n",
-    )
-    .expect("write visible config");
-    fs::write(
-        root.join(".wist-agentd").join("agentd.toml"),
-        "schema_version = \"v1\"\n",
-    )
-    .expect("write legacy config");
-
-    assert_eq!(resolve_config_root(&root), root.join("wist-agentd"));
+fn default_config_root_is_the_system_dir() {
+    assert_eq!(
+        super::default_config_root(),
+        PathBuf::from(crate::config_runtime::SYSTEM_CONFIG_DIR)
+    );
 }
 
 #[test]
-fn resolve_config_root_falls_back_to_legacy_hidden_directory() {
-    let root = temp_dir("config-root-legacy");
-    fs::create_dir_all(root.join(".wist-agentd")).expect("create legacy config dir");
-    fs::write(
-        root.join(".wist-agentd").join("agentd.toml"),
-        "schema_version = \"v1\"\n",
-    )
-    .expect("write legacy config");
-
-    assert_eq!(resolve_config_root(&root), root.join(".wist-agentd"));
-}
-
-#[test]
-fn resolve_config_root_accepts_legacy_agent_toml_in_visible_directory() {
-    let root = temp_dir("config-root-visible-legacy-file");
-    fs::create_dir_all(root.join("wist-agentd")).expect("create visible config dir");
-    fs::write(
-        root.join("wist-agentd").join("agent.toml"),
-        "schema_version = \"v1\"\n",
-    )
-    .expect("write visible legacy config");
-
-    assert_eq!(resolve_config_root(&root), root.join("wist-agentd"));
-}
-
-#[test]
-fn resolve_config_root_accepts_legacy_agent_toml_in_hidden_directory() {
-    let root = temp_dir("config-root-hidden-legacy-file");
-    fs::create_dir_all(root.join(".wist-agentd")).expect("create hidden config dir");
-    fs::write(
-        root.join(".wist-agentd").join("agent.toml"),
-        "schema_version = \"v1\"\n",
-    )
-    .expect("write hidden legacy config");
-
-    assert_eq!(resolve_config_root(&root), root.join(".wist-agentd"));
-}
-
-#[test]
-fn resolve_config_root_defaults_to_visible_directory_when_missing() {
-    let root = temp_dir("config-root-default");
-
-    assert_eq!(resolve_config_root(&root), root.join("wist-agentd"));
-}
-
-#[test]
-fn resolve_config_root_prefers_legacy_when_visible_dir_has_no_config_file() {
-    let root = temp_dir("config-root-visible-empty");
-    fs::create_dir_all(root.join("wist-agentd")).expect("create visible config dir");
-    fs::create_dir_all(root.join(".wist-agentd")).expect("create legacy config dir");
-    fs::write(
-        root.join(".wist-agentd").join("agentd.toml"),
-        "schema_version = \"v1\"\n",
-    )
-    .expect("write legacy config");
-
-    assert_eq!(resolve_config_root(&root), root.join(".wist-agentd"));
-}
-
-#[test]
-fn resolve_requested_config_root_uses_relative_override_from_root() {
+fn resolve_config_dir_arg_uses_relative_override_from_root() {
     let root = temp_dir("requested-config-root-relative");
 
     assert_eq!(
-        resolve_requested_config_root(&root, Some(Path::new("conf"))),
+        resolve_config_dir_arg(&root, Path::new("conf")),
         root.join("conf")
     );
 }
 
 #[test]
-fn resolve_requested_config_root_preserves_absolute_override() {
+fn resolve_config_dir_arg_preserves_absolute_override() {
     let root = temp_dir("requested-config-root-absolute");
     let absolute = root.join("external-conf");
 
-    assert_eq!(
-        resolve_requested_config_root(&root, Some(&absolute)),
-        absolute
-    );
+    assert_eq!(resolve_config_dir_arg(&root, &absolute), absolute);
 }
 
 #[test]

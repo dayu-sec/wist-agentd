@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::support::{apply_path_defaults, default_paths_for, is_system_config_dir};
 use super::{
     default_config_template, ensure_default_config, load_from_path, load_or_init,
     resolve_config_path,
@@ -25,6 +26,15 @@ fn load_or_init_creates_default_config() {
     assert!(root.join("agentd.toml").exists());
     assert_eq!(config.paths.root_dir, root.display().to_string());
     assert_eq!(config.paths.run_dir, root.join("run").display().to_string());
+    assert_eq!(config.paths.log_dir, root.join("log").display().to_string());
+    // 未声明的采集输出路径属数据：跟随数据根目录（非系统级 = 配置目录下的 data/）。
+    assert_eq!(
+        config.telemetry.logs.output.file.path,
+        root.join("data")
+            .join("wist-records.ndjson")
+            .display()
+            .to_string()
+    );
     assert_eq!(
         config.telemetry.logs.spool_dir,
         root.join("state")
@@ -74,7 +84,10 @@ fn default_config_template_contains_file_input_example() {
     assert!(template.contains("# [[telemetry.logs.file_inputs]]"));
     assert!(template.contains("input_id = \"macos_install_log\""));
     assert!(template.contains("input_id = \"macos_launchd\""));
-    assert!(template.contains("path = \"log/wist-records.ndjson\""));
+    // 采集输出路径不再硬编码：未声明时按“数据”落 <数据根>/data。
+    assert!(template.contains("# path = \"/var/lib/wist-agentd/data/wist-records.ndjson\""));
+    assert!(template.contains("数据（run/state/spool + 采集输出 data/）落 /var/lib/wist-agentd"));
+    assert!(template.contains("日志落 /var/log/wist-agentd"));
     assert!(template.contains("# kind = \"tcp\""));
     assert!(!template.contains("max_running_actions = 1"));
     assert!(!template.contains("instance_name = \"local\""));
@@ -294,6 +307,96 @@ path = "log/out.ndjson"
     assert!(config.discovery.endpoint_enabled);
     assert!(config.discovery.process_enabled);
     assert!(!config.discovery.container_enabled);
+}
+
+#[test]
+fn default_paths_separate_data_from_system_config_dir() {
+    let system = default_paths_for(Path::new("/etc/wist-agentd"));
+    assert_eq!(system.root_dir, "/var/lib/wist-agentd");
+    assert_eq!(system.run_dir, "run");
+    assert_eq!(system.state_dir, "state");
+    assert_eq!(system.log_dir, "/var/log/wist-agentd");
+
+    // 非系统位置（开发机 / --user）保持“数据就在配置目录下”。
+    let local = default_paths_for(Path::new("/Users/me/.wist-agentd"));
+    assert_eq!(local.root_dir, ".");
+    assert_eq!(local.log_dir, "log");
+}
+
+#[test]
+fn apply_path_defaults_routes_collected_output_to_data_dir() {
+    let text = "schema_version = \"v1\"\n";
+    let raw: toml::Value = toml::from_str(text).expect("parse raw toml");
+
+    let mut system: wist_contracts::agent_config::AgentConfig =
+        toml::from_str(text).expect("parse config");
+    apply_path_defaults(&mut system, Path::new("/etc/wist-agentd/agentd.toml"), &raw);
+    assert_eq!(system.paths.log_dir, "/var/log/wist-agentd");
+    // 采集输出是数据，不属于日志。
+    assert_eq!(
+        system.telemetry.logs.output.file.path,
+        "/var/lib/wist-agentd/data/wist-records.ndjson"
+    );
+
+    let mut local: wist_contracts::agent_config::AgentConfig =
+        toml::from_str(text).expect("parse config");
+    apply_path_defaults(&mut local, Path::new("/tmp/dev/agentd.toml"), &raw);
+    assert_eq!(local.paths.log_dir, "log");
+    assert_eq!(
+        local.telemetry.logs.output.file.path,
+        "data/wist-records.ndjson"
+    );
+}
+
+#[test]
+fn apply_path_defaults_keeps_declared_keys_and_fills_the_rest() {
+    let text = r#"
+schema_version = "v1"
+
+[paths]
+root_dir = "/srv/wist"
+"#;
+    let raw: toml::Value = toml::from_str(text).expect("parse raw toml");
+    let mut config: wist_contracts::agent_config::AgentConfig =
+        toml::from_str(text).expect("parse config");
+
+    apply_path_defaults(&mut config, Path::new("/etc/wist-agentd/agentd.toml"), &raw);
+
+    // 显式声明的 root_dir 保留；未声明的 run/state 相对 root、log 仍按系统级绝对路径。
+    assert_eq!(config.paths.root_dir, "/srv/wist");
+    assert_eq!(config.paths.run_dir, "run");
+    assert_eq!(config.paths.state_dir, "state");
+    assert_eq!(config.paths.log_dir, "/var/log/wist-agentd");
+}
+
+#[test]
+fn is_system_config_dir_only_matches_the_system_tree() {
+    assert!(is_system_config_dir(Path::new("/etc/wist-agentd")));
+    assert!(is_system_config_dir(Path::new("/etc/wist-agentd/sub")));
+    assert!(!is_system_config_dir(Path::new("/etc/wist-agentd-dev")));
+    assert!(!is_system_config_dir(Path::new("/tmp/etc/wist-agentd")));
+    assert!(!is_system_config_dir(Path::new("/Users/me/.wist-agentd")));
+}
+
+#[test]
+fn apply_path_defaults_only_fills_undeclared_keys() {
+    let text = r#"
+schema_version = "v1"
+
+[paths]
+state_dir = "custom-state"
+"#;
+    let raw: toml::Value = toml::from_str(text).expect("parse raw toml");
+    let mut config: wist_contracts::agent_config::AgentConfig =
+        toml::from_str(text).expect("parse config");
+
+    apply_path_defaults(&mut config, Path::new("/etc/wist-agentd/agentd.toml"), &raw);
+
+    assert_eq!(config.paths.root_dir, "/var/lib/wist-agentd");
+    assert_eq!(config.paths.run_dir, "run");
+    assert_eq!(config.paths.log_dir, "/var/log/wist-agentd");
+    // 显式声明的键不被覆盖。
+    assert_eq!(config.paths.state_dir, "custom-state");
 }
 
 #[test]

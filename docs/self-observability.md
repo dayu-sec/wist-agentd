@@ -13,8 +13,6 @@
 相关文档：
 
 - [`agentd-architecture.md`](agentd-architecture.md)
-- [`metrics-batch-a-plan.md`](../../../doc/design/telemetry/metrics-batch-a-plan.md)
-- [`error-codes.md`](error-codes.md)
 
 ---
 
@@ -22,15 +20,15 @@
 
 `warp-insight` 必须把自观测视为一等能力，而不是上线后再补的辅助项。
 
-第一版自观测至少要覆盖三类信息：
+第一版自观测的落点集中在 `wist-agentd` 的文本日志，分三类输出：
 
-- agent 自身指标
-- agent 自身日志
-- agent 自身关键事件
+- 周期性快照：`health …`、`metrics_runtime …`、`discovery_probe …`（`src/runtime/self_observability.rs`）
+- 状态变化事件：`event=DiscoveryRefreshed` / `event=DiscoveryRefreshFailed` / `event=MetricsRuntimeUpdated` / `event=MetricsRuntimeFailed`
+- 工作状态通知：`telemetry work-state paused|resumed`，并随 `AgentStatusReport.work_state_changes` 上报控制面
 
 一句话说：
 
-- 没有 self-observability，就很难验证 `warp-insight` 是否真的轻、稳、可退化、可恢复
+- 没有 self-observability，就很难验证 `warp-insight` 是否真的轻、稳、可恢复
 
 ---
 
@@ -48,9 +46,8 @@
 
 第一版必须控制：
 
-- 自身指标数量
 - 自身日志量
-- 事件采样与保留窗口
+- 周期性快照的输出频率（`steady_log` 按「内容签名 + 心跳间隔」收敛，见 §5.2）
 
 ### 3.3 自观测优先服务工程验收
 
@@ -60,7 +57,6 @@
 - 为什么拒绝了一个计划
 - queue/running/reporting 当前是什么状态
 - metrics 数据面是否过载
-- 是否进入 degrade / protect 模式
 
 ---
 
@@ -68,13 +64,14 @@
 
 ### 4.1 `wist-agentd`
 
-重点观测：
+重点观测（对应 `RuntimeHealthSnapshot`，见 `src/runtime/self_observability.rs`）：
 
-- daemon 生命周期
-- control plane 连接
-- execution_queue / running / reporting 状态
-- metrics collection framework 健康
-- degrade / protect 状态
+- daemon 生命周期：启动日志 `wist-agentd {version} starting: …`
+- 运行健康 `health …`：`state` / `queue` / `running` / `reporting` / `paused_inputs` / `discovery_readiness` / `discovery_cached_loaded` / `discovery_used_cached` / `discovery_resources` / `discovery_targets` / `discovery_failures` / `discovery_last_success_at` / `updated_at`
+- 发现探针 `discovery_probe …`：`source` / `probe` / `phase` / `status` / `resources` / `targets` / `error`
+- 指标健康 `metrics_runtime …`：`target_view_loaded` / `used_cached_snapshot` / `total_targets` / `host_targets` / `process_targets` / `container_targets` / `attempted_targets` / `succeeded_targets` / `failed_targets` / `failures` / `last_error` / `updated_at`
+- 状态变化事件：`event=DiscoveryRefreshed` / `event=DiscoveryRefreshFailed` / `event=MetricsRuntimeUpdated` / `event=MetricsRuntimeFailed`
+- 工作状态通知：`telemetry work-state paused|resumed`
 
 ### 4.2 `wist-exec`
 
@@ -96,112 +93,26 @@
 
 ---
 
-## 5. Self Metrics
+## 5. Self Logs
 
-### 5.1 `wist-agentd` 基础指标
+### 5.1 输出分类
 
-建议第一版至少包括：
+实际输出按四类：
 
-- `agent_up`
-- `agent_build_info`
-- `agent_uptime_seconds`
-- `agent_mode`
+- 周期性快照：`health …`、`metrics_runtime …`、`discovery_probe …`
+- 状态变化事件：`event=DiscoveryRefreshed`、`event=DiscoveryRefreshFailed`、`event=MetricsRuntimeUpdated`、`event=MetricsRuntimeFailed`
+- 工作状态通知：`telemetry work-state paused …` / `telemetry work-state resumed …`
+- 失败与告警：telemetry 输入失败（`telemetry input missing|failed|output invalid …`）、指标上送失败（`wist-agentd metrics uplink failed: …`）、状态上报失败（`wist-agentd status report failed: …`）、凭证续期失败（`wist-agentd credential renewal failed …`）
 
-说明：
+### 5.2 稳态收敛
 
-- `agent_mode` 可用受控枚举表示：
-  - `normal`
-  - `degraded`
-  - `protect`
-  - `upgrade_in_progress`
+常驻主循环每 tick 都会产出一份健康/指标快照，逐 tick 打印会持续写盘。`src/runtime/steady_log.rs` 按「内容签名 + 心跳间隔」收敛：
 
-### 5.2 调度与执行指标
+- 签名变化（状态迁移、失败计数变化、探针结果变化）立即打印
+- 签名不变时只按心跳间隔补一条（默认 300s，`WIST_AGENTD_LOG_HEARTBEAT_SECS` 可调，`0` 关闭收敛）
+- 只收敛周期性快照；事件、工作状态通知、失败类日志始终逐条打印
 
-建议至少包括：
-
-- `agent_execution_queue_size`
-- `agent_running_executions`
-- `agent_reporting_executions`
-- `agent_plan_received_total`
-- `agent_plan_rejected_total`
-- `agent_plan_completed_total`
-- `agent_plan_failed_total`
-- `agent_plan_cancelled_total`
-- `agent_plan_timed_out_total`
-
-### 5.3 子进程指标
-
-建议至少包括：
-
-- `agent_exec_spawn_total`
-- `agent_exec_spawn_failed_total`
-- `agent_exec_exit_total`
-- `agent_exec_kill_total`
-
-### 5.4 metrics 数据面指标
-
-建议至少包括：
-
-- `agent_metrics_targets_total`
-- `agent_metrics_scrape_total`
-- `agent_metrics_scrape_failed_total`
-- `agent_metrics_samples_received_total`
-- `agent_metrics_samples_dropped_total`
-- `agent_metrics_receiver_rejected_total`
-
-### 5.5 资源与保护模式指标
-
-建议至少包括：
-
-- `agent_cpu_usage_pct`
-- `agent_memory_rss_bytes`
-- `agent_open_fds`
-- `agent_degrade_enter_total`
-- `agent_protect_enter_total`
-- `agent_backpressure_events_total`
-
----
-
-## 6. Self Logs
-
-### 6.1 日志分类
-
-建议第一版分三类：
-
-- `system`
-- `execution`
-- `metrics`
-
-### 6.2 `system`
-
-记录：
-
-- 启动
-- 配置加载
-- control plane 连接变化
-- 模式切换
-
-### 6.3 `execution`
-
-记录：
-
-- 计划接收
-- 校验拒绝
-- spawn
-- cancel
-- exit
-- result report
-
-### 6.4 `metrics`
-
-记录：
-
-- target discovery 变化
-- scrape 错误摘要
-- receiver 拒绝摘要
-- budget 命中
-
-### 6.5 日志约束
+### 5.3 日志约束
 
 第一版必须避免：
 
@@ -211,50 +122,11 @@
 
 ---
 
-## 7. Self Events
-
-建议自观测事件与 [`agentd-events.md`](agentd-events.md) 对齐。
-
-第一版建议至少把以下事件进入本地审计或事件流：
-
-- `PlanReceived`
-- `PlanRejected`
-- `SpawnRequested`
-- `ProcessSpawned`
-- `CancelRequested`
-- `ProcessExited`
-- `ResultReady`
-- `ReportFailed`
-
-metrics 数据面建议至少有：
-
-- `DiscoveryRefreshed`
-- `TargetAdded`
-- `TargetRemoved`
-- `ScrapeBudgetHit`
-- `ReceiverRejected`
-
----
-
-## 8. 指标与事件命名建议
-
-第一版建议统一前缀：
-
-- metrics: `agent_`
-- events: `Agent*`
-
-例如：
-
-- `agent_execution_queue_size`
-- `AgentPlanRejected`
-
----
-
-## 9. Batch A 验收依赖
+## 6. Batch A 验收依赖
 
 `Batch A` metrics 数据面是否达标，强依赖 self-observability。
 
-至少需要依靠这些指标判断：
+至少需要依靠自观测输出判断：
 
 - scrape 是否稳定
 - 样本是否被丢弃
@@ -268,7 +140,7 @@ metrics 数据面建议至少有：
 
 ---
 
-## 10. 第一版限制
+## 7. 第一版限制
 
 第一版不建议：
 
@@ -278,19 +150,18 @@ metrics 数据面建议至少有：
 
 第一版先把：
 
-- 核心 metrics
-- 核心 logs
-- 核心事件
+- 周期性快照（`health` / `metrics_runtime` / `discovery_probe`）
+- 状态变化事件与工作状态通知
 
 做稳定即可。
 
 ---
 
-## 11. 当前决定
+## 8. 当前决定
 
 当前阶段固定以下结论：
 
 - `warp-insight` 自身必须具备自观测能力
-- `wist-agentd` 的 queue / running / reporting / mode 必须有对应指标
-- metrics 数据面验收必须依赖 self-observability 指标
+- `wist-agentd` 的 queue / running / reporting / paused 必须有对应的 health 快照字段
+- metrics 数据面验收必须依赖 self-observability 输出（health 快照字段 + 文本日志）
 - 自观测要受控，不能反过来拖重 agent

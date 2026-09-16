@@ -10,7 +10,6 @@
 - `execution_queue.json`
 - `running/<execution_id>.json`
 - `reporting/<execution_id>.json`
-- `history/recent.json`
 
 本文档当前聚焦：
 
@@ -101,12 +100,8 @@ AgentRuntimeState {
   schema_version
   agent_id
   instance_id
-  boot_id
   version
-  config_version
-  policy_version?
   mode
-  started_at
   updated_at
 }
 ```
@@ -191,8 +186,8 @@ RunningExecutionState {
   state
   workdir
   pid?
-  started_at?
-  deadline_at
+  started_at
+  deadline_at?
   current_step_id?
   attempt?
   cancel_requested_at?
@@ -200,21 +195,6 @@ RunningExecutionState {
   updated_at
 }
 ```
-
-### 6.3 `state` 枚举
-
-第一版建议：
-
-- `validating`
-- `queued`
-- `dispatching_local`
-- `running`
-- `cancelling`
-
-说明：
-
-- `rejected` 不应长期保留在 `running` 目录
-- `succeeded` / `failed` / `cancelled` / `timed_out` 形成最终结果后应转入 `reporting`
 
 ---
 
@@ -238,10 +218,8 @@ ReportingExecutionState {
   result_digest?
   result_signature?
   report_attempt
-  first_report_at?
   last_report_at?
   last_report_error?
-  updated_at
 }
 ```
 
@@ -257,44 +235,7 @@ ReportingExecutionState {
 
 ---
 
-## 8. `history/recent.json`
-
-### 8.1 作用
-
-保存最近执行摘要，用于本地排障和最小审计索引。
-
-### 8.2 建议字段
-
-```text
-RecentHistoryState {
-  schema_version
-  updated_at
-  items[]
-}
-```
-
-```text
-RecentHistoryItem {
-  execution_id
-  action_id
-  plan_digest?
-  request_id
-  final_state
-  started_at?
-  finished_at?
-  reason_code?
-  summary?
-}
-```
-
-### 8.3 第一版建议
-
-- 本地只保留最近 N 条
-- N 作为配置项
-
----
-
-## 9. 与 workdir 文件的关系
+## 8. 与 workdir 文件的关系
 
 本地状态文件不应替代 workdir 协议文件。
 
@@ -316,9 +257,9 @@ RecentHistoryItem {
 
 ---
 
-## 10. 最小示例
+## 9. 最小示例
 
-### 10.1 `execution_queue.json`
+### 9.1 `execution_queue.json`
 
 ```json
 {
@@ -340,7 +281,7 @@ RecentHistoryItem {
 }
 ```
 
-### 10.2 `running/exec_01.json`
+### 9.2 `running/exec_01.json`
 
 ```json
 {
@@ -349,7 +290,7 @@ RecentHistoryItem {
   "action_id": "act_01",
   "plan_digest": "sha256:abc123",
   "request_id": "req_01",
-  "state": "running",
+  "state": "spawned",
   "workdir": "/var/lib/warp-insight/run/actions/exec_01",
   "pid": 38122,
   "started_at": "2026-04-12T10:00:01Z",
@@ -362,7 +303,7 @@ RecentHistoryItem {
 
 ---
 
-## 11. 当前决定
+## 10. 当前决定
 
 当前阶段固定以下结论：
 

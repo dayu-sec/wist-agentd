@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use orion_error::{conversion::ToStructError, prelude::*};
@@ -49,6 +49,61 @@ pub async fn ensure_enrolled_with_config_path(
     ensure_enrolled_with_optional_config_path(config, state_dir, Some(config_path)).await
 }
 
+/// 用**命令行传入的一次性 token** 完成注册：token 不写入任何文件。
+///
+/// - 配置必须已存在（`init-config` 生成），其中提供 `control_plane.endpoint`（非秘密，可由 CM 管）；
+/// - token 只在本进程内存里使用，注完就走与守护进程启动时**完全相同**的注册路径；
+/// - 已注册（state 里有正式 `agent_id`）时直接返回 `ExistingStateIdentity`，不重复注册；
+/// - 成功后仅有签发凭据落 `state/agent_runtime.json`（0600）；配置文件不会被改动
+///   （配置里本来就没有 token 行，scrub 无事可做）。
+///
+/// 参数校验（endpoint 必填、token 必填）交给注册路径自身：这样“已注册”与“控制面关掉”
+/// 这类不需要 token/endpoint 的情形才能给出正确的返回与报错。
+pub async fn enroll_with_token(
+    config_root: &Path,
+    token: String,
+) -> EnrollmentResult<EnrollmentDecision> {
+    enroll_with_optional_token(config_root, Some(token)).await
+}
+
+/// 不带 token 的注册（用配置／环境变量里的 token）；等价于守护进程启动时的注册。
+pub async fn enroll_from_config(config_root: &Path) -> EnrollmentResult<EnrollmentDecision> {
+    enroll_with_optional_token(config_root, None).await
+}
+
+async fn enroll_with_optional_token(
+    config_root: &Path,
+    token: Option<String>,
+) -> EnrollmentResult<EnrollmentDecision> {
+    let config_path = crate::config_runtime::resolve_config_path(config_root);
+    if !config_path.is_file() {
+        return Err(EnrollmentReason::MissingConfigFile
+            .to_err()
+            .with_detail(format!(
+                "config file not found: {} (run `wist-agentd init-config --config-dir {}` first)",
+                config_path.display(),
+                config_root.display()
+            )));
+    }
+
+    let mut config = crate::config_runtime::load_from_path_async(&config_path)
+        .await
+        .conv_err()?;
+
+    let root_dir = PathBuf::from(&config.paths.root_dir);
+    let run_dir = PathBuf::from(&config.paths.run_dir);
+    let state_dir = PathBuf::from(&config.paths.state_dir);
+    let log_dir = PathBuf::from(&config.paths.log_dir);
+    crate::bootstrap::initialize_async(&root_dir, &run_dir, &state_dir, &log_dir)
+        .await
+        .source_err(EnrollmentReason::Io, "initialize runtime directories")?;
+
+    if let Some(token) = token {
+        config.control_plane.enrollment_token = Some(token);
+    }
+    ensure_enrolled_with_config_path(&mut config, &state_dir, &config_path).await
+}
+
 async fn ensure_enrolled_with_optional_config_path(
     config: &mut AgentConfig,
     state_dir: &Path,
@@ -80,9 +135,10 @@ async fn ensure_enrolled_with_optional_config_path(
         .to_string();
     let token = required_option(config.control_plane.enrollment_token.as_deref())
         .ok_or_else(|| {
-            EnrollmentReason::MissingEnrollmentToken
-                .to_err()
-                .with_detail("control_plane.enrollment_token is required for enrollment")
+            EnrollmentReason::MissingEnrollmentToken.to_err().with_detail(
+                "no enrollment token available; enroll first with `wist-agentd enroll --token <token>` \
+(or install with `service install --enrollment-token <token>`)",
+            )
         })?
         .to_string();
     let request = build_enrollment_request(config, token);
@@ -586,9 +642,9 @@ mod tests {
     };
 
     use super::{
-        EnrollmentDecision, EnrollmentReason, build_enrollment_request, enrollment_http_client,
-        ensure_enrolled, ensure_enrolled_with_config_path, hostname_from_sources, post_enrollment,
-        renew_credential,
+        EnrollmentDecision, EnrollmentReason, build_enrollment_request, enroll_from_config,
+        enroll_with_token, enrollment_http_client, ensure_enrolled,
+        ensure_enrolled_with_config_path, hostname_from_sources, post_enrollment, renew_credential,
     };
 
     fn config() -> AgentConfig {
@@ -923,6 +979,124 @@ mod tests {
         assert_eq!(decision, EnrollmentDecision::Enrolled);
         assert_eq!(config.agent.agent_id.as_deref(), Some("agent-http"));
         assert!(crate::state_store::agent_runtime::path_for(&state_dir).exists());
+    }
+
+    #[tokio::test]
+    async fn enroll_with_token_persists_credential_without_touching_config() {
+        let config_root = temp_dir("enroll-cli-token");
+        let config_path = config_root.join("agentd.toml");
+        // 配置里**没有** token：token 只从命令行传进来。
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        fs::write(
+            &config_path,
+            format!(
+                r#"schema_version = "v1"
+
+[control_plane]
+enabled = true
+endpoint = "{endpoint}"
+credential_request = "bearer"
+
+[paths]
+root_dir = "."
+state_dir = "state"
+"#
+            ),
+        )
+        .expect("write config");
+        let before = fs::read_to_string(&config_path).expect("read config");
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request_bytes = Vec::new();
+            loop {
+                let mut chunk = [0u8; 1024];
+                let read = socket.read(&mut chunk).await.expect("read");
+                if read == 0 {
+                    break;
+                }
+                request_bytes.extend_from_slice(&chunk[..read]);
+                if request_is_complete(&request_bytes) {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request_bytes);
+            assert!(request.contains("\"token\":\"cli-token\""));
+            let body = r#"{"result":{"status":"accepted","reason_code":null,"agent_id":"agent-cli","instance_id":"inst-cli","issued_identity":null,"credential_bundle":null,"initial_config":null,"policy_binding":null}}"#;
+            let response = format!(
+                "HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        let decision = enroll_with_token(&config_root, "cli-token".to_string())
+            .await
+            .expect("enroll");
+        server.await.expect("server task");
+
+        assert_eq!(decision, EnrollmentDecision::Enrolled);
+        // 凭据落 state（单独文件），配置文件一字未改。
+        let state_path = crate::state_store::agent_runtime::path_for(&config_root.join("state"));
+        assert!(state_path.exists());
+        let state: wist_contracts::agent_state::AgentRuntimeState =
+            wist_shared::fs::read_json(&state_path).expect("read runtime state");
+        assert_eq!(state.agent_id, "agent-cli");
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("read config"),
+            before
+        );
+
+        // 幂等：已注册后再调（甚至给个别的 token）不再发请求。
+        let again = enroll_with_token(&config_root, "other-token".to_string())
+            .await
+            .expect("enroll again");
+        assert_eq!(again, EnrollmentDecision::ExistingStateIdentity);
+    }
+
+    #[tokio::test]
+    async fn enroll_with_token_requires_existing_config() {
+        let config_root = temp_dir("enroll-cli-missing-config");
+
+        let err = enroll_with_token(&config_root, "cli-token".to_string())
+            .await
+            .expect_err("missing config must fail");
+
+        assert_eq!(err.reason(), &EnrollmentReason::MissingConfigFile);
+    }
+
+    #[tokio::test]
+    async fn enroll_from_config_without_token_points_at_the_cli() {
+        let config_root = temp_dir("enroll-no-token");
+        fs::write(
+            config_root.join("agentd.toml"),
+            r#"schema_version = "v1"
+
+[control_plane]
+enabled = true
+endpoint = "http://127.0.0.1:1"
+
+[paths]
+root_dir = "."
+state_dir = "state"
+"#,
+        )
+        .expect("write config");
+
+        let err = enroll_from_config(&config_root)
+            .await
+            .expect_err("no token available");
+
+        assert_eq!(err.reason(), &EnrollmentReason::MissingEnrollmentToken);
+        assert!(
+            err.to_string().contains("wist-agentd enroll --token"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

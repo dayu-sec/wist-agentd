@@ -16,8 +16,16 @@ use wist_validate::config::validate_config;
 mod support;
 
 use support::{
-    absolutize, default_file_config_text, expand_env_contract, expand_string, resolve_paths,
+    absolutize, apply_path_defaults, default_file_config_text, expand_env_contract, expand_string,
+    is_system_config_dir, resolve_paths,
 };
+
+/// 系统级部署的配置目录：普通运行、`init-config`、`service install --system` 的默认值。
+pub const SYSTEM_CONFIG_DIR: &str = "/etc/wist-agentd";
+/// 系统级部署的数据根目录：配置在 [`SYSTEM_CONFIG_DIR`] 下时，`run/state/spool` 默认落在这里。
+pub const SYSTEM_DATA_ROOT: &str = "/var/lib/wist-agentd";
+/// 系统级部署的日志目录：配置在 [`SYSTEM_CONFIG_DIR`] 下时，agent 日志与采集输出默认落在这里。
+pub const SYSTEM_LOG_DIR: &str = "/var/log/wist-agentd";
 
 #[derive(Debug, Clone, PartialEq, Eq, ::jumo_derive::Jumo)]
 #[jumo(kind = "struct", domain = "Discovery", module = "Discovery.Config")]
@@ -64,14 +72,22 @@ pub fn load_from_path(config_path: &Path) -> Result<AgentConfig, ConfigError> {
         ConfigReason::Io,
         format!("read config {}", config_path.display()),
     )?;
+    let raw = toml::from_str::<toml::Value>(&text)
+        .source_raw_err(ConfigReason::ParseToml, "parse config")?;
     let mut parsed = toml::from_str::<AgentConfig>(&text)
         .source_raw_err(ConfigReason::ParseToml, "parse config")?;
+    apply_path_defaults(&mut parsed, config_path, &raw);
     load_file_inputs_from_task_file(&mut parsed, config_path)?;
     let env_resolved = expand_env_contract(parsed)?;
     let path_resolved = resolve_paths(env_resolved, config_path);
     validate_config(&path_resolved)
         .map_err(|err| ConfigReason::Validation.to_err().with_detail(err.code))?;
     Ok(path_resolved)
+}
+
+/// 配置目录在 `/etc` 下时，数据默认根目录（供 `init-config` 提示使用）。
+pub fn system_data_root_for(config_dir: &Path) -> Option<PathBuf> {
+    is_system_config_dir(config_dir).then(|| PathBuf::from(SYSTEM_DATA_ROOT))
 }
 
 /// 若声明了 `[telemetry.logs] file_inputs_file`，从该外置任务清单加载 `file_inputs`。
@@ -162,8 +178,11 @@ pub async fn load_from_path_async(config_path: &Path) -> Result<AgentConfig, Con
         ConfigReason::Io,
         format!("read config {}", config_path.display()),
     )?;
+    let raw = toml::from_str::<toml::Value>(&text)
+        .source_raw_err(ConfigReason::ParseToml, "parse config")?;
     let mut parsed = toml::from_str::<AgentConfig>(&text)
         .source_raw_err(ConfigReason::ParseToml, "parse config")?;
+    apply_path_defaults(&mut parsed, config_path, &raw);
     load_file_inputs_from_task_file_async(&mut parsed, config_path).await?;
     let env_resolved = expand_env_contract(parsed)?;
     let path_resolved = resolve_paths(env_resolved, config_path);

@@ -4,18 +4,15 @@
 
 本文档定义 `wist-agentd` 的职责边界、模块拆分、本地状态机和与 `wist-exec` / `wist-upgrader` 的关系。
 
-它主要服务于 [`roadmap.md`](../../../doc/design/foundation/roadmap.md) 中的：
+它主要服务于：
 
 - `M3 Edge Runtime Skeleton`
 - `M5 Controlled Action MVP`
 
 相关文档：
 
-- [`architecture.md`](../../../doc/design/foundation/architecture.md)
-- [`action-plan-ir.md`](../../../doc/design/execution/action-plan-ir.md)
 - [`agentd-failure-handling.md`](agentd-failure-handling.md)
 - [`agentd-exec-protocol.md`](agentd-exec-protocol.md)
-- [`roadmap.md`](../../../doc/design/foundation/roadmap.md)
 
 ---
 
@@ -58,7 +55,7 @@
 `managed` 模式下：
 
 - 在 `standalone` 模式能力基础上接入中心节点
-- 启用会话、心跳、能力上报
+- 启用会话、心跳、状态上报
 - 启用本地采集、发现、标准化、缓冲、上送与自观测（数据面链路）
 - 启用远程任务与中心编排升级
 
@@ -85,10 +82,10 @@
 
 约束：
 
-- 模式切换（standalone ↔ managed）时，上表相应链路随之启用/停用；standalone 下发不再产生新的 spool。
+- 模式切换（standalone ↔ managed）时，上表相应链路随之启用/停用；standalone 下发不产生新的 spool。
 - standalone 是“本地执行器 + 状态机”，不是“无人中心的采集器”；无中心时不得持续采集/发现/上送。
 
-> 实现对齐：`crates/wist-agentd` 当前尚未完全按本表收敛（如 standalone 下 `[telemetry.logs]` 的本地 file 输出
+> 实现对齐：`wist-agentd` 当前尚未完全按本表收敛（如 standalone 下 `[telemetry.logs]` 的本地 file 输出
 > 与部分 discovery 默认值仍可能开启）；实现侧需按本表逐项落地并在 `agent-config-schema.md` 同步约束。
 
 ---
@@ -115,7 +112,7 @@
 
 - `bootstrap/` — 初始化与运行目录布局
 - `config/` — 配置加载 / 默认模板 / 校验（`config_runtime.rs`）
-- `control/` — 对 gateway 控制面：注册（`enrollment`）、运行入口（`runtime_entry`）、能力上报（`capability_report`）
+- `control/` — 对 gateway 控制面：注册（`enrollment`）、运行入口（`runtime_entry`）
 - `discovery/` — 资源发现与观测（host / network / process / endpoint / container / k8s / cache）
 - `exec/` — 动作执行：`local_exec`（拉起 `wist-exec`）、`process_control`（子进程生命周期）、
   `execution_support`、`planner_bridge`、`quarantine`、`recovery`
@@ -125,10 +122,8 @@
 - `state_store/` — 本地持久状态（execution_queue / running / history / log_checkpoint_state / reporting）
 - `telemetry/` — metrics 与日志采集上送：`metrics`、`logs`（文件输入在 `logs/files`）、`spool`、`warp_parse`
 
-历史说明：早期草案曾把“控制接收 / 计划校验 / 调度 / 执行管理 / 升级管理 / 结果聚合 / 审计”规划为
-平铺模块。实现中这些职责被收敛进上述域（计划校验与入队由 `scheduler` + `exec` 承担）；
 升级执行体在独立 crate `wist-upgrader`（见 §11），agentd 只做编排入口；
-审计类事件不设独立模块（见 §5 与 `agentd-events.md`）。
+审计类事件不设独立模块（见 §5）。
 
 ---
 
@@ -152,7 +147,7 @@
 负责与 gateway 控制面的会话与身份：
 
 - 注册（enrollment）、凭据续期、token 清除；
-- 能力上报（capability_report）与运行状态心跳（在 `runtime/daemon` 循环内上报）；
+- 运行状态心跳（在 `runtime/daemon` 循环内上报）；
 - standalone 模式（`control_plane.enabled=false`）：不建立中心会话、不接收远程计划，
   不影响其它本地模块启动。
 
@@ -181,7 +176,7 @@ crash 后恢复时重建最小现场。
 ### 5.7 `runtime/self_observability`
 
 负责暴露 daemon 自身状态：健康、执行队列长度、运行中任务数、拒绝/失败计数、
-运行模式与中心连接状态；配合 `telemetry` 与 `agentd-events.md` 的事件输出。
+运行模式与中心连接状态；配合 `telemetry` 的事件输出。
 
 ### 5.8 `telemetry`
 
@@ -198,7 +193,7 @@ rotate / multiline / spool 重放）、断连缓冲与重试、上送帧（JSON 
 - 升级：执行体在独立 crate `wist-upgrader`，agentd 侧仅调度入口与互斥约束（见 §11）；
   standalone 下本地升级辅助不应阻断 agent 正常运行；
 - 审计：计划接收/拒绝、进程启动、取消与 kill、结果归档等关注点不设独立模块，
-  由事件（`agentd-events.md`）与 `self_observability`/`telemetry` 承担。
+  由事件与 `self_observability`/`telemetry` 承担。
 
 ---
 
@@ -254,7 +249,7 @@ rotate / multiline / spool 重放）、断连缓冲与重试、上送帧（JSON 
 
 读表约定：
 
-- 状态只因**事件**而改变；每行表示“该事件发生时，把『前置』改成『变更后』”。
+- 状态只因**事件**而改变；每行表示“该事件发生时，由『前置』变为『变更后』”。
 - `∅` 表示该维度此刻还没有值；表中未列出的维度**保持不变**。
 - 只有表中出现的（事件 × 前置）组合合法；其它组合一律视为非法转移并被拒绝。
 - 终局结果 `outcome` 在第 8–10 行按下方“outcome 判定”填写。
@@ -318,7 +313,7 @@ outcome 判定（第 8 行使用）：
 - `rejected` 只能由 `validating → finished` 产生（无执行阶段）；
 - `timed_out` 仅在存在 `deadline_at` 且触发时出现；
 - `cancel_requested_at` / `kill_requested_at` 可并存、可重复请求但只保留首次时间戳，**不改变阶段**；
-- `cancelling` / `kill_requested` / `reporting` 不再是状态（分别为“信号已设”“settling 阶段”）。
+- 不存在 `cancelling` / `kill_requested` / `reporting` 状态：取消与终止由上一行的时间戳表达，上报归属 `settling` 阶段。
 
 ### 7.5 与当前实现的映射
 
@@ -353,7 +348,6 @@ outcome 判定（第 8 行使用）：
 ```text
 <agent_root>/run/
   actions/
-  upgrades/
 ```
 
 ### 8.2 状态目录
@@ -363,8 +357,6 @@ outcome 判定（第 8 行使用）：
 ```text
 <agent_root>/state/
   execution_queue.json
-  running.json
-  last_reported.json
 ```
 
 ### 8.3 日志目录
@@ -373,9 +365,6 @@ outcome 判定（第 8 行使用）：
 
 ```text
 <agent_root>/log/
-  agentd.log
-  actions/
-  upgrades/
 ```
 
 ---
@@ -445,10 +434,8 @@ outcome 判定（第 8 行使用）：
 
 第一版不要求复杂恢复，但至少应做到：
 
-- 启动时扫描 `run/actions/*`
 - 识别孤儿执行目录
 - 标记上次异常退出的执行
-- 将未完成执行标记为 `failed` 或 `unknown`
 - 避免重复上报同一结果
 
 这对守护进程是必要能力，不应留到太后面。

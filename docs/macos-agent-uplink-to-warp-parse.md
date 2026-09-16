@@ -15,13 +15,8 @@
 相关文档：
 
 - [macos-security-audit-log-sources.md](macos-security-audit-log-sources.md)（P0 源清单与位置）
-- [telemetry-uplink-and-warp-parse.md](telemetry-uplink-and-warp-parse.md)（数据面角色边界）
 - [log-file-input-spec.md](log-file-input-spec.md)（文件输入 tail/watcher/checkpoint 设计）
-- [./.md](./.md)（agentd 配置 schema）
-- [./.md](./.md)
-- [./.md](./.md)
-- [../../../doc/design/foundation/security-model.md](../../../doc/design/foundation/security-model.md)
-- [../../../doc/design/foundation/implementation-backlog.md](../../../doc/design/foundation/implementation-backlog.md)
+- [agent-config-schema.md](agent-config-schema.md)（agentd 配置 schema）
 
 ---
 
@@ -44,15 +39,14 @@
   带本地缓冲（`state/spool/logs`）与 checkpoint（见 log-file-input-spec）；
 - `[telemetry.logs.output] kind = "file" | "tcp"`；
   - `tcp`：`addr / port / framing="line"`（行帧 NDJSON 发送已现成）；
-  - `file`：`log/wist-records.ndjson`（本地落盘/回放）。
+  - `file`：未显式声明 `path` 时按“数据”落点改写为 `<数据根>/data/wist-records.ndjson`
+    （系统级 `/var/lib/wist-agentd/data/wist-records.ndjson`），本地落盘/回放。
 
 ### 3.2 Gateway 数据平面已就绪
 
-- `wparse` 常驻（`sysrun/warp-gateway/bin/wparse` 0.25.21，工程在
-  `sysrun/warp-gateway/data-plane`）；
+- `wparse` 常驻（0.25.21）；
 - `tcp_1`：0.0.0.0:9000，`tcp_src`，`data_format=ndjson`、`framing=auto`（已实测可收）；
-- `syslog_1`：1514（syslog 协议，可选）；
-- WPL 素材：`models/wpl/mac/<类>/sample.dat`（真机样本）与逐步补齐的 `parse.wpl`/OML。
+- `syslog_1`：1514（syslog 协议，可选）。
 
 ### 3.3 能力缺口（决定工作量）
 
@@ -93,25 +87,28 @@
 
 - 数据面只做：接入、解析、转换、路由。
 - agent 只做：采集、结构化、缓冲、上送。
-- 无论来源类型，统一先转结构化 record，便于数据面一套入口 + 按 `category` 路由。
+- 无论来源类型，统一先转结构化 record，便于数据面一套入口 + 按规则逐类路由。
 
 ### 4.1 上送帧格式（每行一条）
 
-**JSON 信封 + 行尾 `RAW:<RAW>` 原文**，`raw` 不作为 JSON 字段、不做 JSON 转义：
+**JSON 信封 + 行尾 ` RAW: ` 原文**，`raw` 不作为 JSON 字段、不做 JSON 转义：
 
 ```text
-{JSON 信封} RAW:<原始单行>
+{JSON 信封} RAW: <原始单行>
 ```
 
 示例（launchd 真实行）：
 
 ```text
-{"agent_id":"node-uuid","instance_name":"mbp-ops","tenant_id":"tenant-default","env_id":"env-default","ts":"2026-09-09T08:56:22.956Z","category":"macos.launchd","host_ts":"2026-09-09 08:56:24.392429","event":{"level":"Warning","scope":"system","message":"failed lookup: name = com.apple.AppleLOM.Watchdog"}} RAW: 2026-09-09 08:56:24.392429 (system) <Warning>: failed lookup: name = com.apple.AppleLOM.Watchdog, flags = 0x1, requestor = watchdogd[551], error = 3: No such process
+{"schema":"v1","agent":"node-uuid","ts":"2026-09-09T08:56:22.956Z","seq":1042} RAW: 2026-09-09 08:56:24.392429 (system) <Warning>: failed lookup: name = com.apple.AppleLOM.Watchdog, flags = 0x1, requestor = watchdogd[551], error = 3: No such process
 ```
+
+指标帧复用同一连接与同一信封，帧标记换为 ` METRICS: `，正文是 VM JSON line
+（`{JSON 信封} METRICS: {"metric":{...},"value":<number>}`）。
 
 约定：
 
-- JSON 信封只承载结构化字段（`agent_id/category/ts/host_ts/event...`），**不含 raw**；
+- JSON 信封只承载通用字段（`schema/agent/ts/seq`），**不含 raw**；
 - `RAW:` 是行尾固定前缀，之后到行尾为原始内容；原始内容**保持原样，不转义**，避免体积膨胀并便于审计核对；
 - 因此上送行要求原始内容为**单行**；多行内容（如 `.ips`/panic 文本）由 agent 侧先归一为单行（换行转可视转义或取首行元数据）再上送，或该类走独立入口；
 - 数据面处理：先 `json(...)` 解析信封字段路由；`RAW:` 原文按需由规则抓取，miss/rescue 保留原文供回放核对。
@@ -140,8 +137,8 @@
 ## 6. 数据面接入（Gateway 侧）
 
 - 已就绪：`tcp_1`（9000，ndjson）与 `syslog_1`（1514）。
-- 规则开发顺序：以 `models/wpl/mac/<类>/sample.dat`（真机实采）为准，逐类写 `parse.wpl` + OML；
-  安全语义类路由到独立 sink 分组（参考 telemetry-uplink 的 security receiver 结论）。
+- 规则开发顺序：以真机实采样本为准，逐类写 `parse.wpl` + OML；
+  安全语义类路由到独立 sink 分组（security receiver 结论）。
 - **未决风险：入站认证**。当前 wparse tcp/syslog 监听 0.0.0.0 且无认证：
   - V1 部署约束：数据面只监听可信网段/专用链路，Agent 指向该地址；
   - V2：为 `tcp_src` 增加 token/TLS 握手，或 agent 侧加密隧道后再进数据面。
@@ -155,7 +152,7 @@
 | 缓冲/重试 | 复用 spool：断连本地排队、重连回放；TCP 指数退避；JSON 信封带 `seq` 序号，去重基于信封字段（不依赖 raw） |
 | 隐私/合规 | 统一日志完整字段需 `private_data:on`——采集决策点；默认脱敏可用，仅对授权主机开完整；`RAW:` 原文按类裁剪 |
 | 完整性 | audit 事件尽快离机；本地副本仅短期缓冲；数据面记录级去重兜底 |
-| 时钟 | record 同时携带 `host_ts`（源时间）与 `ts`（采集/上送时间），WPL/OML 统一时区处理 |
+| 时钟 | record 只携带 `ts`（采集/上送时间）；源时间在 `RAW:` 原文里，由 WPL 规则抽取，WPL/OML 统一时区处理 |
 | 权限治理 | root helper 提权面最小化（仅 audit/TCC/private log 采集），其余保持用户态 |
 | 认证 | V1 内网约束；V2 agent↔wparse TCP 认证/TLS |
 
@@ -190,10 +187,9 @@
 
 | 模块 | 改动 |
 |---|---|
-| `crates/wist-agentd` telemetry | ① file_inputs 支持目录新文件（.ips）；② 新增 source 类型 `unified_log / audit_export / tcc_snapshot`；③ root helper |
+| `src/telemetry` | ① file_inputs 支持目录新文件（.ips）；② 新增 source 类型 `unified_log / audit_export / tcc_snapshot`；③ root helper |
 | agent 配置 schema | `telemetry.logs.sources` 扩展（unified_log predicate 集、audit flags/周期、快照源） |
 | data-plane | 已就绪；后续补入站认证 |
-| `models/wpl/mac/*` | 逐类补 `parse.wpl` + OML，真机样本校准 |
 
 ---
 
@@ -209,7 +205,5 @@
 ## 11. 相关文档
 
 - [macos-security-audit-log-sources.md](macos-security-audit-log-sources.md)
-- [telemetry-uplink-and-warp-parse.md](telemetry-uplink-and-warp-parse.md)
 - [log-file-input-spec.md](log-file-input-spec.md)
-- [./.md](./.md)
-- [../../../doc/design/foundation/implementation-backlog.md](../../../doc/design/foundation/implementation-backlog.md)
+- [agent-config-schema.md](agent-config-schema.md)

@@ -21,7 +21,6 @@
 - [`agentd-state-schema.md`](agentd-state-schema.md)
 - [`agentd-state-and-boundaries.md`](agentd-state-and-boundaries.md)
 - [`./log-file-input-spec.md`](./log-file-input-spec.md)
-- [`../../../doc/design/foundation/glossary.md`](../../../doc/design/foundation/glossary.md)
 
 ---
 
@@ -62,24 +61,37 @@
 ### 4.1 `checkpoints.json`
 
 ```text
-FileLogCheckpointState {
+LogCheckpointState {
   schema_version
   input_id
   updated_at
+  next_seq
+  pending_multiline?
   files[]
 }
 ```
 
-字段说明：
+字段说明（结构体定义见 `src/state_store/log_checkpoint_state.rs:6-34`）：
 
 - `schema_version`
   第一版固定为 `v1`
 - `input_id`
-  对应 `logs.file_inputs[].id`
+  对应 `logs.file_inputs[].input_id`（入口字段名，契约见 `wist-contracts-0.1.2/src/agent_config.rs:277`）
 - `updated_at`
   本次状态文件成功落盘时间
+- `next_seq`
+  【已废弃，仅兼容】历史遗留的 per-input 序号字段；因为结构体带 `#[serde(deny_unknown_fields)]`，
+  保留它才能读出旧 `checkpoints.json`，当前不再读写
+  （`src/state_store/log_checkpoint_state.rs:13-17`）
+- `pending_multiline?`
+  未闭合的多行组快照（`indented` 模式下跨 tick 保留的组），无则为空且不落盘
+  （`skip_serializing_if = "Option::is_none"`，`src/state_store/log_checkpoint_state.rs:18-19`）
 - `files[]`
   当前仍保留 checkpoint 的文件状态集合
+
+全局 `seq` 高水位**不属本 schema 管辖**：它已从 per-input checkpoint 迁到独立文件
+`state/logs/seq.json`（内容 `{"next_seq": N}`），与各 input 的 checkpoint 解耦
+（`src/state_store/log_seq_state.rs:13-28`）。
 
 ### 4.2 `TrackedFileCheckpoint`
 
@@ -91,6 +103,7 @@ TrackedFileCheckpoint {
   inode?
   fingerprint?
   checkpoint_offset
+  checkpoint_probe?
   last_size?
   last_read_at?
   last_commit_point_at?
@@ -98,7 +111,7 @@ TrackedFileCheckpoint {
 }
 ```
 
-字段说明：
+字段说明（结构体定义见 `src/state_store/log_checkpoint_state.rs:47-62`）：
 
 - `file_id`
   `file identity` 的持久化字段
@@ -110,6 +123,11 @@ TrackedFileCheckpoint {
   inode 不可靠或需额外校验时使用
 - `checkpoint_offset`
   最近一次已提交的文件读取进度
+- `checkpoint_probe`
+  `checkpoint_offset` 前最多 16 字节（`CHECKPOINT_PROBE_BYTES`）的十六进制内容指纹，
+  用于 copytruncate / 同前缀重写判定：若该位置前的字节与它不一致，则按 truncate 从 `0` 重读
+  （`src/telemetry/logs/files/file_reader.rs:10`、`264-282`；`src/telemetry/logs/files/file_watcher.rs:53-64`、`129-142`）；
+  `checkpoint_offset = 0` 或探测失败时为空
 - `last_size`
   最近一次观测到的文件大小
 - `last_read_at`
@@ -119,6 +137,10 @@ TrackedFileCheckpoint {
 - `rotated_from_path`
   当前文件由哪个旧路径 rotate 而来；无则为空
 
+本结构带 `#[serde(deny_unknown_fields)]`：`file_id` / `path` / `checkpoint_offset` 必填，
+其余均为 `Option<T>`，缺失即为 `None`（serde 对 `Option` 字段缺失的处理）；多出未知键会被拒绝
+（`src/state_store/log_checkpoint_state.rs:47-62`）。
+
 ---
 
 ## 5. `file_id` 与 `file identity`
@@ -127,7 +149,6 @@ TrackedFileCheckpoint {
 
 - `file_id` 不是自由字符串语义名，而是 `file identity` 的稳定持久化结果
 - Linux / Unix 优先基于 `device_id + inode`
-- `compare_filename = true` 时同时校验 `path`
 - 当 inode 不可靠时，退化为 `canonical_path + fingerprint`
 
 工程约束：
@@ -179,7 +200,7 @@ TrackedFileCheckpoint {
 
 - 旧文件的 `file identity` 保持不变
 - 原路径上的新文件形成新的 `file identity`
-- 旧文件可在 `rotate_wait_ms` 窗口内继续读尾
+- 旧文件继续读尾
 - checkpoint 继续绑定到各自的 `file_id`
 
 ### 7.2 truncate
@@ -191,25 +212,12 @@ TrackedFileCheckpoint {
 
 处理建议：
 
-- 记录 `truncate` 事件
 - 将 runtime `read offset` 重置到 `0`
 - 后续从 `0` 重新建立新的 `checkpoint_offset`
 
 ---
 
-## 8. 清理与保留策略
-
-第一版建议：
-
-- 已长期不存在且超过保留窗口的 `file_id` 可被清理
-- 正在 `rotate_wait_ms` 窗口内的旧文件 checkpoint 不应过早删除
-- 清理动作必须更新 `updated_at`
-
-建议保留策略字段后续再进配置，不在第一版 schema 中编码。
-
----
-
-## 9. 文件更新策略
+## 8. 文件更新策略
 
 `checkpoints.json` 建议沿用 `agentd-state-schema.md` 的统一规则：
 
@@ -224,7 +232,7 @@ TrackedFileCheckpoint {
 
 ---
 
-## 10. 最小示例
+## 9. 最小示例
 
 ```json
 {
@@ -233,10 +241,10 @@ TrackedFileCheckpoint {
   "updated_at": "2026-04-12T10:00:00Z",
   "files": [
     {
-      "file_id": "dev_2049_ino_912345",
+      "file_id": "dev:2049:ino:912345",
       "path": "/var/log/nginx/access.log",
-      "device_id": "2049",
-      "inode": "912345",
+      "device_id": 2049,
+      "inode": 912345,
       "checkpoint_offset": 1839201,
       "last_size": 1839201,
       "last_read_at": "2026-04-12T09:59:58Z",
@@ -248,7 +256,7 @@ TrackedFileCheckpoint {
 
 ---
 
-## 11. 当前决定
+## 10. 当前决定
 
 当前阶段固定以下结论：
 

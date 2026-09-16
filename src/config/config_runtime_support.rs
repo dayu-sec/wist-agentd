@@ -4,7 +4,14 @@ use std::path::{Component, Path, PathBuf};
 use orion_error::conversion::ToStructError;
 use wist_contracts::agent_config::AgentConfig;
 
-use crate::config_runtime::{ConfigError, ConfigReason};
+use crate::config_runtime::{
+    ConfigError, ConfigReason, SYSTEM_CONFIG_DIR, SYSTEM_DATA_ROOT, SYSTEM_LOG_DIR,
+};
+
+/// 采集输出（file sink，属于数据）在数据根目录下的子目录。
+const COLLECTED_OUTPUT_SUBDIR: &str = "data";
+/// 采集输出默认文件名。
+const COLLECTED_OUTPUT_FILE: &str = "wist-records.ndjson";
 
 pub(super) fn default_file_config_text() -> String {
     r#"schema_version = "v1"
@@ -16,8 +23,12 @@ spool_dir = "state/spool/logs"
 [telemetry.logs.output]
 kind = "file"
 
-[telemetry.logs.output.file]
-path = "log/wist-records.ndjson"
+# 采集输出（file sink）路径：不写则按“它是数据”处理，跟数据根目录走 ——
+#   系统级部署（配置在 /etc/wist-agentd）→ /var/lib/wist-agentd/data/wist-records.ndjson
+#   开发机 / --user 安装　　→ <配置目录>/data/wist-records.ndjson
+# 需要指定就显式声明（相对路径相对本配置文件所在目录，绝对路径原样使用）：
+# [telemetry.logs.output.file]
+# path = "/var/lib/wist-agentd/data/wist-records.ndjson"
 
 [discovery]
 # 默认保留 host + network + endpoint + process discovery，便于本地 metrics / action target 建模。
@@ -35,21 +46,29 @@ container_enabled = false
 #
 # 可选：
 # [control_plane]
-# # install.sh 可写入管理端地址和 enrollment token；注册成功后 daemon 会把正式 agent_id 写入 state。
+# # 管理端端点（非秘密，可由 CM 下发）。注册是一次性动作：成功后 daemon 把正式 agent_id
+# # 与凭据写入 state，无需把 token 写进本文件。
 # enabled = true
 # endpoint = "https://10.0.1.1"
-# enrollment_token = "${WARP_INSIGHT_ENROLLMENT_TOKEN}"
 # tls_mode = "https"
 # trust_bundle = ""
-# auth_mode = "enrollment_token"
+#
+# 注册 token（一次性）不写配置，装的时候传一次就行（不落盘）：
+#   sudo wist-agentd service install --system --enrollment-token <token>
+# 已装好但还没注册，也可以单独补注册：
+#   sudo wist-agentd enroll --token <token>            # 或： echo <token> | sudo wist-agentd enroll --token-stdin
 #
 # 可选：
 # [paths]
-# # 下面这些默认分别是 ".", "run", "state", "log"
-# # root_dir = "."
+# # 数据/日志目录默认值随**配置目录**而定（只填充未声明的键，显式声明优先）：
+# #   配置在 /etc/wist-agentd（系统级部署）→ 数据（run/state/spool + 采集输出 data/）落 /var/lib/wist-agentd，
+# #                                         日志落 /var/log/wist-agentd
+# #   其它位置（开发机 / --user 安装）→ 数据与日志就放在配置目录下
+# # 解析规则：相对路径相对本配置文件所在目录，绝对路径原样使用。
+# # root_dir = "/var/lib/wist-agentd"   # run/state/spool 的基准
 # # run_dir = "run"
 # # state_dir = "state"
-# # log_dir = "log"
+# # log_dir = "/var/log/wist-agentd"
 #
 # 采集任务与运行设定的稳定度不同：可以把 [[telemetry.logs.file_inputs]] 清单移到独立文件，
 # 在 [telemetry.logs] 内用 file_inputs_file 引用（路径相对本配置文件，与内联二选一）：
@@ -149,6 +168,104 @@ pub(super) fn expand_env_contract(mut config: AgentConfig) -> Result<AgentConfig
         input.multiline_mode = expand_string(std::mem::take(&mut input.multiline_mode))?;
     }
     Ok(config)
+}
+
+/// `[paths]` 中未显式声明时的默认目录。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DefaultPaths {
+    pub(super) root_dir: String,
+    pub(super) run_dir: String,
+    pub(super) state_dir: String,
+    pub(super) log_dir: String,
+}
+
+/// 数据默认落点由**配置目录**决定：
+///
+/// - 配置在 `/etc/wist-agentd`（系统级部署）→ 配置与数据分离：
+///   `run/state/spool` 落 `/var/lib/wist-agentd`，日志（含采集输出）落 `/var/log/wist-agentd`；
+/// - 其它位置（开发机 / `--user` 安装）→ 数据就放在配置目录下（`run` / `state` / `log`）。
+///
+/// `run/state` 保持相对 `root_dir`，`log_dir` 在系统级下是绝对的 `/var/log/wist-agentd`。
+pub(super) fn default_paths_for(config_dir: &Path) -> DefaultPaths {
+    if is_system_config_dir(config_dir) {
+        DefaultPaths {
+            root_dir: SYSTEM_DATA_ROOT.to_string(),
+            run_dir: "run".to_string(),
+            state_dir: "state".to_string(),
+            log_dir: SYSTEM_LOG_DIR.to_string(),
+        }
+    } else {
+        DefaultPaths {
+            root_dir: ".".to_string(),
+            run_dir: "run".to_string(),
+            state_dir: "state".to_string(),
+            log_dir: "log".to_string(),
+        }
+    }
+}
+
+/// 配置目录是否落在系统级配置目录（`/etc/wist-agentd` 及其子目录）下。
+pub(super) fn is_system_config_dir(config_dir: &Path) -> bool {
+    let absolute = if config_dir.is_absolute() {
+        config_dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(config_dir))
+            .unwrap_or_else(|_| config_dir.to_path_buf())
+    };
+    absolute.starts_with(SYSTEM_CONFIG_DIR)
+}
+
+/// 把 `[paths]`（和采集输出路径）中**未显式声明**的键填成平台默认值。
+///
+/// 只填未声明的键：显式写 `root_dir = "."` 仍按原意解析，不会被静默改写。
+/// 采集输出（`[telemetry.logs.output.file].path`）未声明时按“它是数据”处理：
+/// 系统级 → `/var/lib/wist-agentd/data/wist-records.ndjson`；开发机 → `<配置目录>/data/wist-records.ndjson`。
+pub(super) fn apply_path_defaults(config: &mut AgentConfig, config_path: &Path, raw: &toml::Value) {
+    let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+    let system = is_system_config_dir(config_dir);
+    let defaults = default_paths_for(config_dir);
+    let declared = raw.get("paths");
+    let declared_key = |key: &str| declared.and_then(|paths| paths.get(key)).is_some();
+
+    if !declared_key("root_dir") {
+        config.paths.root_dir = defaults.root_dir;
+    }
+    if !declared_key("run_dir") {
+        config.paths.run_dir = defaults.run_dir;
+    }
+    if !declared_key("state_dir") {
+        config.paths.state_dir = defaults.state_dir;
+    }
+    if !declared_key("log_dir") {
+        config.paths.log_dir = defaults.log_dir;
+    }
+
+    let output_declared = raw
+        .get("telemetry")
+        .and_then(|telemetry| telemetry.get("logs"))
+        .and_then(|logs| logs.get("output"))
+        .and_then(|output| output.get("file"))
+        .and_then(|file| file.get("path"))
+        .is_some();
+    if !output_declared {
+        config.telemetry.logs.output.file.path = collected_output_default(system);
+    }
+}
+
+/// 采集输出（file sink）未显式声明时的默认路径：它是**数据**，跟数据根目录走 ——
+/// 系统级 `/var/lib/wist-agentd/data/wist-records.ndjson`，
+/// 开发机 / `--user` `<配置目录>/data/wist-records.ndjson`。
+fn collected_output_default(system: bool) -> String {
+    let relative = format!("{COLLECTED_OUTPUT_SUBDIR}/{COLLECTED_OUTPUT_FILE}");
+    if system {
+        Path::new(SYSTEM_DATA_ROOT)
+            .join(&relative)
+            .display()
+            .to_string()
+    } else {
+        relative
+    }
 }
 
 pub(super) fn resolve_paths(mut config: AgentConfig, config_path: &Path) -> AgentConfig {

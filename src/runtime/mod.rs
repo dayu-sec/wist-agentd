@@ -3,3 +3,4 @@
 pub mod daemon;
 pub mod scheduler;
 pub mod self_observability;
+pub(crate) mod steady_log;

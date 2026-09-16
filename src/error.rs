@@ -69,6 +69,8 @@ pub enum EnrollmentReason {
     Io,
     #[orion_error(identity = "biz.warp.agentd.enroll.missing_endpoint")]
     MissingEndpoint,
+    #[orion_error(identity = "biz.warp.agentd.enroll.missing_config_file")]
+    MissingConfigFile,
     #[orion_error(identity = "biz.warp.agentd.enroll.missing_token")]
     MissingEnrollmentToken,
     #[orion_error(identity = "sys.warp.agentd.enroll.http")]
@@ -83,6 +85,8 @@ pub enum EnrollmentReason {
     UnsupportedCredentialScheme,
     #[orion_error(identity = "conf.warp.agentd.enroll.invalid_tls_mode")]
     InvalidTlsMode,
+    #[orion_error(identity = "biz.warp.agentd.enroll.config")]
+    Config,
     #[orion_error(transparent)]
     General(UnifiedReason),
 }
@@ -96,6 +100,12 @@ pub enum AgentdReason {
     IdentityConflict,
     #[orion_error(identity = "biz.warp.agentd.runtime.already_running")]
     AlreadyRunning,
+    #[orion_error(identity = "biz.warp.agentd.service.already_installed")]
+    ServiceAlreadyInstalled,
+    #[orion_error(identity = "biz.warp.agentd.service.path_unresolved")]
+    ServicePathUnresolved,
+    #[orion_error(identity = "sys.warp.agentd.service.command_failed")]
+    ServiceCommandFailed,
     #[orion_error(identity = "sys.warp.agentd.exec_bin_unavailable")]
     ExecBinUnavailable,
     #[orion_error(identity = "biz.warp.agentd.config")]
@@ -204,6 +214,15 @@ impl From<ConfigReason> for AgentdReason {
         match value {
             ConfigReason::General(reason) => AgentdReason::General(reason),
             _ => AgentdReason::Config,
+        }
+    }
+}
+
+impl From<ConfigReason> for EnrollmentReason {
+    fn from(value: ConfigReason) -> Self {
+        match value {
+            ConfigReason::General(reason) => EnrollmentReason::General(reason),
+            _ => EnrollmentReason::Config,
         }
     }
 }

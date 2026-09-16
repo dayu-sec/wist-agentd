@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # 启动 wist-agentd（macOS P0 采集实例）。
 #
+# 注意：本脚本只用于**开发机联调**（后台跑 + pidfile + disown，无自启/无崩溃拉起）。
+# 生产常驻请用 `wist-agentd service install`，见 docs/agentd-service-deployment.md。
+#
 # 运行布局：
 #   仓库 sysrun/           只放启停脚本（start.sh / stop.sh）
 #   ~/.wist-agentd/        配置 agentd.toml + tasks/ + 运行时数据 run|state|log/

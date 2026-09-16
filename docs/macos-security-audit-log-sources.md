@@ -15,11 +15,7 @@
 
 相关文档：
 
-- [`telemetry-uplink-and-warp-parse.md`](telemetry-uplink-and-warp-parse.md)
 - [`log-file-input-spec.md`](log-file-input-spec.md)
-- [`./.md`](./.md)
-- [`./.md`](./.md)
-- [`../../../doc/design/foundation/security-model.md`](../../../doc/design/foundation/security-model.md)
 
 ---
 
@@ -40,7 +36,7 @@
 
 | 采集面 | 载体 / 位置 | 价值 | 在 warp-insight 中的接入方式 |
 |---|---|---|---|
-| A. 文件型日志（file） | `/var/log/*`、`/Library/Logs/*`、`~/Library/Logs/*` | 安装、崩溃、WiFi、第三方 | `agentd telemetry.file_inputs` tail（现成能力，见 [log-file-input-spec.md](log-file-input-spec.md)） |
+| A. 文件型日志（file） | `/var/log/*`、`/Library/Logs/*`、`~/Library/Logs/*` | 安装、崩溃、WiFi、第三方 | `[telemetry.logs.file_inputs]` tail（对追加型文本为现成能力，见 [log-file-input-spec.md](log-file-input-spec.md)） |
 | B. 统一日志（Unified Logging） | `log` CLI 查询 `/var/db/diagnostics` 存储 | 登录/认证/防火墙/进程深度事件 | 需新增“统一日志采集器”（`log show` / `log stream`），当前是能力缺口 |
 | C. OpenBSM audit | `/var/audit/*.log`（`praudit`/`auditreduce` 解码） | 登录/认证/可选命令执行的权威审计链 | 需新增“audit 导出器”（定期 `auditreduce` → 文本 → file input / 直发） |
 | D. 隐私/安全数据库快照 | `TCC.db`、`~/Library/Preferences`、quarantine xattr 等 | 权限变更、下载来源（Gatekeeper） | 周期快照 + 差异上报（非实时日志） |
@@ -178,14 +174,14 @@ macOS 的登录链：图形登录（`loginwindow`）、SSH 远程登录（`sshd`
 
 | 能力分级 | 采集对象 | 当前状态 | 做法 |
 |---|---|---|---|
-| A. 现成 | `/var/log/install.log`、`wifi.log`、launchd、崩溃 `.ips` 等**文本文件** | `agentd telemetry.file_inputs` 支持 tail/checkpoint/轮转（见 [log-file-input-spec.md](log-file-input-spec.md)） | 直接配置 glob + 规则解析 |
+| A. 现成 | `/var/log/install.log`、`wifi.log`、launchd 等**追加型文本文件** | `[telemetry.logs.file_inputs]` 支持 tail/checkpoint/轮转（见 [log-file-input-spec.md](log-file-input-spec.md)） | 直接配置显式文件路径 + 规则解析（崩溃 `.ips` 是每次生成新文件的形态，tail 语义不适用，需目录新文件发现，当前不支持） |
 | B. 需“定时导出器” | OpenBSM audit、`last/lastb`、TCC 快照 | 二进制/DB，不能直接 tail | agentd 新增周期任务：`auditreduce`/`last`/`sqlite3` 导出文本 → 复用 file input 或直发 |
 | C. 需“统一日志源” | Unified Logging（登录/防火墙/安全事件） | 需新 source 类型（`log stream` 订阅 + 结构化输出） | 按 predicate 集实现事件流 source；输出结构化 security record |
-| D. 直发 | 已结构化的安全事件 | `agentd telemetry.output.kind = tcp`（NDJSON）→ data-plane `warp-parse` | 见 [telemetry-uplink-and-warp-parse.md](telemetry-uplink-and-warp-parse.md) |
+| D. 直发 | 已结构化的安全事件 | `[telemetry.logs.output] kind = "tcp"`（NDJSON）→ data-plane `warp-parse` | 见 [macos-agent-uplink-to-warp-parse.md](macos-agent-uplink-to-warp-parse.md) |
 
 推荐首版最小集（P0 且改动小）：
 
-1. `file_inputs`：`/var/log/install.log`、`/var/log/shutdown_monitor.log`、`/var/log/com.apple.xpc.launchd/launchd.log`、`/var/log/wifi.log`、`/Library/Logs/DiagnosticReports/*.ips`；
+1. `file_inputs`：`/var/log/install.log`、`/var/log/shutdown_monitor.log`、`/var/log/com.apple.xpc.launchd/launchd.log`、`/var/log/wifi.log`；
 2. 周期导出器：`last`/`lastb`、`auditreduce`（root）；
 3. 数据面规则按 `security` 语义路由（`warp-parse` security receiver），与控制面互不耦合。
 
@@ -193,12 +189,8 @@ macOS 的登录链：图形登录（`loginwindow`）、SSH 远程登录（`sshd`
 
 ## 9. 相关文档
 
-- [telemetry-uplink-and-warp-parse.md](telemetry-uplink-and-warp-parse.md)：数据面上报与 `warp-parse` 角色
+- [macos-agent-uplink-to-warp-parse.md](macos-agent-uplink-to-warp-parse.md)：数据面上报与 `warp-parse` 角色
 - [log-file-input-spec.md](log-file-input-spec.md)：文件输入（tail/checkpoint/rotate）设计
-- [./.md](./.md)：本地状态与 checkpoint
-- [./.md](./.md)：agent 能力上报（file.tail 等）
-- [../../../doc/design/foundation/security-model.md](../../../doc/design/foundation/security-model.md)：整体安全模型
-- [../../../doc/design/foundation/implementation-backlog.md](../../../doc/design/foundation/implementation-backlog.md)：能力缺口登记（统一日志源 / audit 导出器）
 
 ---
 

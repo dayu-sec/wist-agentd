@@ -45,6 +45,15 @@ mod telemetry_support;
 /// to the control plane.
 const STATUS_REPORT_INTERVAL: Duration = Duration::from_secs(3);
 
+/// 主循环空闲节拍。
+///
+/// 每轮都要重算/落盘派生状态（指标快照、`state/export/*.jsonl`、`agent_runtime`）并扫描
+/// `state/`，所以这个值直接等于“稳态每秒多少次磁盘动作”。250ms（4Hz）在空闲主机上也
+/// 会持续写盘，属于白付的代价；3s 把稳态开销降到 1/12，同时：
+/// - file 输入最坏延迟 3s（采集类负载可接受，仍远优于 scan 周期）；
+/// - `drain` 每轮只处理一个队列项且**等它跑完**，因此这个值是空闲轮询间隔，不是执行吞吐上限。
+const TICK_INTERVAL: Duration = Duration::from_secs(3);
+
 /// A sampled CPU-time reading used to compute a percentage across the report interval.
 struct CpuSample {
     ticks: u64,
@@ -237,7 +246,6 @@ pub struct DaemonLoop<'a> {
 }
 
 pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
-    let sleep_interval = Duration::from_millis(250);
     let mut previous_telemetry_failures = BTreeSet::new();
     let mut previous_metrics_failures = BTreeSet::new();
     let mut previous_telemetry_paused = BTreeSet::new();
@@ -284,7 +292,7 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                 last_latency_ms = Some(latency);
             }
         }
-        tokio::time::sleep(sleep_interval).await;
+        tokio::time::sleep(TICK_INTERVAL).await;
     }
 }
 
