@@ -47,7 +47,7 @@ fn daemon_run_once_quarantines_execution_local_failure_without_stopping_loop() {
 
     assert_eq!(
         snapshot.state,
-        wist_agentd::self_observability::HealthState::Idle
+        wist_agentd::self_observability::DaemonWorkState::Idle
     );
     assert_eq!(snapshot.queue_depth, 0);
     assert_eq!(snapshot.running_count, 0);
@@ -186,7 +186,7 @@ fn daemon_run_once_reports_active_when_execution_is_running() {
 
     assert_eq!(
         snapshot.state,
-        wist_agentd::self_observability::HealthState::Active
+        wist_agentd::self_observability::DaemonWorkState::Active
     );
     assert_eq!(snapshot.running_count, 1);
     assert_eq!(snapshot.reporting_count, 0);
@@ -235,7 +235,7 @@ fn daemon_run_once_reports_active_when_reporting_backlog_exists() {
 
     assert_eq!(
         snapshot.state,
-        wist_agentd::self_observability::HealthState::Active
+        wist_agentd::self_observability::DaemonWorkState::Active
     );
     assert_eq!(snapshot.queue_depth, 0);
     assert_eq!(snapshot.running_count, 0);

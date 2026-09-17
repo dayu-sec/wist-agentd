@@ -140,7 +140,7 @@ fn daemon_run_once_processes_configured_file_input() {
 
     assert_eq!(
         snapshot.state,
-        wist_agentd::self_observability::HealthState::Active
+        wist_agentd::self_observability::DaemonWorkState::Active
     );
     assert_eq!(snapshot.discovery.readiness, DiscoveryReadiness::Ready);
     assert!(!snapshot.discovery.used_cached_snapshot);
@@ -556,7 +556,7 @@ fn daemon_run_once_uses_cached_metrics_snapshot_when_target_view_is_missing() {
     assert_eq!(records.len(), 2);
     assert_eq!(
         snapshot.state,
-        wist_agentd::self_observability::HealthState::Active
+        wist_agentd::self_observability::DaemonWorkState::Active
     );
     assert!(!snapshot.metrics.target_view_loaded);
     assert!(snapshot.metrics.used_cached_snapshot);
@@ -688,7 +688,7 @@ fn daemon_run_once_continues_when_one_file_input_fails() {
 
     assert_eq!(
         snapshot.state,
-        wist_agentd::self_observability::HealthState::Active
+        wist_agentd::self_observability::DaemonWorkState::Active
     );
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].body, "good\n");
@@ -775,7 +775,7 @@ fn daemon_run_once_marks_active_when_only_file_input_fails() {
 
     assert_eq!(
         snapshot.state,
-        wist_agentd::self_observability::HealthState::Active
+        wist_agentd::self_observability::DaemonWorkState::Active
     );
     assert!(!root.join("log").join("wist-records.ndjson").exists());
 }
@@ -807,7 +807,7 @@ fn daemon_run_once_marks_active_when_configured_file_is_missing() {
 
     assert_eq!(
         snapshot.state,
-        wist_agentd::self_observability::HealthState::Active
+        wist_agentd::self_observability::DaemonWorkState::Active
     );
     assert!(!root.join("log").join("wist-records.ndjson").exists());
     assert!(!wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "missing").exists());
@@ -878,7 +878,7 @@ fn daemon_run_once_replays_existing_spool_even_when_source_file_is_missing() {
 
     assert_eq!(
         snapshot.state,
-        wist_agentd::self_observability::HealthState::Active
+        wist_agentd::self_observability::DaemonWorkState::Active
     );
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].body, "first\n");
@@ -940,7 +940,7 @@ fn daemon_run_once_sends_raw_log_lines_to_tcp_output() {
 
     assert_eq!(
         snapshot.state,
-        wist_agentd::self_observability::HealthState::Active
+        wist_agentd::self_observability::DaemonWorkState::Active
     );
     let raws = raw_body_sections(&payload);
     assert_eq!(raws, vec!["alpha".to_string(), "beta".to_string()]);
@@ -997,7 +997,7 @@ fn daemon_run_once_replays_spool_when_tcp_output_recovers() {
 
     assert_eq!(
         first_snapshot.state,
-        wist_agentd::self_observability::HealthState::Active
+        wist_agentd::self_observability::DaemonWorkState::Active
     );
     assert!(spooled.contains("\"body\":\"first\\n\""));
     assert!(spooled.contains("\"body\":\"second\\n\""));
@@ -1044,7 +1044,7 @@ fn daemon_run_once_replays_spool_when_tcp_output_recovers() {
 
     assert_eq!(
         second_snapshot.state,
-        wist_agentd::self_observability::HealthState::Active
+        wist_agentd::self_observability::DaemonWorkState::Active
     );
     assert_eq!(
         raw_body_sections(&payload),

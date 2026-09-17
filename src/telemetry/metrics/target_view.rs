@@ -11,9 +11,8 @@ use crate::state_store::planner_candidates;
 
 pub use wist_metrics::target::MetricsTargetViewEntry;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ::jumo_derive::Jumo)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[jumo(kind = "struct", domain = "Discovery", module = "Discovery.Collect")]
 pub struct MetricsTargetView {
     pub generated_at: String,
     #[serde(default)]

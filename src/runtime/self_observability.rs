@@ -53,7 +53,7 @@ pub struct MetricsHealthSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HealthState {
+pub enum DaemonWorkState {
     Idle,
     Active,
 }
@@ -61,7 +61,7 @@ pub enum HealthState {
 #[derive(Debug, Clone, PartialEq, Eq, ::jumo_derive::Jumo)]
 #[jumo(kind = "struct", domain = "Reporting", module = "Reporting.Health")]
 pub struct RuntimeHealthSnapshot {
-    pub state: HealthState,
+    pub state: DaemonWorkState,
     pub queue_depth: usize,
     pub running_count: usize,
     pub reporting_count: usize,
@@ -191,7 +191,7 @@ mod tests {
 
     fn snapshot(updated_at: &str) -> RuntimeHealthSnapshot {
         RuntimeHealthSnapshot {
-            state: HealthState::Idle,
+            state: DaemonWorkState::Idle,
             queue_depth: 0,
             running_count: 0,
             reporting_count: 0,

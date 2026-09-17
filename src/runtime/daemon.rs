@@ -26,7 +26,7 @@ use crate::exporter;
 use crate::planner_bridge;
 use crate::scheduler;
 use crate::self_observability::{
-    DiscoveryHealthSnapshot, DiscoveryProbeHealth, DiscoveryReadiness, HealthState,
+    DiscoveryHealthSnapshot, DiscoveryProbeHealth, DiscoveryReadiness, DaemonWorkState,
     RuntimeHealthSnapshot, emit,
 };
 use crate::state_store::{agent_runtime, execution_queue, log_seq_state, planner_candidates};
@@ -404,9 +404,9 @@ async fn run_once_with_failure_cache(
             || reporting_count > 0
             || !queue.items.is_empty()
         {
-            HealthState::Active
+            DaemonWorkState::Active
         } else {
-            HealthState::Idle
+            DaemonWorkState::Idle
         },
         queue_depth: queue.items.len(),
         running_count,
