@@ -1,7 +1,9 @@
 use super::{
-    init_config_message, parse_command, resolve_config_dir_arg, resolve_exec_bin_from,
-    run_from_args, sync_runtime_identity, usage_message,
+    enrollment_report_lines, init_config_message, parse_command, resolve_config_dir_arg,
+    resolve_exec_bin_from, run_from_args, sync_runtime_identity, usage_message,
 };
+use crate::enrollment::EnrollmentDecision;
+use crate::state_store::agent_runtime;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -762,4 +764,179 @@ fn sync_runtime_identity_rejects_config_agent_id_conflicting_with_enrolled_ident
 
     assert!(err.to_string().contains("conflicts"));
     assert_eq!(runtime.agent_id, "agent-a");
+}
+
+// ---- 注册结果报告：`agent_id=` 只在本安装真已注册时出现 ----
+
+fn write_agent_config(root: &Path, agent_id: Option<&str>) {
+    let mut text = String::from("schema_version = \"v1\"\n");
+    if let Some(agent_id) = agent_id {
+        text.push_str(&format!("\n[agent]\nagent_id = \"{agent_id}\"\n"));
+    }
+    fs::write(root.join("agentd.toml"), text).expect("write config");
+}
+
+fn write_state_identity(root: &Path, agent_id: &str) {
+    let state = AgentRuntimeState::new(
+        agent_id.to_string(),
+        "instance-a".to_string(),
+        "0.1.0".to_string(),
+        RuntimeMode::Normal,
+        "2026-09-21T00:00:00Z".to_string(),
+    );
+    agent_runtime::store(&agent_runtime::path_for(&root.join("state")), &state)
+        .expect("store runtime state");
+}
+
+fn report_agent_id_line(root: &Path) -> Option<String> {
+    enrollment_report_lines(root, EnrollmentDecision::Enrolled)
+        .into_iter()
+        .find_map(|line| line.strip_prefix("agent_id=").map(str::to_string))
+}
+
+#[test]
+fn enrollment_report_uses_config_identity() {
+    let root = temp_dir("report-config-identity");
+    write_agent_config(&root, Some("agent-from-config"));
+
+    let lines = enrollment_report_lines(&root, EnrollmentDecision::Enrolled);
+
+    assert_eq!(lines[0], "enrolled");
+    assert_eq!(lines[1], "agent_id=agent-from-config");
+    assert!(lines.iter().any(|line| line.starts_with("credential_file=")));
+    assert_eq!(lines.last().expect("last line"), "token_persisted=false");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn enrollment_report_uses_state_identity() {
+    let root = temp_dir("report-state-identity");
+    write_agent_config(&root, None);
+    write_state_identity(&root, "agent-from-state");
+
+    assert_eq!(
+        report_agent_id_line(&root).as_deref(),
+        Some("agent-from-state")
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn enrollment_report_omits_agent_id_before_enrollment() {
+    let root = temp_dir("report-unregistered");
+    write_agent_config(&root, None);
+
+    let lines = enrollment_report_lines(&root, EnrollmentDecision::Enrolled);
+
+    // 没身份就不打这行：`agent_id=-` 会被读成“没注册上”。
+    assert!(report_agent_id_line(&root).is_none());
+    // 这种“还没注册”是正常状态，不该报 warning。
+    assert!(!lines.iter().any(|line| line.starts_with("warning:")));
+    // 但凭据落点与 token 不落盘仍要说清楚。
+    let credential = lines
+        .iter()
+        .find(|line| line.starts_with("credential_file="))
+        .expect("credential line");
+    assert!(credential.contains("agent_runtime.json"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn enrollment_report_ignores_placeholder_config_identity() {
+    let root = temp_dir("report-placeholder-config");
+    // `local-agent` 是 agentd 自己生成的占位身份，不算“已注册”。
+    write_agent_config(&root, Some("local-agent"));
+    assert!(report_agent_id_line(&root).is_none());
+
+    // 同目录下已有 state 身份时，应报 state 里那个，而不是配置里的占位值。
+    write_state_identity(&root, "agent-from-state");
+    assert_eq!(
+        report_agent_id_line(&root).as_deref(),
+        Some("agent-from-state")
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn enrollment_report_trims_config_identity() {
+    let root = temp_dir("report-trim-config");
+    write_agent_config(&root, Some("  agent-padded  "));
+
+    assert_eq!(report_agent_id_line(&root).as_deref(), Some("agent-padded"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn enrollment_report_warns_when_state_identity_unreadable() {
+    let root = temp_dir("report-corrupt-state");
+    write_agent_config(&root, None);
+    let state_dir = root.join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    fs::write(agent_runtime::path_for(&state_dir), b"{ not json").expect("write corrupt state");
+
+    let lines = enrollment_report_lines(&root, EnrollmentDecision::Enrolled);
+
+    // 行序：label → warning → credential_file → token_persisted。
+    assert_eq!(lines[0], "enrolled");
+    assert!(lines[1].starts_with("warning: "), "{lines:?}");
+    assert_eq!(lines.last().expect("last line"), "token_persisted=false");
+    // 坏文件不能让安装收尾报告崩掉，也不该报一个读不出来的身份。
+    assert!(report_agent_id_line(&root).is_none());
+    // 但也不能静默：这份文件是 daemon 启动的必需品，读不出来就是起不来。
+    let warning = lines
+        .iter()
+        .find(|line| line.starts_with("warning: "))
+        .expect("warning line");
+    assert!(warning.contains("agent_runtime.json"), "{warning}");
+    assert!(warning.contains("will not start"), "{warning}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn enrollment_report_stays_quiet_for_placeholder_state_identity() {
+    let root = temp_dir("report-placeholder-state");
+    write_agent_config(&root, None);
+    // 占位身份是“还没注册”的正常形态，不是要提示的故障。
+    write_state_identity(&root, "local-agent");
+
+    let lines = enrollment_report_lines(&root, EnrollmentDecision::Enrolled);
+
+    assert!(report_agent_id_line(&root).is_none());
+    assert!(!lines.iter().any(|line| line.starts_with("warning:")));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn enrollment_report_without_config_reports_outcome_only() {
+    let root = temp_dir("report-no-config");
+
+    let lines = enrollment_report_lines(&root, EnrollmentDecision::ExistingStateIdentity);
+
+    assert_eq!(
+        lines,
+        vec![
+            "already enrolled (state identity, no request sent)".to_string(),
+            "token_persisted=false".to_string(),
+        ]
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn enrollment_report_labels_each_decision() {
+    let root = temp_dir("report-labels");
+    write_agent_config(&root, None);
+
+    let label = |decision| enrollment_report_lines(&root, decision)[0].clone();
+    assert_eq!(label(EnrollmentDecision::Enrolled), "enrolled");
+    assert_eq!(
+        label(EnrollmentDecision::ExistingStateIdentity),
+        "already enrolled (state identity, no request sent)"
+    );
+    assert_eq!(
+        label(EnrollmentDecision::ExistingConfigIdentity),
+        "already enrolled (config identity, no request sent)"
+    );
+    assert_eq!(label(EnrollmentDecision::Disabled), "enrollment disabled");
+    let _ = fs::remove_dir_all(root);
 }

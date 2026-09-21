@@ -633,6 +633,23 @@ fn read_token_from_stdin() -> AgentdResult<String> {
 
 /// 打印注册结果：只说结果与凭据落点，不吐任何秘密。
 fn report_enrollment(config_root: &Path, decision: crate::enrollment::EnrollmentDecision) {
+    for line in enrollment_report_lines(config_root, decision) {
+        println!("{line}");
+    }
+}
+
+/// 注册结果报告的各行。
+///
+/// 抽成纯函数只为了能断言（`report_enrollment` 只负责打印）：注册结果是安装脚本的
+/// 最后一步产物，行数与顺序都是对外可见的，靠看日志回归不现实。
+///
+/// `agent_id=` 只在**真拿到已注册身份**时才出现：配置里没有就退回 state 里的身份；
+/// 两边都没有（或只是个占位值，如 `local-agent`）就整行不打 —— 打 `agent_id=-` 会让人
+/// 误以为没注册上，而实际原因可能只是这个安装还没注册。
+fn enrollment_report_lines(
+    config_root: &Path,
+    decision: crate::enrollment::EnrollmentDecision,
+) -> Vec<String> {
     use crate::enrollment::EnrollmentDecision;
 
     let label = match decision {
@@ -645,21 +662,91 @@ fn report_enrollment(config_root: &Path, decision: crate::enrollment::Enrollment
         }
         EnrollmentDecision::Disabled => "enrollment disabled",
     };
-    println!("{label}");
+    let mut lines = vec![label.to_string()];
 
     let config_path = crate::config_runtime::resolve_config_path(config_root);
     if let Ok(config) = crate::config_runtime::load_from_path(&config_path) {
-        println!(
-            "agent_id={}",
-            config.agent.agent_id.as_deref().unwrap_or("-")
-        );
-        println!(
+        let identity = reported_identity(&config);
+        if let Some(agent_id) = identity.agent_id {
+            lines.push(format!("agent_id={agent_id}"));
+        }
+        if let Some(warning) = identity.warning {
+            lines.push(warning);
+        }
+        lines.push(format!(
             "credential_file={}",
-            crate::state_store::agent_runtime::path_for(Path::new(&config.paths.state_dir))
-                .display()
-        );
+            state_store::agent_runtime::path_for(Path::new(&config.paths.state_dir)).display()
+        ));
     }
-    println!("token_persisted=false");
+    lines.push("token_persisted=false".to_string());
+    lines
+}
+
+/// 报告用的身份结论。
+struct ReportedIdentity {
+    /// 已注册身份；没有就是 `None`。
+    agent_id: Option<String>,
+    /// 需要提示运维的一行（state 文件读不出来时）；正常情况为 `None`。
+    warning: Option<String>,
+}
+
+/// state 文件里的身份读取结果。
+enum StateIdentity {
+    Registered(String),
+    /// 还没注册：文件不存在，或里面还是占位值。
+    Absent,
+    /// 文件在、但读不出来 —— 不能静默当成「没注册」。
+    Unreadable(String),
+}
+
+/// 报告用的身份：配置里声明的优先，否则取 state 里的；两处都归一化后再判。
+///
+/// 不能把配置里的原样值直接当身份：`load_from_path` 不会把空串归一成 `None`，
+/// 而占位值恰是 agentd 自己生成的默认身份（`local-agent`）。
+///
+/// state 文件读不出来时单独给一行提示：那份文件是守护进程启动的必需品
+/// （`initialize_runtime_state_async` 读它失败会让 daemon 直接起不来），
+/// 静默当成「没注册」会把一个真故障藏起来。
+fn reported_identity(config: &wist_contracts::agent_config::AgentConfig) -> ReportedIdentity {
+    let from_config = config
+        .agent
+        .agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| is_registered_agent_id(value))
+        .map(str::to_string);
+    let from_state = state_identity(&config.paths.state_dir);
+
+    let warning = match &from_state {
+        StateIdentity::Unreadable(detail) => Some(format!(
+            "warning: state identity unreadable ({detail}); the daemon will not start until it is restored or removed"
+        )),
+        StateIdentity::Registered(_) | StateIdentity::Absent => None,
+    };
+    let agent_id = from_config.or_else(|| match from_state {
+        StateIdentity::Registered(agent_id) => Some(agent_id),
+        StateIdentity::Absent | StateIdentity::Unreadable(_) => None,
+    });
+    ReportedIdentity { agent_id, warning }
+}
+
+/// state 里的已注册身份（`agent_runtime.json`）。
+fn state_identity(state_dir: &str) -> StateIdentity {
+    let path = state_store::agent_runtime::path_for(Path::new(state_dir));
+    if !path.exists() {
+        return StateIdentity::Absent;
+    }
+    match state_store::agent_runtime::load_or_default(&path) {
+        Ok(runtime) => {
+            let agent_id = runtime.agent_id.trim().to_string();
+            if is_registered_agent_id(&agent_id) {
+                StateIdentity::Registered(agent_id)
+            } else {
+                StateIdentity::Absent
+            }
+        }
+        Err(err) => StateIdentity::Unreadable(format!("{}: {err}", path.display())),
+    }
 }
 
 /// 执行 `service` 子命令：解析安装位置 →（可选）先注册 → 落盘定义 → 交给服务管理器加载。

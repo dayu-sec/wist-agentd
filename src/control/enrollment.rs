@@ -644,8 +644,33 @@ mod tests {
     use super::{
         EnrollmentDecision, EnrollmentReason, build_enrollment_request, enroll_from_config,
         enroll_with_token, enrollment_http_client, ensure_enrolled,
-        ensure_enrolled_with_config_path, hostname_from_sources, post_enrollment, renew_credential,
+        ensure_enrolled_with_config_path, hostname_from_sources, is_registered_agent_id,
+        post_enrollment, renew_credential,
     };
+
+    #[test]
+    fn is_registered_agent_id_rejects_placeholders_and_blanks() {
+        // 占位值不算身份：这些正是 agentd 自己生成的默认值，被当成“已注册”会让
+        // 安装收尾报告与注册幂等判断都读错。
+        for placeholder in [
+            "local-agent",
+            "unregistered-agent",
+            "unknown",
+            "unknown-agent",
+        ] {
+            assert!(!is_registered_agent_id(placeholder), "{placeholder}");
+            assert!(
+                !is_registered_agent_id(&format!("  {placeholder}  ")),
+                "{placeholder} with padding"
+            );
+        }
+        assert!(!is_registered_agent_id(""));
+        assert!(!is_registered_agent_id("   "));
+
+        // 真身份（带不带空白都算）。
+        assert!(is_registered_agent_id("agent-mbp-01"));
+        assert!(is_registered_agent_id("  agent-mbp-01  "));
+    }
 
     fn config() -> AgentConfig {
         AgentConfig::new(
