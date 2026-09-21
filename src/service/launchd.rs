@@ -6,7 +6,7 @@
 //! - `ThrottleInterval=10`：launchd 的最小重启间隔，避免启动即失败时形成重启风暴。
 //! - 标准输出/错误：系统级落 `/var/log/wist-agentd/`（与 agent 日志目录一致），
 //!   用户级落 `~/Library/Logs/wist-agentd/`（用户写不了 `/var/log`），
-//!   需要配合 newsyslog / logrotate 轮转（见 `docs/agentd-install-and-usage.md`）。
+//!   需要配合 newsyslog / logrotate 轮转（见 `docs/usage/agentd-install-and-usage.md`）。
 //! - `WorkingDirectory` 落在稳定目录，`--config-dir` 始终用绝对路径。
 //! - LaunchDaemon 的环境变量极简，故显式补 `PATH`。macOS 侧**不做** `EnvironmentFile` 等价物：
 //!   一次性 enrollment token 走命令行（`service install --enrollment-token` / `enroll --token`），不落盘；

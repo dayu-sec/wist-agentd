@@ -7,15 +7,18 @@ wist-agentd（edge daemon）实现时最重要的设计文档。
 ## 阅读顺序建议
 
 0. [development-plan.md](./development-plan.md) — 开发计划（当前差距 → 批次落地 → 验收标准）
-1. [agentd-install-and-usage.md](./agentd-install-and-usage.md) — **安装与使用手册**（两种安装方式：开发环境 / 通过 Wist-Gateway（TODO）；配置、运行方式、命令参考、运维、验收、排障）
-2. [agentd-architecture.md](./agentd-architecture.md) — daemon 总体架构与边界
-3. [agentd-state-and-boundaries.md](./agentd-state-and-boundaries.md) — 状态与边界
-4. [agentd-state-schema.md](./agentd-state-schema.md) — 本地状态 schema
-5. [agentd-failure-handling.md](./agentd-failure-handling.md) — 故障处理
-6. [agentd-exec-protocol.md](./agentd-exec-protocol.md) — 本地执行协议（配合 `src/exec/`）
-7. [agent-config-schema.md](./agent-config-schema.md) — 配置 schema（配合 `src/config/`）
-8. [self-observability.md](./self-observability.md) — 自观测（配合 `src/runtime/self_observability.rs`）
-9. [agentd-service-deployment.md](./agentd-service-deployment.md) — 后台长期运行方案（设计说明；配合 `src/service/`）
+1. [agentd-architecture.md](./agentd-architecture.md) — daemon 总体架构与边界
+2. [agentd-state-and-boundaries.md](./agentd-state-and-boundaries.md) — 状态与边界
+3. [agentd-state-schema.md](./agentd-state-schema.md) — 本地状态 schema
+4. [agentd-failure-handling.md](./agentd-failure-handling.md) — 故障处理
+5. [agentd-exec-protocol.md](./agentd-exec-protocol.md) — 本地执行协议（配合 `src/exec/`）
+6. [agent-config-schema.md](./agent-config-schema.md) — 配置 schema（配合 `src/config/`）
+7. [self-observability.md](./self-observability.md) — 自观测（配合 `src/runtime/self_observability.rs`）
+8. [agentd-service-deployment.md](./agentd-service-deployment.md) — 后台长期运行方案（设计说明；配合 `src/service/`）
+
+> 面向运维的安装/使用/排障手册不在本目录，在 [`../usage/`](../usage/README.md)：
+> [agentd-install-and-usage.md](../usage/agentd-install-and-usage.md)（安装与使用手册）、
+> [README.md](../usage/README.md)（使用帮助：常见问题处理）。
 
 ## 日志 / telemetry 采集（配合 `src/telemetry/logs/files/`）
 
@@ -32,5 +35,5 @@ wist-agentd（edge daemon）实现时最重要的设计文档。
 | `src/config` | agent-config-schema |
 | `src/exec` | agentd-exec-protocol、agentd-failure-handling |
 | `src/runtime` | agentd-architecture、self-observability |
-| `src/service` | agentd-install-and-usage、agentd-service-deployment |
+| `src/service` | agentd-service-deployment（设计）＋ `../usage/agentd-install-and-usage`（安装/运维） |
 | `src/telemetry` | log-file-input-spec、log-file-state-schema、macos-* |

@@ -1,10 +1,10 @@
 # wist-agentd macOS / Linux 后台长期运行方案（设计说明）
 
 本文说明**为什么**这样让 `wist-agentd` 长期后台运行。具体命令、安装位置表、升级步骤、排障表在
-[安装与使用手册](./agentd-install-and-usage.md)，本文不重复。
+[安装与使用手册](../usage/agentd-install-and-usage.md)，本文不重复。
 
-- 相关代码：[`src/service/`](../src/service)、[`src/single_instance.rs`](../src/single_instance.rs)、
-  [`src/runtime/steady_log.rs`](../src/runtime/steady_log.rs)
+- 相关代码：[`src/service/`](../../src/service)、[`src/single_instance.rs`](../../src/single_instance.rs)、
+  [`src/runtime/steady_log.rs`](../../src/runtime/steady_log.rs)
 - 相关文档：[agentd-architecture.md](./agentd-architecture.md)、[agentd-failure-handling.md](./agentd-failure-handling.md)
 
 ---

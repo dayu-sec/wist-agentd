@@ -35,14 +35,15 @@ host/process metrics, and reports status, health, and execution results back ups
 | `wist-agentd`   | 边缘控制器（本 crate 的守护进程二进制）。           |
 | `wist-exec`     | 执行器子进程（内置 `[[bin]]`）。                  |
 
-守护进程与执行器通过本地文件协议通信：守护进程准备好工作目录（`plan.json` / `runtime.json`），拉起 `wist-exec`，再读回状态与结果文件。详见 [`docs/agentd-exec-protocol.md`](docs/agentd-exec-protocol.md)。
+守护进程与执行器通过本地文件协议通信：守护进程准备好工作目录（`plan.json` / `runtime.json`），拉起 `wist-exec`，再读回状态与结果文件。详见 [`docs/design/agentd-exec-protocol.md`](docs/design/agentd-exec-protocol.md)。
 
 ### 运行模式
 
-`agentd` 自身**只前台运行**，常驻/自启/崩溃拉起交给 OS 服务管理器。**[安装与使用手册](docs/agentd-install-and-usage.md)**
+`agentd` 自身**只前台运行**，常驻/自启/崩溃拉起交给 OS 服务管理器。**[安装与使用手册](docs/usage/agentd-install-and-usage.md)**
 按安装方式组织：**方式一 开发环境安装**（本地构建、免 sudo、数据日志就地）、**方式二 通过 Wist-Gateway 安装**
-（控制面下发，TODO）；配置/运行方式/命令参考/升级/验收/排障两者通用。设计取舍见
-[后台长期运行方案](docs/agentd-service-deployment.md)。
+（控制面下发，`install.sh` 已可用）；配置/运行方式/命令参考/升级/验收/排障两者通用。出问题先翻
+**[使用帮助（常见问题处理）](docs/usage/README.md)**；设计取舍见
+[后台长期运行方案](docs/design/agentd-service-deployment.md)。
 
 ```bash
 # 长期后台运行（Linux systemd / macOS launchd；Linux 需 sudo，macOS 可加 --user）
@@ -105,7 +106,7 @@ wist-agentd --config-dir /etc/wist-agentd
 
 The daemon and executor speak a local, file-based protocol: the daemon prepares a work
 directory (`plan.json` / `runtime.json`), spawns `wist-exec`, and reads back the status and
-result files. See [`docs/agentd-exec-protocol.md`](docs/agentd-exec-protocol.md) for details.
+result files. See [`docs/design/agentd-exec-protocol.md`](docs/design/agentd-exec-protocol.md) for details.
 
 ## Requirements
 
@@ -190,11 +191,12 @@ and reboots is delegated to the OS service manager:
   `~/Library/LaunchAgents/` with `--user`), `KeepAlive`, logs to `/var/log/wist-agentd/`
   (`~/Library/Logs/wist-agentd/` with `--user`, where a non-root daemon cannot write `/var/log`).
 
-See [`docs/agentd-install-and-usage.md`](docs/agentd-install-and-usage.md) for the install and
+See [`docs/usage/agentd-install-and-usage.md`](docs/usage/agentd-install-and-usage.md) for the install and
 operations manual — organized by install path: **dev environment install** (local, no sudo) and
-**install via Wist-Gateway** (control-plane driven, TODO), followed by configuration, run modes,
-the `service` command reference, upgrades, acceptance checks and troubleshooting. See
-[`docs/agentd-service-deployment.md`](docs/agentd-service-deployment.md) for the design rationale. Duplicate instances are rejected by the flock in the state directory, and the
+**install via Wist-Gateway** (control-plane driven, `install.sh` available), followed by configuration, run modes,
+the `service` command reference, upgrades, acceptance checks and troubleshooting. Start from
+[`docs/usage/README.md`](docs/usage/README.md) when something is broken. See
+[`docs/design/agentd-service-deployment.md`](docs/design/agentd-service-deployment.md) for the design rationale. Duplicate instances are rejected by the flock in the state directory, and the
 periodic health/metrics snapshots are collapsed to change-only output plus a heartbeat
 (`WIST_AGENTD_LOG_HEARTBEAT_SECS`, default 300s) so a long-running daemon cannot fill the disk.
 
@@ -241,18 +243,21 @@ src/
   state_store/      # on-disk state (queue, running, reporting, history, checkpoints)
   telemetry/        # log file tailing and metrics sampling
 examples/           # example agentd.toml configs
-docs/               # design documentation
+docs/design/        # design documentation
+docs/usage/         # install & operations manual + usage/troubleshooting help
 ```
 
 ## Documentation
 
-- [`docs/agentd-install-and-usage.md`](docs/agentd-install-and-usage.md) — install & operations
+- [`docs/usage/README.md`](docs/usage/README.md) — **usage & troubleshooting playbook**
+  (start/stop, common failures, SOPs; start here when something is broken).
+- [`docs/usage/agentd-install-and-usage.md`](docs/usage/agentd-install-and-usage.md) — install & operations
   manual (how to install, configure, run, upgrade, troubleshoot).
-- [`docs/agentd-service-deployment.md`](docs/agentd-service-deployment.md) — long-running
+- [`docs/design/agentd-service-deployment.md`](docs/design/agentd-service-deployment.md) — long-running
   service design rationale (systemd / launchd).
-- [`docs/agentd-architecture.md`](docs/agentd-architecture.md) — module boundaries and state model.
-- [`docs/agentd-exec-protocol.md`](docs/agentd-exec-protocol.md) — the `wist-exec` local protocol.
-- [`docs/agent-config-schema.md`](docs/agent-config-schema.md) — the `agentd.toml` schema.
+- [`docs/design/agentd-architecture.md`](docs/design/agentd-architecture.md) — module boundaries and state model.
+- [`docs/design/agentd-exec-protocol.md`](docs/design/agentd-exec-protocol.md) — the `wist-exec` local protocol.
+- [`docs/design/agent-config-schema.md`](docs/design/agent-config-schema.md) — the `agentd.toml` schema.
 - [`CHANGELOG.md`](CHANGELOG.md) — release history.
 
 ## License

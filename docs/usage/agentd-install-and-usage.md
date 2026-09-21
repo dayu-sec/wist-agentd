@@ -5,15 +5,16 @@
 | 安装方式 | 适用 | 状态 |
 | --- | --- | --- |
 | [方式一：开发环境安装](#2-方式一开发环境安装) | 开发/联调；本地构建、免 sudo、配置数据日志就地 | 可用 |
-| [方式二：通过 Wist-Gateway 安装](#3-方式二通过-wist-gateway-安装todo) | 生产主机；由控制面下发安装与注册 | **TODO**（网关侧待补齐，含过渡做法） |
+| [方式二：通过 Wist-Gateway 安装](#3-方式二通过-wist-gateway-安装) | 生产主机；由控制面下发安装与注册 | `install.sh` 已可用（包管理/升级通道仍 TODO） |
 
 之后的 [配置](#4-配置) / [运行方式](#5-运行方式) / [命令参考](#6-service-命令参考) / [日常运维](#7-日常运维) /
 [验收](#8-验收清单) / [排障](#9-排障) 对两种方式通用。
 
+> 出问题怎么处理（症状 → 判定 → 命令）→ 同目录的 [README.md](./README.md)（使用帮助）；
 > 想理解“为什么这样设计”（为什么不自带 daemonize、日志为什么要收敛、为什么 `/etc` 只放配置）→ 看
-> [agentd-service-deployment.md](./agentd-service-deployment.md)。
+> [agentd-service-deployment.md](../design/agentd-service-deployment.md)。
 
-- 相关代码：[`src/service/`](../src/service)（服务定义与安装）、[`src/control/runtime_entry.rs`](../src/control/runtime_entry.rs)（CLI）、[`src/control/enrollment.rs`](../src/control/enrollment.rs)（注册）
+- 相关代码：[`src/service/`](../../src/service)（服务定义与安装）、[`src/control/runtime_entry.rs`](../../src/control/runtime_entry.rs)（CLI）、[`src/control/enrollment.rs`](../../src/control/enrollment.rs)（注册）
 
 ---
 
@@ -95,7 +96,7 @@ WIST_AGENTD_RUN_ONCE=1 ./target/release/wist-agentd --config-dir ./dev-conf     
 
 用户级常驻的日志：systemd 看 `journalctl --user -u wist-agentd -f`；launchd 看 `~/Library/Logs/wist-agentd/agentd.err`。
 
-## 3. 方式二：通过 Wist-Gateway 安装（TODO）
+## 3. 方式二：通过 Wist-Gateway 安装
 
 目标：生产主机上的安装与注册由 **Wist-Gateway（控制面）** 发起，运维不手工拼命令——网关给出安装指令
 （含 `endpoint` 与**一次性注册 token**），agent 完成注册后以系统级常驻方式受管。
@@ -103,15 +104,17 @@ WIST_AGENTD_RUN_ONCE=1 ./target/release/wist-agentd --config-dir ./dev-conf     
 ### 3.1 目标流程
 
 1. 网关侧生成主机/环境对应的一次性 token；
-2. 运维在目标主机执行网关给出的安装指令（脚本或单条命令），大体形如：
+2. 运维在目标主机执行网关给出的安装指令（由网关签名的 `install.sh` 引导，脚本内嵌网关信任锚）：
 
    ```bash
-   # 目标形态（示意，尚未实现）
-   curl -fsSL https://<gateway>/install.sh | sudo sh -s -- --enrollment-token <token>
+   # 运行 install.sh 的实际形态（macOS 用 curl 的证书指纹固定；Linux 用 Ed25519 脚本签名验证）
+   curl -fsSLk --pinnedpubkey "sha256//<gateway-spki-pin>" \
+     "https://<gateway>/api/v1/agent/install/<arch>/install.sh" -o s && sh s
    ```
 
-3. 安装脚本负责：放二进制 → 初始化配置（写 `endpoint`）→ `service install --system --enrollment-token <token>`
-   → 校验 `service status`；
+3. 安装脚本负责：下载安装包并校验摘要 → 放二进制（tarball 形态连 `wist-exec` 一起）→ 下载
+   initial-config 写 `agentd.toml` → `service install --system --enrollment-token <token>`
+   （普通用户执行时为 `--user`）→ 交给 launchd / systemd 拉起；
 4. 注册结果（`agent_id`、凭据）落 state，网关侧能看到该主机上线。
 
 ### 3.2 当前已经具备（agent 侧）
@@ -123,12 +126,13 @@ WIST_AGENTD_RUN_ONCE=1 ./target/release/wist-agentd --config-dir ./dev-conf     
 | 系统级常驻 + 自启 + 崩溃拉起 | `service install --system`（systemd / launchd） | ✅ 已实现 |
 | 配置 / 数据（含采集输出）/ 日志分离 | `[paths]` 与采集输出的默认推导 | ✅ 已实现 |
 | 幂等注册、重复执行安全 | 已注册时直接返回 `already enrolled` | ✅ 已实现 |
-| 安装脚本 / 包管理 / 网关下发 | `install.sh`、deb/rpm、网关 UI 生成安装指令 | ❌ TODO |
+| 安装脚本 / 网关下发 | 网关 `wist-gateway/src/api/install.sh`（签名 + 摘要校验 + `service install`） | ✅ 已实现 |
+| 系统包 / 升级通道 / 批量编排 | deb/rpm/brew、网关下发新版本、`--no-activate` + CM | ❌ TODO |
 
-### 3.3 TODO（网关可用前先用“手工过渡做法”）
+### 3.3 剩余 TODO（离线场景仍可用手工过渡做法，见 §3.4）
 
-- [ ] 网关侧：主机授权、一次性 token 生成/回收、安装指令（脚本或包）生成；
-- [ ] 安装脚本：下载 + 校验（哈希/签名）、放二进制、`init-config`、`service install --enrollment-token`、自检；
+- [x] 网关侧：主机授权、一次性 token 生成/回收、安装指令生成；
+- [x] 安装脚本：下载 + 校验（哈希/签名）、放二进制、`init-config`、`service install --enrollment-token`、自检；
 - [ ] 发行形态：deb/rpm/brew 或 tarball（含 systemd unit / launchd plist 的模板，`service print --for <platform>` 已能输出）；
 - [ ] 升级通道：网关下发新版本 + 校验 + 重启（当前手工替换二进制，见 §7.3）；
 - [ ] 批量/无人值守：`--no-activate` + CM 分发定义文件的编排方式。
@@ -568,8 +572,8 @@ sudo sysrun/verify-system-install.sh --cleanup       # 清理它装的东西
 
 ## 10. 相关文档
 
-- [agentd-service-deployment.md](./agentd-service-deployment.md) — 设计说明（服务托管取舍、配置/数据/日志分离理由、日志收敛原理、已知限制）
-- [agent-config-schema.md](./agent-config-schema.md) — `agentd.toml` 全量字段
-- [agentd-architecture.md](./agentd-architecture.md) — 模块边界与运行模型
-- [agentd-failure-handling.md](./agentd-failure-handling.md) — 崩溃恢复与失败隔离
-- [log-file-input-spec.md](./log-file-input-spec.md) — 日志文件采集（tail/checkpoint/轮转）
+- [agentd-service-deployment.md](../design/agentd-service-deployment.md) — 设计说明（服务托管取舍、配置/数据/日志分离理由、日志收敛原理、已知限制）
+- [agent-config-schema.md](../design/agent-config-schema.md) — `agentd.toml` 全量字段
+- [agentd-architecture.md](../design/agentd-architecture.md) — 模块边界与运行模型
+- [agentd-failure-handling.md](../design/agentd-failure-handling.md) — 崩溃恢复与失败隔离
+- [log-file-input-spec.md](../design/log-file-input-spec.md) — 日志文件采集（tail/checkpoint/轮转）
