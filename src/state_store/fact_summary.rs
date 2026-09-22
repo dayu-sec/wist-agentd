@@ -24,6 +24,13 @@ pub struct FactSummaryDigestState {
     /// 同一时刻的毫秒时间戳（给最小间隔判定用，免去解析 RFC3339）。
     #[serde(default)]
     pub reported_at_ms: i64,
+    /// 上次**发起尝试**的毫秒时间戳（不管成没成）。
+    ///
+    /// 节流必须按「上次尝试」而不是「上次成功」：网关宕机时 `reported_at_ms` 不更新，
+    /// 若用它当节流键就形同无节流，每 tick 都重发。`#[serde(default)]` 兼容老文件
+    /// （缺字段时读成 0，即「没有历史尝试」，首次放行）。
+    #[serde(default)]
+    pub last_attempt_at_ms: i64,
 }
 
 pub fn path_for(state_dir: &Path) -> PathBuf {

@@ -68,6 +68,13 @@ const TICK_INTERVAL: Duration = Duration::from_secs(3);
 /// 等批次 2 把探针周期改成按策略调度后，这个下限就可以去掉（那时 tick 本身就是慢的）。
 const FACT_REPORT_MIN_INTERVAL_MS: i64 = 300_000;
 
+/// 事实上送单次请求的超时。
+///
+/// 上送发生在每 `TICK_INTERVAL`（3s）一次的 `refresh_discovery_snapshot` 里，且排在
+/// 指标/日志上送之前，所以这条路径**必须自己封顶**，不能吃 `enrollment_http_client`
+/// 的 10s 请求超时 —— 否则网关卡住会把 tick 拖长并连带推迟数据面上送。
+const FACT_REPORT_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// A sampled CPU-time reading used to compute a percentage across the report interval.
 struct CpuSample {
     ticks: u64,
@@ -242,7 +249,19 @@ async fn report_fact_summary_if_changed(
     };
 
     let state_path = fact_summary_state::path_for(state_dir);
-    let previous = fact_summary_state::load_async(&state_path).await?;
+    // 缺陷 2：读到坏 JSON 时 fail-open —— 当作「没有历史状态」继续（`None`）。
+    // 否则 load 每次都 Err，摘要永远发不出去，且文件也永远不会被重写修复；
+    // 成功送达后会重写该文件，自愈。
+    let previous = match fact_summary_state::load_async(&state_path).await {
+        Ok(state) => state,
+        Err(err) => {
+            eprintln!(
+                "wist-agentd fact summary report: ignoring unreadable state {}: {err}",
+                state_path.display()
+            );
+            None
+        }
+    };
     let digest = fact_summary::content_digest(summary);
     if previous
         .as_ref()
@@ -253,7 +272,7 @@ async fn report_fact_summary_if_changed(
     let now_ms = now_ts_ms();
     if previous
         .as_ref()
-        .is_some_and(|state| now_ms - state.reported_at_ms < FACT_REPORT_MIN_INTERVAL_MS)
+        .is_some_and(|state| within_fact_report_min_interval(state.last_attempt_at_ms, now_ms))
     {
         return Ok(false);
     }
@@ -283,21 +302,36 @@ async fn report_fact_summary_if_changed(
         }
     };
     let url = format!("{}/api/v1/agent/facts", endpoint.trim_end_matches('/'));
+
+    // 缺陷 1：节流键用「上次尝试」而不是「上次成功」。真正发请求前先落一次盘，
+    // 这样即使这次失败，下一个 tick 也在下限内，不会每 3s 重试一次（网关宕机时尤其重要）。
+    // 发起前的写入失败只记日志、**不阻止发送** —— 至多退化成不节流，好过不发。
+    // 取舍：下限本身 ≥5 分钟，所以最坏只是「每 5 分钟多一次写盘」，完全可接受。
+    // 注意：放在客户端构建之后，让「trust bundle 坏」这类不会自愈的配置错每次都能被看见。
+    let mut attempt_state = previous.clone().unwrap_or_default();
+    attempt_state.last_attempt_at_ms = now_ms;
+    if let Err(err) = fact_summary_state::store_async(&state_path, &attempt_state).await {
+        eprintln!("wist-agentd fact summary report: failed to record attempt: {err}");
+    }
+
     match client
         .post(&url)
+        // 缺陷 4：这条路径在 tick 主循环里，必须自己封顶，不能吃掉 tick。
+        .timeout(FACT_REPORT_TIMEOUT)
         .bearer_auth(bearer_token)
         .json(&report)
         .send()
         .await
     {
         Ok(response) if response.status().is_success() => {
-            // 只有送达才记摘要：否则下次内容还没变时会被自己拦住，永远补不上。
+            // 只有送达才记摘要 + 报成功时刻：否则下次内容还没变时会被自己拦住，永远补不上。
             fact_summary_state::store_async(
                 &state_path,
                 &fact_summary_state::FactSummaryDigestState {
                     content_digest: digest,
                     reported_at,
                     reported_at_ms: now_ms,
+                    last_attempt_at_ms: now_ms,
                 },
             )
             .await?;
@@ -316,6 +350,17 @@ async fn report_fact_summary_if_changed(
             Ok(false)
         }
     }
+}
+
+/// 是否还在事实摘要上送的最小间隔内（即应当跳过）。
+///
+/// 节流必须 **fail-open**：宁可多发一次，不可因为时钟问题永远不发。
+/// 因此时间戳为 0（没有历史尝试）或晚于 `now_ms`（墙钟回拨 / 状态损坏）
+/// 都判为**已到期**（放行）；只有真正落在下限窗口内的才拦截。
+fn within_fact_report_min_interval(last_attempt_at_ms: i64, now_ms: i64) -> bool {
+    last_attempt_at_ms != 0
+        && last_attempt_at_ms <= now_ms
+        && now_ms.saturating_sub(last_attempt_at_ms) < FACT_REPORT_MIN_INTERVAL_MS
 }
 
 use metrics_support::{
@@ -940,6 +985,8 @@ mod tests {
         }
     }
 
+    /// 种一份「已有历史状态」。`reported_at_ms` 同时用作 `last_attempt_at_ms`：
+    /// 老测试里两者本来就是同一时刻，节流键改成「上次尝试」后语义保持不变。
     async fn seeded_state(state_dir: &Path, content_digest: &str, reported_at_ms: i64) {
         fact_summary_state::store_async(
             &fact_summary_state::path_for(state_dir),
@@ -947,6 +994,7 @@ mod tests {
                 content_digest: content_digest.to_string(),
                 reported_at: now_rfc3339(),
                 reported_at_ms,
+                last_attempt_at_ms: reported_at_ms,
             },
         )
         .await
@@ -1006,6 +1054,8 @@ mod tests {
             .expect("state recorded");
         assert_eq!(state.content_digest, fact_summary::content_digest(&summary));
         assert!(state.reported_at_ms > 0);
+        // 成功送达也记录尝试时刻（同一时刻）。
+        assert_eq!(state.last_attempt_at_ms, state.reported_at_ms);
     }
 
     #[tokio::test]
@@ -1078,12 +1128,106 @@ mod tests {
         server.await.expect("server task");
 
         assert!(!reported);
-        assert!(
-            fact_summary_state::load_async(&fact_summary_state::path_for(&state_dir))
-                .await
-                .expect("load state")
-                .is_none()
+        // 失败不能把摘要记成「已送出」—— 否则内容没再变时会被自己拦住，永远补不上。
+        // 但节流键（last_attempt_at_ms）要写：下次 tick 不应立刻重试。
+        let state = fact_summary_state::load_async(&fact_summary_state::path_for(&state_dir))
+            .await
+            .expect("load state")
+            .expect("attempt recorded");
+        assert_ne!(
+            state.content_digest,
+            fact_summary::content_digest(&draft(&["/usr/bin/xcodebuild"]))
         );
+        assert!(state.last_attempt_at_ms > 0);
+    }
+
+    #[tokio::test]
+    async fn fact_summary_throttles_a_failing_gateway() {
+        // 网关回 500：第一次尝试（Ok(false)）；紧接着再调一次，内容仍不同
+        // （上次没成功、摘要没记），但尝试时刻刚写过 → 必须被节流拦住，不发第二个请求。
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let state_dir = fact_summary_state_dir("throttle-failing");
+        let mut config = test_config();
+        config.control_plane.endpoint = Some(endpoint);
+        let summary = draft(&["/usr/bin/xcodebuild"]);
+
+        let (first, ()) = tokio::join!(
+            report_fact_summary_if_changed(&config, &state_dir, &summary),
+            async {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let _ = read_http_request(&mut socket).await;
+                let response = "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                socket.write_all(response.as_bytes()).await.expect("write");
+            }
+        );
+        assert!(!first.expect("first report"));
+
+        let second = report_fact_summary_if_changed(&config, &state_dir, &summary)
+            .await
+            .expect("second report");
+        assert!(!second);
+        assert_no_request(&listener).await;
+    }
+
+    #[tokio::test]
+    async fn fact_summary_recovers_from_a_corrupt_state_file() {
+        // 状态文件坏掉不能永久停摆：fail-open，照常发送并成功重写状态（自愈）。
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let state_dir = fact_summary_state_dir("corrupt");
+        let state_path = fact_summary_state::path_for(&state_dir);
+        tokio::fs::write(&state_path, b"{ this is not json")
+            .await
+            .expect("write corrupt state");
+
+        let mut config = test_config();
+        config.control_plane.endpoint = Some(endpoint);
+        let summary = draft(&["/usr/bin/xcodebuild"]);
+
+        let (reported, ()) = tokio::join!(
+            report_fact_summary_if_changed(&config, &state_dir, &summary),
+            async {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let _ = read_http_request(&mut socket).await;
+                let response =
+                    "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                socket.write_all(response.as_bytes()).await.expect("write");
+            }
+        );
+        assert!(reported.expect("report ok (fail-open)"));
+
+        let state = fact_summary_state::load_async(&state_path)
+            .await
+            .expect("load state")
+            .expect("state rewritten");
+        assert_eq!(state.content_digest, fact_summary::content_digest(&summary));
+    }
+
+    #[tokio::test]
+    async fn fact_summary_sends_despite_a_rolled_back_clock() {
+        // 状态里的尝试时刻在未来（墙钟回拨 / 状态损坏）→ 放行，不能被节流按死。
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let state_dir = fact_summary_state_dir("rolled-back");
+        let future_ms = now_ts_ms() + 10 * FACT_REPORT_MIN_INTERVAL_MS;
+        seeded_state(&state_dir, "sha256:previous", future_ms).await;
+
+        let mut config = test_config();
+        config.control_plane.endpoint = Some(endpoint);
+        let summary = draft(&["/usr/bin/xcodebuild"]);
+
+        let (reported, ()) = tokio::join!(
+            report_fact_summary_if_changed(&config, &state_dir, &summary),
+            async {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let _ = read_http_request(&mut socket).await;
+                let response =
+                    "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                socket.write_all(response.as_bytes()).await.expect("write");
+            }
+        );
+        assert!(reported.expect("report ok"));
     }
 
     #[tokio::test]

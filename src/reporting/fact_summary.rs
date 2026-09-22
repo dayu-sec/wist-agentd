@@ -109,14 +109,22 @@ fn attribute<'a>(resource: &'a DiscoveredResource, key: &str) -> Option<&'a str>
 /// 它是**变更检测的幂等键**，一旦碰撞就会静默跳过上报、摘要停在旧内容上，
 /// 这不是该放开发占位的地方。`ring` 本来就在依赖图里（rustls 带进来），无新增构建成本。
 pub fn content_digest(summary: &FactSummaryDraft) -> String {
+    // 归一化放在**这个函数内部**，而不是只靠 `build_summary` 的 `BTreeSet`：
+    // 不变式要由主张它的函数来守 —— 否则谁传一份手工构造/从缓存来的 draft（顺序或重复项不同），
+    // 幂等键就静默失真（多发一次，不会丢数据，但“内容没变就不发”就不再成立）。
+    let process_executables = normalized(&summary.process_executables);
+    let packages = normalized(&summary.packages);
+    let listen_ports = normalized(&summary.listen_ports);
     let view = DigestView {
         os: &summary.os,
         arch: &summary.arch,
-        process_executables: &summary.process_executables,
-        packages: &summary.packages,
-        listen_ports: &summary.listen_ports,
+        process_executables: &process_executables,
+        packages: &packages,
+        listen_ports: &listen_ports,
     };
-    let bytes = serde_json::to_vec(&view).unwrap_or_default();
+    // 对 `&str` / `&[String]` 序列化不可能失败；这里不用 `unwrap_or_default()`：
+    // 那会把“序列化失败”变成“空输入的常量摘要”，等于“内容永远没变”，上送会永久停摆。
+    let bytes = serde_json::to_vec(&view).expect("digest view serialization is infallible");
     let hash = digest::digest(&digest::SHA256, &bytes);
     let hex: String = hash
         .as_ref()
@@ -124,6 +132,16 @@ pub fn content_digest(summary: &FactSummaryDraft) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     format!("sha256:{hex}")
+}
+
+/// 去重 + 定序。
+fn normalized(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect()
 }
 
 #[cfg(test)]
@@ -232,6 +250,23 @@ mod tests {
         assert_ne!(content_digest(&base), content_digest(&more));
         assert!(content_digest(&base).starts_with("sha256:"));
         assert_eq!(content_digest(&base).len(), "sha256:".len() + 64);
+    }
+
+    #[test]
+    fn digest_normalizes_order_and_duplicates_within_itself() {
+        // 不变式由 content_digest 自己守：手工构造的 draft（乱序/含重复）也必须算出同一摘要。
+        let mut base = build_summary(&snapshot(vec![process("a"), process("b")]));
+        let canonical = content_digest(&base);
+
+        base.process_executables = vec!["b".to_string(), "a".to_string(), "a".to_string()];
+        assert_eq!(content_digest(&base), canonical);
+
+        base.listen_ports = vec!["6379".to_string(), "5432".to_string(), "5432".to_string()];
+        let with_ports = content_digest(&base);
+        assert_ne!(with_ports, canonical);
+
+        base.listen_ports = vec!["5432".to_string(), "6379".to_string()];
+        assert_eq!(content_digest(&base), with_ports);
     }
 
     #[test]
