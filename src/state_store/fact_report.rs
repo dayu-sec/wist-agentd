@@ -28,8 +28,14 @@ pub struct FactReportState {
     pub last_attempt_at_ms: i64,
 }
 
+/// 节流状态文件：**故意放在 `state_dir` 根下，不在 `reporting/` 里**。
+///
+/// 因为 `reporting/` 的内容会被健康计数当作「待送报告积压」逐个数
+/// （`count_reporting_entries_async`），而这是一串**时间戳**，不是待送报告 —— 放在那里
+/// 会让 `reporting_count` 永远多 1。原先放在 `reporting/` 里，只是因为在控制面直报模式下
+/// 「没配端点就早退」把这个问题遮住了；改走数据面后就显形了。
 pub fn path_for(state_dir: &Path) -> PathBuf {
-    state_dir.join("reporting").join("fact_report.json")
+    state_dir.join("fact_report.json")
 }
 
 /// 读取节流状态；文件不存在（首次运行）返回 `None`。

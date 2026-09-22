@@ -72,6 +72,21 @@ impl TelemetryRecordSink {
             Self::Tcp(sink) => sink.write_metrics(envelope, metrics).await,
         }
     }
+
+    /// 上送一帧事实帧（` OBSFACT:` 标记 + 契约对象 JSON）。
+    ///
+    /// 与指标**故意不同的一点**：文件输出下指标是静默跳过（本地调试不需要指标），事实则返回
+    /// `Err` —— 「事实发不出去」是一个必须被看见的配置错误：数据面上行没开，网关就永远拿不到
+    /// 事实（用途推断与资产清单全空），而这种故障在两侧都不显形。
+    pub(crate) async fn write_fact(&mut self, envelope: &DataFrame, body: &[u8]) -> io::Result<()> {
+        match self {
+            Self::File(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "fact frames need the data-plane TCP uplink; set [telemetry.logs.output] kind = \"tcp\"",
+            )),
+            Self::Tcp(sink) => sink.write_fact(envelope, body).await,
+        }
+    }
 }
 
 #[derive(Debug, Clone, ::jumo_derive::Jumo)]
@@ -236,6 +251,13 @@ impl TcpRecordSink {
             .await
     }
 
+    /// 写入一帧事实帧（` OBSFACT: ` 标记 + 契约对象 JSON 正文）。
+    pub(crate) async fn write_fact(&mut self, envelope: &DataFrame, body: &[u8]) -> io::Result<()> {
+        let frame = build_fact_frame(envelope, body)?;
+        self.write_payload(&build_payload_bytes(&frame, self.framing))
+            .await
+    }
+
     /// 测试用：缩短退避窗口，避免真实等待默认的 1s。
     #[cfg(test)]
     fn with_backoff(mut self, initial: Duration) -> Self {
@@ -260,16 +282,16 @@ impl RecordSink for TcpRecordSink {
     }
 }
 
-/// TCP 上送帧：结构化信封（不含原文）与 `RAW:` 原始行分离，避免把 raw 塞进 JSON。
+/// TCP 上送帧：结构化信封（不含原文）与 `LOGRAW:` 原始行分离，避免把 raw 塞进 JSON。
 ///
-/// `{envelope} RAW: <body>`，其中 envelope 只承载通用字段（`schema`/`agent`/`ts`/`seq`，短名），
+/// `{envelope} LOGRAW: <body>`，其中 envelope 只承载通用字段（`schema`/`agent`/`ts`/`seq`，短名），
 /// body 保持原文、不转义，供数据面审计核对与回放。来源细节（`input`/路径/偏移）不进帧。
 fn build_record_frame(record: &TelemetryRecord) -> io::Result<Vec<u8>> {
     let envelope = DataFrame::from(record);
     let mut frame = serde_json::to_vec(&envelope)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    // RAW: 后跟一个空格分隔帧标记与原文，保证原文从正文首字符开始、不带标记前缀。
-    frame.extend_from_slice(b" RAW: ");
+    // LOGRAW: 后跟一个空格分隔帧标记与原文，保证原文从正文首字符开始、不带标记前缀。
+    frame.extend_from_slice(b" LOGRAW: ");
     frame.extend_from_slice(record.body.as_bytes());
     Ok(frame)
 }
@@ -284,6 +306,20 @@ fn build_metrics_frame(envelope: &DataFrame, metrics: &VmMetricLine) -> io::Resu
     let body = serde_json::to_vec(metrics)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     frame.extend_from_slice(&body);
+    Ok(frame)
+}
+
+/// TCP 事实帧：与日志/指标共用 `DataFrame` 信封，帧标记为 ` OBSFACT: `，正文是**契约对象原样**
+/// （`ReportAgentFactSummary` 的 JSON 字节）。
+///
+/// 为什么正文由调用方给字节、不在这里重建：它必须与 `wist-contracts` 的类型表达同一件事，
+/// 而「谁负责构造契约对象」只应有一处（daemon 侧）。这里只做分帧 —— 与指标帧同一个道理，
+/// 只是指标那侧顺手把序列化也放进来了。
+fn build_fact_frame(envelope: &DataFrame, body: &[u8]) -> io::Result<Vec<u8>> {
+    let mut frame = serde_json::to_vec(envelope)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    frame.extend_from_slice(b" OBSFACT: ");
+    frame.extend_from_slice(body);
     Ok(frame)
 }
 
@@ -387,7 +423,7 @@ mod tests {
         let lines: Vec<&str> = body.lines().collect();
         assert_eq!(lines.len(), 2);
         for line in &lines {
-            let (envelope, raw) = line.split_once(" RAW: ").expect("RAW marker");
+            let (envelope, raw) = line.split_once(" LOGRAW: ").expect("LOGRAW marker");
             assert!(envelope.starts_with('{'), "envelope json: {envelope}");
             assert!(envelope.contains("\"agent\":\"agent-a\""));
             assert!(
@@ -470,7 +506,7 @@ mod tests {
     fn record_frame_keeps_raw_outside_json_envelope() {
         let frame = super::build_record_frame(&record("raw 行内容")).expect("build frame");
         let text = String::from_utf8_lossy(&frame);
-        let (envelope, raw) = text.split_once(" RAW: ").expect("RAW marker");
+        let (envelope, raw) = text.split_once(" LOGRAW: ").expect("LOGRAW marker");
         let parsed: serde_json::Value = serde_json::from_str(envelope).expect("valid envelope");
         assert_eq!(parsed["schema"], "v1");
         assert_eq!(parsed["agent"], "agent-a");

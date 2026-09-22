@@ -5,12 +5,14 @@ use std::io;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::telemetry::warp_parse::TelemetryRecordSink;
 use wist_contracts::agent_config::AgentConfig;
 use wist_contracts::discovery_policy::DiscoveryAspectPolicySet;
 use wist_contracts::gateway::{
     AgentStatusReport, AgentWorkState, AgentWorkStateChange, DiscoveryPoliciesReturned,
     POLL_DISCOVERY_POLICIES_KIND, PollDiscoveryPolicies, ReportAgentFactSummary,
 };
+use wist_contracts::telemetry_record::DataFrame;
 use wist_shared::time::{now_rfc3339, now_ts_ms};
 
 use crate::enrollment::enrollment_http_client;
@@ -68,13 +70,6 @@ const TICK_INTERVAL: Duration = Duration::from_secs(3);
 /// 会跟着采集同频，与「发现是慢变量（分钟级）」的设计相反。
 /// 等批次 2 把探针周期改成按策略调度后，这个下限就可以去掉（那时 tick 本身就是慢的）。
 const FACT_REPORT_MIN_INTERVAL_MS: i64 = 300_000;
-
-/// 事实上送单次请求的超时。
-///
-/// 上送发生在每 `TICK_INTERVAL`（3s）一次的 `refresh_discovery_snapshot` 里，且排在
-/// 指标/日志上送之前，所以这条路径**必须自己封顶**，不能吃 `enrollment_http_client`
-/// 的 10s 请求超时 —— 否则网关卡住会把 tick 拖长并连带推迟数据面上送。
-const FACT_REPORT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 拉取发现方向**策略表**的最小间隔。
 ///
@@ -250,24 +245,28 @@ async fn report_status_to_control_plane(
     }
 }
 
-/// 把事实摘要上报控制面（尽力而为，失败只进日志）。
+/// 把事实摘要上送数据面（走 TCP uplink，与日志/指标同一条连接）。
 ///
-/// 返回 `Ok(true)` = 这次真发出去了；`Ok(false)` = 还在最小间隔内，或缺端点/身份。
+/// 返回 `Ok(true)` = 这次真发出去了；`Ok(false)` = 还在最小间隔内，或缺 `agent_id`。
+///
+/// **为什么不再走控制面 HTTP**：事实只有**一条上行通道** —— agentd → 数据面（`OBSFACT:` 帧），
+/// 网关与中心各自订阅。控制面那条直报端点（`POST /api/v1/agent/facts`）已废弃，见
+/// `doc/design/center/agent-work-delivery-plan.md` §4.1。两套通道就是两套连接、两套节流、
+/// 两套失败模式。
 ///
 /// **不做本地判重**：判重归网关（它从收到的内容自己重算摘要，判定 `accepted`/`duplicate`）。
-/// 这里只按最小间隔节流 —— agentd 必须**无条件周期全量**上报，否则本地算法或状态一退化
+/// 这里只按最小间隔节流 —— agentd 必须**无条件周期全量**上送，否则本地算法或状态一退化
 /// 就会静默停报，而且没有任何一层能发现。多发一次的代价是流量，停报的代价是视图停滞。
 async fn report_fact_summary(
+    sink: &mut TelemetryRecordSink,
     config: &AgentConfig,
     state_dir: &Path,
     summary: &fact_summary::FactSummaryDraft,
+    next_seq: &mut u64,
+    global_seq_path: &Path,
 ) -> RuntimeResult<bool> {
-    let Some(endpoint) = config.control_plane.endpoint.as_deref() else {
-        return Ok(false);
-    };
-    let Some(bearer_token) = config.control_plane.bearer_token.as_deref() else {
-        return Ok(false);
-    };
+    // 这里**不**再检查控制面端点与凭据：帧走的是数据面，身份校验尚未落地
+    // （见计划 §9 风险行）。缺 agent_id 时仍然跳过 —— 它是信封里的自称。
     let Some(agent_id) = config.agent.agent_id.as_deref() else {
         return Ok(false);
     };
@@ -312,7 +311,7 @@ async fn report_fact_summary(
         summary.process_executables.clone(),
         summary.packages.clone(),
         summary.listen_ports.clone(),
-        reported_at,
+        reported_at.clone(),
     )
     // 主机标识与网卡地址：**留痕/展示**，不进内容摘要（见 `ReportAgentFactSummary` 的注释）。
     .with_display(
@@ -320,20 +319,10 @@ async fn report_fact_summary(
         summary.host_name.clone(),
         summary.network_addresses.clone(),
     );
-    let client = match enrollment_http_client(config) {
-        Ok(client) => client,
-        Err(err) => {
-            eprintln!("wist-agentd fact summary report: failed to build client: {err}");
-            return Ok(false);
-        }
-    };
-    let url = format!("{}/api/v1/agent/facts", endpoint.trim_end_matches('/'));
-
-    // 节流键用「上次尝试」而不是「上次成功」。真正发请求前先落一次盘，
-    // 这样即使这次失败，下一个 tick 也在下限内，不会每 3s 重试一次（网关宕机时尤其重要）。
+    // 节流键用「上次尝试」而不是「上次成功」。真正发送前先落一次盘，
+    // 这样即使这次失败，下一个 tick 也在下限内，不会每 3s 重试一次（数据面宕机时尤其重要）。
     // 发起前的写入失败只记日志、**不阻止发送** —— 至多退化成不节流，好过不发。
     // 取舍：下限本身 ≥5 分钟，所以最坏只是「每 5 分钟多一次写盘」，完全可接受。
-    // 注意：放在客户端构建之后，让「trust bundle 坏」这类不会自愈的配置错每次都能被看见。
     let attempt_state = fact_report::FactReportState {
         last_attempt_at_ms: now_ms,
     };
@@ -341,29 +330,18 @@ async fn report_fact_summary(
         eprintln!("wist-agentd fact summary report: failed to record attempt: {err}");
     }
 
-    match client
-        .post(&url)
-        // 这条路径在 tick 主循环里，必须自己封顶，不能吃掉 tick。
-        .timeout(FACT_REPORT_TIMEOUT)
-        .bearer_auth(bearer_token)
-        .json(&report)
-        .send()
-        .await
-    {
-        Ok(response) if response.status().is_success() => Ok(true),
-        Ok(response) => {
-            eprintln!(
-                "wist-agentd fact summary report failed: HTTP {} from {}",
-                response.status(),
-                endpoint
-            );
-            Ok(false)
-        }
-        Err(err) => {
-            eprintln!("wist-agentd fact summary report failed: {err}");
-            Ok(false)
-        }
-    }
+    // 正文是**契约对象原样**（`ReportAgentFactSummary`）：订阅端按 `wist-contracts` 解析，
+    // 不做字段建模。
+    let body = serde_json::to_vec(&report)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    // 取号 → 先持久化高水位 → 再发送（与日志/指标同一个 seq 空间；
+    // `(agent, seq)` 是数据面的去重键，跳号可以、撞号不行）。
+    let seq = *next_seq;
+    *next_seq += 1;
+    log_seq_state::store_async(global_seq_path, *next_seq).await?;
+    let envelope = DataFrame::new(agent_id, reported_at, seq);
+    sink.write_fact(&envelope, &body).await?;
+    Ok(true)
 }
 
 /// 是否还在事实摘要上送的最小间隔内（即应当跳过）。
@@ -579,7 +557,7 @@ async fn run_once_with_failure_cache(
         .agent_id
         .as_deref()
         .unwrap_or("unknown");
-    let discovery = refresh_discovery_snapshot(loop_ctx.config, state_dir, discovery_runtime).await;
+    let (discovery, fact_summary) = refresh_discovery_snapshot(state_dir, discovery_runtime).await;
     let metrics_tick = process_metrics_tick(state_dir);
     emit_metrics_tick(&metrics_tick);
     if let Some(previous) = previous_metrics_failures {
@@ -608,6 +586,27 @@ async fn run_once_with_failure_cache(
                 .await
             {
                 eprintln!("wist-agentd metrics uplink failed: {err}");
+            }
+            // 事实摘要在**指标之后**发：同样共用这条连接与全局 `seq`，只是帧标记不同。
+            match report_fact_summary(
+                &mut sink,
+                loop_ctx.config,
+                state_dir,
+                &fact_summary,
+                &mut next_seq,
+                &global_seq_path,
+            )
+            .await
+            {
+                Ok(true) => eprintln!(
+                    "event=FactSummaryReported digest={} processes={} executables={} ports={}",
+                    fact_summary.content_digest(),
+                    fact_summary.process_count,
+                    fact_summary.process_executables.len(),
+                    fact_summary.listen_ports.len()
+                ),
+                Ok(false) => {}
+                Err(err) => eprintln!("wist-agentd fact summary uplink failed: {err}"),
             }
             process_telemetry_inputs(loop_ctx.config, &mut sink, &mut next_seq).await
         }
@@ -731,10 +730,9 @@ async fn refresh_discovery_policy(config: &AgentConfig, runtime: &mut DiscoveryR
 }
 
 async fn refresh_discovery_snapshot(
-    config: &AgentConfig,
     state_dir: &Path,
     runtime: &mut DiscoveryRuntime,
-) -> DiscoveryHealth {
+) -> (DiscoveryHealth, fact_summary::FactSummaryDraft) {
     let (cached, cache_load_failure) = runtime.load_from_state_dir_async(state_dir).await;
     let (cached_meta, meta_load_failure) = runtime.load_meta_from_state_dir_async(state_dir).await;
     // 按各探针的 `refresh_interval()` 调度：只刷到期的，未到期的沿用上次输出。
@@ -808,20 +806,10 @@ async fn refresh_discovery_snapshot(
     );
     emit_discovery_refresh(&result, &probes);
 
-    // 事实摘要上送（尽力而为）。放在这里而不是主循环：快照就在手上，
-    // 不必再读一遍 discovery 缓存再解析一次（那份 JSON 有几百个进程）。
+    // 事实摘要**在这里压缩，不在这里上送**：摘要要从快照算（快照就在手上，不必再读一遍
+    // discovery 缓存再解析一次），但上行走 TCP uplink，而 sink 在调用方（主 tick）才建。
+    // 所以带回主 tick，与指标一起发 —— 同一条连接、同一个全局 `seq`。
     let fact_summary = fact_summary::build_summary(&result.persisted_snapshot);
-    match report_fact_summary(config, state_dir, &fact_summary).await {
-        Ok(true) => eprintln!(
-            "event=FactSummaryReported digest={} processes={} executables={} ports={}",
-            fact_summary.content_digest(),
-            fact_summary.process_count,
-            fact_summary.process_executables.len(),
-            fact_summary.listen_ports.len()
-        ),
-        Ok(false) => {}
-        Err(err) => eprintln!("wist-agentd fact summary report failed: {err}"),
-    }
 
     let readiness = if result.used_cached_snapshot {
         DiscoveryReadiness::ReadyWithStaleSnapshot
@@ -833,7 +821,7 @@ async fn refresh_discovery_snapshot(
         DiscoveryReadiness::NotReady
     };
 
-    DiscoveryHealth {
+    let health = DiscoveryHealth {
         snapshot: DiscoveryHealthSnapshot {
             readiness,
             cached_snapshot_loaded: cached.is_some(),
@@ -851,7 +839,8 @@ async fn refresh_discovery_snapshot(
             updated_at: result.refreshed_snapshot.generated_at.clone(),
             probes,
         },
-    }
+    };
+    (health, fact_summary)
 }
 
 fn discovery_probes(config: &AgentConfig) -> Vec<Box<dyn DiscoveryProbe + Send + Sync>> {
@@ -1006,6 +995,7 @@ pub fn recover_incomplete_executions(state_dir: &Path, instance_id: &str) -> Run
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -1014,6 +1004,8 @@ mod tests {
     use wist_contracts::agent_config::{
         AgentSection, ControlPlaneSection, ExecutionSection, PathsSection,
     };
+
+    use crate::telemetry::warp_parse::{FileRecordSink, TcpFraming, TcpRecordSink};
 
     fn test_config() -> AgentConfig {
         AgentConfig::new(
@@ -1146,7 +1138,7 @@ mod tests {
             .expect("duration")
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("warp-insight-fact-summary-{name}-{suffix}"));
-        std::fs::create_dir_all(dir.join("reporting")).expect("create state dir");
+        std::fs::create_dir_all(&dir).expect("create state dir");
         dir
     }
 
@@ -1194,50 +1186,123 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn fact_summary_reports_periodically() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
-        let server = tokio::spawn(async move {
+    /// 收**一帧**（line framing：一帧一行）后返回文本。
+    ///
+    /// 不读到 EOF：sink 会把连接留着复用，读 EOF 会挂到测试结束。
+    fn frame_server(listener: TcpListener) -> tokio::task::JoinHandle<String> {
+        tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("accept");
-            let request = read_http_request(&mut socket).await;
-            assert!(request.contains("/api/v1/agent/facts"));
-            assert!(
-                request
-                    .to_lowercase()
-                    .contains("authorization: bearer wic_test_token")
-            );
-            assert!(request.contains("\"agent_id\":\"agent-x\""));
-            assert!(request.contains("\"instance_id\":\"instance-x\""));
-            assert!(request.contains("\"kind\":\"report_agent_fact_summary\""));
-            // 声明用的是与网关同源的实现（版本前缀 fact-v1）。
-            assert!(request.contains("\"content_digest\":\"fact-v1:sha256:"));
-            assert!(request.contains("\"process_executables\":[\"/usr/bin/xcodebuild\"]"));
-            assert!(request.contains("\"process_count\":1"));
-            // 主机标识与网卡地址随摘要一起上去（留痕/展示，不进内容摘要）。
-            assert!(request.contains("\"host_id\":\"machine-id\""));
-            assert!(request.contains("\"host_name\":\"demo-host\""));
-            assert!(request.contains("\"network_addresses\":[\"en0 192.168.1.5/24\"]"));
-            // revision 与 observed_at 只是留痕，但确实要带上。
-            assert!(request.contains("\"revision\":7"));
-            assert!(request.contains("\"observed_at\":\"2026-09-22T00:00:00Z\""));
-            let response =
-                "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
-            socket.write_all(response.as_bytes()).await.expect("write");
-        });
+            let mut body = Vec::new();
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let n = socket.read(&mut buf).await.expect("read");
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&buf[..n]);
+                if body.contains(&b'\n') {
+                    break;
+                }
+            }
+            String::from_utf8_lossy(&body).into_owned()
+        })
+    }
+
+    fn tcp_sink(port: u16) -> TelemetryRecordSink {
+        TelemetryRecordSink::Tcp(TcpRecordSink::new(
+            "127.0.0.1".to_string(),
+            port,
+            TcpFraming::Line,
+        ))
+    }
+
+    /// 一个确定没人监听的端口：`bind` 后立刻 drop，端口即被释放。
+    async fn closed_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        listener.local_addr().expect("addr").port()
+    }
+
+    /// 走共用的 `test_config()` + 自己的 seq 状态，把六个参数收成一个调用。
+    async fn report_fact(
+        sink: &mut TelemetryRecordSink,
+        state_dir: &Path,
+        summary: &fact_summary::FactSummaryDraft,
+    ) -> RuntimeResult<bool> {
+        let seq_path = log_seq_state::path_for(state_dir);
+        let mut next_seq = log_seq_state::load_or_default_async(&seq_path)
+            .await
+            .unwrap_or(0);
+        report_fact_summary(
+            sink,
+            &test_config(),
+            state_dir,
+            summary,
+            &mut next_seq,
+            &seq_path,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn fact_summary_sends_an_obsfact_frame_over_the_uplink() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = frame_server(listener);
 
         let state_dir = fact_summary_state_dir("periodic");
-        let mut config = test_config();
-        config.control_plane.endpoint = Some(endpoint);
+        let mut sink = tcp_sink(port);
         let summary = draft(&["/usr/bin/xcodebuild"]);
-        let reported = report_fact_summary(&config, &state_dir, &summary)
+        let reported = report_fact(&mut sink, &state_dir, &summary)
             .await
             .expect("report");
-        server.await.expect("server task");
+        let frame = server.await.expect("server task");
 
         assert!(reported);
+        // 帧标记 + 信封：身份在信封里（`agent`），正文里也有一份用于交叉核对。
+        assert!(
+            frame.contains(" OBSFACT: "),
+            "frame missing marker: {frame}"
+        );
+        assert!(frame.contains("\"agent\":\"agent-x\""));
+        assert!(frame.contains("\"seq\":0"));
+        // 正文是契约对象**原样透传**（订阅端按 wist-contracts 解析）。
+        assert!(frame.contains("\"agent_id\":\"agent-x\""));
+        assert!(frame.contains("\"instance_id\":\"instance-x\""));
+        assert!(frame.contains("\"kind\":\"report_agent_fact_summary\""));
+        // 声明用的是与网关同源的实现（版本前缀 fact-v1）。
+        assert!(frame.contains("\"content_digest\":\"fact-v1:sha256:"));
+        assert!(frame.contains("\"process_executables\":[\"/usr/bin/xcodebuild\"]"));
+        assert!(frame.contains("\"process_count\":1"));
+        // 主机标识与网卡地址随摘要一起上去（留痕/展示，不进内容摘要）。
+        assert!(frame.contains("\"host_id\":\"machine-id\""));
+        assert!(frame.contains("\"host_name\":\"demo-host\""));
+        assert!(frame.contains("\"network_addresses\":[\"en0 192.168.1.5/24\"]"));
+        assert!(frame.contains("\"revision\":7"));
+        assert!(frame.contains("\"observed_at\":\"2026-09-22T00:00:00Z\""));
+        // 走数据面就不应该再出现控制面那条路的东西（端点/凭据）。
+        assert!(!frame.to_lowercase().contains("authorization"));
+        assert!(!frame.contains("/api/v1/agent/facts"));
+
         assert!(loaded_attempt(&state_dir).await > 0);
         assert!(summary.content_digest().starts_with("fact-v1:sha256:"));
+    }
+
+    #[tokio::test]
+    async fn fact_summary_fails_loudly_when_the_uplink_is_not_tcp() {
+        // 文件输出只承载日志（本地调试）：事实发不出去必须**报错**，不能像指标那样静默跳过 ——
+        // “数据面上行没开”会让网关永远拿不到事实（推断与清单全空），而这种故障两侧都不显形。
+        let state_dir = fact_summary_state_dir("file-only");
+        let mut sink = TelemetryRecordSink::File(FileRecordSink::new(PathBuf::from(
+            "fact-should-not-be-written.ndjson",
+        )));
+        let result = report_fact(&mut sink, &state_dir, &draft(&["/usr/bin/xcodebuild"])).await;
+        let err = result.expect_err("file sink must reject fact frames");
+        assert!(
+            err.to_string().contains("kind = \"tcp\""),
+            "error should point at the config knob: {err}"
+        );
+        // 这次尝试仍然被记下：配置错也不会变成每 3s 一条日志。
+        assert!(loaded_attempt(&state_dir).await > 0);
     }
 
     #[tokio::test]
@@ -1245,29 +1310,28 @@ mod tests {
         // agentd 不做本地判重：只要过了下限，内容一模一样也照发。
         // （以前的实现会因「摘要没变」静默跳过；一旦本地算法或状态退化那就是永久漏报。）
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let port = listener.local_addr().expect("addr").port();
         let state_dir = fact_summary_state_dir("unchanged");
         seeded_attempt(&state_dir, now_ts_ms() - FACT_REPORT_MIN_INTERVAL_MS - 1).await;
 
-        let mut config = test_config();
-        config.control_plane.endpoint = Some(endpoint);
+        let mut sink = tcp_sink(port);
         let summary = draft(&["/usr/bin/xcodebuild"]);
 
-        let (reported, ()) =
-            tokio::join!(report_fact_summary(&config, &state_dir, &summary), async {
-                let (mut socket, _) = listener.accept().await.expect("accept");
-                let _ = read_http_request(&mut socket).await;
-                let response =
-                    "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
-                socket.write_all(response.as_bytes()).await.expect("write");
-            });
+        let (reported, frame) = tokio::join!(
+            report_fact(&mut sink, &state_dir, &summary),
+            frame_server(listener)
+        );
         assert!(reported.expect("report ok"));
-        // 第二次立刻再调：刚写过尝试时刻 → 这次才被下限拦住。
-        let second = report_fact_summary(&config, &state_dir, &summary)
+        assert!(frame.expect("server task").contains(" OBSFACT: "));
+        let after_first = loaded_attempt(&state_dir).await;
+
+        // 第二次立刻再调：刚写过尝试时刻 → 这次才被下限拦住，且**不改写**状态
+        // （改写了会把重试窗口往后推，变成“越重试越晚”）。
+        let second = report_fact(&mut sink, &state_dir, &summary)
             .await
             .expect("second report");
         assert!(!second);
-        assert_no_request(&listener).await;
+        assert_eq!(loaded_attempt(&state_dir).await, after_first);
     }
 
     #[tokio::test]
@@ -1278,10 +1342,9 @@ mod tests {
         seeded_attempt(&state_dir, seeded).await;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let mut config = test_config();
-        config.control_plane.endpoint =
-            Some(format!("http://{}", listener.local_addr().expect("addr")));
-        let reported = report_fact_summary(&config, &state_dir, &draft(&["/usr/bin/xcodebuild"]))
+        let port = listener.local_addr().expect("addr").port();
+        let mut sink = tcp_sink(port);
+        let reported = report_fact(&mut sink, &state_dir, &draft(&["/usr/bin/xcodebuild"]))
             .await
             .expect("report");
 
@@ -1291,26 +1354,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fact_summary_records_the_attempt_before_sending() {
-        // 网关回 500：发不出去也要记下这次尝试 —— 否则网关宕机时会每 tick 重试。
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept");
-            let _ = read_http_request(&mut socket).await;
-            let response = "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
-            socket.write_all(response.as_bytes()).await.expect("write");
-        });
-
+    async fn fact_summary_records_the_attempt_even_when_the_send_fails() {
+        // 数据面不在：发不出去也要记下这次尝试 —— 否则服务宕机时会每 tick（3s）重试。
+        // 与旧版“网关回 500”同一个不变式，只是失败形式换成 TCP 连不上。
         let state_dir = fact_summary_state_dir("failed");
-        let mut config = test_config();
-        config.control_plane.endpoint = Some(endpoint);
-        let reported = report_fact_summary(&config, &state_dir, &draft(&["/usr/bin/xcodebuild"]))
-            .await
-            .expect("report");
-        server.await.expect("server task");
-
-        assert!(!reported);
+        let mut sink = tcp_sink(closed_port().await);
+        let result = report_fact(&mut sink, &state_dir, &draft(&["/usr/bin/xcodebuild"])).await;
+        assert!(
+            result.is_err(),
+            "send to a closed port must surface as an error"
+        );
         assert!(loaded_attempt(&state_dir).await > 0);
     }
 
@@ -1318,50 +1371,42 @@ mod tests {
     async fn fact_summary_respects_a_rolled_back_clock() {
         // 状态里的尝试时刻在未来（墙钟回拨 / 状态损坏）→ 放行，不能被节流按死。
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let port = listener.local_addr().expect("addr").port();
         let state_dir = fact_summary_state_dir("rolled-back");
         let future_ms = now_ts_ms() + 10 * FACT_REPORT_MIN_INTERVAL_MS;
         seeded_attempt(&state_dir, future_ms).await;
 
-        let mut config = test_config();
-        config.control_plane.endpoint = Some(endpoint);
+        let mut sink = tcp_sink(port);
         let summary = draft(&["/usr/bin/xcodebuild"]);
 
-        let (reported, ()) =
-            tokio::join!(report_fact_summary(&config, &state_dir, &summary), async {
-                let (mut socket, _) = listener.accept().await.expect("accept");
-                let _ = read_http_request(&mut socket).await;
-                let response =
-                    "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
-                socket.write_all(response.as_bytes()).await.expect("write");
-            });
+        let (reported, frame) = tokio::join!(
+            report_fact(&mut sink, &state_dir, &summary),
+            frame_server(listener)
+        );
         assert!(reported.expect("report ok"));
+        assert!(frame.expect("server task").contains(" OBSFACT: "));
     }
 
     #[tokio::test]
     async fn fact_summary_recovers_from_a_corrupt_state_file() {
         // 状态文件坏掉不能永久停摆：fail-open，照常发送并成功重写状态（自愈）。
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let port = listener.local_addr().expect("addr").port();
         let state_dir = fact_summary_state_dir("corrupt");
         let state_path = fact_report::path_for(&state_dir);
         tokio::fs::write(&state_path, b"{ this is not json")
             .await
             .expect("write corrupt state");
 
-        let mut config = test_config();
-        config.control_plane.endpoint = Some(endpoint);
+        let mut sink = tcp_sink(port);
         let summary = draft(&["/usr/bin/xcodebuild"]);
 
-        let (reported, ()) =
-            tokio::join!(report_fact_summary(&config, &state_dir, &summary), async {
-                let (mut socket, _) = listener.accept().await.expect("accept");
-                let _ = read_http_request(&mut socket).await;
-                let response =
-                    "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
-                socket.write_all(response.as_bytes()).await.expect("write");
-            });
+        let (reported, frame) = tokio::join!(
+            report_fact(&mut sink, &state_dir, &summary),
+            frame_server(listener)
+        );
         assert!(reported.expect("report ok (fail-open)"));
+        assert!(frame.expect("server task").contains(" OBSFACT: "));
 
         assert!(loaded_attempt(&state_dir).await > 0);
     }
@@ -1383,14 +1428,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fact_summary_is_skipped_without_an_enrolled_identity() {
+    async fn fact_summary_is_skipped_without_an_agent_id() {
+        // 信封里的身份是自称的，但它仍然必需：没有 agent_id 就无从表达「这是谁的观测」。
+        // （控制面凭据**不再**是前提 —— 帧走数据面，身份校验尚未落地，见计划 §9 风险行。）
         let state_dir = fact_summary_state_dir("unenrolled");
+        let seq_path = log_seq_state::path_for(&state_dir);
+        let mut next_seq = 0;
         let mut config = test_config();
-        config.control_plane.bearer_token = None;
-        let reported = report_fact_summary(&config, &state_dir, &draft(&["/usr/bin/xcodebuild"]))
-            .await
-            .expect("report");
+        config.agent.agent_id = None;
+        let mut sink = tcp_sink(closed_port().await);
+        let reported = report_fact_summary(
+            &mut sink,
+            &config,
+            &state_dir,
+            &draft(&["/usr/bin/xcodebuild"]),
+            &mut next_seq,
+            &seq_path,
+        )
+        .await
+        .expect("report");
         assert!(!reported);
+        assert!(
+            fact_report::load_async(&fact_report::path_for(&state_dir))
+                .await
+                .expect("load state")
+                .is_none(),
+            "缺少 agent_id 时不应记录尝试"
+        );
     }
 
     // ── 发现方向策略表拉取 ────────────────────────────────────
