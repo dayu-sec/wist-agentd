@@ -238,6 +238,20 @@ wist-agentd version
 - 别用 `systemctl enable --now` 代替 restart（在已 active 的 unit 上是 no-op，会留旧进程跑旧二进制）。
 - 回滚：换回旧二进制 + 重建服务进程；state 是 schema 化 JSON，不丢 checkpoint。
 
+C（开发机：就是用**本机刚编出来的**二进制）：`sysrun/install-local.sh` [--dry-run|--rollback]
+
+```bash
+sysrun/install-local.sh            # 取 target/release → 备份 → 换上 → 重启服务 → 验证
+sysrun/install-local.sh --dry-run  # 只打印将执行的命令
+sysrun/install-local.sh --rollback # 换回最近一次备份
+```
+
+- 把上面 A/B 的手工步骤（构建、备份、换 inode、重启、验证）封成一条命令，并补上 A/B 没做的两步：
+  **换前备份**（回滚不再依赖“手边还留着旧包”）与**换后按 sha256 核对**。
+- 以**普通用户**运行（它自己为需要 root 的步骤提权）：整个脚本以 root 跑会让 `cargo build` 把 `target/` 变成 root 属主。
+- 它不下载、不写配置、不碰注册与凭据 —— 升级前后 enrollment 与 state 不变。
+- 默认 `WIST_AGENTD_SCOPE=system`；`user` 作用域同理（装 `~/bin` + `~/.wist-agentd`）。
+
 ### 3.2 换网关地址 / 重新注册
 
 | 只变了 | 做法 |
