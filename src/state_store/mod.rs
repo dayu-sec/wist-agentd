@@ -7,6 +7,7 @@
 
 pub mod agent_runtime;
 pub mod execution_queue;
+pub mod fact_summary;
 pub mod history;
 pub(crate) mod log_checkpoint_state;
 pub mod log_checkpoints;

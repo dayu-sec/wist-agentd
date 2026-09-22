@@ -12,18 +12,25 @@ orion-error = { version = "0.8", features = ["derive", "serde_json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots"] }
+# 事实摘要的内容摘要用 sha256（幂等键，不能用开发占位哈希）。
+# ring 本来就在依赖图里（rustls 带进来），没有新增构建成本。
+ring = "0.17"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 toml = "1.1"
 tokio = { version = "1.48", features = ["full"] }
-wist-contracts = { version = "0.1"  }
-wist-metrics = { version = "0.1"  }
-wist-shared = { version = "0.1"  }
-wist-validate = { version = "0.1" }
-
-#wist-contracts = { version = "0.1.1", path = "../wist-contracts" }
-#wist-metrics = { version = "0.1.1", path = "../wist-metrics" }
-#wist-shared = { version = "0.1.1", path = "../wist-shared" }
-#wist-validate = { version = "0.1.1", path = "../wist-validate" }
+# NOTE(local-dev): 事实摘要上行要新契约类型，而发布版 wist-contracts 里还没有，
+# 所以把整条链切到本地 path 依赖（仓里原本就留了这几个开关）。
+# 注意：必须**整条链**一起切，否则 wist-metrics / wist-validate 内部仍用 registry 的
+# wist-contracts，会出现两份 wist_contracts，跨边界类型（AgentConfig / StringKeyValue）对不上。
+# 发布新版本后应全部切回 registry。
+wist-contracts = { version = "0.1.1", path = "../wist-contracts" }
+#wist-contracts = { version = "0.1"  }
+wist-metrics = { version = "0.1.1", path = "../wist-metrics" }
+#wist-metrics = { version = "0.1"  }
+wist-shared = { version = "0.1.1", path = "../wist-shared" }
+#wist-shared = { version = "0.1"  }
+wist-validate = { version = "0.1.1", path = "../wist-validate" }
+#wist-validate = { version = "0.1" }
 
 [lib]
 path = "src/lib.rs"

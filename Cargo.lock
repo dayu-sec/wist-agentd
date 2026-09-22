@@ -1988,6 +1988,7 @@ dependencies = [
  "libc",
  "orion-error",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "sysinfo",
@@ -2003,9 +2004,8 @@ dependencies = [
 [[package]]
 name = "wist-contracts"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c4a409c90b530d597946df3b3cc01633d1dca9ca89c167db8656bdbe1662bce"
 dependencies = [
+ "jumo-derive",
  "serde",
  "serde_json",
 ]
@@ -2013,8 +2013,6 @@ dependencies = [
 [[package]]
 name = "wist-metrics"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "771b9c2e5b6e507294b6f9ebdd9efb2840c9c367931ade4bed7b6076a380c975"
 dependencies = [
  "jumo-derive",
  "serde",
@@ -2024,8 +2022,6 @@ dependencies = [
 [[package]]
 name = "wist-shared"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb248ae9e6c57651296666df8bf3205384fe06f1aab7f6b5fd78f4598ed1e821"
 dependencies = [
  "chrono",
  "serde",
@@ -2036,8 +2032,6 @@ dependencies = [
 [[package]]
 name = "wist-validate"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f409426d36933d49410c28f067782b13169430adac0b4e2706c86ceb8cfe5391"
 dependencies = [
  "serde_json",
  "time",
