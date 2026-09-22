@@ -33,8 +33,7 @@ use crate::self_observability::{
     RuntimeHealthSnapshot, emit,
 };
 use crate::state_store::{
-    agent_runtime, execution_queue, fact_summary as fact_summary_state, log_seq_state,
-    planner_candidates,
+    agent_runtime, execution_queue, fact_report, log_seq_state, planner_candidates,
 };
 use crate::telemetry::metrics::target_view;
 
@@ -227,13 +226,14 @@ async fn report_status_to_control_plane(
     }
 }
 
-/// 内容变了才把事实摘要上报控制面（尽力而为，失败只进日志）。
+/// 把事实摘要上报控制面（尽力而为，失败只进日志）。
 ///
-/// 返回 `Ok(true)` = 这次真发出去了；`Ok(false)` = 内容没变、或还在最小间隔内。
+/// 返回 `Ok(true)` = 这次真发出去了；`Ok(false)` = 还在最小间隔内，或缺端点/身份。
 ///
-/// 这里只是**省流量**的本地判定；真正的幂等由网关侧按 `content_digest` 兑底
-/// （重发同一份摘要会被判 `duplicate`，不重算）—— 两边用同一把钥匙，语义一致。
-async fn report_fact_summary_if_changed(
+/// **不做本地判重**：判重归网关（它从收到的内容自己重算摘要，判定 `accepted`/`duplicate`）。
+/// 这里只按最小间隔节流 —— agentd 必须**无条件周期全量**上报，否则本地算法或状态一退化
+/// 就会静默停报，而且没有任何一层能发现。多发一次的代价是流量，停报的代价是视图停滞。
+async fn report_fact_summary(
     config: &AgentConfig,
     state_dir: &Path,
     summary: &fact_summary::FactSummaryDraft,
@@ -248,11 +248,11 @@ async fn report_fact_summary_if_changed(
         return Ok(false);
     };
 
-    let state_path = fact_summary_state::path_for(state_dir);
-    // 缺陷 2：读到坏 JSON 时 fail-open —— 当作「没有历史状态」继续（`None`）。
+    let state_path = fact_report::path_for(state_dir);
+    // 读到坏 JSON 时 fail-open —— 当作「没有历史状态」继续（`None`）。
     // 否则 load 每次都 Err，摘要永远发不出去，且文件也永远不会被重写修复；
     // 成功送达后会重写该文件，自愈。
-    let previous = match fact_summary_state::load_async(&state_path).await {
+    let previous = match fact_report::load_async(&state_path).await {
         Ok(state) => state,
         Err(err) => {
             eprintln!(
@@ -262,13 +262,6 @@ async fn report_fact_summary_if_changed(
             None
         }
     };
-    let digest = fact_summary::content_digest(summary);
-    if previous
-        .as_ref()
-        .is_some_and(|state| state.content_digest == digest)
-    {
-        return Ok(false);
-    }
     let now_ms = now_ts_ms();
     if previous
         .as_ref()
@@ -279,11 +272,14 @@ async fn report_fact_summary_if_changed(
 
     let instance_id = config.agent.instance_name.as_deref().unwrap_or_default();
     let reported_at = now_rfc3339();
+    // 摘要只作**声明**：网关会自己重算一遍并比对，不一致时记告警。
+    // 带它出去的价值是当版本金丝雀 —— 两侧实现同源，所以正常永远一致。
+    let digest = summary.content_digest();
     let report = ReportAgentFactSummary::new_agent_facts(
         format!("fact_{agent_id}_{now_ms}"),
         agent_id.to_string(),
         instance_id.to_string(),
-        digest.clone(),
+        digest,
         summary.revision,
         summary.observed_at.clone(),
         summary.os.clone(),
@@ -292,7 +288,7 @@ async fn report_fact_summary_if_changed(
         summary.process_executables.clone(),
         summary.packages.clone(),
         summary.listen_ports.clone(),
-        reported_at.clone(),
+        reported_at,
     );
     let client = match enrollment_http_client(config) {
         Ok(client) => client,
@@ -303,40 +299,28 @@ async fn report_fact_summary_if_changed(
     };
     let url = format!("{}/api/v1/agent/facts", endpoint.trim_end_matches('/'));
 
-    // 缺陷 1：节流键用「上次尝试」而不是「上次成功」。真正发请求前先落一次盘，
+    // 节流键用「上次尝试」而不是「上次成功」。真正发请求前先落一次盘，
     // 这样即使这次失败，下一个 tick 也在下限内，不会每 3s 重试一次（网关宕机时尤其重要）。
     // 发起前的写入失败只记日志、**不阻止发送** —— 至多退化成不节流，好过不发。
     // 取舍：下限本身 ≥5 分钟，所以最坏只是「每 5 分钟多一次写盘」，完全可接受。
     // 注意：放在客户端构建之后，让「trust bundle 坏」这类不会自愈的配置错每次都能被看见。
-    let mut attempt_state = previous.clone().unwrap_or_default();
-    attempt_state.last_attempt_at_ms = now_ms;
-    if let Err(err) = fact_summary_state::store_async(&state_path, &attempt_state).await {
+    let attempt_state = fact_report::FactReportState {
+        last_attempt_at_ms: now_ms,
+    };
+    if let Err(err) = fact_report::store_async(&state_path, &attempt_state).await {
         eprintln!("wist-agentd fact summary report: failed to record attempt: {err}");
     }
 
     match client
         .post(&url)
-        // 缺陷 4：这条路径在 tick 主循环里，必须自己封顶，不能吃掉 tick。
+        // 这条路径在 tick 主循环里，必须自己封顶，不能吃掉 tick。
         .timeout(FACT_REPORT_TIMEOUT)
         .bearer_auth(bearer_token)
         .json(&report)
         .send()
         .await
     {
-        Ok(response) if response.status().is_success() => {
-            // 只有送达才记摘要 + 报成功时刻：否则下次内容还没变时会被自己拦住，永远补不上。
-            fact_summary_state::store_async(
-                &state_path,
-                &fact_summary_state::FactSummaryDigestState {
-                    content_digest: digest,
-                    reported_at,
-                    reported_at_ms: now_ms,
-                    last_attempt_at_ms: now_ms,
-                },
-            )
-            .await?;
-            Ok(true)
-        }
+        Ok(response) if response.status().is_success() => Ok(true),
         Ok(response) => {
             eprintln!(
                 "wist-agentd fact summary report failed: HTTP {} from {}",
@@ -675,10 +659,10 @@ async fn refresh_discovery_snapshot(
     // 事实摘要上送（尽力而为）。放在这里而不是主循环：快照就在手上，
     // 不必再读一遍 discovery 缓存再解析一次（那份 JSON 有几百个进程）。
     let fact_summary = fact_summary::build_summary(&result.persisted_snapshot);
-    match report_fact_summary_if_changed(config, state_dir, &fact_summary).await {
+    match report_fact_summary(config, state_dir, &fact_summary).await {
         Ok(true) => eprintln!(
             "event=FactSummaryReported digest={} processes={} executables={} ports={}",
-            fact_summary::content_digest(&fact_summary),
+            fact_summary.content_digest(),
             fact_summary.process_count,
             fact_summary.process_executables.len(),
             fact_summary.listen_ports.len()
@@ -999,20 +983,22 @@ mod tests {
         }
     }
 
-    /// 种一份「已有历史状态」。`reported_at_ms` 同时用作 `last_attempt_at_ms`：
-    /// 老测试里两者本来就是同一时刻，节流键改成「上次尝试」后语义保持不变。
-    async fn seeded_state(state_dir: &Path, content_digest: &str, reported_at_ms: i64) {
-        fact_summary_state::store_async(
-            &fact_summary_state::path_for(state_dir),
-            &fact_summary_state::FactSummaryDigestState {
-                content_digest: content_digest.to_string(),
-                reported_at: now_rfc3339(),
-                reported_at_ms,
-                last_attempt_at_ms: reported_at_ms,
-            },
+    /// 种一份「上次尝试在 `last_attempt_at_ms`」的节流状态。
+    async fn seeded_attempt(state_dir: &Path, last_attempt_at_ms: i64) {
+        fact_report::store_async(
+            &fact_report::path_for(state_dir),
+            &fact_report::FactReportState { last_attempt_at_ms },
         )
         .await
         .expect("seed state");
+    }
+
+    async fn loaded_attempt(state_dir: &Path) -> i64 {
+        fact_report::load_async(&fact_report::path_for(state_dir))
+            .await
+            .expect("load state")
+            .expect("state recorded")
+            .last_attempt_at_ms
     }
 
     /// 断言短窗口内没有任何连接进来。loopback 上真发了就会立刻排队，
@@ -1026,7 +1012,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fact_summary_reports_when_the_content_changed() {
+    async fn fact_summary_reports_periodically() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
         let server = tokio::spawn(async move {
@@ -1041,7 +1027,8 @@ mod tests {
             assert!(request.contains("\"agent_id\":\"agent-x\""));
             assert!(request.contains("\"instance_id\":\"instance-x\""));
             assert!(request.contains("\"kind\":\"report_agent_fact_summary\""));
-            assert!(request.contains("\"content_digest\":\"sha256:"));
+            // 声明用的是与网关同源的实现（版本前缀 fact-v1）。
+            assert!(request.contains("\"content_digest\":\"fact-v1:sha256:"));
             assert!(request.contains("\"process_executables\":[\"/usr/bin/xcodebuild\"]"));
             assert!(request.contains("\"process_count\":1"));
             // revision 与 observed_at 只是留痕，但确实要带上。
@@ -1052,77 +1039,73 @@ mod tests {
             socket.write_all(response.as_bytes()).await.expect("write");
         });
 
-        let state_dir = fact_summary_state_dir("changed");
+        let state_dir = fact_summary_state_dir("periodic");
         let mut config = test_config();
         config.control_plane.endpoint = Some(endpoint);
         let summary = draft(&["/usr/bin/xcodebuild"]);
-        let reported = report_fact_summary_if_changed(&config, &state_dir, &summary)
+        let reported = report_fact_summary(&config, &state_dir, &summary)
             .await
             .expect("report");
         server.await.expect("server task");
 
         assert!(reported);
-        let state = fact_summary_state::load_async(&fact_summary_state::path_for(&state_dir))
-            .await
-            .expect("load state")
-            .expect("state recorded");
-        assert_eq!(state.content_digest, fact_summary::content_digest(&summary));
-        assert!(state.reported_at_ms > 0);
-        // 成功送达也记录尝试时刻（同一时刻）。
-        assert_eq!(state.last_attempt_at_ms, state.reported_at_ms);
+        assert!(loaded_attempt(&state_dir).await > 0);
+        assert!(summary.content_digest().starts_with("fact-v1:sha256:"));
     }
 
     #[tokio::test]
-    async fn fact_summary_skips_unchanged_content() {
-        let state_dir = fact_summary_state_dir("unchanged");
-        let summary = draft(&["/usr/bin/xcodebuild"]);
-        seeded_state(
-            &state_dir,
-            &fact_summary::content_digest(&summary),
-            now_ts_ms() - FACT_REPORT_MIN_INTERVAL_MS,
-        )
-        .await;
-
+    async fn fact_summary_reports_even_when_the_content_is_unchanged() {
+        // agentd 不做本地判重：只要过了下限，内容一模一样也照发。
+        // （以前的实现会因「摘要没变」静默跳过；一旦本地算法或状态退化那就是永久漏报。）
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let mut config = test_config();
-        config.control_plane.endpoint =
-            Some(format!("http://{}", listener.local_addr().expect("addr")));
-        let reported = report_fact_summary_if_changed(&config, &state_dir, &summary)
-            .await
-            .expect("report");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let state_dir = fact_summary_state_dir("unchanged");
+        seeded_attempt(&state_dir, now_ts_ms() - FACT_REPORT_MIN_INTERVAL_MS - 1).await;
 
-        assert!(!reported);
+        let mut config = test_config();
+        config.control_plane.endpoint = Some(endpoint);
+        let summary = draft(&["/usr/bin/xcodebuild"]);
+
+        let (reported, ()) =
+            tokio::join!(report_fact_summary(&config, &state_dir, &summary), async {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let _ = read_http_request(&mut socket).await;
+                let response =
+                    "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                socket.write_all(response.as_bytes()).await.expect("write");
+            });
+        assert!(reported.expect("report ok"));
+        // 第二次立刻再调：刚写过尝试时刻 → 这次才被下限拦住。
+        let second = report_fact_summary(&config, &state_dir, &summary)
+            .await
+            .expect("second report");
+        assert!(!second);
         assert_no_request(&listener).await;
     }
 
     #[tokio::test]
     async fn fact_summary_respects_the_minimum_interval() {
-        // 内容确实变了，但刚刚才送过：这次不发，等过了下限再说。
+        // 刚刚才送过：这次不发，且不能改写状态（否则重试窗口会被推后）。
         let state_dir = fact_summary_state_dir("interval");
-        seeded_state(&state_dir, "sha256:previous", now_ts_ms()).await;
+        let seeded = now_ts_ms() - 1_000;
+        seeded_attempt(&state_dir, seeded).await;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let mut config = test_config();
         config.control_plane.endpoint =
             Some(format!("http://{}", listener.local_addr().expect("addr")));
-        let reported =
-            report_fact_summary_if_changed(&config, &state_dir, &draft(&["/usr/bin/xcodebuild"]))
-                .await
-                .expect("report");
+        let reported = report_fact_summary(&config, &state_dir, &draft(&["/usr/bin/xcodebuild"]))
+            .await
+            .expect("report");
 
         assert!(!reported);
         assert_no_request(&listener).await;
-        // 被下限拦下时不能改写状态（否则重试窗口会被推后）。
-        let state = fact_summary_state::load_async(&fact_summary_state::path_for(&state_dir))
-            .await
-            .expect("load state")
-            .expect("state kept");
-        assert_eq!(state.content_digest, "sha256:previous");
+        assert_eq!(loaded_attempt(&state_dir).await, seeded);
     }
 
     #[tokio::test]
-    async fn fact_summary_does_not_record_a_failed_report() {
-        // 网关回 500：不能把摘要记成“已送出”—— 否则内容没再变时会被自己拦住，永远补不上。
+    async fn fact_summary_records_the_attempt_before_sending() {
+        // 网关回 500：发不出去也要记下这次尝试 —— 否则网关宕机时会每 tick 重试。
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
         let server = tokio::spawn(async move {
@@ -1135,53 +1118,37 @@ mod tests {
         let state_dir = fact_summary_state_dir("failed");
         let mut config = test_config();
         config.control_plane.endpoint = Some(endpoint);
-        let reported =
-            report_fact_summary_if_changed(&config, &state_dir, &draft(&["/usr/bin/xcodebuild"]))
-                .await
-                .expect("report");
+        let reported = report_fact_summary(&config, &state_dir, &draft(&["/usr/bin/xcodebuild"]))
+            .await
+            .expect("report");
         server.await.expect("server task");
 
         assert!(!reported);
-        // 失败不能把摘要记成「已送出」—— 否则内容没再变时会被自己拦住，永远补不上。
-        // 但节流键（last_attempt_at_ms）要写：下次 tick 不应立刻重试。
-        let state = fact_summary_state::load_async(&fact_summary_state::path_for(&state_dir))
-            .await
-            .expect("load state")
-            .expect("attempt recorded");
-        assert_ne!(
-            state.content_digest,
-            fact_summary::content_digest(&draft(&["/usr/bin/xcodebuild"]))
-        );
-        assert!(state.last_attempt_at_ms > 0);
+        assert!(loaded_attempt(&state_dir).await > 0);
     }
 
     #[tokio::test]
-    async fn fact_summary_throttles_a_failing_gateway() {
-        // 网关回 500：第一次尝试（Ok(false)）；紧接着再调一次，内容仍不同
-        // （上次没成功、摘要没记），但尝试时刻刚写过 → 必须被节流拦住，不发第二个请求。
+    async fn fact_summary_respects_a_rolled_back_clock() {
+        // 状态里的尝试时刻在未来（墙钟回拨 / 状态损坏）→ 放行，不能被节流按死。
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
-        let state_dir = fact_summary_state_dir("throttle-failing");
+        let state_dir = fact_summary_state_dir("rolled-back");
+        let future_ms = now_ts_ms() + 10 * FACT_REPORT_MIN_INTERVAL_MS;
+        seeded_attempt(&state_dir, future_ms).await;
+
         let mut config = test_config();
         config.control_plane.endpoint = Some(endpoint);
         let summary = draft(&["/usr/bin/xcodebuild"]);
 
-        let (first, ()) = tokio::join!(
-            report_fact_summary_if_changed(&config, &state_dir, &summary),
-            async {
+        let (reported, ()) =
+            tokio::join!(report_fact_summary(&config, &state_dir, &summary), async {
                 let (mut socket, _) = listener.accept().await.expect("accept");
                 let _ = read_http_request(&mut socket).await;
-                let response = "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                let response =
+                    "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
                 socket.write_all(response.as_bytes()).await.expect("write");
-            }
-        );
-        assert!(!first.expect("first report"));
-
-        let second = report_fact_summary_if_changed(&config, &state_dir, &summary)
-            .await
-            .expect("second report");
-        assert!(!second);
-        assert_no_request(&listener).await;
+            });
+        assert!(reported.expect("report ok"));
     }
 
     #[tokio::test]
@@ -1190,7 +1157,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
         let state_dir = fact_summary_state_dir("corrupt");
-        let state_path = fact_summary_state::path_for(&state_dir);
+        let state_path = fact_report::path_for(&state_dir);
         tokio::fs::write(&state_path, b"{ this is not json")
             .await
             .expect("write corrupt state");
@@ -1199,49 +1166,33 @@ mod tests {
         config.control_plane.endpoint = Some(endpoint);
         let summary = draft(&["/usr/bin/xcodebuild"]);
 
-        let (reported, ()) = tokio::join!(
-            report_fact_summary_if_changed(&config, &state_dir, &summary),
-            async {
+        let (reported, ()) =
+            tokio::join!(report_fact_summary(&config, &state_dir, &summary), async {
                 let (mut socket, _) = listener.accept().await.expect("accept");
                 let _ = read_http_request(&mut socket).await;
                 let response =
                     "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
                 socket.write_all(response.as_bytes()).await.expect("write");
-            }
-        );
+            });
         assert!(reported.expect("report ok (fail-open)"));
 
-        let state = fact_summary_state::load_async(&state_path)
-            .await
-            .expect("load state")
-            .expect("state rewritten");
-        assert_eq!(state.content_digest, fact_summary::content_digest(&summary));
+        assert!(loaded_attempt(&state_dir).await > 0);
     }
 
     #[tokio::test]
-    async fn fact_summary_sends_despite_a_rolled_back_clock() {
-        // 状态里的尝试时刻在未来（墙钟回拨 / 状态损坏）→ 放行，不能被节流按死。
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
-        let state_dir = fact_summary_state_dir("rolled-back");
-        let future_ms = now_ts_ms() + 10 * FACT_REPORT_MIN_INTERVAL_MS;
-        seeded_state(&state_dir, "sha256:previous", future_ms).await;
+    async fn fact_summary_state_ignores_superseded_fields() {
+        // 老版本的状态文件带 content_digest / reported_at；反序列化必须兼容（不报错），
+        // 因为读到坏 JSON 会 fail-open，但那会把下限让出去、每次 tick 都发。
+        let state_dir = fact_summary_state_dir("legacy-fields");
+        let state_path = fact_report::path_for(&state_dir);
+        tokio::fs::write(
+            &state_path,
+            br#"{"content_digest":"sha256:old","reported_at":"2026-09-01T00:00:00Z","reported_at_ms":1000,"last_attempt_at_ms":1234}"#,
+        )
+        .await
+        .expect("write legacy state");
 
-        let mut config = test_config();
-        config.control_plane.endpoint = Some(endpoint);
-        let summary = draft(&["/usr/bin/xcodebuild"]);
-
-        let (reported, ()) = tokio::join!(
-            report_fact_summary_if_changed(&config, &state_dir, &summary),
-            async {
-                let (mut socket, _) = listener.accept().await.expect("accept");
-                let _ = read_http_request(&mut socket).await;
-                let response =
-                    "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
-                socket.write_all(response.as_bytes()).await.expect("write");
-            }
-        );
-        assert!(reported.expect("report ok"));
+        assert_eq!(loaded_attempt(&state_dir).await, 1234);
     }
 
     #[tokio::test]
@@ -1249,10 +1200,9 @@ mod tests {
         let state_dir = fact_summary_state_dir("unenrolled");
         let mut config = test_config();
         config.control_plane.bearer_token = None;
-        let reported =
-            report_fact_summary_if_changed(&config, &state_dir, &draft(&["/usr/bin/xcodebuild"]))
-                .await
-                .expect("report");
+        let reported = report_fact_summary(&config, &state_dir, &draft(&["/usr/bin/xcodebuild"]))
+            .await
+            .expect("report");
         assert!(!reported);
     }
 

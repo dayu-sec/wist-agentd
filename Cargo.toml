@@ -12,9 +12,8 @@ orion-error = { version = "0.8", features = ["derive", "serde_json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots"] }
-# 事实摘要的内容摘要用 sha256（幂等键，不能用开发占位哈希）。
-# ring 本来就在依赖图里（rustls 带进来），没有新增构建成本。
-ring = "0.17"
+# 事实摘要的内容摘要（`fact-v1:sha256:…`）现在只有一份实现，在 `wist-contracts::fact_summary`
+# （sha2）。agentd 只转接，所以这里不再直依赖 ring。
 time = { version = "0.3", features = ["formatting", "parsing"] }
 toml = "1.1"
 tokio = { version = "1.48", features = ["full"] }

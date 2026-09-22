@@ -3,13 +3,15 @@
 //! 为什么压缩放在 agentd：压缩是**机械操作**（去重 + 只留推断要用的字段），
 //! 不需要知道规则表，所以策展知识不必下放。原文快照照旧走数据面给中心做资产整理。
 //!
-//! 幂等键是内容摘要，不是 discovery 的 revision（后者每轮 refresh 无条件 +1）。
+//! 为什么 agentd 不拿内容摘要做判重：那会让 agent 侧算法一退化（比如退化成常量）
+//! 就永远不再上报。agentd **无条件周期全量**上送（只按最小间隔节流），
+//! 判重归网关 —— 网关从收到的内容自己重算摘要，agent 声明坏了也不影响入库。
 
 use std::collections::BTreeSet;
 
-use ring::digest;
 use serde::{Deserialize, Serialize};
 use wist_contracts::discovery::{DiscoveredResource, DiscoverySnapshot};
+use wist_contracts::fact_summary::FactContent;
 
 /// `DiscoveredResource::kind`：进程（与 `ProcessDiscoveryProbe` 写入的值一致）。
 const PROCESS_KIND: &str = "process";
@@ -41,18 +43,28 @@ pub struct FactSummaryDraft {
     pub listen_ports: Vec<String>,
 }
 
-/// 内容摘要的规范化视图。
-///
-/// **刻意不含** `revision` / `observed_at` / `process_count`：
-/// 前两者每轮 refresh 都变，后者随无关进程生灭一直动 —— 放进摘要等于每轮都变，
-/// 幂等就失效了。摘要表达的是「内容」，不是「哪一次采的」。
-#[derive(Serialize)]
-struct DigestView<'a> {
-    os: &'a str,
-    arch: &'a str,
-    process_executables: &'a [String],
-    packages: &'a [String],
-    listen_ports: &'a [String],
+impl FactSummaryDraft {
+    /// 取内容视图（摘要的输入）。
+    pub fn content(&self) -> FactContent {
+        FactContent::new(
+            self.os.clone(),
+            self.arch.clone(),
+            self.process_executables.clone(),
+            self.packages.clone(),
+            self.listen_ports.clone(),
+        )
+    }
+
+    /// 内容摘要（`fact-v1:sha256:<hex>`）。
+    ///
+    /// 实现只有一份 —— 在 `wist_contracts::fact_summary`，与网关共用。
+    /// 这里只做转接：两侧各写一份规范化的话，一边改了另一边不知道，
+    /// 就会出现「一边认为变了、另一边永远认为没变」的静默漏报。
+    ///
+    /// 注意：这个值在 wire 上只是**声明**。真正的判重在网关（它自己重算一遍）。
+    pub fn content_digest(&self) -> String {
+        self.content().content_digest()
+    }
 }
 
 /// 从发现快照压出摘要。
@@ -101,47 +113,6 @@ fn attribute<'a>(resource: &'a DiscoveredResource, key: &str) -> Option<&'a str>
         .get(key)
         .map(String::as_str)
         .filter(|value| !value.is_empty())
-}
-
-/// 内容摘要（`sha256:<hex>`）。
-///
-/// 为什么用 sha256 而不是仓库里那个 `fnv64` 开发占位（`wist_shared::integrity`）：
-/// 它是**变更检测的幂等键**，一旦碰撞就会静默跳过上报、摘要停在旧内容上，
-/// 这不是该放开发占位的地方。`ring` 本来就在依赖图里（rustls 带进来），无新增构建成本。
-pub fn content_digest(summary: &FactSummaryDraft) -> String {
-    // 归一化放在**这个函数内部**，而不是只靠 `build_summary` 的 `BTreeSet`：
-    // 不变式要由主张它的函数来守 —— 否则谁传一份手工构造/从缓存来的 draft（顺序或重复项不同），
-    // 幂等键就静默失真（多发一次，不会丢数据，但“内容没变就不发”就不再成立）。
-    let process_executables = normalized(&summary.process_executables);
-    let packages = normalized(&summary.packages);
-    let listen_ports = normalized(&summary.listen_ports);
-    let view = DigestView {
-        os: &summary.os,
-        arch: &summary.arch,
-        process_executables: &process_executables,
-        packages: &packages,
-        listen_ports: &listen_ports,
-    };
-    // 对 `&str` / `&[String]` 序列化不可能失败；这里不用 `unwrap_or_default()`：
-    // 那会把“序列化失败”变成“空输入的常量摘要”，等于“内容永远没变”，上送会永久停摆。
-    let bytes = serde_json::to_vec(&view).expect("digest view serialization is infallible");
-    let hash = digest::digest(&digest::SHA256, &bytes);
-    let hex: String = hash
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    format!("sha256:{hex}")
-}
-
-/// 去重 + 定序。
-fn normalized(values: &[String]) -> Vec<String> {
-    values
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<String>>()
-        .into_iter()
-        .collect()
 }
 
 #[cfg(test)]
@@ -239,7 +210,7 @@ mod tests {
         reordered.observed_at = "2030-01-01T00:00:00Z".to_string();
         reordered.process_count = 1;
 
-        assert_eq!(content_digest(&base), content_digest(&reordered));
+        assert_eq!(base.content_digest(), reordered.content_digest());
     }
 
     #[test]
@@ -247,26 +218,43 @@ mod tests {
         let base = build_summary(&snapshot(vec![process("a")]));
         let more = build_summary(&snapshot(vec![process("a"), process("b")]));
 
-        assert_ne!(content_digest(&base), content_digest(&more));
-        assert!(content_digest(&base).starts_with("sha256:"));
-        assert_eq!(content_digest(&base).len(), "sha256:".len() + 64);
+        assert_ne!(base.content_digest(), more.content_digest());
+        // 版本前缀是契约的一部分：网关用同一实现重算，两侧算法/字段集必须对齐。
+        let digest = base.content_digest();
+        assert!(digest.starts_with("fact-v1:sha256:"), "{digest}");
+        assert_eq!(digest.len(), "fact-v1:sha256:".len() + 64);
+    }
+
+    #[test]
+    fn digest_matches_the_shared_contract_implementation() {
+        // 证明 agentd 报的声明就是网关重算的那把钥匙 —— 两边都调 FactContent。
+        let summary = build_summary(&snapshot(vec![process("a"), process("b")]));
+        let expected = FactContent::new(
+            summary.os.clone(),
+            summary.arch.clone(),
+            summary.process_executables.clone(),
+            summary.packages.clone(),
+            summary.listen_ports.clone(),
+        )
+        .content_digest();
+        assert_eq!(summary.content_digest(), expected);
     }
 
     #[test]
     fn digest_normalizes_order_and_duplicates_within_itself() {
-        // 不变式由 content_digest 自己守：手工构造的 draft（乱序/含重复）也必须算出同一摘要。
+        // 不变式由共享实现自己守：手工构造的 draft（乱序/含重复）也必须算出同一摘要。
         let mut base = build_summary(&snapshot(vec![process("a"), process("b")]));
-        let canonical = content_digest(&base);
+        let canonical = base.content_digest();
 
         base.process_executables = vec!["b".to_string(), "a".to_string(), "a".to_string()];
-        assert_eq!(content_digest(&base), canonical);
+        assert_eq!(base.content_digest(), canonical);
 
         base.listen_ports = vec!["6379".to_string(), "5432".to_string(), "5432".to_string()];
-        let with_ports = content_digest(&base);
+        let with_ports = base.content_digest();
         assert_ne!(with_ports, canonical);
 
         base.listen_ports = vec!["5432".to_string(), "6379".to_string()];
-        assert_eq!(content_digest(&base), with_ports);
+        assert_eq!(base.content_digest(), with_ports);
     }
 
     #[test]
