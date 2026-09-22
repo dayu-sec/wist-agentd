@@ -17,6 +17,10 @@ use wist_contracts::fact_summary::FactContent;
 const PROCESS_KIND: &str = "process";
 /// `DiscoveredResource::kind`：监听端点（与 `EndpointDiscoveryProbe` 写入的值一致）。
 const ENDPOINT_KIND: &str = "service_endpoint";
+/// `DiscoveredResource::kind`：主机（与 `HostDiscoveryProbe` 写入的值一致）。
+const HOST_KIND: &str = "host";
+/// `DiscoveredResource::kind`：网卡地址（与 `NetworkDiscoveryProbe` 写入的值一致）。
+const IP_ADDRESS_KIND: &str = "ip_address";
 
 /// 进程可执行标识的属性名。
 ///
@@ -26,6 +30,13 @@ const ENDPOINT_KIND: &str = "service_endpoint";
 const PROCESS_EXECUTABLE: &str = "process.executable.name";
 /// 监听端口的属性名。
 const ENDPOINT_PORT: &str = "endpoint.bind.port";
+/// 主机标识 / 主机名的属性名（`host` 方向）。
+const HOST_ID: &str = "host.id";
+const HOST_NAME: &str = "host.name";
+/// 网卡地址的属性名（`ip_address` 方向）。cidr 比裸地址更能说明「在哪个网段」。
+const ADDR_IFACE: &str = "net.if.name";
+const ADDR_CIDR: &str = "net.if.cidr";
+const ADDR_IP: &str = "net.if.addr";
 
 /// 可上报的事实摘要（对应模型 `Control.AgentFactSummary` 的可上报部分）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +52,15 @@ pub struct FactSummaryDraft {
     pub process_executables: Vec<String>,
     pub packages: Vec<String>,
     pub listen_ports: Vec<String>,
+    // ── 以下三项是**留痕/展示**：不进内容摘要（见 `FactContent`）。──
+    // 机器名/IP 会因改名、换网而变，但它们不影响「这台机器是干什么用的」；
+    // 放进摘要会让每次换网就触发一次重报与重算。
+    /// 主机标识（`host.id`）。
+    pub host_id: String,
+    /// 主机名（`host.name`）。
+    pub host_name: String,
+    /// 网卡地址（每块网卡一条，形如 `en0 192.168.1.5/24`）。
+    pub network_addresses: Vec<String>,
 }
 
 impl FactSummaryDraft {
@@ -74,7 +94,10 @@ impl FactSummaryDraft {
 pub fn build_summary(snapshot: &DiscoverySnapshot) -> FactSummaryDraft {
     let mut executables = BTreeSet::new();
     let mut ports = BTreeSet::new();
+    let mut addresses = BTreeSet::new();
     let mut process_count: i64 = 0;
+    let mut host_id = String::new();
+    let mut host_name = String::new();
 
     for resource in &snapshot.resources {
         match resource.kind.as_str() {
@@ -88,6 +111,27 @@ pub fn build_summary(snapshot: &DiscoverySnapshot) -> FactSummaryDraft {
                 if let Some(value) = attribute(resource, ENDPOINT_PORT) {
                     ports.insert(value.to_string());
                 }
+            }
+            HOST_KIND => {
+                if let Some(value) = attribute(resource, HOST_ID) {
+                    host_id = value.to_string();
+                }
+                if let Some(value) = attribute(resource, HOST_NAME) {
+                    host_name = value.to_string();
+                }
+            }
+            IP_ADDRESS_KIND => {
+                // cidr 优先：它同时说明地址与网段；没有就退回裸地址。
+                let Some(address) =
+                    attribute(resource, ADDR_CIDR).or_else(|| attribute(resource, ADDR_IP))
+                else {
+                    continue;
+                };
+                // 带上网卡名，否则多块网卡时一堆地址分不清谁是谁。
+                addresses.insert(match attribute(resource, ADDR_IFACE) {
+                    Some(iface) => format!("{iface} {address}"),
+                    None => address.to_string(),
+                });
             }
             _ => {}
         }
@@ -104,6 +148,9 @@ pub fn build_summary(snapshot: &DiscoverySnapshot) -> FactSummaryDraft {
         // 别让「没采」看起来像「没装」。
         packages: Vec::new(),
         listen_ports: ports.into_iter().collect(),
+        host_id,
+        host_name,
+        network_addresses: addresses.into_iter().collect(),
     }
 }
 
@@ -209,6 +256,8 @@ mod tests {
         reordered.revision = 999;
         reordered.observed_at = "2030-01-01T00:00:00Z".to_string();
         reordered.process_count = 1;
+        reordered.host_id = "other".to_string();
+        reordered.network_addresses = vec!["en0 10.0.0.1/24".to_string()];
 
         assert_eq!(base.content_digest(), reordered.content_digest());
     }
@@ -255,6 +304,49 @@ mod tests {
 
         base.listen_ports = vec!["5432".to_string(), "6379".to_string()];
         assert_eq!(base.content_digest(), with_ports);
+    }
+
+    #[test]
+    fn collects_host_identity_and_network_addresses_for_display() {
+        // 这三项只用于展示（页面上“这台机器是谁、在哪”），不进内容摘要。
+        let summary = build_summary(&snapshot(vec![
+            resource("host", &[("host.id", "mid-1"), ("host.name", "demo")]),
+            resource(
+                IP_ADDRESS_KIND,
+                &[
+                    (ADDR_IFACE, "en0"),
+                    (ADDR_CIDR, "192.168.1.5/24"),
+                    (ADDR_IP, "192.168.1.5"),
+                ],
+            ),
+            // 同一块网卡多条地址：都收，按串去重定序。
+            resource(
+                IP_ADDRESS_KIND,
+                &[(ADDR_IFACE, "en0"), (ADDR_CIDR, "192.168.1.5/24")],
+            ),
+            // 没有 cidr 时退回裸地址，且没有网卡名也能用。
+            resource(IP_ADDRESS_KIND, &[(ADDR_IP, "10.8.0.2")]),
+        ]));
+
+        assert_eq!(summary.host_id, "mid-1");
+        assert_eq!(summary.host_name, "demo");
+        assert_eq!(
+            summary.network_addresses,
+            vec!["10.8.0.2", "en0 192.168.1.5/24"]
+        );
+    }
+
+    #[test]
+    fn host_and_network_changes_do_not_change_the_content_digest() {
+        // 关键不变式：改机器名、换网络（DHCP）不该触发重报与重算 ——
+        // 摘要回答的是“这台机器是干什么用的”，不是“它叫什么、在哪”。
+        let base = build_summary(&snapshot(vec![process("a")]));
+        let mut renamed = build_summary(&snapshot(vec![process("a")]));
+        renamed.host_id = "another-mid".to_string();
+        renamed.host_name = "another-name".to_string();
+        renamed.network_addresses = vec!["en1 10.0.0.9/24".to_string()];
+
+        assert_eq!(base.content_digest(), renamed.content_digest());
     }
 
     #[test]

@@ -313,6 +313,12 @@ async fn report_fact_summary(
         summary.packages.clone(),
         summary.listen_ports.clone(),
         reported_at,
+    )
+    // 主机标识与网卡地址：**留痕/展示**，不进内容摘要（见 `ReportAgentFactSummary` 的注释）。
+    .with_display(
+        summary.host_id.clone(),
+        summary.host_name.clone(),
+        summary.network_addresses.clone(),
     );
     let client = match enrollment_http_client(config) {
         Ok(client) => client,
@@ -1154,6 +1160,9 @@ mod tests {
             process_executables: executables.iter().map(|value| value.to_string()).collect(),
             packages: Vec::new(),
             listen_ports: Vec::new(),
+            host_id: "machine-id".to_string(),
+            host_name: "demo-host".to_string(),
+            network_addresses: vec!["en0 192.168.1.5/24".to_string()],
         }
     }
 
@@ -1205,6 +1214,10 @@ mod tests {
             assert!(request.contains("\"content_digest\":\"fact-v1:sha256:"));
             assert!(request.contains("\"process_executables\":[\"/usr/bin/xcodebuild\"]"));
             assert!(request.contains("\"process_count\":1"));
+            // 主机标识与网卡地址随摘要一起上去（留痕/展示，不进内容摘要）。
+            assert!(request.contains("\"host_id\":\"machine-id\""));
+            assert!(request.contains("\"host_name\":\"demo-host\""));
+            assert!(request.contains("\"network_addresses\":[\"en0 192.168.1.5/24\"]"));
             // revision 与 observed_at 只是留痕，但确实要带上。
             assert!(request.contains("\"revision\":7"));
             assert!(request.contains("\"observed_at\":\"2026-09-22T00:00:00Z\""));
