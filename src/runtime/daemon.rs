@@ -191,11 +191,16 @@ fn cpu_percent_since(previous: &CpuSample, now: Instant, ticks_per_sec: u64) -> 
 
 /// Best-effort status heartbeat to the admin control plane. Returns the measured
 /// round-trip latency in milliseconds when the report succeeded.
+///
+/// `discovery_policy_version` 是**本机实际生效**的发现方向策略版本：
+/// 网关知道自己发布了哪一版，但不知道哪台机器拉到了、应用了 ——
+/// 而「我改了策略，哪些机器还没生效」只能由 agent 回答。
 async fn report_status_to_control_plane(
     config: &AgentConfig,
     cpu_percent: Option<f64>,
     last_latency_ms: Option<u64>,
     work_state_changes: Option<Vec<AgentWorkStateChange>>,
+    discovery_policy_version: Option<i64>,
 ) -> Option<u64> {
     let endpoint = config.control_plane.endpoint.as_deref()?;
     let bearer_token = config.control_plane.bearer_token.as_deref()?;
@@ -209,6 +214,7 @@ async fn report_status_to_control_plane(
         cpu_percent,
         admin_latency_ms: last_latency_ms,
         work_state_changes,
+        discovery_policy_version,
     };
     let client = match enrollment_http_client(config) {
         Ok(client) => client,
@@ -531,6 +537,8 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                 cpu_percent,
                 last_latency_ms,
                 changes,
+                // 还没拿到策略表时为 None（网关据此区分「在用内建默认周期」）。
+                discovery_runtime.policy_version(),
             )
             .await
             {
@@ -701,9 +709,16 @@ async fn refresh_discovery_policy(config: &AgentConfig, runtime: &mut DiscoveryR
         // 版本没变就不吭声：策略是慢变量，每 5 分钟都会重新拉到同一版，
         // 每次都打日志就是每 5 分钟一行噪声。
         if runtime.apply_discovery_policy(set) {
+            // 夹取/弃用过的周期一并带出来：这不是错误，但静默夹取会把
+            // 「网关发布了一份坏表」伪装成一切正常。
+            let adjustments = runtime.policy_adjustments_summary();
+            let adjustments = if adjustments.is_empty() {
+                String::new()
+            } else {
+                format!(" adjustments=[{adjustments}]")
+            };
             eprintln!(
-                "event=DiscoveryPolicyApplied policy_version={} aspects={}",
-                policy_version, aspects
+                "event=DiscoveryPolicyApplied policy_version={policy_version} aspects={aspects}{adjustments}"
             );
         }
     }
@@ -1077,6 +1092,8 @@ mod tests {
             assert!(request.contains("\"cpu_percent\":"));
             assert!(request.contains("\"admin_latency_ms\":"));
             assert!(request.contains("\"work_state_changes\":null"));
+            // 本机实际生效的策略版本随状态上报一起上去（`null` = 还没拉到策略表）。
+            assert!(request.contains("\"discovery_policy_version\":7"));
             let response =
                 "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
             socket.write_all(response.as_bytes()).await.expect("write");
@@ -1084,7 +1101,33 @@ mod tests {
 
         let mut config = test_config();
         config.control_plane.endpoint = Some(endpoint);
-        let latency = report_status_to_control_plane(&config, Some(12.5), Some(3), None).await;
+        let latency =
+            report_status_to_control_plane(&config, Some(12.5), Some(3), None, Some(7)).await;
+        server.await.expect("server task");
+        assert!(latency.is_some());
+    }
+
+    #[tokio::test]
+    async fn report_status_sends_a_null_policy_version_before_any_policy_arrives() {
+        // 没拿到策略表时必须显式送 null，而不是省略字段更不能送 0：
+        // 网关那边 0 是「确实生效了第 0 版」，混同会让「谁还没生效」看错。
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let request = read_http_request(&mut socket).await;
+            assert!(
+                request.contains("\"discovery_policy_version\":null"),
+                "{request}"
+            );
+            let response =
+                "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let mut config = test_config();
+        config.control_plane.endpoint = Some(endpoint);
+        let latency = report_status_to_control_plane(&config, None, None, None, None).await;
         server.await.expect("server task");
         assert!(latency.is_some());
     }
@@ -1453,7 +1496,8 @@ mod tests {
             reason: "spool over limit".to_string(),
             at: "now".to_string(),
         }]);
-        let latency = report_status_to_control_plane(&config, Some(12.5), Some(3), changes).await;
+        let latency =
+            report_status_to_control_plane(&config, Some(12.5), Some(3), changes, None).await;
         server.await.expect("server task");
         assert!(latency.is_some());
     }
@@ -1462,7 +1506,7 @@ mod tests {
     async fn report_status_skips_when_not_enrolled() {
         let mut config = test_config();
         config.control_plane.bearer_token = None;
-        let latency = report_status_to_control_plane(&config, None, None, None).await;
+        let latency = report_status_to_control_plane(&config, None, None, None, None).await;
         assert!(latency.is_none());
     }
 

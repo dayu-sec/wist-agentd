@@ -73,6 +73,17 @@ impl DiscoveryRuntime {
         self.policy.as_ref().map(|policy| policy.policy_version())
     }
 
+    /// 已应用策略里被**夹取/弃用**的周期摘要；没有调整时为空串。
+    ///
+    /// 夹取本身是对的（宁可采慢一点，也不能让被管机器被打满），但**静默**夹取会把
+    /// 「网关发布了坏表」伪装成一切正常 —— 所以调用方在应用那一轮把它打进日志。
+    pub fn policy_adjustments_summary(&self) -> String {
+        self.policy
+            .as_ref()
+            .map(|policy| policy.adjustments_summary())
+            .unwrap_or_default()
+    }
+
     /// 是否到了该拉取策略表的时刻：从未拉过 → 到期（**启动即拉**），否则看过没过最小间隔。
     ///
     /// 用 `Instant`（单调）而不是墙钟：回拨不会把节流窗口算歪。
