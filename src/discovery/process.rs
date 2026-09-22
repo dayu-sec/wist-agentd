@@ -30,7 +30,10 @@ impl DiscoveryProbe for ProcessDiscoveryProbe {
     }
 
     fn refresh_interval(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(30)
+        // 值取自模型 DiscoveryAspectPolicy.default_interval_seconds（模型是唯一来源）。
+        // 注：目前还是**字面量**，尚未由已发布的策略表下发；改周期先改模型再改这里。
+
+        std::time::Duration::from_secs(300)
     }
 
     fn refresh(&self, _now: std::time::SystemTime) -> Result<ProbeOutput, DiscoveryError> {

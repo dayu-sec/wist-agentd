@@ -403,6 +403,8 @@ pub struct DaemonLoop<'a> {
 }
 
 pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
+    // 运行时**跨 tick 活着**：观测频率的调度记忆就在它里面（内存态，不落盘）。
+    let mut discovery_runtime = DiscoveryRuntime::new(discovery_probes(loop_ctx.config));
     let mut previous_telemetry_failures = BTreeSet::new();
     let mut previous_metrics_failures = BTreeSet::new();
     let mut previous_telemetry_paused = BTreeSet::new();
@@ -419,6 +421,7 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
             Some(&mut previous_telemetry_failures),
             Some(&mut previous_metrics_failures),
             Some(&mut previous_telemetry_paused),
+            &mut discovery_runtime,
         )
         .await?;
         pending_work_state_changes.extend(changes);
@@ -454,7 +457,9 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
 }
 
 pub async fn run_once_async(loop_ctx: &DaemonLoop<'_>) -> RuntimeResult<RuntimeHealthSnapshot> {
-    run_once_with_failure_cache(loop_ctx, None, None, None)
+    // 一次性路径：运行时只活这一次，所以每个探针都是“没过” → 全量刷新（与旧语义一致）。
+    let mut discovery_runtime = DiscoveryRuntime::new(discovery_probes(loop_ctx.config));
+    run_once_with_failure_cache(loop_ctx, None, None, None, &mut discovery_runtime)
         .await
         .map(|(snapshot, _)| snapshot)
 }
@@ -464,6 +469,7 @@ async fn run_once_with_failure_cache(
     previous_telemetry_failures: Option<&mut BTreeSet<String>>,
     previous_metrics_failures: Option<&mut BTreeSet<String>>,
     previous_telemetry_paused: Option<&mut BTreeSet<String>>,
+    discovery_runtime: &mut DiscoveryRuntime,
 ) -> RuntimeResult<(RuntimeHealthSnapshot, Vec<TelemetryWorkState>)> {
     let run_dir = Path::new(&loop_ctx.config.paths.run_dir);
     let state_dir = Path::new(&loop_ctx.config.paths.state_dir);
@@ -474,7 +480,7 @@ async fn run_once_with_failure_cache(
         .agent_id
         .as_deref()
         .unwrap_or("unknown");
-    let discovery = refresh_discovery_snapshot(loop_ctx.config, state_dir).await;
+    let discovery = refresh_discovery_snapshot(loop_ctx.config, state_dir, discovery_runtime).await;
     let metrics_tick = process_metrics_tick(state_dir);
     emit_metrics_tick(&metrics_tick);
     if let Some(previous) = previous_metrics_failures {
@@ -588,11 +594,19 @@ struct DiscoveryHealth {
     snapshot: DiscoveryHealthSnapshot,
 }
 
-async fn refresh_discovery_snapshot(config: &AgentConfig, state_dir: &Path) -> DiscoveryHealth {
-    let mut runtime = DiscoveryRuntime::new(discovery_probes(config));
+async fn refresh_discovery_snapshot(
+    config: &AgentConfig,
+    state_dir: &Path,
+    runtime: &mut DiscoveryRuntime,
+) -> DiscoveryHealth {
     let (cached, cache_load_failure) = runtime.load_from_state_dir_async(state_dir).await;
     let (cached_meta, meta_load_failure) = runtime.load_meta_from_state_dir_async(state_dir).await;
-    let mut result = runtime.refresh_and_store_async(state_dir).await;
+    // 按各探针的 `refresh_interval()` 调度：只刷到期的，未到期的沿用上次输出。
+    // 这是“基础观测频率”真的生效的地方 —— 在此之前各探针声明的周期是死代码，
+    // 运行时每 tick（3s）把所有探针全刷一遍（含 906 个进程的枚举）。
+    let mut result = runtime
+        .refresh_due_and_store_async(state_dir, Instant::now())
+        .await;
     let candidates = planner_bridge::build_collection_candidates(&result.persisted_snapshot);
     let host_candidates: Vec<_> = candidates
         .iter()

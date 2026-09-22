@@ -1,12 +1,16 @@
 //! Discovery runtime orchestration skeleton.
 
 use std::path::Path;
+use std::time::Instant;
 
-use wist_contracts::discovery::{DiscoveryCacheMeta, DiscoverySnapshot};
+use wist_contracts::discovery::{
+    DiscoveredResource, DiscoveredTarget, DiscoveryCacheMeta, DiscoveryOrigin, DiscoverySnapshot,
+};
 use wist_shared::time::now_rfc3339;
 
 use super::DiscoveryError;
 use super::DiscoveryProbe;
+use super::ProbeOutput;
 use super::cache::{
     DiscoveryCacheLoadFailure, DiscoveryCachePaths, load_meta, load_meta_async, load_snapshot,
     load_snapshot_async, store_snapshot, store_snapshot_async,
@@ -17,13 +21,25 @@ use super::cache::{
 pub struct DiscoveryRuntime {
     probes: Vec<Box<dyn DiscoveryProbe + Send + Sync>>,
     latest_snapshot: Option<DiscoverySnapshot>,
+    // 每探针的**上次成功输出**与**上次尝试时刻**（内存态）。
+    //
+    // 为什么放内存而不落盘：调度只需“跨 tick”的记忆，重启后全量刷一次本来就是对的
+    // （也顺带把重启当成一次按需全量）。落盘会多一个会损坏的状态。
+    //
+    // 为什么必须缓存上次输出：未到期的探针不能“什么都不交” —— 快照是从各探针输出**重新拼**出来的，
+    // 少了谁就等于把它的资源从快照里删掉（进程/端口会凭空消失）。
+    last_outputs: Vec<Option<ProbeOutput>>,
+    last_run_at: Vec<Option<Instant>>,
 }
 
 impl DiscoveryRuntime {
     pub fn new(probes: Vec<Box<dyn DiscoveryProbe + Send + Sync>>) -> Self {
+        let output_slots = probes.len();
         Self {
             probes,
             latest_snapshot: None,
+            last_outputs: vec![None; output_slots],
+            last_run_at: vec![None; output_slots],
         }
     }
 
@@ -101,6 +117,29 @@ impl DiscoveryRuntime {
         result
     }
 
+    /// 按各探针的 `refresh_interval()` 调度（只刷到期的），并把结果落盘。
+    ///
+    /// 这是常驻循环用的那个；一次性 / 按需路径仍用 [`Self::refresh_all`]（全量）。
+    pub async fn refresh_due_and_store_async(
+        &mut self,
+        state_dir: &Path,
+        now: Instant,
+    ) -> DiscoveryRefreshResult {
+        let mut result = self.refresh_due(now);
+        let paths = DiscoveryCachePaths::under_state_dir(state_dir);
+        if let Err(err) = store_snapshot_async(
+            &paths,
+            &result.persisted_snapshot,
+            result.last_success_at.as_deref(),
+            result.last_error.clone(),
+        )
+        .await
+        {
+            result.record_store_error(err);
+        }
+        result
+    }
+
     pub fn refresh_and_store(&mut self, state_dir: &Path) -> DiscoveryRefreshResult {
         let mut result = self.refresh_all();
         let paths = DiscoveryCachePaths::under_state_dir(state_dir);
@@ -116,6 +155,21 @@ impl DiscoveryRuntime {
     }
 
     pub fn refresh_all(&mut self) -> DiscoveryRefreshResult {
+        self.refresh_inner(None)
+    }
+
+    /// 只刷新**到期**的探针（按各自 `refresh_interval()`）。
+    ///
+    /// 未到期的沿用上次成功输出 —— 不是“什么都不交”，因为快照是从各探针输出重新拼出来的，
+    /// 少交一个就等于把它的资源从快照里删掉。
+    ///
+    /// `now` 由调用方给（而不是内部取），这样调度可以测。
+    pub fn refresh_due(&mut self, now: Instant) -> DiscoveryRefreshResult {
+        self.refresh_inner(Some(now))
+    }
+
+    /// `due_at = None` 表示全量刷新（一次性 / 按需路径，保持原语义）。
+    fn refresh_inner(&mut self, due_at: Option<Instant>) -> DiscoveryRefreshResult {
         let now = std::time::SystemTime::now();
         let mut resources = Vec::new();
         let mut targets = Vec::new();
@@ -123,8 +177,43 @@ impl DiscoveryRuntime {
         let mut errors = Vec::new();
         let mut successful_probes = Vec::new();
 
-        for probe in &self.probes {
-            match probe.refresh(now) {
+        for index in 0..self.probes.len() {
+            // 到期判定：没跑过 → 到期；跑过 → 看间隔。
+            let due = match due_at {
+                None => true,
+                Some(instant) => match self.last_run_at[index] {
+                    None => true,
+                    Some(last) => {
+                        instant.duration_since(last) >= self.probes[index].refresh_interval()
+                    }
+                },
+            };
+            let output = if due {
+                self.last_run_at[index] = due_at;
+                match self.probes[index].refresh(now) {
+                    Ok(output) => {
+                        // 只记**成功**的输出：失败的那一轮不该让旧结果被“刷新”了。
+                        self.last_outputs[index] = Some(output.clone());
+                        Ok(output)
+                    }
+                    Err(err) => Err(err),
+                }
+            } else {
+                match self.last_outputs[index].clone() {
+                    Some(cached) => Ok(cached),
+                    // 没有历史（首次且被判定为未到期，理论上不会发生）→ 还是刷一次。
+                    None => match self.probes[index].refresh(now) {
+                        Ok(output) => {
+                            self.last_outputs[index] = Some(output.clone());
+                            self.last_run_at[index] = due_at;
+                            Ok(output)
+                        }
+                        Err(err) => Err(err),
+                    },
+                }
+            };
+
+            match output {
                 Ok(mut output) => {
                     let origin_idx = origins.len();
                     for resource in &mut output.resources {
@@ -147,6 +236,19 @@ impl DiscoveryRuntime {
             }
         }
 
+        self.compose_snapshot(resources, targets, origins, errors, successful_probes)
+    }
+
+    fn compose_snapshot(
+        &mut self,
+        resources: Vec<DiscoveredResource>,
+        targets: Vec<DiscoveredTarget>,
+        origins: Vec<DiscoveryOrigin>,
+        errors: Vec<DiscoveryError>,
+        successful_probes: Vec<SuccessfulProbeRefresh>,
+    ) -> DiscoveryRefreshResult {
+        let now_generated = now_rfc3339();
+
         let previous_snapshot = self.latest_snapshot.clone();
         let previous_last_success_at = previous_snapshot
             .as_ref()
@@ -154,7 +256,7 @@ impl DiscoveryRuntime {
         let revision = previous_snapshot
             .as_ref()
             .map_or(1, |snapshot| snapshot.revision + 1);
-        let generated_at = now_rfc3339();
+        let generated_at = now_generated;
         let snapshot_id = format!("discovery:{revision}:{generated_at}");
         let mut refreshed_snapshot =
             DiscoverySnapshot::new(snapshot_id, revision, generated_at.clone());
@@ -239,7 +341,9 @@ impl DiscoveryRefreshResult {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::time::{Duration, SystemTime};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant, SystemTime};
     use std::{fs, path::PathBuf};
 
     use wist_contracts::discovery::{DiscoveredResource, DiscoveryOrigin, DiscoverySnapshot};
@@ -445,5 +549,143 @@ mod tests {
         assert_eq!(meta.last_error.as_deref(), Some("process discovery failed"));
         assert_eq!(meta.last_success_at, None);
         assert_eq!(meta_failure, None);
+    }
+
+    // ── 观测频率调度 ───────────────────────────────────────────
+    //
+    // 在此之前各探针声明的 `refresh_interval()` 是死代码：运行时每 tick 把所有探针全刷一遍。
+
+    /// 自带周期与调用计数的探针。每次调用输出一个以探针名命名的资源，便于断言资源是否还在快照里。
+    struct IntervalProbe {
+        name: &'static str,
+        interval: Duration,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl crate::discovery::DiscoveryProbe for IntervalProbe {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn source(&self) -> DiscoverySourceKind {
+            DiscoverySourceKind::LocalRuntime
+        }
+
+        fn refresh_interval(&self) -> Duration {
+            self.interval
+        }
+
+        fn refresh(&self, _now: SystemTime) -> Result<ProbeOutput, DiscoveryError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ProbeOutput {
+                probe: self.name.to_string(),
+                source: DiscoverySourceKind::LocalRuntime,
+                refreshed_at: "2026-09-22T00:00:00Z".to_string(),
+                origin: DiscoveryOrigin {
+                    origin_id: format!("origin-{}", self.name),
+                    probe: self.name.to_string(),
+                    source: "local_runtime".to_string(),
+                    observed_at: "2026-09-22T00:00:00Z".to_string(),
+                },
+                resources: vec![DiscoveredResource {
+                    resource_id: format!("{}-1", self.name),
+                    kind: self.name.to_string(),
+                    origin_idx: 0,
+                    attributes: BTreeMap::new(),
+                    discovered_at: "2026-09-22T00:00:00Z".to_string(),
+                    last_seen_at: "2026-09-22T00:00:00Z".to_string(),
+                    health: "healthy".to_string(),
+                    source: self.name.to_string(),
+                }],
+                targets: Vec::new(),
+            })
+        }
+    }
+
+    fn interval_probe(
+        name: &'static str,
+        interval: Duration,
+    ) -> (
+        Box<dyn crate::discovery::DiscoveryProbe + Send + Sync>,
+        Arc<AtomicUsize>,
+    ) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        (
+            Box::new(IntervalProbe {
+                name,
+                interval,
+                calls: Arc::clone(&calls),
+            }),
+            calls,
+        )
+    }
+
+    fn resource_ids(runtime: &DiscoveryRuntime) -> Vec<String> {
+        let mut ids: Vec<String> = runtime
+            .latest_snapshot()
+            .expect("snapshot")
+            .resources
+            .iter()
+            .map(|resource| resource.resource_id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn refresh_due_skips_probes_that_are_not_due_and_keeps_their_resources() {
+        let (fast, fast_calls) = interval_probe("fast", Duration::from_secs(1));
+        let (slow, slow_calls) = interval_probe("slow", Duration::from_secs(3600));
+        let mut runtime = DiscoveryRuntime::new(vec![fast, slow]);
+        let t0 = Instant::now();
+
+        // 第一次：谁都没跑过 → 都到期。
+        runtime.refresh_due(t0);
+        assert_eq!(fast_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(slow_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resource_ids(&runtime), vec!["fast-1", "slow-1"]);
+
+        // 过了 2 秒：只有 1s 周期的到期；未到期的**沿用上次输出**，
+        // 而不是“什么都不交” —— 否则未到期探针的资源会从快照里消失。
+        runtime.refresh_due(t0 + Duration::from_secs(2));
+        assert_eq!(fast_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(slow_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resource_ids(&runtime), vec!["fast-1", "slow-1"]);
+
+        // 过了 1 小时 + 1 秒：两边都到期。
+        runtime.refresh_due(t0 + Duration::from_secs(3601));
+        assert_eq!(fast_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(slow_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(resource_ids(&runtime), vec!["fast-1", "slow-1"]);
+    }
+
+    #[test]
+    fn refresh_all_ignores_the_intervals() {
+        // 一次性 / 按需路径必须仍然全量刷新（它的语义是“现在就扫一遍”）。
+        let (fast, fast_calls) = interval_probe("fast", Duration::from_secs(3600));
+        let (slow, slow_calls) = interval_probe("slow", Duration::from_secs(3600));
+        let mut runtime = DiscoveryRuntime::new(vec![fast, slow]);
+
+        runtime.refresh_all();
+        runtime.refresh_all();
+
+        assert_eq!(fast_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(slow_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn refresh_due_keeps_the_last_successful_output_when_a_probe_fails() {
+        // 探针上一轮成功、这一轮失败：快照里不该凭空多出又少掉它的资源，
+        // 而“上次成功输出”要留着当未到期时的替补。
+        let (flaky, calls) = interval_probe("flaky", Duration::from_secs(1));
+        let mut runtime = DiscoveryRuntime::new(vec![flaky]);
+        let t0 = Instant::now();
+        runtime.refresh_due(t0);
+        assert_eq!(resource_ids(&runtime), vec!["flaky-1"]);
+
+        // 未到期 → 用缓存；调用次数不变。
+        runtime.refresh_due(t0 + Duration::from_millis(100));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resource_ids(&runtime), vec!["flaky-1"]);
     }
 }
