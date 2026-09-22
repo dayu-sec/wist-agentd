@@ -1,7 +1,7 @@
 //! Discovery runtime orchestration skeleton.
 
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use wist_contracts::discovery::{
     DiscoveredResource, DiscoveredTarget, DiscoveryCacheMeta, DiscoveryOrigin, DiscoverySnapshot,
@@ -15,6 +15,8 @@ use super::cache::{
     DiscoveryCacheLoadFailure, DiscoveryCachePaths, load_meta, load_meta_async, load_snapshot,
     load_snapshot_async, store_snapshot, store_snapshot_async,
 };
+use super::policy::AppliedDiscoveryPolicy;
+use wist_contracts::discovery_policy::DiscoveryAspectPolicySet;
 
 #[derive(::jumo_derive::Jumo)]
 #[jumo(kind = "struct", domain = "Discovery", module = "Discovery.Probe")]
@@ -30,6 +32,15 @@ pub struct DiscoveryRuntime {
     // 少了谁就等于把它的资源从快照里删掉（进程/端口会凭空消失）。
     last_outputs: Vec<Option<ProbeOutput>>,
     last_run_at: Vec<Option<Instant>>,
+    // 平台下发的策略表（已应用）与**上次拉取尝试时刻**。
+    //
+    // 为什么放在运行时而不是主循环局部变量：拉取要用 config 走网络，最省事是落在
+    // `refresh_discovery_snapshot`（那里 config / runtime 都在手上）；而「上次尝试时刻」必须
+    // 跨 tick，运行时本来就是那个跨 tick 的内存对象（与 `last_run_at` 同类）。放主循环局部
+    // 变量则要把 `&mut Option<Instant>` 一路透传给下游函数，徒增签名改动。
+    // 同样不落盘：重启后重新拉一次本来就是对的（拿不到就用内建默认值）。
+    policy: Option<AppliedDiscoveryPolicy>,
+    last_policy_fetch_at: Option<Instant>,
 }
 
 impl DiscoveryRuntime {
@@ -40,7 +51,43 @@ impl DiscoveryRuntime {
             latest_snapshot: None,
             last_outputs: vec![None; output_slots],
             last_run_at: vec![None; output_slots],
+            policy: None,
+            last_policy_fetch_at: None,
         }
+    }
+
+    /// 应用一份策略表；返回**版本是否变化**（调用方据此决定要不要打日志 —— 版本没变就不吭声，
+    /// 否则每 5 分钟重新拉到同一版就会刷一次屏）。
+    ///
+    /// 无论版本是否变化都**覆盖**：agentd 只认「最近拿到的那一份」，不替网关保管历史。
+    pub fn apply_discovery_policy(&mut self, set: DiscoveryAspectPolicySet) -> bool {
+        let changed = match self.policy.as_ref() {
+            Some(current) => current.policy_version() != set.policy_version,
+            None => true,
+        };
+        self.policy = Some(AppliedDiscoveryPolicy::new(set));
+        changed
+    }
+
+    pub fn policy_version(&self) -> Option<i64> {
+        self.policy.as_ref().map(|policy| policy.policy_version())
+    }
+
+    /// 是否到了该拉取策略表的时刻：从未拉过 → 到期（**启动即拉**），否则看过没过最小间隔。
+    ///
+    /// 用 `Instant`（单调）而不是墙钟：回拨不会把节流窗口算歪。
+    pub fn policy_fetch_due(&self, now: Instant, min_interval: Duration) -> bool {
+        match self.last_policy_fetch_at {
+            None => true,
+            Some(last) => now.duration_since(last) >= min_interval,
+        }
+    }
+
+    /// 记录一次拉取**尝试**（无论成败），下次到期由它与最小间隔共同决定。
+    ///
+    /// 记尝试而不是记成功：失败也必须被节流，否则网关宕机时每 tick（3s）重试一次。
+    pub fn record_policy_fetch_attempt(&mut self, now: Instant) {
+        self.last_policy_fetch_at = Some(now);
     }
 
     pub fn probe_count(&self) -> usize {
@@ -184,7 +231,15 @@ impl DiscoveryRuntime {
                 Some(instant) => match self.last_run_at[index] {
                     None => true,
                     Some(last) => {
-                        instant.duration_since(last) >= self.probes[index].refresh_interval()
+                        // 周期优先取自平台下发的策略表（按探针名查）。策略表是**平台级**取舍，
+                        // 应当盖过二进制里的内建默认值；表里没有这个方向（或周期非正）才回退到
+                        // `refresh_interval()`。
+                        let interval = self
+                            .policy
+                            .as_ref()
+                            .and_then(|policy| policy.interval_for(self.probes[index].name()))
+                            .unwrap_or_else(|| self.probes[index].refresh_interval());
+                        instant.duration_since(last) >= interval
                     }
                 },
             };
@@ -347,6 +402,7 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use wist_contracts::discovery::{DiscoveredResource, DiscoveryOrigin, DiscoverySnapshot};
+    use wist_contracts::discovery_policy::{DiscoveryAspectPolicy, DiscoveryAspectPolicySet};
 
     use crate::discovery::{DiscoveryError, DiscoverySourceKind, ProbeOutput};
 
@@ -620,6 +676,24 @@ mod tests {
         )
     }
 
+    /// 构造一份只带周期的最小策略表（其余字段不是调度用的，填占位值即可）。
+    fn policy_set(version: i64, intervals: &[(&str, i64)]) -> DiscoveryAspectPolicySet {
+        let policies = intervals
+            .iter()
+            .map(|(aspect, interval)| DiscoveryAspectPolicy {
+                aspect: aspect.to_string(),
+                default_interval_seconds: *interval,
+                min_interval_seconds: 1,
+                max_interval_seconds: 86_400,
+                baseline: false,
+                enabled_by_default: true,
+                platforms: vec!["macos".to_string()],
+                yields: String::new(),
+            })
+            .collect();
+        DiscoveryAspectPolicySet::new(version, "2026-09-22T00:00:00Z".to_string(), policies)
+    }
+
     fn resource_ids(runtime: &DiscoveryRuntime) -> Vec<String> {
         let mut ids: Vec<String> = runtime
             .latest_snapshot()
@@ -630,6 +704,80 @@ mod tests {
             .collect();
         ids.sort();
         ids
+    }
+
+    #[test]
+    fn refresh_due_prefers_the_applied_policy_interval() {
+        // 探针自报 1 小时，策略表把 host 压到 1s：过了 2s 就该按**策略表**的周期再刷。
+        let (probe, calls) = interval_probe("host", Duration::from_secs(3600));
+        let mut runtime = DiscoveryRuntime::new(vec![probe]);
+        assert!(runtime.apply_discovery_policy(policy_set(1, &[("host", 1)])));
+        let t0 = Instant::now();
+
+        runtime.refresh_due(t0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        runtime.refresh_due(t0 + Duration::from_secs(2));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn refresh_due_without_a_policy_uses_the_probe_interval() {
+        // 没有策略表（断网 / 网关未配表）→ 回退探针内建周期，行为与从前一致。
+        let (probe, calls) = interval_probe("host", Duration::from_secs(3600));
+        let mut runtime = DiscoveryRuntime::new(vec![probe]);
+        let t0 = Instant::now();
+
+        runtime.refresh_due(t0);
+        runtime.refresh_due(t0 + Duration::from_secs(2));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn refresh_due_keeps_the_probe_interval_when_the_policy_omits_the_aspect() {
+        // 表里有，但**没提** host：这一方向仍按内建周期走，不能被别人的周期带偏。
+        let (probe, calls) = interval_probe("host", Duration::from_secs(3600));
+        let mut runtime = DiscoveryRuntime::new(vec![probe]);
+        runtime.apply_discovery_policy(policy_set(1, &[("process", 1)]));
+        let t0 = Instant::now();
+
+        runtime.refresh_due(t0);
+        runtime.refresh_due(t0 + Duration::from_secs(2));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn apply_discovery_policy_reports_only_version_changes() {
+        let mut runtime = DiscoveryRuntime::new(Vec::new());
+        assert_eq!(runtime.policy_version(), None);
+
+        // 首份 → 视为变化（要打日志）。
+        assert!(runtime.apply_discovery_policy(policy_set(1, &[("host", 900)])));
+        assert_eq!(runtime.policy_version(), Some(1));
+
+        // 同一版再来 → 不报变化（agentd 据此不重复打日志）。
+        assert!(!runtime.apply_discovery_policy(policy_set(1, &[("host", 600)])));
+        assert_eq!(runtime.policy_version(), Some(1));
+
+        // 版本递增 → 报变化，且新周期被采纳。
+        assert!(runtime.apply_discovery_policy(policy_set(2, &[("host", 600)])));
+        assert_eq!(runtime.policy_version(), Some(2));
+    }
+
+    #[test]
+    fn policy_fetch_is_due_until_the_first_attempt_then_throttled() {
+        let mut runtime = DiscoveryRuntime::new(Vec::new());
+        let min = Duration::from_millis(300_000);
+        let t0 = Instant::now();
+
+        // 从未拉过 → 启动即到期。
+        assert!(runtime.policy_fetch_due(t0, min));
+
+        runtime.record_policy_fetch_attempt(t0);
+        // 刚记过尝试 → 未到期（失败也一样被节流）。
+        assert!(!runtime.policy_fetch_due(t0 + Duration::from_secs(1), min));
+        // 过了最小间隔 → 到期。
+        assert!(runtime.policy_fetch_due(t0 + min, min));
     }
 
     #[test]

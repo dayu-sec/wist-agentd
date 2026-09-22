@@ -23,8 +23,9 @@ impl DiscoveryProbe for HostDiscoveryProbe {
     }
 
     fn refresh_interval(&self) -> std::time::Duration {
-        // 值取自模型 DiscoveryAspectPolicy.default_interval_seconds（模型是唯一来源）。
-        // 注：目前还是**字面量**，尚未由已发布的策略表下发；改周期先改模型再改这里。
+        // 这是**内建默认值**：与策展数据 `jumo/model/content/aspect-policies.toml` 里的
+        // `default_interval_seconds` 同值，只在拿不到平台下发的策略表（断网 / 网关未配表）时生效。
+        // 拿得到表就由表盖过（见 `DiscoveryRuntime` 的到期判定）；改策展值不必改这里。
 
         std::time::Duration::from_secs(900)
     }

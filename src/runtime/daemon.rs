@@ -6,8 +6,10 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use wist_contracts::agent_config::AgentConfig;
+use wist_contracts::discovery_policy::DiscoveryAspectPolicySet;
 use wist_contracts::gateway::{
-    AgentStatusReport, AgentWorkState, AgentWorkStateChange, ReportAgentFactSummary,
+    AgentStatusReport, AgentWorkState, AgentWorkStateChange, DiscoveryPoliciesReturned,
+    POLL_DISCOVERY_POLICIES_KIND, PollDiscoveryPolicies, ReportAgentFactSummary,
 };
 use wist_shared::time::{now_rfc3339, now_ts_ms};
 
@@ -73,6 +75,22 @@ const FACT_REPORT_MIN_INTERVAL_MS: i64 = 300_000;
 /// 指标/日志上送之前，所以这条路径**必须自己封顶**，不能吃 `enrollment_http_client`
 /// 的 10s 请求超时 —— 否则网关卡住会把 tick 拖长并连带推迟数据面上送。
 const FACT_REPORT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 拉取发现方向**策略表**的最小间隔。
+///
+/// 与事实摘要同理，记的是「上次**尝试**」而不是「上次成功」—— 失败也要被节流，
+/// 否则网关宕机时会每 tick（3s）重试一次。策略表是**慢变量**（平台按版本策展发布），
+/// 5 分钟一次足够及时；而 agentd 的内建默认周期与表同值，所以拿不到也不影响采集。
+const DISCOVERY_POLICY_FETCH_MIN_INTERVAL_MS: i64 = 300_000;
+
+/// 策略表拉取的到期判定用 `Duration`；值只有一个来源（上面的毫秒常量）。
+const DISCOVERY_POLICY_FETCH_MIN_INTERVAL: Duration =
+    Duration::from_millis(DISCOVERY_POLICY_FETCH_MIN_INTERVAL_MS as u64);
+
+/// 策略表拉取单次请求的超时。
+///
+/// 与事实摘要同理：它在主循环里排在采集之前，必须自己封顶，不能吃掉 tick。
+const DISCOVERY_POLICY_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A sampled CPU-time reading used to compute a percentage across the report interval.
 struct CpuSample {
@@ -347,6 +365,86 @@ fn within_fact_report_min_interval(last_attempt_at_ms: i64, now_ms: i64) -> bool
         && now_ms.saturating_sub(last_attempt_at_ms) < FACT_REPORT_MIN_INTERVAL_MS
 }
 
+/// 拉取平台发布的发现方向**策略表**（尽力而为，失败只进日志）。
+///
+/// 返回 `None` = 这次没拿到表，且**全部**情况都归结为同一种处理：
+///   - 没配端点 / 没配 bearer / 没配 agent_id（未入网，同 `report_fact_summary` 的早退）；
+///   - 网关回 503（契约里的「网关未配表」语义，不是错误）；
+///   - 传输失败或响应体坏 JSON。
+///
+/// 为什么返回 `Option` 而不是 `RuntimeResult`（紧邻的 `report_fact_summary` 是后者）：
+/// 它真的没有失败路径 —— 每一条错都归到「没拿到表」并只进日志。用一个带 `Err` 的签名，
+/// 会让调用方写下一个永远走不到的 `Err` 分支，并让读代码的人以为存在 fatal 情形。
+///
+/// 关键取舍：**这些都不是致命错误**。agentd 必须继续采集 —— 拉不到表就用自己的内建默认周期
+/// （与策展值同值），行为与策略表没引入之前一致。把拉取失败变成 fatal 会让「网关没配表」
+/// 直接等于「agent 不干活」。
+async fn fetch_discovery_policies(config: &AgentConfig) -> Option<DiscoveryAspectPolicySet> {
+    // 返回 `Option` 后这三行可以写成 `?`：语义与之前的 `let ... else { return None }` 一致，
+    // 且不用为每一步重复一遍早退。
+    let endpoint = config.control_plane.endpoint.as_deref()?;
+    let bearer_token = config.control_plane.bearer_token.as_deref()?;
+    let agent_id = config.agent.agent_id.as_deref()?;
+
+    let instance_id = config.agent.instance_name.as_deref().unwrap_or_default();
+    let request = PollDiscoveryPolicies {
+        api_version: wist_contracts::API_VERSION_V1.to_string(),
+        kind: POLL_DISCOVERY_POLICIES_KIND.to_string(),
+        agent_id: agent_id.to_string(),
+        instance_id: instance_id.to_string(),
+        requested_at: now_rfc3339(),
+    };
+    let client = match enrollment_http_client(config) {
+        Ok(client) => client,
+        Err(err) => {
+            eprintln!("wist-agentd discovery policy fetch: failed to build client: {err}");
+            return None;
+        }
+    };
+    let url = format!(
+        "{}/api/v1/agent/discovery-policies:poll",
+        endpoint.trim_end_matches('/')
+    );
+
+    match client
+        .post(&url)
+        // 这条路径在主循环里，必须自己封顶，不能吃掉 tick。
+        .timeout(DISCOVERY_POLICY_FETCH_TIMEOUT)
+        .bearer_auth(bearer_token)
+        .json(&request)
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            match response.json::<DiscoveryPoliciesReturned>().await {
+                Ok(returned) => Some(DiscoveryAspectPolicySet::new(
+                    returned.policy_version,
+                    returned.published_at,
+                    returned.policies,
+                )),
+                Err(err) => {
+                    eprintln!(
+                        "wist-agentd discovery policy fetch failed: invalid response from {endpoint}: {err}"
+                    );
+                    None
+                }
+            }
+        }
+        Ok(response) => {
+            eprintln!(
+                "wist-agentd discovery policy fetch failed: HTTP {} from {}",
+                response.status(),
+                endpoint
+            );
+            None
+        }
+        Err(err) => {
+            eprintln!("wist-agentd discovery policy fetch failed: {err}");
+            None
+        }
+    }
+}
+
 use metrics_support::{
     emit_metrics_failure, emit_metrics_failures, emit_metrics_tick,
     failure_signatures as metrics_failure_signatures,
@@ -400,6 +498,9 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     let mut last_latency_ms: Option<u64> = None;
     let mut pending_work_state_changes: Vec<TelemetryWorkState> = Vec::new();
     loop {
+        // 到达拉取间隔就拉一次策略表并应用（启动首轮即拉）。必须在 refresh_due 之前，
+        // 这样本轮采集就用上新周期。
+        refresh_discovery_policy(loop_ctx.config, &mut discovery_runtime).await;
         let (snapshot, changes) = run_once_with_failure_cache(
             &loop_ctx,
             Some(&mut previous_telemetry_failures),
@@ -576,6 +677,36 @@ async fn run_once_with_failure_cache(
 #[jumo(kind = "struct", domain = "Reporting", module = "Reporting.Pipeline")]
 struct DiscoveryHealth {
     snapshot: DiscoveryHealthSnapshot,
+}
+
+/// 若到了拉取间隔，拉取并应用发现方向策略表。
+///
+/// 为什么放在主循环而不是 `refresh_discovery_snapshot`：后者一次性路径（`run_once`）也会走，
+/// 而一次性路径是 `refresh_all`（全量、**忽略周期**），策略表对它没有意义 —— 在那儿拉
+/// 等于白付一次网络往返（最坏 `DISCOVERY_POLICY_FETCH_TIMEOUT`）。常驻循环才有「下一 tick」，
+/// 策略也才有落点。计时状态随 `DiscoveryRuntime` 跨 tick（见该字段的注释）。
+async fn refresh_discovery_policy(config: &AgentConfig, runtime: &mut DiscoveryRuntime) {
+    let now = Instant::now();
+    if !runtime.policy_fetch_due(now, DISCOVERY_POLICY_FETCH_MIN_INTERVAL) {
+        return;
+    }
+    // 先记「尝试」再发：失败也要被最小间隔节流，否则网关宕机时会每 tick（3s）重试。
+    // 与事实摘要同一取舍（记尝试，不记成功）。
+    runtime.record_policy_fetch_attempt(now);
+    // 拿到就应用；没拿到（未入网 / 网关联 503 / 出错）则**保留上次应用的表**，什么都不改 ——
+    // 失败清空已应用表会让 agent 从「有策略」倒退成「无策略」，与「失败不致命」相悖。
+    if let Some(set) = fetch_discovery_policies(config).await {
+        let policy_version = set.policy_version;
+        let aspects = set.policies.len();
+        // 版本没变就不吭声：策略是慢变量，每 5 分钟都会重新拉到同一版，
+        // 每次都打日志就是每 5 分钟一行噪声。
+        if runtime.apply_discovery_policy(set) {
+            eprintln!(
+                "event=DiscoveryPolicyApplied policy_version={} aspects={}",
+                policy_version, aspects
+            );
+        }
+    }
 }
 
 async fn refresh_discovery_snapshot(
@@ -1204,6 +1335,99 @@ mod tests {
             .await
             .expect("report");
         assert!(!reported);
+    }
+
+    // ── 发现方向策略表拉取 ────────────────────────────────────
+
+    #[tokio::test]
+    async fn fetch_discovery_policies_posts_poll_and_parses_the_table() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let request = read_http_request(&mut socket).await;
+            assert!(request.contains("/api/v1/agent/discovery-policies:poll"));
+            assert!(
+                request
+                    .to_lowercase()
+                    .contains("authorization: bearer wic_test_token")
+            );
+            assert!(request.contains("\"kind\":\"poll_discovery_policies\""));
+            assert!(request.contains("\"api_version\":\"v1\""));
+            assert!(request.contains("\"agent_id\":\"agent-x\""));
+            assert!(request.contains("\"instance_id\":\"instance-x\""));
+            assert!(request.contains("\"requested_at\":\""));
+            let body = r#"{"policy_version":4,"published_at":"2026-09-22T00:00:00Z","policies":[{"aspect":"host","default_interval_seconds":900,"min_interval_seconds":300,"max_interval_seconds":3600,"baseline":true,"enabled_by_default":true,"platforms":["macos","linux"],"yields":"os/arch"}],"returned_at":"2026-09-22T00:00:00Z"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let mut config = test_config();
+        config.control_plane.endpoint = Some(endpoint);
+        let set = fetch_discovery_policies(&config)
+            .await
+            .expect("table returned");
+        server.await.expect("server task");
+
+        assert_eq!(set.policy_version, 4);
+        assert_eq!(set.interval_seconds_for("host"), Some(900));
+    }
+
+    #[tokio::test]
+    async fn fetch_discovery_policies_returns_none_on_503() {
+        // 网关没配策略表就回 503：这是「未配置」而非错误，agentd 必须静默回退到内建周期。
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let _ = read_http_request(&mut socket).await;
+            let response = "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let mut config = test_config();
+        config.control_plane.endpoint = Some(endpoint);
+        let result = fetch_discovery_policies(&config).await;
+        server.await.expect("server task");
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_discovery_policies_returns_none_on_a_malformed_body() {
+        // 坏 JSON 既不能 panic，也不能是致命错误 —— 回 None，继续用内建周期采集。
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let _ = read_http_request(&mut socket).await;
+            let body = "{ this is not json";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let mut config = test_config();
+        config.control_plane.endpoint = Some(endpoint);
+        let result = fetch_discovery_policies(&config).await;
+        server.await.expect("server task");
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_discovery_policies_is_skipped_without_an_endpoint() {
+        let mut config = test_config();
+        config.control_plane.endpoint = None;
+        let result = fetch_discovery_policies(&config).await;
+        assert!(result.is_none());
     }
 
     #[tokio::test]
