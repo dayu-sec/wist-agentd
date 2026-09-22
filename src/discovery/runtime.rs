@@ -689,13 +689,27 @@ mod tests {
 
     /// 构造一份只带周期的最小策略表（其余字段不是调度用的，填占位值即可）。
     fn policy_set(version: i64, intervals: &[(&str, i64)]) -> DiscoveryAspectPolicySet {
+        bounded_policy_set(
+            version,
+            &intervals
+                .iter()
+                .map(|(aspect, interval)| (*aspect, *interval, 1, 86_400))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// 同上，但显式给出 `[min,max]` —— 用于验夹取。
+    fn bounded_policy_set(
+        version: i64,
+        intervals: &[(&str, i64, i64, i64)],
+    ) -> DiscoveryAspectPolicySet {
         let policies = intervals
             .iter()
-            .map(|(aspect, interval)| DiscoveryAspectPolicy {
+            .map(|(aspect, interval, min, max)| DiscoveryAspectPolicy {
                 aspect: aspect.to_string(),
                 default_interval_seconds: *interval,
-                min_interval_seconds: 1,
-                max_interval_seconds: 86_400,
+                min_interval_seconds: *min,
+                max_interval_seconds: *max,
                 baseline: false,
                 enabled_by_default: true,
                 platforms: vec!["macos".to_string()],
@@ -789,6 +803,26 @@ mod tests {
         assert!(!runtime.policy_fetch_due(t0 + Duration::from_secs(1), min));
         // 过了最小间隔 → 到期。
         assert!(runtime.policy_fetch_due(t0 + min, min));
+    }
+
+    #[test]
+    fn a_non_positive_policy_interval_is_clamped_so_the_probe_cannot_hot_loop() {
+        // 策略里写 0（坏表）：夹到 min。否则到期判定恒真、探针退化成每 tick 热循环。
+        let (probe, calls) = interval_probe("host", Duration::from_secs(3600));
+        let mut runtime = DiscoveryRuntime::new(vec![probe]);
+        runtime.apply_discovery_policy(bounded_policy_set(2, &[("host", 0, 60, 3600)]));
+        let t0 = Instant::now();
+
+        runtime.refresh_due(t0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // 2 秒后不该到期：采用的是夹取后的 60s，不是原值 0。
+        runtime.refresh_due(t0 + Duration::from_secs(2));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // 过了夹取后的周期才到期。
+        runtime.refresh_due(t0 + Duration::from_secs(61));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
