@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use wist_agentd::bootstrap;
+use wist_agentd::control::work::AppliedWorkGrant;
 use wist_agentd::daemon;
 use wist_agentd::self_observability::DiscoveryReadiness;
 use wist_contracts::agent_config::{DiscoverySection, LogFileInputSection};
@@ -13,6 +14,7 @@ use wist_contracts::discovery::{
     CollectionCandidate, DiscoveredResource, DiscoveredTarget, DiscoveryCacheMeta,
 };
 use wist_contracts::telemetry_record::TelemetryRecord;
+use wist_contracts::work::{StandingWork, WorkGrant, WorkSpec, WorkSpecSource, WorkSpecUnit};
 use wist_shared::fs::read_json;
 
 use super::common::{
@@ -28,14 +30,64 @@ fn bind_tcp_listener(addr: &str) -> Option<TcpListener> {
     }
 }
 
-/// 从 `{json} RAW: <raw>` 帧中提取原始日志正文，供 TCP 输出断言使用。
-/// 指标帧（` METRICS: `）与日志帧（` RAW: `）共用同一连接、指标优先，这里只取日志正文。
+/// 从 `{json} LOGRAW: <raw>` 帧中提取原始日志正文，供 TCP 输出断言使用。
+/// 指标帧（` METRICS: `）与日志帧（` LOGRAW: `）共用同一连接、指标优先，这里只取日志正文。
 fn raw_body_sections(payload: &str) -> Vec<String> {
     payload
         .lines()
         .filter(|line| !line.is_empty())
-        .filter_map(|line| line.rsplit_once(" RAW: ").map(|(_, raw)| raw.to_string()))
+        .filter_map(|line| {
+            line.rsplit_once(" LOGRAW: ")
+                .map(|(_, raw)| raw.to_string())
+        })
         .collect()
+}
+
+/// 一份“网关授权了指标采集”的授权快照（`run_once` 不做轮询，得直接给）。
+fn granted_metrics_work() -> AppliedWorkGrant {
+    granted_work("HostMetrics", "collect_metrics", "MetricInterval", "15s")
+}
+
+/// 授权一份工作（一个单元、一个来源）——授权快照是 agentd 唯一的工作来源。
+fn granted_work(
+    family: &str,
+    capability: &str,
+    source_kind: &str,
+    source_target: &str,
+) -> AppliedWorkGrant {
+    let spec = WorkSpec {
+        units: vec![WorkSpecUnit {
+            unit_id: format!("unit-{family}"),
+            capability: capability.to_string(),
+            rule_ref: "agent_uplink".to_string(),
+            requires_privilege: "none".to_string(),
+            sources: vec![WorkSpecSource {
+                kind: source_kind.to_string(),
+                target: source_target.to_string(),
+            }],
+        }],
+    };
+    let mut applied = AppliedWorkGrant::default();
+    applied.apply(&WorkGrant {
+        agent_id: "agent-001".to_string(),
+        standing: vec![StandingWork {
+            work_id: format!("work-agent-001-{family}"),
+            agent_id: "agent-001".to_string(),
+            family: family.to_string(),
+            spec: spec.encode().expect("encode spec"),
+            catalog_version: 1,
+            proposal_id: None,
+            plan_version: 1,
+            effective_from: "2026-09-23T00:00:00Z".to_string(),
+            status: "active".to_string(),
+            updated_by: "admin".to_string(),
+            updated_at: "2026-09-23T00:00:00Z".to_string(),
+        }],
+        one_shot: Vec::new(),
+        sequence: 1,
+        granted_at: "2026-09-23T00:00:00Z".to_string(),
+    });
+    applied
 }
 
 #[derive(Debug, Deserialize)]
@@ -928,10 +980,15 @@ fn daemon_run_once_sends_raw_log_lines_to_tcp_output() {
 
     let config =
         standalone_config_with_tcp_file_input(&root, &input_path, "127.0.0.1", port, "line");
-    let snapshot = daemon::run_once(&daemon::DaemonLoop {
-        config: &config,
-        exec_bin: &test_exec_bin(&root),
-    })
+    // 指标上送需要**授权的指标工作**：没有授权就不上送（见下一个用例）。
+    let work = granted_metrics_work();
+    let snapshot = daemon::run_once_with_work(
+        &daemon::DaemonLoop {
+            config: &config,
+            exec_bin: &test_exec_bin(&root),
+        },
+        &work,
+    )
     .expect("daemon run once");
 
     let payload = server.join().expect("join server");
@@ -948,7 +1005,7 @@ fn daemon_run_once_sends_raw_log_lines_to_tcp_output() {
     let metrics_pos = payload
         .find(" METRICS: ")
         .expect("metrics frame on shared uplink");
-    let raw_pos = payload.find(" RAW: ").expect("raw log frame");
+    let raw_pos = payload.find(" LOGRAW: ").expect("raw log frame");
     assert!(
         metrics_pos < raw_pos,
         "metrics frame should precede log frames"
@@ -961,6 +1018,138 @@ fn daemon_run_once_sends_raw_log_lines_to_tcp_output() {
         checkpoint.files[0].checkpoint_offset,
         "alpha\nbeta\n".len() as u64
     );
+    assert!(!root.join("log").join("wist-records.ndjson").exists());
+}
+
+/// 没有授权的指标工作 → **不上送指标**，但配置里的日志采集照旧。
+///
+/// 这是“不做任务工作的 Agent”在数据面上的具体含义：默认不发指标；
+/// 而本机运维在配置里手工加的那条日志任务是逃生舱，不该被平台派活机制连带关掉。
+#[cfg(unix)]
+#[test]
+fn daemon_run_once_without_granted_metrics_work_skips_the_metrics_frame() {
+    let root = temp_dir("daemon-no-metrics-work");
+    let run_dir = root.join("run");
+    let state_dir = root.join("state");
+    let log_dir = root.join("log");
+    let input_path = root.join("app.log");
+    bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
+    fs::write(&input_path, "alpha\n").expect("write input log");
+
+    let Some(listener) = bind_tcp_listener("127.0.0.1:0") else {
+        return;
+    };
+    let port = listener.local_addr().expect("listener addr").port();
+    let server = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().expect("accept");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set timeout");
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 128];
+        loop {
+            match socket.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        String::from_utf8(buf).expect("utf8 payload")
+    });
+
+    let config =
+        standalone_config_with_tcp_file_input(&root, &input_path, "127.0.0.1", port, "line");
+    daemon::run_once(&daemon::DaemonLoop {
+        config: &config,
+        exec_bin: &test_exec_bin(&root),
+    })
+    .expect("daemon run once");
+
+    let payload = server.join().expect("join server");
+    assert!(!payload.contains(" METRICS: "), "{payload}");
+    assert!(payload.contains(" LOGRAW: alpha"), "{payload}");
+}
+
+/// 网关派的日志活真的变成采集：工作里的 FileGlob 直接变成一个采集任务，
+/// 配置里**什么都没写**。这是「网关决定这台机器该采什么」在 agentd 侧的落点。
+#[cfg(unix)]
+#[test]
+fn a_granted_log_work_collects_the_glob_without_any_config_file_input() {
+    let root = temp_dir("daemon-work-log-input");
+    let run_dir = root.join("run");
+    let state_dir = root.join("state");
+    let log_dir = root.join("log");
+    let input_path = root.join("granted.log");
+    bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
+    // 先放一行历史：授权采集是 tail（不重放历史），所以这行**不该**被采。
+    fs::write(&input_path, "history\n").expect("write input log");
+
+    let Some(listener) = bind_tcp_listener("127.0.0.1:0") else {
+        return;
+    };
+    let port = listener.local_addr().expect("listener addr").port();
+    // 两轮采集各自开一条连接，服务端收两条并拼起来。
+    let server = thread::spawn(move || {
+        let mut collected = String::new();
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set timeout");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 128];
+            loop {
+                match socket.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                }
+            }
+            collected.push_str(&String::from_utf8(buf).expect("utf8 payload"));
+        }
+        collected
+    });
+
+    let mut config =
+        standalone_config_with_tcp_file_input(&root, &input_path, "127.0.0.1", port, "line");
+    // 配置里**没有**任何 file_inputs：本用例要证明采集完全来自授权工作。
+    config.telemetry.logs.file_inputs.clear();
+    let work = granted_work(
+        "CrashPanic",
+        "collect_logs",
+        "FileGlob",
+        input_path.to_str().expect("utf8 path"),
+    );
+    let run = || {
+        daemon::run_once_with_work(
+            &daemon::DaemonLoop {
+                config: &config,
+                exec_bin: &test_exec_bin(&root),
+            },
+            &work,
+        )
+        .expect("daemon run once")
+    };
+
+    run();
+    fs::write(&input_path, "history\nfrom-work\n").expect("append input log");
+    run();
+
+    let payload = server.join().expect("join server");
+    assert!(
+        payload.contains(" LOGRAW: from-work"),
+        "授权工作应当采到新增行：{payload}"
+    );
+    assert!(
+        !payload.contains(" LOGRAW: history"),
+        "授权采集不重放历史（tail）：{payload}"
+    );
+    // 工作折算出的输入 id 带 `work-` 前缀，checkpoint 建在这个名字上。
+    let checkpoint_path = wist_agentd::state_store::log_checkpoints::path_for(
+        &state_dir,
+        "work-CrashPanic-unit-CrashPanic",
+    );
+    assert!(checkpoint_path.exists(), "{}", checkpoint_path.display());
     assert!(!root.join("log").join("wist-records.ndjson").exists());
 }
 

@@ -19,6 +19,7 @@ use crate::enrollment::enrollment_http_client;
 
 use crate::error::RuntimeResult;
 
+use crate::control::work::{AppliedWorkGrant, ack_work, fetch_work_grant};
 use crate::discovery::DiscoveryProbe;
 use crate::discovery::container::ContainerDiscoveryProbe;
 use crate::discovery::endpoint::EndpointDiscoveryProbe;
@@ -86,6 +87,13 @@ const DISCOVERY_POLICY_FETCH_MIN_INTERVAL: Duration =
 ///
 /// 与事实摘要同理：它在主循环里排在采集之前，必须自己封顶，不能吃掉 tick。
 const DISCOVERY_POLICY_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 拉取**工作授权快照**的最小间隔。
+///
+/// 比策略表密得多：策略是平台级策展（版本级慢变量），而工作授权是运维对**这一台机器**
+/// 的动作 —— 派活、暂停、撤回都期望“立刻生效”。30s 是在“够快”与“别把网关当心跳打”
+/// 之间的取值（真正的推送要 agentd 有入站监听，那是另一条路）。
+const WORK_FETCH_MIN_INTERVAL_MS: i64 = 30_000;
 
 /// A sampled CPU-time reading used to compute a percentage across the report interval.
 struct CpuSample {
@@ -477,6 +485,11 @@ pub struct DaemonLoop<'a> {
 pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     // 运行时**跨 tick 活着**：观测频率的调度记忆就在它里面（内存态，不落盘）。
     let mut discovery_runtime = DiscoveryRuntime::new(discovery_probes(loop_ctx.config));
+    // 工作授权跨 tick 活着（与 discovery_runtime 同理）：`acked_plan_version` 就在里面，
+    // 它决定“这一版我确认过了，不用每 30s 重复确认”。
+    let mut work_runtime = AppliedWorkGrant::default();
+    let mut last_work_fetch: Option<Instant> = None;
+    let mut last_metrics_uplink: Option<Instant> = None;
     let mut previous_telemetry_failures = BTreeSet::new();
     let mut previous_metrics_failures = BTreeSet::new();
     let mut previous_telemetry_paused = BTreeSet::new();
@@ -491,12 +504,31 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
         // 到达拉取间隔就拉一次策略表并应用（启动首轮即拉）。必须在 refresh_due 之前，
         // 这样本轮采集就用上新周期。
         refresh_discovery_policy(loop_ctx.config, &mut discovery_runtime).await;
+        // 工作授权同样在采集之前应用：本轮就按新的授权采（或停）。
+        refresh_work_grant(loop_ctx.config, &mut work_runtime, &mut last_work_fetch).await;
+        // 指标上送要不要发生在**这里**决定（而不是深入采集内部）：
+        //   没授权 = 不上送（不做任务工作的 Agent 不该顺手送指标）；
+        //   授权了但没到周期 = 本轮跳过，不算失败。
+        let send_metrics = match work_runtime.metrics_interval() {
+            None => false,
+            Some(interval) => match last_metrics_uplink {
+                None => true,
+                Some(at) => at.elapsed() >= interval,
+            },
+        };
+        if send_metrics {
+            // 记“尝试”而不是“成功”：与策略表拉取同一取舍 —— 失败也要被周期节流，
+            // 否则输出端坏掉时会每 tick（3s）重试并刷满日志。
+            last_metrics_uplink = Some(Instant::now());
+        }
         let (snapshot, changes) = run_once_with_failure_cache(
             &loop_ctx,
             Some(&mut previous_telemetry_failures),
             Some(&mut previous_metrics_failures),
             Some(&mut previous_telemetry_paused),
             &mut discovery_runtime,
+            &work_runtime,
+            send_metrics,
         )
         .await?;
         pending_work_state_changes.extend(changes);
@@ -534,11 +566,7 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
 }
 
 pub async fn run_once_async(loop_ctx: &DaemonLoop<'_>) -> RuntimeResult<RuntimeHealthSnapshot> {
-    // 一次性路径：运行时只活这一次，所以每个探针都是“没过” → 全量刷新（与旧语义一致）。
-    let mut discovery_runtime = DiscoveryRuntime::new(discovery_probes(loop_ctx.config));
-    run_once_with_failure_cache(loop_ctx, None, None, None, &mut discovery_runtime)
-        .await
-        .map(|(snapshot, _)| snapshot)
+    run_once_with_work_async(loop_ctx, &AppliedWorkGrant::default()).await
 }
 
 async fn run_once_with_failure_cache(
@@ -547,6 +575,10 @@ async fn run_once_with_failure_cache(
     previous_metrics_failures: Option<&mut BTreeSet<String>>,
     previous_telemetry_paused: Option<&mut BTreeSet<String>>,
     discovery_runtime: &mut DiscoveryRuntime,
+    // 当前持有的工作授权：日志任务由它折算而来，指标上送由它开关。
+    work: &AppliedWorkGrant,
+    // 本轮要不要上送指标（由调用方按授权与周期定；一次性路径按授权定）。
+    send_metrics: bool,
 ) -> RuntimeResult<(RuntimeHealthSnapshot, Vec<TelemetryWorkState>)> {
     let run_dir = Path::new(&loop_ctx.config.paths.run_dir);
     let state_dir = Path::new(&loop_ctx.config.paths.state_dir);
@@ -575,8 +607,13 @@ async fn run_once_with_failure_cache(
     let telemetry_tick = match build_telemetry_sink(loop_ctx.config) {
         Ok(mut sink) => {
             // 指标优先：先上送指标帧（与日志共用同一 sink/连接 + 同一个全局 seq），再处理日志。
+            //
+            // 但只在**授权允许且到了周期**时才发：没有指标工作就没有指标上送，
+            // 这是“不做任务工作的 Agent”在数据面上的具体含义。
             if let Some(snapshot) = metrics_tick.snapshot.as_ref()
-                && let Err(err) = write_metrics_uplink(
+                && send_metrics
+            {
+                match write_metrics_uplink(
                     &mut sink,
                     agent_id,
                     snapshot,
@@ -584,8 +621,15 @@ async fn run_once_with_failure_cache(
                     &global_seq_path,
                 )
                 .await
-            {
-                eprintln!("wist-agentd metrics uplink failed: {err}");
+                {
+                    // 成功也记一行：否则“指标到底发没发”只能靠间接迹象去猜，
+                    // 而运维问的第一个问题往往是这个（尤其是刚授权完）。
+                    Ok(()) => eprintln!(
+                        "event=MetricsUplinkSent agent_id={agent_id} targets={}",
+                        snapshot.total_targets
+                    ),
+                    Err(err) => eprintln!("wist-agentd metrics uplink failed: {err}"),
+                }
             }
             // 事实摘要在**指标之后**发：同样共用这条连接与全局 `seq`，只是帧标记不同。
             match report_fact_summary(
@@ -608,9 +652,9 @@ async fn run_once_with_failure_cache(
                 Ok(false) => {}
                 Err(err) => eprintln!("wist-agentd fact summary uplink failed: {err}"),
             }
-            process_telemetry_inputs(loop_ctx.config, &mut sink, &mut next_seq).await
+            process_telemetry_inputs(loop_ctx.config, work, &mut sink, &mut next_seq).await
         }
-        Err(err) => invalid_output_tick(loop_ctx.config, err.to_string()),
+        Err(err) => invalid_output_tick(loop_ctx.config, work, err.to_string()),
     };
     if let Some(previous) = previous_telemetry_failures {
         for failure in filter_new_failures(&telemetry_tick.failures, previous) {
@@ -725,6 +769,67 @@ async fn refresh_discovery_policy(config: &AgentConfig, runtime: &mut DiscoveryR
             eprintln!(
                 "event=DiscoveryPolicyApplied policy_version={policy_version} aspects={aspects}{adjustments}"
             );
+        }
+    }
+}
+
+/// 拉取并应用工作授权（启动首轮即拉，之后按最小间隔节流）。
+///
+/// 与发现策略表的差别：这里**会**回报确认。确认只对“真正应用了的工作”发（见
+/// `AppliedWorkGrant::apply`），回报成功才记下版本 —— 否则下一轮会重复回报。
+async fn refresh_work_grant(
+    config: &AgentConfig,
+    runtime: &mut AppliedWorkGrant,
+    last_fetch: &mut Option<Instant>,
+) {
+    let now = Instant::now();
+    if let Some(at) = *last_fetch
+        && at.elapsed() < Duration::from_millis(WORK_FETCH_MIN_INTERVAL_MS as u64)
+    {
+        return;
+    }
+    // 先记“尝试”再发：失败也要被节流，否则网关宕机时会每 tick（3s）重试。
+    *last_fetch = Some(now);
+    let Some(grant) = fetch_work_grant(config, runtime.sequence()).await else {
+        // 拿不到就**保留上次应用的工作**：与策略表同理，失败清空会让 agent 从
+        // 「有活干」倒退成「什么都没授权」—— 那是把网络抖动放大成采集中断。
+        return;
+    };
+    let outcome = runtime.apply(&grant);
+    if outcome.changed {
+        eprintln!(
+            "event=WorkGrantApplied sequence={} {}",
+            runtime.sequence(),
+            runtime.summary()
+        );
+    }
+    for (work_id, detail) in &outcome.broken {
+        // 参数读不懂就不确认：网关那边“期望版本一直没被确认”正是这条坏参数真被看见的形态。
+        eprintln!("event=WorkSpecUnparsable work_id={work_id} detail={detail}");
+    }
+    for unit in &outcome.unsupported {
+        eprintln!(
+            "event=WorkUnitUnsupported work_id={} unit_id={} detail={}",
+            unit.work_id, unit.unit_id, unit.detail
+        );
+    }
+    for work_id in &outcome.stopped {
+        eprintln!("event=WorkStopped work_id={work_id}");
+    }
+    for work_id in &outcome.started {
+        eprintln!("event=WorkStarted work_id={work_id}");
+    }
+    for work_id in &outcome.unexecutable_one_shot {
+        // 收到了但不执行：说清楚，否则网关页面上只剩一个无法解释的“派了没确认”。
+        eprintln!(
+            "event=OneShotWorkNotExecuted work_id={work_id} detail=\"agentd 尚未实现一次性工作的执行\""
+        );
+    }
+    for (work_id, plan_version) in outcome.to_ack {
+        if ack_work(config, &work_id, plan_version).await {
+            runtime.mark_acked(&work_id, plan_version);
+        } else {
+            eprintln!("event=WorkAckFailed work_id={work_id} plan_version={plan_version}");
         }
     }
 }
@@ -977,10 +1082,43 @@ fn emit_discovery_refresh(result: &DiscoveryRefreshResult, probes: &[DiscoveryPr
 }
 
 pub fn run_once(loop_ctx: &DaemonLoop<'_>) -> RuntimeResult<RuntimeHealthSnapshot> {
+    run_once_with_work(loop_ctx, &AppliedWorkGrant::default())
+}
+
+/// 跑一次，并指定当前持有的工作授权。
+///
+/// 存在的理由：工作授权决定了采集任务与指标上送，而一次性路径**不拉工作** ——
+/// 要把“有授权时应该发生什么”测出来（或将来做只跑一轮的 `--once`），就得能把它传进来。
+/// `run_once` 传的是“没有授权”，也就是一个不做任务工作的 Agent。
+pub fn run_once_with_work(
+    loop_ctx: &DaemonLoop<'_>,
+    work: &AppliedWorkGrant,
+) -> RuntimeResult<RuntimeHealthSnapshot> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(run_once_async(loop_ctx))
+        .block_on(run_once_with_work_async(loop_ctx, work))
+}
+
+async fn run_once_with_work_async(
+    loop_ctx: &DaemonLoop<'_>,
+    work: &AppliedWorkGrant,
+) -> RuntimeResult<RuntimeHealthSnapshot> {
+    // 一次性路径：运行时只活这一次，所以每个探针都是“没过” → 全量刷新（与旧语义一致）。
+    let mut discovery_runtime = DiscoveryRuntime::new(discovery_probes(loop_ctx.config));
+    // 只跑一轮，所以“到没到周期”没有意义：授权允许就发。
+    let send_metrics = work.metrics_interval().is_some();
+    run_once_with_failure_cache(
+        loop_ctx,
+        None,
+        None,
+        None,
+        &mut discovery_runtime,
+        work,
+        send_metrics,
+    )
+    .await
+    .map(|(snapshot, _)| snapshot)
 }
 
 pub fn recover_incomplete_executions(state_dir: &Path, instance_id: &str) -> RuntimeResult<()> {
