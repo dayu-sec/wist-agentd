@@ -488,7 +488,7 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     // 工作授权跨 tick 活着：`acked_plan_version` 就在里面，它决定
     // “这一版我确认过了，不用每 30s 重复确认”。
     //
-    // 启动时先用**上次落盘的留痕**恢复（`state/work/grant.json`）：它不是期望状态的
+    // 启动时先用**上次落盘的留痕**恢复（`state/work_grant.json`）：它不是期望状态的
     // 第二份真相，只是「最后已知的那一份」，好处是把确认记忆一起带回来 ——
     // 重启后不会重复确认，页面也不会先闪一次「从未确认」。
     let work_record_path = work_grant::path_for(Path::new(&loop_ctx.config.paths.state_dir));

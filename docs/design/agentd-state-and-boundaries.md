@@ -147,6 +147,8 @@
   state/
     agent_runtime.json
     execution_queue.json
+    fact_report.json
+    work_grant.json
     running/
       <execution_id>.json
     reporting/
@@ -158,6 +160,10 @@
           checkpoints.json
   log/
 ```
+
+约定：**单例状态扁平放在 `state/` 根下**（`agent_runtime.json` / `execution_queue.json` /
+`fact_report.json` / `work_grant.json`），**「一个实体多实例」才用目录**
+（`running/<execution_id>.json`、`logs/file_inputs/<input_id>/`）。
 
 ### 4.1 `agent_runtime.json`
 
@@ -233,6 +239,27 @@
 
 - [`log-file-state-schema.md`](log-file-state-schema.md)
 
+### 4.6 `work_grant.json`
+
+保存**网关授权工作的最后已知一份**（拉取快照 → 折算 → 确认的回执）。
+
+为什么需要它：
+
+- **debug**：出问题时本机直接看「网关到底发了什么」与「我据此在做什么」，
+  不必回到网关翻库；
+- **断网/重启后继续干活**：进程活着时网关联不上本来就会保留上次应用的工作，
+  但重启后内存清空 —— 没有这份留痕就变成「没授权 → 不采集、不上指标」；
+  有了它则是「按最后已知期望继续干」；代价：**断网期间撤回会晚一步生效**；
+- **不重复确认**：确认过的版本一并记下，重启后不把每个版本再点头一遍；
+- 任务式工作（一次性工作）将来要记执行进度与断点，也落在同一份文件里。
+
+字段（`schema_version` / `sequence` / `received_at` / `applied_at` / `log_inputs[]` /
+`metrics_interval_seconds` / `acked{}` / `unexecutable_one_shot[]` / `grant`）：
+
+- 前四项=「什么时候从网关收到的哪一版」；
+- 中三项=「我据此折算成了什么、确认了哪些版本」（**身份以网关为准**，不是第二份真相）；
+- 末项`grant`=网关**原样**发来的快照。
+
 ---
 
 ## 5. 哪些状态必须落盘
@@ -243,6 +270,7 @@
 
 - `agent_runtime.json`
 - `execution_queue.json`
+- `work_grant.json`
 - `running/<execution_id>.json`
 - `reporting/<execution_id>.json`
 - `logs/file_inputs/<input_id>/checkpoints.json`

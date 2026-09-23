@@ -214,7 +214,7 @@ impl AppliedWorkGrant {
         }
     }
 
-    /// 生成落盘留痕（`state/work/grant.json`）。
+    /// 生成落盘留痕（`state/work_grant.json`）。
     ///
     /// 还没收到过任何快照时返回 `None`：那时没什么可留的，不该凭空写一份空文件。
     pub fn record(
@@ -966,7 +966,7 @@ mod tests {
         assert!(!inputs[0].input.input_id.contains('/'));
     }
 
-    // ── 落盘留痕（state/work/grant.json）──
+    // ── 落盘留痕（state/work_grant.json）──
 
     #[test]
     fn a_record_needs_a_received_grant_and_carries_what_we_did_with_it() {

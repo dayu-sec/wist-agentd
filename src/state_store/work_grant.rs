@@ -1,4 +1,4 @@
-//! 网关授权工作的**本地留痕**（`state/work/grant.json`）。
+//! 网关授权工作的**本地留痕**（`state/work_grant.json`）。
 //!
 //! 记三件事，各有各的用处：
 //!   1. 网关**原样发来的快照**（`grant`）—— debug 的第一手材料：「它到底发了我什么」，
@@ -20,7 +20,20 @@
 //! 注意：它**不能**治病「重启后页面显示未确认」这类现象 —— 页面的确认读的是**网关**
 //! 那份回执，agentd 重启不会把网关库里那一行抹掉。这份留痕解决的是本机失忆，不是两边不一致。
 //!
-//! ## 这不是「期望状态的第二份真相」
+//! ## 为什么叫 `work_grant.json`
+//!
+//! 名字跟两件事走，不是凭喜好：
+//!   · **模型的话**：网关「授权（grant）工作」、Agent 拉的叫「授权快照（WorkGrant）」——
+//!     模型里明确要求这三个动作共用一个词根，避免 Grant / Dispatch / Assign 混用；
+//!   · **本仓的目录约定**（`docs/design/agentd-state-and-boundaries.md` §4）：
+//!     **单例状态扁平放在 `state/` 根下**（`agent_runtime.json` / `execution_queue.json`），
+//!     「一个实体多实例」才用目录（`running/<execution_id>.json`）。
+//!     这份只有「最后一次收到的授权」这一份，所以扁平。
+//!
+//! 刻意**不**叫 `work_state.json`：本仓「work state」已被占用（`AgentWorkState { Paused,
+//! Resumed }` / `TelemetryWorkState` 指的是采集暂停/继续），撞语义会害到后来读代码的人。
+//!
+//! ## 它不是「期望状态的第二份真相」
 //!
 //! 连上网关后一律以网关为准：快照是幂等的期望状态，拉一次就回到期望。
 //! 本地这份只是**最后已知**的那一份，永远不参与「谁更新」的比较。
@@ -52,7 +65,7 @@ pub struct WorkLogInputRecord {
     pub path: String,
 }
 
-/// `state/work/grant.json` 的内容。
+/// `state/work_grant.json` 的内容。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkGrantRecord {
     pub schema_version: String,
@@ -79,7 +92,7 @@ pub struct WorkGrantRecord {
 }
 
 pub fn path_for(state_dir: &Path) -> PathBuf {
-    state_dir.join("work").join("grant.json")
+    state_dir.join("work_grant.json")
 }
 
 /// 读取留痕；文件不存在（首次运行）返回 `None`。
