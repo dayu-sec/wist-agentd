@@ -15,4 +15,4 @@ pub(crate) mod log_seq_state;
 pub mod planner_candidates;
 pub mod reporting;
 pub mod running;
-pub mod work_grant;
+pub mod work;

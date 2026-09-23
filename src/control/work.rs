@@ -20,7 +20,8 @@ use std::time::Duration;
 
 use wist_contracts::agent_config::{AgentConfig, LogFileInputSection};
 use wist_contracts::work::{
-    ACK_WORK_KIND, AckWork, POLL_WORK_KIND, PollWork, WorkAccepted, WorkGrant, WorkSpec,
+    ACK_WORK_KIND, AckWork, OneShotWork, POLL_WORK_KIND, PollWork, StandingWork, WorkAccepted,
+    WorkGrant, WorkSpec,
 };
 use wist_shared::time::now_rfc3339;
 
@@ -66,6 +67,8 @@ struct AppliedWork {
     plan_version: i64,
     /// `active` | `paused` | …
     status: String,
+    /// 网关发这份工作时声明的生效时间（落盘时原样记）。
+    effective_from: String,
     /// 解析成功的工作参数；`None` = 参数坏了（`spec_detail` 说明哪里坏）。
     spec: Option<WorkSpec>,
     spec_detail: Option<String>,
@@ -102,16 +105,16 @@ pub struct ApplyOutcome {
     pub unexecutable_one_shot: Vec<String>,
 }
 
-/// 当前持有的工作授权（跨 tick 活着）。
+/// 当前持有与在执行的工作（跨 tick 活着）。
 #[derive(Debug, Clone, Default)]
 pub struct AppliedWorkGrant {
     sequence: i64,
     works: BTreeMap<String, AppliedWork>,
+    /// 未了结的一次性工作（网关侧状态 + 内容）。本机还没执行，但要记下来：
+    /// 「我手里有这件活」本身是工作内容的一部分。
+    one_shot_works: BTreeMap<String, OneShotWork>,
     /// 收到但**未执行**的一次性工作 id（已排序）：留在这里是为了每轮只报一次新增的。
     unexecutable_one_shot: Vec<String>,
-    /// 最后收到的那份快照（**原样**）：落盘留痕时连它一起写，
-    /// 「网关到底发了什么」与「我据此做了什么」就都存在文件里。
-    last_grant: Option<WorkGrant>,
 }
 
 impl AppliedWorkGrant {
@@ -152,6 +155,7 @@ impl AppliedWorkGrant {
                     family: work.family.clone(),
                     plan_version: work.plan_version,
                     status: work.status.clone(),
+                    effective_from: work.effective_from.clone(),
                     spec,
                     spec_detail,
                     acked_plan_version: previous_ack,
@@ -203,7 +207,14 @@ impl AppliedWorkGrant {
 
         self.sequence = grant.sequence;
         self.works = next;
-        self.last_grant = Some(grant.clone());
+        // 「我手里有哪些一次性工作」跟快照走（快照只带**未了结**的活）。全量替换：
+        // 了结的活不该继续留在本机工作视图里 —— 那会让人以为还在等它做什么。
+        self.one_shot_works = grant
+            .one_shot
+            .iter()
+            .filter(|work| work.is_outstanding())
+            .map(|work| (work.work_id.clone(), work.clone()))
+            .collect();
         outcome
     }
 
@@ -214,63 +225,149 @@ impl AppliedWorkGrant {
         }
     }
 
-    /// 生成落盘留痕（`state/work_grant.json`）。
+    /// 生成**本机工作视图**（`state/work.json`）：我手里有哪些工作、各自在采什么、
+    /// 跑成了哪些任务、哪一版确认过了。
     ///
-    /// 还没收到过任何快照时返回 `None`：那时没什么可留的，不该凭空写一份空文件。
-    pub fn record(
-        &self,
-        received_at: &str,
-        applied_at: &str,
-    ) -> Option<crate::state_store::work_grant::WorkGrantRecord> {
-        let grant = self.last_grant.clone()?;
-        Some(crate::state_store::work_grant::WorkGrantRecord {
-            schema_version: crate::state_store::work_grant::SCHEMA_VERSION_V1.to_string(),
-            sequence: self.sequence,
-            received_at: received_at.to_string(),
-            applied_at: applied_at.to_string(),
-            log_inputs: self
-                .log_inputs()
-                .into_iter()
-                .map(|entry| crate::state_store::work_grant::WorkLogInputRecord {
-                    work_id: entry.work_id,
-                    family: entry.family,
-                    unit_id: entry.unit_id,
-                    input_id: entry.input.input_id,
-                    path: entry.input.path,
-                })
-                .collect(),
+    /// 从来没收到过任何快照（网关序号还是初始的 0）时返回 `None`：
+    /// 那时“没有工作”是一个**未知**而不是事实，不该凭空写一份空清单让人以为“确实没活干”。
+    pub fn device_view(&self, recorded_at: &str) -> Option<crate::state_store::work::WorkRecord> {
+        if self.sequence == 0 {
+            return None;
+        }
+        let standing = self
+            .works
+            .iter()
+            .map(
+                |(work_id, work)| crate::state_store::work::StandingWorkRecord {
+                    work_id: work_id.clone(),
+                    family: work.family.clone(),
+                    status: work.status.clone(),
+                    plan_version: work.plan_version,
+                    acknowledged_version: work.acked_plan_version,
+                    effective_from: work.effective_from.clone(),
+                    // 工作内容：直接就是折算时用的那份单元清单。
+                    units: work
+                        .spec
+                        .as_ref()
+                        .map(|spec| spec.units.clone())
+                        .unwrap_or_default(),
+                    // 本机跑起来的采集任务（指标类工作没有任务）。
+                    tasks: self
+                        .log_inputs()
+                        .into_iter()
+                        .filter(|entry| &entry.work_id == work_id)
+                        .map(|entry| crate::state_store::work::WorkTaskRecord {
+                            input_id: entry.input.input_id,
+                            path: entry.input.path,
+                            startup_position: entry.input.startup_position,
+                        })
+                        .collect(),
+                },
+            )
+            .collect();
+        let one_shot = self
+            .one_shot_works
+            .values()
+            .map(|work| crate::state_store::work::OneShotWorkRecord {
+                work_id: work.work_id.clone(),
+                action: work.action.clone(),
+                spec: work.spec.clone(),
+                status: work.status.clone(),
+                // 本机执行状态：网关派发的活还没做（agentd 尚未实现一次性工作的执行）。
+                execution: "unexecuted".to_string(),
+                scheduled_at: work.scheduled_at.clone(),
+                deadline_at: work.deadline_at.clone(),
+                timeout_seconds: work.timeout_seconds,
+            })
+            .collect();
+        Some(crate::state_store::work::WorkRecord {
+            schema_version: crate::state_store::work::SCHEMA_VERSION_V1.to_string(),
+            recorded_at: recorded_at.to_string(),
+            gateway_sequence: self.sequence,
+            standing,
+            one_shot,
             metrics_interval_seconds: self
                 .metrics_interval()
                 .map(|interval| interval.as_secs() as i64),
-            acked: self
-                .works
-                .iter()
-                .filter_map(|(work_id, work)| {
-                    work.acked_plan_version
-                        .map(|version| (work_id.clone(), version))
-                })
-                .collect(),
-            unexecutable_one_shot: self.unexecutable_one_shot.clone(),
-            grant,
         })
     }
 
-    /// 从落盘留痕恢复（重启时用）。
+    /// 从本机工作视图恢复（重启时用）。
     ///
     /// 恢复走的就是 [`apply`](Self::apply) + [`mark_acked`](Self::mark_acked) 这两条既有路径 ——
     /// 不另写一套「从文件推状态」的逻辑，否则那份逻辑迟早与主路不一致。
-    /// 效果：重启后**立刻**就按最后已知期望干活（不再等下一次拉取，网关不可达也能干），
+    /// 效果：重启后**立刻**就按最后已知的工作干活（不再等下一次拉取，网关不可达也能干），
     /// 且已回报的版本被承认、不会把每个版本再点头一遍。
-    pub fn restore(record: &crate::state_store::work_grant::WorkGrantRecord) -> Self {
+    pub fn restore(record: &crate::state_store::work::WorkRecord) -> Self {
+        // 把「本机工作视图」反推成一份等价快照，再走主路应用 —— 两条路算出来的结论必须一样，
+        // 这也顺便让「落盘/恢复」这对操作自带一致性检查（单测里锁的正是这一点）。
+        let standing = record
+            .standing
+            .iter()
+            .map(|entry| StandingWork {
+                work_id: entry.work_id.clone(),
+                agent_id: String::new(),
+                family: entry.family.clone(),
+                spec: WorkSpec {
+                    units: entry.units.clone(),
+                }
+                .encode()
+                // 单元清单由本机自己写的，编不回去说明文件被改坏了：
+                // 用空清单让它**报出参数坏**（与网关发了坏参数同一处置），不静默当没工作。
+                .unwrap_or_else(|_| "unparsable".to_string()),
+                catalog_version: 0,
+                proposal_id: None,
+                plan_version: entry.plan_version,
+                effective_from: entry.effective_from.clone(),
+                status: entry.status.clone(),
+                updated_by: String::new(),
+                updated_at: String::new(),
+            })
+            .collect();
         let mut runtime = Self {
-            sequence: record.sequence,
+            sequence: record.gateway_sequence,
             ..Default::default()
         };
-        // 应用一次只为**重建折算视图**（日志任务/指标周期）；确认与否由下面的 acked 决定。
-        let _ = runtime.apply(&record.grant);
-        for (work_id, plan_version) in &record.acked {
-            runtime.mark_acked(work_id, *plan_version);
+        let _ = runtime.apply(&WorkGrant {
+            agent_id: String::new(),
+            standing,
+            one_shot: Vec::new(),
+            sequence: record.gateway_sequence,
+            granted_at: record.recorded_at.clone(),
+        });
+        for entry in &record.standing {
+            if let Some(version) = entry.acknowledged_version {
+                runtime.mark_acked(&entry.work_id, version);
+            }
         }
+        // 一次性工作也要回到「我手里有哪些」里（页面/日志看得到），而不仅是 `unexecutable` 名单。
+        for entry in &record.one_shot {
+            runtime.one_shot_works.insert(
+                entry.work_id.clone(),
+                OneShotWork {
+                    work_id: entry.work_id.clone(),
+                    agent_id: String::new(),
+                    action: entry.action.clone(),
+                    spec: entry.spec.clone(),
+                    scheduled_at: entry.scheduled_at.clone(),
+                    deadline_at: entry.deadline_at.clone(),
+                    timeout_seconds: entry.timeout_seconds,
+                    interruptible: false,
+                    status: entry.status.clone(),
+                    paused_at: None,
+                    paused_total_seconds: 0,
+                    current_step: None,
+                    completed_steps: Vec::new(),
+                    attempt: 0,
+                    issued_by: String::new(),
+                    issued_at: String::new(),
+                },
+            );
+            if !runtime.unexecutable_one_shot.contains(&entry.work_id) {
+                runtime.unexecutable_one_shot.push(entry.work_id.clone());
+            }
+        }
+        runtime.unexecutable_one_shot.sort();
         runtime
     }
 
@@ -556,7 +653,7 @@ pub(crate) async fn ack_work(config: &AgentConfig, work_id: &str, plan_version: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wist_contracts::work::StandingWork;
+    use crate::state_store::work::SCHEMA_VERSION_V1;
 
     fn spec(units: &[(&str, &str, &str)]) -> String {
         // (unit_id, capability, source) —— source 形如 `FileGlob:/a/b*`。
@@ -966,12 +1063,13 @@ mod tests {
         assert!(!inputs[0].input.input_id.contains('/'));
     }
 
-    // ── 落盘留痕（state/work_grant.json）──
+    // ── 本机工作视图（state/work.json）──
 
     #[test]
-    fn a_record_needs_a_received_grant_and_carries_what_we_did_with_it() {
-        // 还没收到任何快照：没什么可留的，不凭空写一份空文件。
-        assert!(AppliedWorkGrant::default().record("t0", "t1").is_none());
+    fn a_work_view_needs_a_received_grant_and_carries_what_we_are_doing() {
+        // 还没收到任何快照（序号仍是初始的 0）："没有工作"此刻是个**未知**而不是事实，
+        // 不该凭空写一份空清单让人以为"确实没活干"。
+        assert!(AppliedWorkGrant::default().device_view("t0").is_none());
 
         let mut applied = AppliedWorkGrant::default();
         applied.apply(&grant(
@@ -999,22 +1097,83 @@ mod tests {
         ));
         applied.mark_acked("work-m", 2);
 
-        let record = applied.record("t-received", "t-applied").expect("record");
-        assert_eq!(record.sequence, 4);
-        assert_eq!(record.received_at, "t-received");
-        assert_eq!(record.applied_at, "t-applied");
-        assert_eq!(record.metrics_interval_seconds, Some(15));
-        assert_eq!(record.log_inputs.len(), 1);
-        assert_eq!(record.log_inputs[0].input_id, "work-CrashPanic-mac-crash");
-        assert_eq!(
-            record.log_inputs[0].path,
-            "/Library/Logs/DiagnosticReports/*.ips"
-        );
-        // 只记**已确认**的版本：没确认的就不该写成已确认。
-        assert_eq!(record.acked.get("work-m"), Some(&2));
-        assert_eq!(record.acked.get("work-l"), None);
-        // 原样快照也要在（debug 第一手材料）。
-        assert_eq!(record.grant.standing.len(), 2);
+        let view = applied.device_view("t-recorded").expect("view");
+        assert_eq!(view.schema_version, SCHEMA_VERSION_V1);
+        assert_eq!(view.recorded_at, "t-recorded");
+        // 只留最小溯源，不是授权副本：想知道网关当时发了什么，答案在网关。
+        assert_eq!(view.gateway_sequence, 4);
+        assert_eq!(view.metrics_interval_seconds, Some(15));
+        assert!(view.one_shot.is_empty());
+
+        let metrics = view
+            .standing
+            .iter()
+            .find(|work| work.work_id == "work-m")
+            .expect("work-m");
+        assert_eq!(metrics.family, "HostMetrics");
+        assert_eq!(metrics.status, "active");
+        assert_eq!(metrics.plan_version, 2);
+        assert_eq!(metrics.acknowledged_version, Some(2));
+        // 工作内容：真在采什么。
+        assert_eq!(metrics.units.len(), 1);
+        assert_eq!(metrics.units[0].unit_id, "h-metrics");
+        assert!(metrics.tasks.is_empty(), "指标类工作没有采集任务");
+
+        let logs = view
+            .standing
+            .iter()
+            .find(|work| work.work_id == "work-l")
+            .expect("work-l");
+        // 没确认的就不该写成已确认。
+        assert_eq!(logs.acknowledged_version, None);
+        assert_eq!(logs.units.len(), 1);
+        assert_eq!(logs.units[0].sources[0].kind, "FileGlob");
+        // 本机跑起来的采集任务：任务 id 同时是落盘目录名。
+        assert_eq!(logs.tasks.len(), 1);
+        assert_eq!(logs.tasks[0].input_id, "work-CrashPanic-mac-crash");
+        assert_eq!(logs.tasks[0].path, "/Library/Logs/DiagnosticReports/*.ips");
+        assert_eq!(logs.tasks[0].startup_position, "tail");
+    }
+
+    #[test]
+    fn the_work_view_holds_the_one_shot_work_we_have_not_executed() {
+        let mut applied = AppliedWorkGrant::default();
+        let mut snapshot = grant(1, Vec::new());
+        snapshot.one_shot = vec![wist_contracts::work::OneShotWork {
+            work_id: "work-upgrade".to_string(),
+            agent_id: "agent-1".to_string(),
+            action: "upgrade".to_string(),
+            spec: "0.1.4".to_string(),
+            scheduled_at: "2026-09-23T00:00:00Z".to_string(),
+            deadline_at: "2026-09-24T00:00:00Z".to_string(),
+            timeout_seconds: 600,
+            interruptible: false,
+            status: "dispatched".to_string(),
+            paused_at: None,
+            paused_total_seconds: 0,
+            current_step: None,
+            completed_steps: Vec::new(),
+            attempt: 0,
+            issued_by: "admin".to_string(),
+            issued_at: "2026-09-23T00:00:00Z".to_string(),
+        }];
+        applied.apply(&snapshot);
+
+        let view = applied.device_view("t0").expect("view");
+        assert_eq!(view.one_shot.len(), 1);
+        let work = &view.one_shot[0];
+        assert_eq!(work.work_id, "work-upgrade");
+        assert_eq!(work.action, "upgrade");
+        assert_eq!(work.spec, "0.1.4");
+        // 两个轴分开记：`status` 是网关侧的派发状态，`execution` 是本机执行状态。
+        assert_eq!(work.status, "dispatched");
+        assert_eq!(work.execution, "unexecuted");
+        assert_eq!(work.deadline_at, "2026-09-24T00:00:00Z");
+        assert_eq!(work.timeout_seconds, 600);
+
+        // 了结了就不该继续挂在"我手里的活"里。
+        applied.apply(&grant(2, Vec::new()));
+        assert!(applied.device_view("t1").expect("view").one_shot.is_empty());
     }
 
     #[test]
@@ -1031,10 +1190,10 @@ mod tests {
             )],
         ));
         applied.mark_acked("work-m", 2);
-        let record = applied.record("t0", "t1").expect("record");
+        let view = applied.device_view("t0").expect("view");
 
-        // 重启：从留痕恢复。
-        let mut restored = AppliedWorkGrant::restore(&record);
+        // 重启：从本机工作视图恢复（照的就是 apply + mark_acked 这条主路）。
+        let mut restored = AppliedWorkGrant::restore(&view);
         assert_eq!(restored.sequence(), 4);
         assert_eq!(restored.metrics_interval(), Some(Duration::from_secs(15)));
         assert!(restored.summary().contains("working=1"));
@@ -1058,6 +1217,48 @@ mod tests {
         ));
         assert_eq!(bumped.to_ack, vec![("work-m".to_string(), 3)]);
         assert_eq!(restored.metrics_interval(), Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn restore_writes_back_an_identical_view() {
+        // 落盘 → 恢复 → 再落盘：两份视图必须一样。这条往返把"视图"与"恢复"
+        // 锁在一起，否则恢复漏掉的字段会一直安静地退化。
+        let mut applied = AppliedWorkGrant::default();
+        let mut snapshot = grant(
+            7,
+            vec![standing(
+                "work-l",
+                "CrashPanic",
+                1,
+                "active",
+                &spec(&[("mac-crash", "collect_logs", "FileGlob:/a/*")]),
+            )],
+        );
+        snapshot.one_shot = vec![wist_contracts::work::OneShotWork {
+            work_id: "work-exec".to_string(),
+            agent_id: "agent-1".to_string(),
+            action: "exec".to_string(),
+            spec: "id".to_string(),
+            scheduled_at: "2026-09-23T00:00:00Z".to_string(),
+            deadline_at: "2026-09-24T00:00:00Z".to_string(),
+            timeout_seconds: 60,
+            interruptible: true,
+            status: "dispatched".to_string(),
+            paused_at: None,
+            paused_total_seconds: 0,
+            current_step: None,
+            completed_steps: Vec::new(),
+            attempt: 0,
+            issued_by: "admin".to_string(),
+            issued_at: "2026-09-23T00:00:00Z".to_string(),
+        }];
+        applied.apply(&snapshot);
+        let first = applied.device_view("t-recorded").expect("view");
+
+        let back = AppliedWorkGrant::restore(&first)
+            .device_view("t-recorded")
+            .expect("view");
+        assert_eq!(first, back);
     }
 
     fn applied_grant_repeat() -> WorkGrant {

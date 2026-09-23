@@ -148,7 +148,7 @@
     agent_runtime.json
     execution_queue.json
     fact_report.json
-    work_grant.json
+    work.json
     running/
       <execution_id>.json
     reporting/
@@ -162,7 +162,7 @@
 ```
 
 约定：**单例状态扁平放在 `state/` 根下**（`agent_runtime.json` / `execution_queue.json` /
-`fact_report.json` / `work_grant.json`），**「一个实体多实例」才用目录**
+`fact_report.json` / `work.json`），**「一个实体多实例」才用目录**
 （`running/<execution_id>.json`、`logs/file_inputs/<input_id>/`）。
 
 ### 4.1 `agent_runtime.json`
@@ -239,26 +239,33 @@
 
 - [`log-file-state-schema.md`](log-file-state-schema.md)
 
-### 4.6 `work_grant.json`
+### 4.6 `work.json`
 
-保存**网关授权工作的最后已知一份**（拉取快照 → 折算 → 确认的回执）。
+保存**本机工作内容视图**：我手里有哪些工作、各自在采什么、跑成了哪些采集任务、哪一版
+确认过了。
+
+**它不是授权快照的抄本**。谁授权了什么、期望哪一版，是**网关的事实**（网关库里有），
+本机再抄一份只会诱使人拿它当第二份真相。这里只留最小溯源 `gateway_sequence`，用来把
+本机视图与网关那一版期望对上号。
 
 为什么需要它：
 
-- **debug**：出问题时本机直接看「网关到底发了什么」与「我据此在做什么」，
-  不必回到网关翻库；
+- **debug**：「这台机器到底在采什么」一眼可见，不必反解授权快照、也不必回网关翻库；
 - **断网/重启后继续干活**：进程活着时网关联不上本来就会保留上次应用的工作，
-  但重启后内存清空 —— 没有这份留痕就变成「没授权 → 不采集、不上指标」；
-  有了它则是「按最后已知期望继续干」；代价：**断网期间撤回会晚一步生效**；
+  但重启后内存清空 —— 没有这份文件就变成「没授权 → 不采集、不上指标」；
+  有了它则是「按最后已知的工作继续干」；代价：**断网期间撤回会晚一步生效**；
 - **不重复确认**：确认过的版本一并记下，重启后不把每个版本再点头一遍；
-- 任务式工作（一次性工作）将来要记执行进度与断点，也落在同一份文件里。
+- **一次性工作要记进度与断点**，`one_shot[]` 就是它的落点
+  （现在只有一个 `execution: "unexecuted"`）。
 
-字段（`schema_version` / `sequence` / `received_at` / `applied_at` / `log_inputs[]` /
-`metrics_interval_seconds` / `acked{}` / `unexecutable_one_shot[]` / `grant`）：
+字段（`schema_version` / `recorded_at` / `gateway_sequence` / `standing[]` / `one_shot[]` /
+`metrics_interval_seconds`）：
 
-- 前四项=「什么时候从网关收到的哪一版」；
-- 中三项=「我据此折算成了什么、确认了哪些版本」（**身份以网关为准**，不是第二份真相）；
-- 末项`grant`=网关**原样**发来的快照。
+- `standing[]` = 手里生效或暂停的常驻工作，每份带 `units[]`（真在采什么：单元 + 采集来源 +
+  规则标识 + 需什么权限）与 `tasks[]`（折算成本机的采集任务：任务 id + 盯的路径 + 起读位置）；
+- `one_shot[]` = 手里未了结的一次性工作。`status` 是**网关侧**派发状态，`execution` 是
+  **本机执行状态** —— 两个轴分开记，不要混；
+- 写失败/读不动都**只记一行日志**：一份工作视图不该有让采集停下的权力。
 
 ---
 
@@ -270,7 +277,7 @@
 
 - `agent_runtime.json`
 - `execution_queue.json`
-- `work_grant.json`
+- `work.json`
 - `running/<execution_id>.json`
 - `reporting/<execution_id>.json`
 - `logs/file_inputs/<input_id>/checkpoints.json`

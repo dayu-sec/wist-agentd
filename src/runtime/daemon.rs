@@ -38,7 +38,7 @@ use crate::self_observability::{
     RuntimeHealthSnapshot, emit,
 };
 use crate::state_store::{
-    agent_runtime, execution_queue, fact_report, log_seq_state, planner_candidates, work_grant,
+    agent_runtime, execution_queue, fact_report, log_seq_state, planner_candidates, work,
 };
 use crate::telemetry::metrics::target_view;
 
@@ -488,27 +488,27 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     // 工作授权跨 tick 活着：`acked_plan_version` 就在里面，它决定
     // “这一版我确认过了，不用每 30s 重复确认”。
     //
-    // 启动时先用**上次落盘的留痕**恢复（`state/work_grant.json`）：它不是期望状态的
-    // 第二份真相，只是「最后已知的那一份」，好处是把确认记忆一起带回来 ——
-    // 重启后不会重复确认，页面也不会先闪一次「从未确认」。
-    let work_record_path = work_grant::path_for(Path::new(&loop_ctx.config.paths.state_dir));
-    let mut work_runtime = match work_grant::load_async(&work_record_path).await {
+    // 启动时先用**上次落盘的本机工作视图**恢复（`state/work.json`）：它记的是「我最后
+    // 已知在干什么」。好处是重启后立刻接着干（网关不可达也能干），且确认记忆一起带回来 ——
+    // 不会重复确认，页面也不会先闪一次「从未确认」。代价：**断网期间撤回会晚一步生效**。
+    let work_record_path = work::path_for(Path::new(&loop_ctx.config.paths.state_dir));
+    let mut work_runtime = match work::load_async(&work_record_path).await {
         Ok(Some(record)) => {
             let restored = AppliedWorkGrant::restore(&record);
             eprintln!(
-                "event=WorkGrantRestored path={} sequence={} applied_at={} {} note=\"以网关为准；仅在拉不到快照时用这份\"",
+                "event=WorkRestored path={} sequence={} recorded_at={} {} note=\"以网关为准；仅在拉不到快照时用这份\"",
                 work_record_path.display(),
                 restored.sequence(),
-                record.applied_at,
+                record.recorded_at,
                 restored.summary()
             );
             restored
         }
         Ok(None) => AppliedWorkGrant::default(),
         Err(err) => {
-            // 一份留痕不该有让采集停下的权力：读不动就记一行、当没有。
+            // 一份工作视图不该有让采集停下的权力：读不动就记一行、当没有。
             eprintln!(
-                "wist-agentd work grant state: ignoring unreadable {}: {err}",
+                "wist-agentd work view state: ignoring unreadable {}: {err}",
                 work_record_path.display()
             );
             AppliedWorkGrant::default()
@@ -828,7 +828,6 @@ async fn refresh_work_grant(
         // 「有活干」倒退成「什么都没授权」—— 那是把网络抖动放大成采集中断。
         return;
     };
-    let received_at = now_rfc3339();
     let outcome = runtime.apply(&grant);
     if outcome.changed {
         eprintln!(
@@ -868,14 +867,14 @@ async fn refresh_work_grant(
             eprintln!("event=WorkAckFailed work_id={work_id} plan_version={plan_version}");
         }
     }
-    // 有变化（含“确认了某个版本”）才落盘：留痕是给人看的，不必每 30s 重写一遍。
-    // 写失败只记一行日志：一份留痕不该影响采集本身。
+    // 有变化（含“确认了某个版本”）才落盘：这份视图是给人看的，不必每 30s 重写一遍。
+    // 写失败只记一行日志：一份工作视图不该影响采集本身。
     if (outcome.changed || acked_anything)
-        && let Some(record) = runtime.record(&received_at, &now_rfc3339())
-        && let Err(err) = work_grant::store_async(record_path, &record).await
+        && let Some(record) = runtime.device_view(&now_rfc3339())
+        && let Err(err) = work::store_async(record_path, &record).await
     {
         eprintln!(
-            "wist-agentd work grant state: failed to write {}: {err}",
+            "wist-agentd work view state: failed to write {}: {err}",
             record_path.display()
         );
     }
