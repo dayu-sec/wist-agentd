@@ -26,6 +26,7 @@ wist-agentd（edge daemon）实现时最重要的设计文档。
 - [log-file-state-schema.md](./log-file-state-schema.md) — 文件日志 checkpoint 状态 schema
 - [macos-agent-uplink-to-warp-parse.md](./macos-agent-uplink-to-warp-parse.md) — macOS P0 采集端到端方案
 - [macos-security-audit-log-sources.md](./macos-security-audit-log-sources.md) — macOS 安全/审计日志源清单
+- [linux-security-audit-log-sources.md](./linux-security-audit-log-sources.md) — Linux 采集源清单（计算/数据服务器；**未核对**，规则/样本为零）
 
 ## 模块对照（src 目录化后）
 
@@ -36,4 +37,4 @@ wist-agentd（edge daemon）实现时最重要的设计文档。
 | `src/exec` | agentd-exec-protocol、agentd-failure-handling |
 | `src/runtime` | agentd-architecture、self-observability |
 | `src/service` | agentd-service-deployment（设计）＋ `../usage/agentd-install-and-usage`（安装/运维） |
-| `src/telemetry` | log-file-input-spec、log-file-state-schema、macos-* |
+| `src/telemetry` | log-file-input-spec、log-file-state-schema、macos-*、linux-* |

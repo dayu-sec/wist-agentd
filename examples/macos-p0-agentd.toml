@@ -5,7 +5,7 @@
 #
 # 说明：
 # - 采集列表：macOS P0（install.log / launchd / shutdown_monitor / fsck / wifi），
-#   对应 data-plane models/wpl/mac 素材与 macos_agent 数据面规则；
+#   对应 data-plane models/wpl/mac 素材与 agent_uplink 数据面规则；
 # - install.log / launchd.log 体量大：默认 tail（只收新增行），需要首次回放历史时改 head；
 # - 权限：部分路径需 root/Full Disk Access（wifi 需 admin 组）；读不到会失败/进 spool 重试；
 # - .ips（新文件）、统一日志、OpenBSM audit 需 Phase 2 source，不在本文件内。

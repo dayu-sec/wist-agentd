@@ -181,7 +181,7 @@ crash 后恢复时重建最小现场。
 ### 5.8 `telemetry`
 
 负责指标与日志采集上送：metrics 运行时快照、文件日志输入（`logs/files`：checkpoint / tail /
-rotate / multiline / spool 重放）、断连缓冲与重试、上送帧（JSON 信封 + `RAW:`）。
+rotate / multiline / spool 重放）、断连缓冲与重试、上送帧（JSON 信封 + `LOGRAW:`）。
 
 ### 5.9 `discovery`
 

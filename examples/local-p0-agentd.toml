@@ -3,7 +3,7 @@
 # 与 macos-p0-agentd.toml 的差别：
 # - install.log 33 万行历史：tail（只收新增）；
 # - launchd/shutdown_monitor/fsck/wifi 文件小：head 先回放真实历史一次，再转入 tail 增量；
-# - 输出到本机 data-plane tcp 9000（macos_agent 规则 → macos-agent sink 文件）。
+# - 输出到本机 data-plane tcp 9000（agent_uplink 规则 → macos-agent sink 文件）。
 schema_version = "v1"
 
 [telemetry.logs]

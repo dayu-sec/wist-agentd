@@ -496,7 +496,7 @@ record **没有** `source_type`，也没有 `source.file_id` / `source.device_id
 - 分配：记录生成时取号；`next_seq` 为 agent 级全局计数器，存独立文件 `state/logs/seq.json`，提交 checkpoint 前原子写（前移一位）；崩溃重读沿用同一 `seq`，误删单个 checkpoint 不回退号源；
 - 重启：从 state 续号，只要求**不回退**（不要求连续）。
 
-**上送帧**：在信封中新增 `seq`（与 `agent` 等通用字段并列），原文仍在 `RAW:` 之后。帧信号无关，不携带 `input`/文件路径/偏移等来源字段。
+**上送帧**：在信封中新增 `seq`（与 `agent` 等通用字段并列），原文仍在 `LOGRAW:` 之后。帧信号无关，不携带 `input`/文件路径/偏移等来源字段。
 
 **下游去重（数据面规则）**：
 

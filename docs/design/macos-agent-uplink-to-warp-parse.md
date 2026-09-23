@@ -91,16 +91,16 @@
 
 ### 4.1 上送帧格式（每行一条）
 
-**JSON 信封 + 行尾 ` RAW: ` 原文**，`raw` 不作为 JSON 字段、不做 JSON 转义：
+**JSON 信封 + 行尾 ` LOGRAW: ` 原文**，`raw` 不作为 JSON 字段、不做 JSON 转义：
 
 ```text
-{JSON 信封} RAW: <原始单行>
+{JSON 信封} LOGRAW: <原始单行>
 ```
 
 示例（launchd 真实行）：
 
 ```text
-{"schema":"v1","agent":"node-uuid","ts":"2026-09-09T08:56:22.956Z","seq":1042} RAW: 2026-09-09 08:56:24.392429 (system) <Warning>: failed lookup: name = com.apple.AppleLOM.Watchdog, flags = 0x1, requestor = watchdogd[551], error = 3: No such process
+{"schema":"v1","agent":"node-uuid","ts":"2026-09-09T08:56:22.956Z","seq":1042} LOGRAW: 2026-09-09 08:56:24.392429 (system) <Warning>: failed lookup: name = com.apple.AppleLOM.Watchdog, flags = 0x1, requestor = watchdogd[551], error = 3: No such process
 ```
 
 指标帧复用同一连接与同一信封，帧标记换为 ` METRICS: `，正文是 VM JSON line
@@ -109,9 +109,9 @@
 约定：
 
 - JSON 信封只承载通用字段（`schema/agent/ts/seq`），**不含 raw**；
-- `RAW:` 是行尾固定前缀，之后到行尾为原始内容；原始内容**保持原样，不转义**，避免体积膨胀并便于审计核对；
+- `LOGRAW:` 是行尾固定前缀，之后到行尾为原始内容；原始内容**保持原样，不转义**，避免体积膨胀并便于审计核对；
 - 因此上送行要求原始内容为**单行**；多行内容（如 `.ips`/panic 文本）由 agent 侧先归一为单行（换行转可视转义或取首行元数据）再上送，或该类走独立入口；
-- 数据面处理：先 `json(...)` 解析信封字段路由；`RAW:` 原文按需由规则抓取，miss/rescue 保留原文供回放核对。
+- 数据面处理：先 `json(...)` 解析信封字段路由；`LOGRAW:` 原文按需由规则抓取，miss/rescue 保留原文供回放核对。
 
 ---
 
@@ -150,9 +150,9 @@
 | 主题 | 设计 |
 |---|---|
 | 缓冲/重试 | 复用 spool：断连本地排队、重连回放；TCP 指数退避；JSON 信封带 `seq` 序号，去重基于信封字段（不依赖 raw） |
-| 隐私/合规 | 统一日志完整字段需 `private_data:on`——采集决策点；默认脱敏可用，仅对授权主机开完整；`RAW:` 原文按类裁剪 |
+| 隐私/合规 | 统一日志完整字段需 `private_data:on`——采集决策点；默认脱敏可用，仅对授权主机开完整；`LOGRAW:` 原文按类裁剪 |
 | 完整性 | audit 事件尽快离机；本地副本仅短期缓冲；数据面记录级去重兜底 |
-| 时钟 | record 只携带 `ts`（采集/上送时间）；源时间在 `RAW:` 原文里，由 WPL 规则抽取，WPL/OML 统一时区处理 |
+| 时钟 | record 只携带 `ts`（采集/上送时间）；源时间在 `LOGRAW:` 原文里，由 WPL 规则抽取，WPL/OML 统一时区处理 |
 | 权限治理 | root helper 提权面最小化（仅 audit/TCC/private log 采集），其余保持用户态 |
 | 认证 | V1 内网约束；V2 agent↔wparse TCP 认证/TLS |
 

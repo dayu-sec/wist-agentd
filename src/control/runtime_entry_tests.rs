@@ -803,7 +803,11 @@ fn enrollment_report_uses_config_identity() {
 
     assert_eq!(lines[0], "enrolled");
     assert_eq!(lines[1], "agent_id=agent-from-config");
-    assert!(lines.iter().any(|line| line.starts_with("credential_file=")));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("credential_file="))
+    );
     assert_eq!(lines.last().expect("last line"), "token_persisted=false");
     let _ = fs::remove_dir_all(root);
 }

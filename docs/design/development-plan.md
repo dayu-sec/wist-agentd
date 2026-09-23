@@ -7,7 +7,7 @@
 
 - 模块按职责域目录化：`bootstrap / config / control / discovery / exec / reporting / runtime / state_store / telemetry`；
 - 文件日志输入已具备：tail/head、rotate（rename/copytruncate）、truncate 重读、多行折叠、
-  checkpoint、spool 重放；上送帧 = JSON 信封 + `RAW:`；
+  checkpoint、spool 重放；上送帧 = JSON 信封 + `LOGRAW:`；
 - `control/enrollment` 注册/续期已跑通（本机实测 agent 在线）；
 - 执行链路可用：`scheduler` + `exec/local_exec` + `process_control` + `state_store`；
 - 端到端：macOS P0 采集 → 数据平面（warp-gateway data-plane）已实测。
