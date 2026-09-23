@@ -109,6 +109,9 @@ pub struct AppliedWorkGrant {
     works: BTreeMap<String, AppliedWork>,
     /// 收到但**未执行**的一次性工作 id（已排序）：留在这里是为了每轮只报一次新增的。
     unexecutable_one_shot: Vec<String>,
+    /// 最后收到的那份快照（**原样**）：落盘留痕时连它一起写，
+    /// 「网关到底发了什么」与「我据此做了什么」就都存在文件里。
+    last_grant: Option<WorkGrant>,
 }
 
 impl AppliedWorkGrant {
@@ -200,6 +203,7 @@ impl AppliedWorkGrant {
 
         self.sequence = grant.sequence;
         self.works = next;
+        self.last_grant = Some(grant.clone());
         outcome
     }
 
@@ -208,6 +212,66 @@ impl AppliedWorkGrant {
         if let Some(work) = self.works.get_mut(work_id) {
             work.acked_plan_version = Some(plan_version);
         }
+    }
+
+    /// 生成落盘留痕（`state/work/grant.json`）。
+    ///
+    /// 还没收到过任何快照时返回 `None`：那时没什么可留的，不该凭空写一份空文件。
+    pub fn record(
+        &self,
+        received_at: &str,
+        applied_at: &str,
+    ) -> Option<crate::state_store::work_grant::WorkGrantRecord> {
+        let grant = self.last_grant.clone()?;
+        Some(crate::state_store::work_grant::WorkGrantRecord {
+            schema_version: crate::state_store::work_grant::SCHEMA_VERSION_V1.to_string(),
+            sequence: self.sequence,
+            received_at: received_at.to_string(),
+            applied_at: applied_at.to_string(),
+            log_inputs: self
+                .log_inputs()
+                .into_iter()
+                .map(|entry| crate::state_store::work_grant::WorkLogInputRecord {
+                    work_id: entry.work_id,
+                    family: entry.family,
+                    unit_id: entry.unit_id,
+                    input_id: entry.input.input_id,
+                    path: entry.input.path,
+                })
+                .collect(),
+            metrics_interval_seconds: self
+                .metrics_interval()
+                .map(|interval| interval.as_secs() as i64),
+            acked: self
+                .works
+                .iter()
+                .filter_map(|(work_id, work)| {
+                    work.acked_plan_version
+                        .map(|version| (work_id.clone(), version))
+                })
+                .collect(),
+            unexecutable_one_shot: self.unexecutable_one_shot.clone(),
+            grant,
+        })
+    }
+
+    /// 从落盘留痕恢复（重启时用）。
+    ///
+    /// 恢复走的就是 [`apply`](Self::apply) + [`mark_acked`](Self::mark_acked) 这两条既有路径 ——
+    /// 不另写一套「从文件推状态」的逻辑，否则那份逻辑迟早与主路不一致。
+    /// 效果：重启后**立刻**就按最后已知期望干活（不再等下一次拉取，网关不可达也能干），
+    /// 且已回报的版本被承认、不会把每个版本再点头一遍。
+    pub fn restore(record: &crate::state_store::work_grant::WorkGrantRecord) -> Self {
+        let mut runtime = Self {
+            sequence: record.sequence,
+            ..Default::default()
+        };
+        // 应用一次只为**重建折算视图**（日志任务/指标周期）；确认与否由下面的 acked 决定。
+        let _ = runtime.apply(&record.grant);
+        for (work_id, plan_version) in &record.acked {
+            runtime.mark_acked(work_id, *plan_version);
+        }
+        runtime
     }
 
     /// 折算出的日志采集任务（只来自**正在干活**的单元）。
@@ -900,6 +964,113 @@ mod tests {
         let inputs = applied.log_inputs();
         assert_eq!(inputs[0].input.input_id, "work-MiscSystem-weird----id");
         assert!(!inputs[0].input.input_id.contains('/'));
+    }
+
+    // ── 落盘留痕（state/work/grant.json）──
+
+    #[test]
+    fn a_record_needs_a_received_grant_and_carries_what_we_did_with_it() {
+        // 还没收到任何快照：没什么可留的，不凭空写一份空文件。
+        assert!(AppliedWorkGrant::default().record("t0", "t1").is_none());
+
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            4,
+            vec![
+                standing(
+                    "work-m",
+                    "HostMetrics",
+                    2,
+                    "active",
+                    &spec(&[("h-metrics", "collect_metrics", "MetricInterval:15s")]),
+                ),
+                standing(
+                    "work-l",
+                    "CrashPanic",
+                    1,
+                    "active",
+                    &spec(&[(
+                        "mac-crash",
+                        "collect_logs",
+                        "FileGlob:/Library/Logs/DiagnosticReports/*.ips",
+                    )]),
+                ),
+            ],
+        ));
+        applied.mark_acked("work-m", 2);
+
+        let record = applied.record("t-received", "t-applied").expect("record");
+        assert_eq!(record.sequence, 4);
+        assert_eq!(record.received_at, "t-received");
+        assert_eq!(record.applied_at, "t-applied");
+        assert_eq!(record.metrics_interval_seconds, Some(15));
+        assert_eq!(record.log_inputs.len(), 1);
+        assert_eq!(record.log_inputs[0].input_id, "work-CrashPanic-mac-crash");
+        assert_eq!(
+            record.log_inputs[0].path,
+            "/Library/Logs/DiagnosticReports/*.ips"
+        );
+        // 只记**已确认**的版本：没确认的就不该写成已确认。
+        assert_eq!(record.acked.get("work-m"), Some(&2));
+        assert_eq!(record.acked.get("work-l"), None);
+        // 原样快照也要在（debug 第一手材料）。
+        assert_eq!(record.grant.standing.len(), 2);
+    }
+
+    #[test]
+    fn restore_brings_back_the_confirmed_versions_so_nothing_is_re_acked() {
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            4,
+            vec![standing(
+                "work-m",
+                "HostMetrics",
+                2,
+                "active",
+                &spec(&[("h-metrics", "collect_metrics", "MetricInterval:15s")]),
+            )],
+        ));
+        applied.mark_acked("work-m", 2);
+        let record = applied.record("t0", "t1").expect("record");
+
+        // 重启：从留痕恢复。
+        let mut restored = AppliedWorkGrant::restore(&record);
+        assert_eq!(restored.sequence(), 4);
+        assert_eq!(restored.metrics_interval(), Some(Duration::from_secs(15)));
+        assert!(restored.summary().contains("working=1"));
+
+        // 关键：同一份快照再来一次**不会**重复确认，也不会在页面上闪一次漂移。
+        let repeat = restored.apply(&applied_grant_repeat());
+        assert!(!repeat.changed);
+        assert!(repeat.to_ack.is_empty());
+        assert!(restored.apply(&applied_grant_repeat()).to_ack.is_empty());
+
+        // 但真涨了版本还是要重新应用并重新确认。
+        let bumped = restored.apply(&grant(
+            5,
+            vec![standing(
+                "work-m",
+                "HostMetrics",
+                3,
+                "active",
+                &spec(&[("h-metrics", "collect_metrics", "MetricInterval:60s")]),
+            )],
+        ));
+        assert_eq!(bumped.to_ack, vec![("work-m".to_string(), 3)]);
+        assert_eq!(restored.metrics_interval(), Some(Duration::from_secs(60)));
+    }
+
+    fn applied_grant_repeat() -> WorkGrant {
+        grant(
+            4,
+            vec![standing(
+                "work-m",
+                "HostMetrics",
+                2,
+                "active",
+                &spec(&[("h-metrics", "collect_metrics", "MetricInterval:15s")]),
+            )],
+        )
     }
 
     #[test]
