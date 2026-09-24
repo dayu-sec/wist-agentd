@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use wist_contracts::SCHEMA_VERSION_V1;
+use wist_shared::records::Record;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ::jumo_derive::Jumo)]
 #[serde(deny_unknown_fields)]
@@ -38,10 +39,13 @@ impl LogCheckpointState {
 #[jumo(kind = "struct", domain = "Discovery", module = "Discovery.Collect")]
 pub(crate) struct PendingMultilineState {
     pub source_path: String,
-    pub body: String,
-    pub start_offset: u64,
-    pub end_offset: u64,
+    /// 上次**喂进**这条记录的时间（用于"空闲多久算到头"）。没有新行时不动它 ——
+    /// 否则手里那条永远显得刚更新过，到期封口再也等不到。
     pub last_updated_at: String,
+    /// 手里那条未封口的记录（正文 + 来源区间 + 行数），由
+    /// `wist_shared::records::Delimiter` 界定出来，跨 tick / 跨重启接着算。
+    /// 它的 `completion` 此刻还没定（只在封口那一刻有意义）。
+    pub record: Record,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ::jumo_derive::Jumo)]

@@ -1,20 +1,19 @@
-//! Conversion from folded lines into structured telemetry records.
+//! Conversion from delimited records into structured telemetry records.
 
 use wist_contracts::telemetry_record::TelemetryRecord;
+use wist_shared::records::Record;
 
-use super::multiline::FoldedLine;
-
-pub fn parse_folded_lines(
+pub fn parse_delimited_records(
     agent_id: &str,
     observed_at: &str,
     input_id: &str,
     source_path: &str,
-    lines: Vec<FoldedLine>,
+    records: Vec<Record>,
     next_seq: &mut u64,
 ) -> Vec<TelemetryRecord> {
-    lines
+    records
         .into_iter()
-        .map(|line| {
+        .map(|record| {
             let seq = *next_seq;
             *next_seq += 1;
             TelemetryRecord::new_log(
@@ -22,9 +21,9 @@ pub fn parse_folded_lines(
                 observed_at.to_string(),
                 input_id.to_string(),
                 source_path.to_string(),
-                line.body,
-                line.start_offset,
-                line.end_offset,
+                record.body,
+                record.start_offset,
+                record.end_offset,
                 seq,
             )
         })

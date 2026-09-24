@@ -160,6 +160,7 @@ mod tests {
                     sources: vec![WorkSpecSource {
                         kind: "FileGlob".to_string(),
                         target: "/Library/Logs/DiagnosticReports/*.ips".to_string(),
+                        multiline: "none".to_string(),
                     }],
                 }],
                 tasks: vec![WorkTaskRecord {

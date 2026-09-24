@@ -30,6 +30,13 @@ pub(super) fn emit_telemetry_failure(failure: &TelemetryFailure) {
             "telemetry output invalid input_id={} path={} err={}",
             failure.input_id, failure.path, failure.detail
         ),
+        TelemetryFailureKind::RecordWithheld => {
+            let magnitude = failure.magnitude.as_deref().unwrap_or("n/a");
+            eprintln!(
+                "telemetry record withheld input_id={} path={} detail={} magnitude={magnitude}",
+                failure.input_id, failure.path, failure.detail
+            );
+        }
     }
 }
 
@@ -179,6 +186,7 @@ mod tests {
             input_id: input_id.to_string(),
             path: path.to_string(),
             detail: detail.to_string(),
+            magnitude: None,
         }
     }
 

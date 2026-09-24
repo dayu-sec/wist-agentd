@@ -55,6 +55,17 @@ fn granted_work(
     source_kind: &str,
     source_target: &str,
 ) -> AppliedWorkGrant {
+    granted_work_multiline(family, capability, source_kind, source_target, "none")
+}
+
+/// 同上，但可声明来源的读法（`none` / `indented`）。
+fn granted_work_multiline(
+    family: &str,
+    capability: &str,
+    source_kind: &str,
+    source_target: &str,
+    multiline: &str,
+) -> AppliedWorkGrant {
     let spec = WorkSpec {
         units: vec![WorkSpecUnit {
             unit_id: format!("unit-{family}"),
@@ -64,6 +75,7 @@ fn granted_work(
             sources: vec![WorkSpecSource {
                 kind: source_kind.to_string(),
                 target: source_target.to_string(),
+                multiline: multiline.to_string(),
             }],
         }],
     };

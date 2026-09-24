@@ -5,6 +5,7 @@ use wist_contracts::telemetry_record::TelemetryRecord;
 use crate::state_store::log_checkpoint_state::{LogCheckpointState, PendingMultilineState};
 use crate::telemetry::logs::files::file_reader::ObservedFileIdentity;
 use crate::telemetry::logs::files::file_watcher::ResumeDecision;
+use crate::telemetry::logs::gate::Withheld;
 
 #[derive(Debug, Clone, ::jumo_derive::Jumo)]
 #[jumo(kind = "struct", domain = "Discovery", module = "Discovery.Collect")]
@@ -32,6 +33,8 @@ pub(super) struct CollectedReadBatch {
     pub(super) checkpoints: Vec<PendingCheckpoint>,
     pub(super) checkpoint_offset: u64,
     pub(super) truncated_lines: usize,
+    /// 本次因**内容不全**被挡下（不转发）的记录。
+    pub(super) withheld: Withheld,
     pub(super) resume: ResumeDecision,
 }
 
@@ -43,6 +46,7 @@ impl CollectedReadBatch {
             checkpoints: Vec::new(),
             checkpoint_offset: 0,
             truncated_lines: 0,
+            withheld: Withheld::default(),
             resume,
         }
     }

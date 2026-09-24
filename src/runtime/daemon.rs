@@ -636,7 +636,7 @@ async fn run_once_with_failure_cache(
     let mut next_seq = log_seq_state::load_or_default_async(&global_seq_path)
         .await
         .unwrap_or(0);
-    let telemetry_tick = match build_telemetry_sink(loop_ctx.config) {
+    let telemetry_tick = match build_telemetry_sink(loop_ctx.config, work) {
         Ok(mut sink) => {
             // 指标优先：先上送指标帧（与日志共用同一 sink/连接 + 同一个全局 seq），再处理日志。
             //

@@ -13,6 +13,7 @@ use crate::telemetry::logs::files::file_reader::{
     ReadLimits, inspect_path_async, read_from_offset_async,
 };
 use crate::telemetry::logs::files::file_watcher::{StartupPosition, decide_resume_async};
+use crate::telemetry::logs::gate::{UplinkGate, Withheld};
 use crate::telemetry::logs::multiline::MultilineMode;
 use crate::telemetry::spool;
 use crate::telemetry::warp_parse::RecordSink;
@@ -78,6 +79,9 @@ pub struct ProcessOutcome {
     pub truncated: bool,
     /// 本次因超长被截断提交的行数（每行已作为一条记录提交）。
     pub truncated_lines: usize,
+    /// 本次因**内容不全**被挡下（不转发、不取号）的记录。
+    /// 不是 0 就说明边界判据在这个文件上没起作用（例如某个块永不结束），必须说出来。
+    pub withheld: Withheld,
     pub rotated: bool,
     /// 是否因 spool 超限而暂停采集。
     pub paused: bool,
@@ -92,6 +96,7 @@ impl ProcessOutcome {
         replayed_spool: usize,
         truncated: bool,
         truncated_lines: usize,
+        withheld: Withheld,
         rotated: bool,
     ) -> Self {
         Self {
@@ -103,6 +108,7 @@ impl ProcessOutcome {
             replayed_spool,
             truncated,
             truncated_lines,
+            withheld,
             rotated,
             paused: false,
             spool_bytes: 0,
@@ -119,6 +125,7 @@ impl ProcessOutcome {
             replayed_spool,
             truncated: false,
             truncated_lines: 0,
+            withheld: Withheld::default(),
             rotated: false,
             paused: false,
             spool_bytes: 0,
@@ -136,6 +143,7 @@ impl ProcessOutcome {
             replayed_spool: 0,
             truncated: false,
             truncated_lines: 0,
+            withheld: Withheld::default(),
             rotated: false,
             paused: true,
             spool_bytes,
@@ -184,6 +192,7 @@ where
             checkpoints,
             checkpoint_offset,
             truncated_lines,
+            withheld,
             resume,
         } = batch;
         let delivery = self.deliver_records_async(records).await?;
@@ -202,6 +211,7 @@ where
             runtime.replayed_spool,
             resume.truncated,
             truncated_lines,
+            withheld,
             resume.rotated,
         ))
     }
@@ -218,12 +228,36 @@ where
     async fn load_runtime_state_async(&mut self) -> io::Result<RuntimeState> {
         let checkpoint_path =
             log_checkpoints::path_for(&self.config.state_dir, &self.config.input_id);
+        // 读不动就**当没有**：一份 checkpoint 不该有让采集停下的权力。
+        //
+        // 不这么做的话，读不动的 checkpoint 会让这个输入**每 tick 都失败**（而且 daemon
+        // 的失败去重让它只打印一次），变成"这个文件永远不进数据"的一个静默停摆；
+        // 换 schema 时尤其容易踩到。
+        //
+        // 代价要说清：当没有 = 按 `startup_position` 重新定位 —— `tail` 跳过历史（安全），
+        // `head` 会重放一遍（可能重复）。重复看得见且一次性，停摆看不见且持续。
+        let log_state = match log_checkpoints::load_or_default_from_path_async(
+            &checkpoint_path,
+            &self.config.input_id,
+        )
+        .await
+        {
+            Ok(state) => state,
+            Err(err) => {
+                eprintln!(
+                    "event=LogCheckpointUnreadable input_id={} path={} err={err} action=\"按没有 checkpoint 处理，按 startup_position={} 重新定位\"",
+                    self.config.input_id,
+                    checkpoint_path.display(),
+                    match self.config.startup_position {
+                        StartupPosition::Head => "head",
+                        StartupPosition::Tail => "tail",
+                    },
+                );
+                log_checkpoints::load_or_default(&self.config.input_id)
+            }
+        };
         Ok(RuntimeState {
-            log_state: log_checkpoints::load_or_default_from_path_async(
-                &checkpoint_path,
-                &self.config.input_id,
-            )
-            .await?,
+            log_state,
             checkpoint_path,
             observed_at: now_rfc3339(),
             replayed_spool: 0,
@@ -259,28 +293,27 @@ where
         .await;
         let mut batch = CollectedReadBatch::new(resume);
         batch.pending_multiline = runtime.log_state.pending_multiline.take();
+        // 记录出口的闸门：本次采集的所有记录都过它（内容不全的在它那里被挡下）。
+        // 时间戳取一份：闸门会一直持有它，而 `runtime` 后面还要可变借用。
+        let observed_at = runtime.observed_at.clone();
+        let mut gate = UplinkGate::new(&self.config.agent_id, &observed_at, &self.config.input_id);
         let mut saw_new_lines = self
-            .collect_rotated_tail(runtime, tracked.as_ref(), &mut batch, next_seq)
+            .collect_rotated_tail(runtime, tracked.as_ref(), &mut batch, &mut gate, next_seq)
             .await?;
 
         if batch.resume.rotated || batch.resume.truncated {
             batch.records.extend(records_from_pending(
-                &self.config.agent_id,
-                &runtime.observed_at,
-                &self.config.input_id,
+                &mut gate,
                 batch.pending_multiline.take(),
                 next_seq,
             ));
         } else {
-            flush_pending_if_source_changes(
-                &mut batch.records,
+            batch.records.extend(flush_pending_if_source_changes(
+                &mut gate,
                 &mut batch.pending_multiline,
-                &self.config.agent_id,
-                &runtime.observed_at,
-                &self.config.input_id,
                 &self.config.source_path,
                 next_seq,
-            );
+            ));
         }
 
         let active_read = read_from_offset_async(
@@ -291,17 +324,17 @@ where
         .await?;
         saw_new_lines |= !active_read.lines.is_empty();
         batch.truncated_lines += active_read.truncated_lines;
-        batch.pending_multiline = records_from_read(
-            &mut batch.records,
-            &self.config.agent_id,
-            &runtime.observed_at,
-            &self.config.input_id,
-            &self.config.source_path,
+        let folded = records_from_read(
+            &mut gate,
             self.config.multiline_mode,
+            &observed_at,
+            &self.config.source_path,
             active_read.lines,
             batch.pending_multiline,
             next_seq,
         );
+        batch.records.extend(folded.records);
+        batch.pending_multiline = folded.pending;
         batch.checkpoint_offset = active_read.committed_end_offset;
         batch.checkpoints.push(PendingCheckpoint {
             source_path: self.config.source_path.clone(),
@@ -310,18 +343,15 @@ where
             rotated_from_path: batch.resume.rotated_from_path.clone(),
         });
 
-        if !saw_new_lines
-            && pending_should_flush(batch.pending_multiline.as_ref(), &runtime.observed_at)
-        {
+        if !saw_new_lines && pending_should_flush(batch.pending_multiline.as_ref(), &observed_at) {
             batch.records.extend(records_from_pending(
-                &self.config.agent_id,
-                &runtime.observed_at,
-                &self.config.input_id,
+                &mut gate,
                 batch.pending_multiline.take(),
                 next_seq,
             ));
         }
 
+        batch.withheld = gate.withheld();
         Ok(batch)
     }
 
@@ -330,6 +360,7 @@ where
         runtime: &mut RuntimeState,
         tracked: Option<&TrackedFileCheckpoint>,
         batch: &mut CollectedReadBatch,
+        gate: &mut UplinkGate<'_>,
         next_seq: &mut u64,
     ) -> io::Result<bool> {
         if !batch.resume.rotated {
@@ -358,17 +389,17 @@ where
         .await?;
         let saw_new_lines = !rotated_read.lines.is_empty();
         batch.truncated_lines += rotated_read.truncated_lines;
-        batch.pending_multiline = records_from_read(
-            &mut batch.records,
-            &self.config.agent_id,
-            &runtime.observed_at,
-            &self.config.input_id,
-            &rotated_path,
+        let folded = records_from_read(
+            gate,
             self.config.multiline_mode,
+            &runtime.observed_at,
+            &rotated_path,
             rotated_read.lines,
             batch.pending_multiline.take(),
             next_seq,
         );
+        batch.records.extend(folded.records);
+        batch.pending_multiline = folded.pending;
         batch.checkpoints.push(PendingCheckpoint {
             source_path: rotated_path,
             identity: rotated_read.identity,

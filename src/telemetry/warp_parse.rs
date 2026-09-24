@@ -43,7 +43,14 @@ impl RecordSink for TelemetryRecordSink {
 }
 
 impl TelemetryRecordSink {
-    pub(crate) fn from_logs_output(output: &LogsOutputSection) -> io::Result<Self> {
+    /// `framing` 给了就**覆盖**配置里的值：调用方已经算出「实际必须用哪种分帧」。
+    ///
+    /// 为什么要能覆盖：分帧合不合法取决于**记录是否可能含多行**（协议 §3：`line` 只适用于
+    /// 单行记录），而那取决于本轮采什么（授权工作），不是静态配置能表达全的。
+    pub(crate) fn from_logs_output(
+        output: &LogsOutputSection,
+        framing: Option<TcpFraming>,
+    ) -> io::Result<Self> {
         match output.kind.as_str() {
             "file" => Ok(Self::File(FileRecordSink::new(PathBuf::from(
                 &output.file.path,
@@ -51,7 +58,10 @@ impl TelemetryRecordSink {
             "tcp" => Ok(Self::Tcp(TcpRecordSink::new(
                 output.tcp.addr.clone(),
                 output.tcp.port,
-                TcpFraming::parse(&output.tcp.framing)?,
+                match framing {
+                    Some(framing) => framing,
+                    None => TcpFraming::parse(&output.tcp.framing)?,
+                },
             ))),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

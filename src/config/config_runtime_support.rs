@@ -98,7 +98,9 @@ container_enabled = false
 # input_id = "macos_install_log"
 # path = "/var/log/install.log"
 # startup_position = "tail"
-# multiline_mode = "none"
+# # 实测约 28% 的行是缩进续行（一条 installer 事件后面跟 plist/TOML 详情块）。
+# # 声明 indented 后 agentd 会把上送自动升到 len 分帧（协议 §3：line 只用于单行）。
+# multiline_mode = "indented"
 #
 # [[telemetry.logs.file_inputs]]
 # input_id = "macos_launchd"

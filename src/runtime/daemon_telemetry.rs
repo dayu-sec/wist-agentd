@@ -6,14 +6,14 @@ use wist_shared::time::now_rfc3339;
 
 use crate::control::work::AppliedWorkGrant;
 use crate::telemetry::logs::files::{FileInputProcessor, ProcessOutcome};
-use crate::telemetry::warp_parse::{RecordSink, TelemetryRecordSink};
+use crate::telemetry::warp_parse::{RecordSink, TcpFraming, TelemetryRecordSink};
 
 #[path = "daemon_telemetry_support.rs"]
 mod support;
 
 use support::{
     build_file_input_config, build_record_sink, invalid_output_failure, missing_input_failure,
-    processing_failure, replay_spool_only, spool_paused_reason,
+    processing_failure, replay_spool_only, spool_paused_reason, withheld_failure,
 };
 
 #[derive(::jumo_derive::Jumo)]
@@ -30,6 +30,9 @@ pub(super) enum TelemetryFailureKind {
     MissingInput,
     ProcessingFailed,
     InvalidOutput,
+    /// 有记录因**内容不全**被挡下不转发（边界判据在这个文件上没起作用）。
+    /// 不是"采集失败"，但必须说出来 —— 否则一条永不结束的块会静默消失。
+    RecordWithheld,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ::jumo_derive::Jumo)]
@@ -38,7 +41,15 @@ pub(super) struct TelemetryFailure {
     pub(super) kind: TelemetryFailureKind,
     pub(super) input_id: String,
     pub(super) path: String,
+    /// 问题的**身份** —— 去重按它（`kind|input_id|path|detail`）。
+    ///
+    /// 所以它必须是**稳定**的：同一个问题反复出现就应该是同一行字。
     pub(super) detail: String,
+    /// 这个问题的**量**（会变，如"本次挡下几条"）。
+    ///
+    /// **不参与去重**：重复报的是"问题还在"，不是"它又大了一点"。
+    /// 把会变的东西放进 `detail` 会让每个 tick 都成新签名、每 tick 打印一次。
+    pub(super) magnitude: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,9 +79,52 @@ impl TelemetryTick {
     }
 }
 
+/// 分帧**必须**升到 `len` 时返回是谁要求的（`input_id`）；`None` = 照配置即可。
+///
+/// 抽成纯函数是为了能直接测这个判定：它错了会让日志静默丢进 miss（续行没有信封、
+/// 匹配不上任何规则），而端到端测试很难稳定复现“恰好掉在 miss 里”。
+///
+/// 只看 tcp + `line`：file sink 逐条 JSON 编码，换行天然安全；`len` 对单行同样合法。
+pub(super) fn len_framing_required<'a>(
+    config: &AgentConfig,
+    mut inputs: impl Iterator<Item = &'a LogFileInputSection>,
+) -> Option<&'a str> {
+    if config.telemetry.logs.output.kind != "tcp"
+        || config.telemetry.logs.output.tcp.framing == "len"
+    {
+        return None;
+    }
+    inputs
+        .find(|input| input.multiline_mode != "none")
+        .map(|input| input.input_id.as_str())
+}
+
 /// 构建共享的遥测上送 sink（日志与指标共用同一连接）。
-pub(super) fn build_telemetry_sink(config: &AgentConfig) -> io::Result<TelemetryRecordSink> {
-    build_record_sink(config)
+///
+/// 分帧**不照抄配置**：`line` 只适用于不含换行的记录（协议 §3）。一旦有输入声明的读法
+/// 是 `indented`，折叠出来的正文就可能含换行 —— 此时若还用 `line`，接收端会把续行当成
+/// 独立行；那些行没有信封、匹配不上任何规则，**静默掉进 miss**（实测复现过）。
+///
+/// 所以这里不靠人去配对配置，而是按本轮真要采什么定：有这种输入就升到 `len` 并说清是谁要求的。
+pub(super) fn build_telemetry_sink(
+    config: &AgentConfig,
+    work: &AppliedWorkGrant,
+) -> io::Result<TelemetryRecordSink> {
+    let from_work = work.log_inputs();
+    let required = len_framing_required(
+        config,
+        from_work
+            .iter()
+            .map(|entry| &entry.input)
+            .chain(config.telemetry.logs.file_inputs.iter()),
+    );
+    let Some(input_id) = required else {
+        return build_record_sink(config, None);
+    };
+    eprintln!(
+        "event=UplinkFramingEscalated from=line to=len input_id={input_id} reason=\"该输入声明多行读法，折叠出的正文可能含换行（协议 §3：line 只用于单行）\""
+    );
+    build_record_sink(config, Some(TcpFraming::Len))
 }
 
 /// 当 sink 无法构建（非法输出配置）时，为每个输入生成一条 `InvalidOutput` 失败。
@@ -181,6 +235,12 @@ async fn process_telemetry_input<S: RecordSink>(
                     at: now_rfc3339(),
                 });
             }
+            // 被挡下的记录走 failure 通道，是为了蹭 daemon 已有的**按签名去重**：
+            // 一个持续存在的病态块只报一次，恢复正常后自动清掉。
+            // （量放 `magnitude`：它会变，不能进签名，否则每 tick 都算新问题。）
+            if let Some(failure) = withheld_failure(input, &outcome.withheld) {
+                failures.push(failure);
+            }
             outcomes.push(outcome);
         }
         Err(err) => failures.push(processing_failure(input, err.to_string())),
@@ -197,4 +257,69 @@ async fn process_input_with_sink<S: RecordSink>(
     let mut processor =
         FileInputProcessor::new(build_file_input_config(config, input, source_path), sink);
     processor.process_once_async(next_seq).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::len_framing_required;
+    use wist_contracts::agent_config::{
+        AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, LogFileInputSection,
+        PathsSection,
+    };
+
+    fn config(kind: &str, framing: &str) -> AgentConfig {
+        let mut config = AgentConfig::new(
+            AgentSection::default(),
+            ControlPlaneSection::default(),
+            PathsSection::default(),
+            ExecutionSection::default(),
+        );
+        config.telemetry.logs.output.kind = kind.to_string();
+        config.telemetry.logs.output.tcp.framing = framing.to_string();
+        config
+    }
+
+    fn input(id: &str, multiline: &str) -> LogFileInputSection {
+        LogFileInputSection {
+            input_id: id.to_string(),
+            path: "/var/log/app.log".to_string(),
+            startup_position: "tail".to_string(),
+            multiline_mode: multiline.to_string(),
+        }
+    }
+
+    fn required(config: &AgentConfig, inputs: &[LogFileInputSection]) -> Option<String> {
+        len_framing_required(config, inputs.iter()).map(str::to_string)
+    }
+
+    #[test]
+    fn a_folding_input_forces_length_framing_on_a_line_uplink() {
+        // `line` 分帧靠 `\n` 切帧；折叠出的正文自带换行 → 续行会被当成独立行、掉进 miss。
+        // 所以只要有一个输入要归并，就必须升到 `len`，而且要报出是谁要求的。
+        let config = config("tcp", "line");
+        assert_eq!(
+            required(&config, &[input("a", "none"), input("b", "indented")]),
+            Some("b".to_string())
+        );
+    }
+
+    #[test]
+    fn all_single_line_inputs_leave_the_configured_framing_alone() {
+        let config = config("tcp", "line");
+        assert_eq!(required(&config, &[input("a", "none")]), None);
+    }
+
+    #[test]
+    fn an_explicit_length_uplink_needs_no_escalation() {
+        // 配置已经写了 `len`：对单行同样合法，不必（也不该）再报一次升级。
+        let config = config("tcp", "len");
+        assert_eq!(required(&config, &[input("a", "indented")]), None);
+    }
+
+    #[test]
+    fn a_file_uplink_needs_no_escalation() {
+        // file sink 逐条 JSON 编码，换行天然安全 —— 没有“被切开”这回事。
+        let config = config("file", "line");
+        assert_eq!(required(&config, &[input("a", "indented")]), None);
+    }
 }

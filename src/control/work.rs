@@ -385,8 +385,8 @@ impl AppliedWorkGrant {
                 if unit.capability != "collect_logs" {
                     continue;
                 }
-                let globs = unit.file_globs();
-                for (index, glob) in globs.iter().enumerate() {
+                let globs = unit.file_sources();
+                for (index, source) in globs.iter().enumerate() {
                     // 一个单元可能有多条路径通配，任务 id 必须各不相同（它是落盘文件名的一部分）。
                     let suffix = if globs.len() > 1 {
                         format!("-{}", index + 1)
@@ -404,12 +404,14 @@ impl AppliedWorkGrant {
                                 safe_token(&unit.unit_id),
                                 suffix
                             ),
-                            path: glob.to_string(),
+                            path: source.target.clone(),
                             // 授权采集不重放历史：平台派活时若从文件头读，一台机器上
                             // 几百 MB 的历史日志会在派活瞬间灌进数据面。要回放历史是
                             // **运维的一次性动作**，不该由"授权"顺带触发。
                             startup_position: "tail".to_string(),
-                            multiline_mode: "none".to_string(),
+                            // 怎么读这个文件由**策展在目录里声明**（跟着单元走），
+                            // agentd 不自己猜：猜错会把多行记录拆散、或把独立记录粘成一条。
+                            multiline_mode: source.multiline.clone(),
                         },
                     });
                 }
@@ -656,13 +658,18 @@ mod tests {
     use crate::state_store::work::SCHEMA_VERSION_V1;
 
     fn spec(units: &[(&str, &str, &str)]) -> String {
-        // (unit_id, capability, source) —— source 形如 `FileGlob:/a/b*`。
+        // (unit_id, capability, source) —— source 形如 `FileGlob:/a/b*`，
+        // 可加 `@<multiline>` 后缀声明读法（如 `FileGlob:/a/b*@indented`）。
         let units: Vec<String> = units
             .iter()
             .map(|(unit_id, capability, source)| {
+                let (source, multiline) = match source.split_once('@') {
+                    Some((source, multiline)) => (source, multiline),
+                    None => (*source, "none"),
+                };
                 let (kind, target) = source.split_once(':').expect("source kind:target");
                 format!(
-                    r#"{{"unit_id":"{unit_id}","capability":"{capability}","rule_ref":"r","requires_privilege":"none","sources":[{{"kind":"{kind}","target":"{target}"}}]}}"#
+                    r#"{{"unit_id":"{unit_id}","capability":"{capability}","rule_ref":"r","requires_privilege":"none","sources":[{{"kind":"{kind}","target":"{target}","multiline":"{multiline}"}}]}}"#
                 )
             })
             .collect();
@@ -1061,6 +1068,49 @@ mod tests {
         let inputs = applied.log_inputs();
         assert_eq!(inputs[0].input.input_id, "work-MiscSystem-weird----id");
         assert!(!inputs[0].input.input_id.contains('/'));
+    }
+
+    #[test]
+    fn the_declared_read_mode_reaches_the_file_input() {
+        // 「怎么读这条来源」是策展声明的，agentd 只负责照搬（它不该自己猜文件格式）。
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![
+                standing(
+                    "work-folded",
+                    "SoftwareChange",
+                    1,
+                    "active",
+                    &spec(&[(
+                        "mac-software-change",
+                        "collect_logs",
+                        "FileGlob:/var/log/install.log@indented",
+                    )]),
+                ),
+                standing(
+                    "work-single",
+                    "CrashPanic",
+                    1,
+                    "active",
+                    &spec(&[("mac-crash", "collect_logs", "FileGlob:/a/*")]),
+                ),
+            ],
+        ));
+        let by_id: BTreeMap<String, String> = applied
+            .log_inputs()
+            .into_iter()
+            .map(|entry| (entry.input.input_id, entry.input.multiline_mode))
+            .collect();
+        assert_eq!(
+            by_id.get("work-SoftwareChange-mac-software-change"),
+            Some(&"indented".to_string())
+        );
+        // 没声明的来源默认一行一条。
+        assert_eq!(
+            by_id.get("work-CrashPanic-mac-crash"),
+            Some(&"none".to_string())
+        );
     }
 
     // ── 本机工作视图（state/work.json）──
