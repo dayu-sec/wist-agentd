@@ -101,6 +101,18 @@ struct CpuSample {
     at: Instant,
 }
 
+/// 本机**逻辑核数**（`available_parallelism`）。
+///
+/// 为什么要跟 `cpu_percent` 一起报：那个数是**单核口径**（100% = 占满一个核），
+/// 而运维看图时要回答的往往是「这台机器被它占了百分之几」——那是 `cpu_percent / 核数`。
+/// 只报百分比不报核数，右侧那个数既算不出来、也无法复核（4 核上的 13% 与 64 核上的 13%
+/// 完全不是一回事）。换算留给网关做：agent 只交原始事实。
+fn local_cpu_cores() -> Option<u32> {
+    std::thread::available_parallelism()
+        .ok()
+        .map(|count| count.get() as u32)
+}
+
 /// Current resident set size in bytes, when the platform exposes it.
 fn current_rss_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
@@ -198,6 +210,10 @@ fn cpu_percent_since(previous: &CpuSample, now: Instant, ticks_per_sec: u64) -> 
 /// `discovery_policy_version` 是**本机实际生效**的发现方向策略版本：
 /// 网关知道自己发布了哪一版，但不知道哪台机器拉到了、应用了 ——
 /// 而「我改了策略，哪些机器还没生效」只能由 agent 回答。
+///
+/// `cpu_cores` 是**本机逻辑核数**：`cpu_percent` 是单核口径（100% = 占满一个核），
+/// 网关要用核数才能把它换算成「整台机器的百分之几」。换算**不在 agent 做** ——
+/// agent 只交原始事实（自己的 CPU 时间、自己的核数），派生值只留一处实现。
 async fn report_status_to_control_plane(
     config: &AgentConfig,
     cpu_percent: Option<f64>,
@@ -215,6 +231,7 @@ async fn report_status_to_control_plane(
         version: env!("CARGO_PKG_VERSION").to_string(),
         memory_bytes: current_rss_bytes(),
         cpu_percent,
+        cpu_cores: local_cpu_cores(),
         admin_latency_ms: last_latency_ms,
         work_state_changes,
         discovery_policy_version,
@@ -1272,6 +1289,15 @@ mod tests {
             assert!(request.contains("\"agent_id\":\"agent-x\""));
             assert!(request.contains("\"memory_bytes\":"));
             assert!(request.contains("\"cpu_percent\":"));
+            // 核数必须**是实测的那个**，不能是写死的常量：网关要靠它把单核占比
+            // 换算成整机占比，写死等于把换算整体带偏。
+            let expected_cores = std::thread::available_parallelism()
+                .expect("available_parallelism")
+                .get();
+            assert!(
+                request.contains(&format!("\"cpu_cores\":{expected_cores}")),
+                "cpu_cores must be the measured core count, got {request}"
+            );
             assert!(request.contains("\"admin_latency_ms\":"));
             assert!(request.contains("\"work_state_changes\":null"));
             // 本机实际生效的策略版本随状态上报一起上去（`null` = 还没拉到策略表）。
