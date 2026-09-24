@@ -10,7 +10,8 @@
 //!   2. **暂停 ≠ 撤回**：`paused` 的工作仍被持有（记得版本、保留确认），但折算不出任务；
 //!      恢复沿用同一版本，不重新审定。
 //!   3. **折算不了就说**：`Exporter` / `UnifiedLogPredicate` 这类来源 agentd 现在接不了，
-//!      如实记进 `unsupported`，绝不当成"没这回事"。
+//!      目标不是显式路径的（通配 / `~`）同样接不了 —— 两者都如实记进 `unsupported`，
+//!      绝不当成"没这回事"，也不造一条永远报错的采集任务。
 //!
 //! 关于确认（ack）：只对**真正应用了**的工作回报版本。工作参数解析不了就**不回报** ——
 //! 网关那边「期望版本一直没被确认」正是漂移的可见形态，回一个确认反而把问题盖住。
@@ -20,8 +21,8 @@ use std::time::Duration;
 
 use wist_contracts::agent_config::{AgentConfig, LogFileInputSection};
 use wist_contracts::work::{
-    ACK_WORK_KIND, AckWork, OneShotWork, POLL_WORK_KIND, PollWork, StandingWork, WorkAccepted,
-    WorkGrant, WorkSpec,
+    ACK_WORK_KIND, AckWork, EXECUTABLE_SOURCE_KINDS, OneShotWork, POLL_WORK_KIND, PollWork,
+    StandingWork, WorkAccepted, WorkGrant, WorkSpec, WorkSpecSource,
 };
 use wist_shared::time::now_rfc3339;
 
@@ -385,7 +386,15 @@ impl AppliedWorkGrant {
                 if unit.capability != "collect_logs" {
                     continue;
                 }
-                let globs = unit.file_sources();
+                // 只折算**今天真能采**的来源：目标不是显式路径的（通配 / `~`）会被
+                // `unsupported_units()` 如实报出来，而不是在这里造一条永远报"路径不存在"的输入。
+                let globs: Vec<&WorkSpecSource> = unit
+                    .file_sources()
+                    .into_iter()
+                    .filter(|source| {
+                        wist_contracts::work::is_executable_source(&source.kind, &source.target)
+                    })
+                    .collect();
                 for (index, source) in globs.iter().enumerate() {
                     // 一个单元可能有多条路径通配，任务 id 必须各不相同（它是落盘文件名的一部分）。
                     let suffix = if globs.len() > 1 {
@@ -465,10 +474,7 @@ impl AppliedWorkGrant {
                     unsupported.push(UnsupportedUnit {
                         work_id: work_id.clone(),
                         unit_id: unit.unit_id.clone(),
-                        detail: format!(
-                            "source kind {} is not collectable on this agent",
-                            source.kind
-                        ),
+                        detail: unsupported_reason(source),
                     });
                 }
             }
@@ -500,6 +506,25 @@ impl AppliedWorkGrant {
     /// 收到但未执行的一次性工作（agentd 侧未实现执行）。
     pub fn unexecutable_one_shot(&self) -> &[String] {
         &self.unexecutable_one_shot
+    }
+}
+
+/// 一条来源接不了的原因 —— 说清是**类型**没实现，还是**目标形态**没实现。
+///
+/// 两种情况给运维的下一步完全不同：前者等实现，后者把目标改成显式绝对路径就行。
+/// 合成笼统一句就会把人引向错误的下一步。
+fn unsupported_reason(source: &WorkSpecSource) -> String {
+    if !EXECUTABLE_SOURCE_KINDS.contains(&source.kind.as_str()) {
+        format!(
+            "source kind {} is not collectable on this agent",
+            source.kind
+        )
+    } else {
+        format!(
+            "source target {:?} is not an explicit absolute path \
+             (glob/~ expansion is not implemented on this agent)",
+            source.target
+        )
     }
 }
 
@@ -658,8 +683,8 @@ mod tests {
     use crate::state_store::work::SCHEMA_VERSION_V1;
 
     fn spec(units: &[(&str, &str, &str)]) -> String {
-        // (unit_id, capability, source) —— source 形如 `FileGlob:/a/b*`，
-        // 可加 `@<multiline>` 后缀声明读法（如 `FileGlob:/a/b*@indented`）。
+        // (unit_id, capability, source) —— source 形如 `FileGlob:/a/b.log`，
+        // 可加 `@<multiline>` 后缀声明读法（如 `FileGlob:/a/b.log@indented`）。
         let units: Vec<String> = units
             .iter()
             .map(|(unit_id, capability, source)| {
@@ -731,12 +756,12 @@ mod tests {
                     (
                         "mac-crash-panic",
                         "collect_logs",
-                        "FileGlob:/Library/Logs/DiagnosticReports/*.ips",
+                        "FileGlob:/Library/Logs/DiagnosticReports/crash.ips",
                     ),
                     (
                         "mac-crash-other",
                         "collect_logs",
-                        "FileGlob:/Library/Logs/DiagnosticReports/*.panic",
+                        "FileGlob:/Library/Logs/DiagnosticReports/crash.panic",
                     ),
                 ]),
             )],
@@ -751,12 +776,12 @@ mod tests {
         assert_eq!(inputs[0].input.input_id, "work-CrashPanic-mac-crash-panic");
         assert_eq!(
             inputs[0].input.path,
-            "/Library/Logs/DiagnosticReports/*.ips"
+            "/Library/Logs/DiagnosticReports/crash.ips"
         );
         assert_eq!(inputs[1].input.input_id, "work-CrashPanic-mac-crash-other");
         assert_eq!(
             inputs[1].input.path,
-            "/Library/Logs/DiagnosticReports/*.panic"
+            "/Library/Logs/DiagnosticReports/crash.panic"
         );
         // 授权采集不重放历史（否则派活瞬间会灌进几百 MB）。
         assert_eq!(inputs[0].input.startup_position, "tail");
@@ -1038,7 +1063,7 @@ mod tests {
                     (
                         "mac-privilege-files",
                         "collect_logs",
-                        "FileGlob:/var/log/pra*",
+                        "FileGlob:/var/log/pra.log",
                     ),
                 ]),
             )],
@@ -1052,6 +1077,35 @@ mod tests {
     }
 
     #[test]
+    fn a_glob_target_is_reported_not_turned_into_an_input() {
+        // `FileGlob` 这个类型名不等于可采：**目标形态**也得是采集端能执行的。
+        // 通配今天展开不了 —— 既不能造一条永远报"路径不存在"的任务，也不能当没看见。
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![standing(
+                "work-1",
+                "NetworkFirewall",
+                1,
+                "active",
+                &spec(&[(
+                    "mac-network-wifi",
+                    "collect_logs",
+                    "FileGlob:/var/log/wifi.log*",
+                )]),
+            )],
+        ));
+        assert!(applied.log_inputs().is_empty(), "通配目标不应变成采集任务");
+        let unsupported = applied.unsupported_units();
+        assert_eq!(unsupported.len(), 1);
+        assert!(
+            unsupported[0].detail.contains("explicit absolute path"),
+            "{}",
+            unsupported[0].detail
+        );
+    }
+
+    #[test]
     fn task_ids_are_filename_safe() {
         // 目录是策展数据，unit_id 由一个没有字符集校验的上游手写。
         let mut applied = AppliedWorkGrant::default();
@@ -1062,7 +1116,7 @@ mod tests {
                 "MiscSystem",
                 1,
                 "active",
-                &spec(&[("weird/../id", "collect_logs", "FileGlob:/var/log/a*")]),
+                &spec(&[("weird/../id", "collect_logs", "FileGlob:/var/log/app.log")]),
             )],
         ));
         let inputs = applied.log_inputs();
@@ -1093,7 +1147,7 @@ mod tests {
                     "CrashPanic",
                     1,
                     "active",
-                    &spec(&[("mac-crash", "collect_logs", "FileGlob:/a/*")]),
+                    &spec(&[("mac-crash", "collect_logs", "FileGlob:/a/app.log")]),
                 ),
             ],
         ));
@@ -1140,7 +1194,7 @@ mod tests {
                     &spec(&[(
                         "mac-crash",
                         "collect_logs",
-                        "FileGlob:/Library/Logs/DiagnosticReports/*.ips",
+                        "FileGlob:/Library/Logs/DiagnosticReports/crash.ips",
                     )]),
                 ),
             ],
@@ -1181,7 +1235,10 @@ mod tests {
         // 本机跑起来的采集任务：任务 id 同时是落盘目录名。
         assert_eq!(logs.tasks.len(), 1);
         assert_eq!(logs.tasks[0].input_id, "work-CrashPanic-mac-crash");
-        assert_eq!(logs.tasks[0].path, "/Library/Logs/DiagnosticReports/*.ips");
+        assert_eq!(
+            logs.tasks[0].path,
+            "/Library/Logs/DiagnosticReports/crash.ips"
+        );
         assert_eq!(logs.tasks[0].startup_position, "tail");
     }
 
@@ -1281,7 +1338,7 @@ mod tests {
                 "CrashPanic",
                 1,
                 "active",
-                &spec(&[("mac-crash", "collect_logs", "FileGlob:/a/*")]),
+                &spec(&[("mac-crash", "collect_logs", "FileGlob:/a/app.log")]),
             )],
         );
         snapshot.one_shot = vec![wist_contracts::work::OneShotWork {
@@ -1342,14 +1399,14 @@ mod tests {
                     "CrashPanic",
                     1,
                     "active",
-                    &spec(&[("mac-crash", "collect_logs", "FileGlob:/a/*")]),
+                    &spec(&[("mac-crash", "collect_logs", "FileGlob:/a/app.log")]),
                 ),
                 standing(
                     "work-p",
                     "LoginSession",
                     1,
                     "paused",
-                    &spec(&[("mac-login", "collect_logs", "FileGlob:/b/*")]),
+                    &spec(&[("mac-login", "collect_logs", "FileGlob:/b/app.log")]),
                 ),
             ],
         ));

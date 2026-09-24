@@ -224,9 +224,9 @@ LogFileInputSection {
 - `path`
   目标文件路径，必填非空；相对路径相对 `paths.root_dir` 解析（`src/config/config_runtime_support.rs:292-301`）
 - `startup_position?`
-  首次观测该文件（尚无 checkpoint）时的起点，省略时默认 `head`：
-  - `head`：从文件头开始，回放已有内容
-  - `tail`：从文件当前长度开始，只收新增行
+  首次观测该文件（尚无 checkpoint）时的起点，省略时默认 **`tail`**：
+  - `tail`：从文件当前长度开始，只收新增行（**默认**，不重放历史）
+  - `head`：从文件头开始，回放已有内容（要看历史才显式写）
   映射见 `src/runtime/daemon_telemetry_support.rs:107-112`、`src/telemetry/logs/files/file_watcher.rs:28-38`
 - `multiline_mode?`
   多行折叠模式，省略时默认 `none`：

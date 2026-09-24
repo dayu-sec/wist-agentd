@@ -9,6 +9,7 @@ use wist_shared::time::now_rfc3339;
 use crate::state_store::log_checkpoint_state::{PendingMultilineState, TrackedFileCheckpoint};
 use crate::state_store::log_checkpoints;
 use crate::state_store::log_seq_state;
+use crate::telemetry::logs::InputOrigin;
 use crate::telemetry::logs::files::file_reader::{
     ReadLimits, inspect_path_async, read_from_offset_async,
 };
@@ -47,6 +48,8 @@ const SPOOL_REPLAY_BATCH_SIZE: usize = 128;
 pub struct FileInputConfig {
     pub agent_id: String,
     pub input_id: String,
+    /// 来源身份（面 + 目录单元）：随记录进帧。空 = 本机运维手工配置的输入。
+    pub origin: InputOrigin,
     pub source_path: PathBuf,
     pub state_dir: PathBuf,
     pub spool_path: PathBuf,
@@ -296,7 +299,12 @@ where
         // 记录出口的闸门：本次采集的所有记录都过它（内容不全的在它那里被挡下）。
         // 时间戳取一份：闸门会一直持有它，而 `runtime` 后面还要可变借用。
         let observed_at = runtime.observed_at.clone();
-        let mut gate = UplinkGate::new(&self.config.agent_id, &observed_at, &self.config.input_id);
+        let mut gate = UplinkGate::new(
+            &self.config.agent_id,
+            &observed_at,
+            &self.config.input_id,
+            self.config.origin.clone(),
+        );
         let mut saw_new_lines = self
             .collect_rotated_tail(runtime, tracked.as_ref(), &mut batch, &mut gate, next_seq)
             .await?;

@@ -56,6 +56,8 @@ fn config(root: &Path, source_path: &Path) -> FileInputConfig {
     FileInputConfig {
         agent_id: "agent-test".to_string(),
         input_id: "input-app".to_string(),
+        // 测试里的输入默认不带来源身份（相当于本机手工配置的那类）。
+        origin: crate::telemetry::logs::InputOrigin::default(),
         source_path: source_path.to_path_buf(),
         state_dir: root.join("state"),
         spool_path: root.join("state").join("spool").join("input-app.ndjson"),

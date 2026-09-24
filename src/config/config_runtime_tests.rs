@@ -544,8 +544,9 @@ file_inputs_file = "tasks/apps.toml"
             .display()
             .to_string()
     );
-    // 省略字段走契约默认值：startup_position 默认 head，multiline_mode 默认 none。
-    assert_eq!(inputs[1].startup_position, "head");
+    // 省略字段走契约默认值：startup_position 默认 **tail**（不重放历史，与授权派活同口径），
+    // multiline_mode 默认 none。
+    assert_eq!(inputs[1].startup_position, "tail");
     assert_eq!(inputs[1].multiline_mode, "none");
 }
 

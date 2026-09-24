@@ -1025,6 +1025,12 @@ fn daemon_run_once_sends_raw_log_lines_to_tcp_output() {
     assert!(payload.contains("\"schema\":\"v1\""));
     assert!(payload.contains("\"agent\":\"agent-001\""));
     assert!(payload.contains("\"seq\":0"));
+    // 本机手工配置的输入**不来自任何采集面**：帧里就不带 `family`/`unit`。
+    // 这不是缺字段 —— “不是平台派活来的”本身就是有用的信息。
+    assert!(
+        !payload.contains("\"family\":"),
+        "手工配置的输入不该带采集面：{payload}"
+    );
     assert_eq!(checkpoint.files.len(), 1);
     assert_eq!(
         checkpoint.files[0].checkpoint_offset,
@@ -1155,6 +1161,12 @@ fn a_granted_log_work_collects_the_glob_without_any_config_file_input() {
     assert!(
         !payload.contains(" LOGRAW: history"),
         "授权采集不重放历史（tail）：{payload}"
+    );
+    // 授权派活的输入把**来源身份**带进帧：这是「这条来自哪个面」唯一的依据 ——
+    // 正文规则没写时 `category` 恒为泛化的 `agent.log`，两个面一起跑就分不出来了。
+    assert!(
+        payload.contains(r#""family":"CrashPanic","unit":"unit-CrashPanic""#),
+        "授权采集要把面与目录单元带进帧：{payload}"
     );
     // 工作折算出的输入 id 带 `work-` 前缀，checkpoint 建在这个名字上。
     let checkpoint_path = wist_agentd::state_store::log_checkpoints::path_for(

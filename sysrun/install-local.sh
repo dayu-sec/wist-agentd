@@ -403,6 +403,5 @@ step "完成"
 note "日志：$(short "${LOG_DIR}")/agentd.err"
 note "状态：${DEST_BIN} service status ${SCOPE_ARG}"
 if [ "${MODE}" = "install" ]; then
-  note "确认本轮新功能是否在跑：grep -E 'DiscoveryPolicy' $(short "${LOG_DIR}")/agentd.err"
-  note "  （没配策略表时会是 discovery policy fetch failed: HTTP 503，属预期：拉不到就用内建周期）"
+  note "确认新功能在生效：网关「采集日志」页每条记录应带采集面（family / unit）"
 fi

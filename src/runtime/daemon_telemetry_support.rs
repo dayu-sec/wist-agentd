@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use wist_contracts::agent_config::{AgentConfig, LogFileInputSection};
 
+use crate::telemetry::logs::InputOrigin;
 use crate::telemetry::logs::files::file_reader::ReadLimits;
 use crate::telemetry::logs::files::file_watcher::StartupPosition;
 use crate::telemetry::logs::files::{FileInputConfig, ProcessOutcome};
@@ -40,6 +41,7 @@ pub(super) fn build_file_input_config(
     config: &AgentConfig,
     input: &LogFileInputSection,
     source_path: PathBuf,
+    origin: &InputOrigin,
 ) -> FileInputConfig {
     FileInputConfig {
         agent_id: config
@@ -48,6 +50,7 @@ pub(super) fn build_file_input_config(
             .clone()
             .unwrap_or_else(|| "unknown".to_string()),
         input_id: input.input_id.clone(),
+        origin: origin.clone(),
         source_path,
         state_dir: PathBuf::from(&config.paths.state_dir),
         spool_path: spool_path_for(config, input),
@@ -84,6 +87,26 @@ pub(super) fn missing_input_failure(input: &LogFileInputSection) -> TelemetryFai
         detail: "source path does not exist".to_string(),
         magnitude: None,
     }
+}
+
+/// 这份输入的**目标形态**采集端今天能不能处理；不能就返回该报的失败。
+///
+/// 为什么单独一条（不复用 [`missing_input_failure`]）：
+///   那个说的是“路径不存在”（去查权限/拼写），这个是“这种目标形态还没实现”
+///   （去改成显式绝对路径，或等 glob 展开落地）——两句话把人引向不同的下一步。
+pub(super) fn unsupported_target(input: &LogFileInputSection) -> Option<TelemetryFailure> {
+    if wist_contracts::work::is_explicit_path(&input.path) {
+        return None;
+    }
+    Some(TelemetryFailure {
+        kind: TelemetryFailureKind::MissingInput,
+        input_id: input.input_id.clone(),
+        path: input.path.clone(),
+        detail: "target must be an explicit absolute path \
+                 (glob expansion and `~` are not implemented on this agent)"
+            .to_string(),
+        magnitude: None,
+    })
 }
 
 pub(super) fn processing_failure(input: &LogFileInputSection, detail: String) -> TelemetryFailure {
@@ -130,16 +153,23 @@ fn multiline_mode_for(input: &LogFileInputSection) -> MultilineMode {
     }
 }
 
+/// 启动位：`tail`（默认，只采新增）| `head`（从文件头读一遍）。
+///
+/// 认不出的值一律按 `tail`：默认方向必须落在「不会把历史灌进去」那一侧。
 fn startup_position_for(input: &LogFileInputSection) -> StartupPosition {
     match input.startup_position.as_str() {
-        "tail" => StartupPosition::Tail,
-        _ => StartupPosition::Head,
+        "head" => StartupPosition::Head,
+        _ => StartupPosition::Tail,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Withheld, build_file_input_config, withheld_failure};
+    use super::{
+        InputOrigin, Withheld, build_file_input_config, startup_position_for, unsupported_target,
+        withheld_failure,
+    };
+    use crate::telemetry::logs::files::file_watcher::StartupPosition;
     use std::path::PathBuf;
     use wist_contracts::agent_config::{
         AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, LogFileInputSection,
@@ -169,11 +199,55 @@ mod tests {
     }
 
     #[test]
+    fn startup_position_defaults_to_tail_and_a_typo_never_becomes_head() {
+        // 默认方向必须落在“不会把历史灌进去”那一侧。
+        // （本地配置里写错的值其实已在 `wist-validate` 被拒（`invalid_log_startup_position`）；
+        // 这里是第二道：万一校验被绕过，也不能默默变成 head。）
+        let cases = [
+            ("tail", StartupPosition::Tail),
+            ("", StartupPosition::Tail),
+            ("head", StartupPosition::Head),
+            ("typo", StartupPosition::Tail),
+        ];
+        for (raw, expected) in cases {
+            let mut entry = input();
+            entry.startup_position = raw.to_string();
+            assert_eq!(startup_position_for(&entry), expected, "raw {raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_target_that_is_not_an_explicit_path_is_reported_as_such() {
+        // 通配 / `~` / 相对路径今天都采不到。必须报成“形态不支持”，
+        // 而不是拖到下面报“路径不存在” —— 那会把人引去查权限。
+        for target in [
+            "/var/log/wifi.log*",
+            "~/Library/Logs/Homebrew/*",
+            "relative/app.log",
+        ] {
+            let mut entry = input();
+            entry.path = target.to_string();
+            let failure = unsupported_target(&entry).expect("must be rejected as unsupported");
+            assert_eq!(failure.path, target);
+            assert!(
+                failure.detail.contains("explicit absolute path"),
+                "{failure:?}"
+            );
+        }
+
+        // 显式绝对路径放行：存在与否由后面的 `exists()` 分支管，不在这里拦。
+        let mut ok = input();
+        ok.path = "/var/log/install.log".to_string();
+        assert!(unsupported_target(&ok).is_none());
+    }
+
+    #[test]
     fn uses_configured_agent_id() {
         let config = build_file_input_config(
             &config_with_agent(Some("agent-x")),
             &input(),
             PathBuf::from("/var/log/app.log"),
+            &InputOrigin::default(),
         );
         assert_eq!(config.agent_id, "agent-x");
     }
@@ -184,6 +258,7 @@ mod tests {
             &config_with_agent(None),
             &input(),
             PathBuf::from("/var/log/app.log"),
+            &InputOrigin::default(),
         );
         assert_eq!(config.agent_id, "unknown");
     }
@@ -197,7 +272,8 @@ mod tests {
             build_file_input_config(
                 &config_with_agent(Some("a")),
                 &input,
-                PathBuf::from("/var/log/app.log")
+                PathBuf::from("/var/log/app.log"),
+                &InputOrigin::default(),
             )
             .multiline_mode,
             crate::telemetry::logs::multiline::MultilineMode::None
@@ -208,7 +284,8 @@ mod tests {
             build_file_input_config(
                 &config_with_agent(Some("a")),
                 &input,
-                PathBuf::from("/var/log/app.log")
+                PathBuf::from("/var/log/app.log"),
+                &InputOrigin::default(),
             )
             .multiline_mode,
             crate::telemetry::logs::multiline::MultilineMode::IndentedContinuation

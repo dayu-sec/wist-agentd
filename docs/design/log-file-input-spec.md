@@ -40,6 +40,15 @@
   - `file watcher` 与轮询 fallback
     （`src/` 下无 `inotify` / `native_notify` 相关代码；读取由主循环 tick 逐轮驱动，
     见 `src/runtime/daemon_telemetry.rs` 中逐 input 的 `process_once_async`）
+- **轮转不用通配表达**（这是**策略**，不是缺能力）：一个文件是不是“历史”，不看它叫什么名字，
+  看它是不是**当前正在被写的那个**。所以文件族（`wifi.log` → `wifi.log.0` → `wifi.log.1`）
+  应当写成**单个显式路径**（`/var/log/wifi.log`），轮转由采集器按 **inode** 跟踪：
+  文件被改名后**只把剩余的尾巴读完**（不读完会丢数据），再跟到新建的主文件。
+  写成 `wifi.log*` 是**错的** —— 它把轮转产物当成独立采集对象，而那些是历史
+  （实测教训：按名字/扩展名过滤永远列不全，`wifi.log.0` 没压缩但同样是历史）。
+  落地见 `src/telemetry/logs/files/file_watcher.rs` 的 `decide_resume`（`rotated_from_path` / `rotated`）
+  与 `src/telemetry/logs/files/checkpoint_support.rs` 的 `find_rotated_path_async`；
+  测试：`tests/rotation.rs::rotate_keeps_draining_old_file_tail_and_tracks_new_file_separately`。
 - 第一版不要求完全复刻 Fluent Bit 的全部历史兼容行为
 
 一句话说：
@@ -208,7 +217,7 @@ LogsSection {                          # [telemetry.logs]，全局配置（非 p
 LogFileInputSection {                  # [[telemetry.logs.file_inputs]]
   input_id                             # 必填，唯一
   path                                 # 必填，单个显式路径
-  startup_position?                    # "head"（默认）| "tail"
+  startup_position?                    # "tail"（默认）| "head"
   multiline_mode?                      # "none"（默认）| "indented"
 }
 ```
@@ -229,8 +238,12 @@ LogFileInputSection {                  # [[telemetry.logs.file_inputs]]
 字段说明：
 
 - `startup_position`
-  - `head`
-  - `tail`
+  - `tail`（**默认**）：只采启动之后的**新增**内容 —— 不重放历史（一个几百 MB 的存量文件
+    不会在启动瞬间被灌进数据面）。与授权派活同口径（`AppliedWorkGrant::log_inputs` 写死 `tail`），
+    也与 Fluent Bit 的 `read_from_head = false` 一致。
+  - `head`：首次读到该文件时**从文件头读一遍**。要看历史才显式写它 —— 那是运维的
+    一次性动作，不该由默认值顺带触发。
+  - 取值只允许 `head` / `tail`（`wist-validate`：`invalid_log_startup_position`）。
 
 ### 6.1 `parser`
 

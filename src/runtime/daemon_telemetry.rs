@@ -5,6 +5,7 @@ use wist_contracts::agent_config::{AgentConfig, LogFileInputSection};
 use wist_shared::time::now_rfc3339;
 
 use crate::control::work::AppliedWorkGrant;
+use crate::telemetry::logs::InputOrigin;
 use crate::telemetry::logs::files::{FileInputProcessor, ProcessOutcome};
 use crate::telemetry::warp_parse::{RecordSink, TcpFraming, TelemetryRecordSink};
 
@@ -13,7 +14,8 @@ mod support;
 
 use support::{
     build_file_input_config, build_record_sink, invalid_output_failure, missing_input_failure,
-    processing_failure, replay_spool_only, spool_paused_reason, withheld_failure,
+    processing_failure, replay_spool_only, spool_paused_reason, unsupported_target,
+    withheld_failure,
 };
 
 #[derive(::jumo_derive::Jumo)]
@@ -154,8 +156,10 @@ pub(super) fn invalid_output_tick(
 /// 按本轮要采的输入清单跑一遍。
 ///
 /// 两类输入**并存**，各有各的道理：
-///   * 配置里的 `file_inputs`：本机运维的逃生舱（临时盯一个文件不需要惊动网关）；
-///   * 工作折算出来的：平台派活（`Control.Agent.Work`），任务 id 带 `work-` 前缀。
+///   * 配置里的 `file_inputs`：本机运维的逃生舱（临时盯一个文件不需要惊动网关）——
+///     它**不来自任何采集面**，帧里就不带 `family`/`unit`；
+///   * 工作折算出来的：平台派活（`Control.Agent.Work`），任务 id 带 `work-` 前缀，
+///     并把**面 + 目录单元**带进帧 —— 这就是「这条来自哪个面」的依据。
 ///
 /// 两者同名冲突是不可能的（前缀不同），但同一路径被两边同时盯着是可能的 —— 那会让
 /// 同一行日志上送两次。这是有意留的：去重会掩盖“人手工加了一条本该由网关派的任务”，
@@ -174,6 +178,7 @@ pub(super) async fn process_telemetry_inputs(
         process_telemetry_input(
             config,
             input,
+            &InputOrigin::default(),
             sink,
             &mut outcomes,
             &mut failures,
@@ -186,6 +191,7 @@ pub(super) async fn process_telemetry_inputs(
         process_telemetry_input(
             config,
             &entry.input,
+            &InputOrigin::new(entry.family.clone(), entry.unit_id.clone()),
             sink,
             &mut outcomes,
             &mut failures,
@@ -205,12 +211,20 @@ pub(super) async fn process_telemetry_inputs(
 async fn process_telemetry_input<S: RecordSink>(
     config: &AgentConfig,
     input: &LogFileInputSection,
+    origin: &InputOrigin,
     sink: &mut S,
     outcomes: &mut Vec<ProcessOutcome>,
     failures: &mut Vec<TelemetryFailure>,
     notifications: &mut Vec<TelemetryWorkState>,
     next_seq: &mut u64,
 ) {
+    // 目标形态先过一道：通配 / `~` / 相对路径今天采不了，要报成“形态不支持”，
+    // 而不是拖到下面报“路径不存在”（那会把运维引去查权限）。
+    if let Some(failure) = unsupported_target(input) {
+        failures.push(failure);
+        return;
+    }
+
     let source_path = PathBuf::from(&input.path);
     if !source_path.exists() {
         failures.push(missing_input_failure(input));
@@ -225,7 +239,7 @@ async fn process_telemetry_input<S: RecordSink>(
         return;
     }
 
-    match process_input_with_sink(config, input, source_path, sink, next_seq).await {
+    match process_input_with_sink(config, input, origin, source_path, sink, next_seq).await {
         Ok(outcome) => {
             if outcome.paused {
                 notifications.push(TelemetryWorkState {
@@ -250,12 +264,15 @@ async fn process_telemetry_input<S: RecordSink>(
 async fn process_input_with_sink<S: RecordSink>(
     config: &AgentConfig,
     input: &LogFileInputSection,
+    origin: &InputOrigin,
     source_path: PathBuf,
     sink: &mut S,
     next_seq: &mut u64,
 ) -> io::Result<ProcessOutcome> {
-    let mut processor =
-        FileInputProcessor::new(build_file_input_config(config, input, source_path), sink);
+    let mut processor = FileInputProcessor::new(
+        build_file_input_config(config, input, source_path, origin),
+        sink,
+    );
     processor.process_once_async(next_seq).await
 }
 

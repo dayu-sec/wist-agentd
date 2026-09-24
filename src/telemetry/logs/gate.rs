@@ -31,6 +31,8 @@ use wist_shared::records::{Completion, Record};
 use crate::telemetry::logs::multiline::{MAX_RECORD_BYTES, MAX_RECORD_LINES};
 use crate::telemetry::logs::parser::parse_delimited_records;
 
+use super::InputOrigin;
+
 /// 挡下的原因码（将来进丢弃区间报告时用它当 `reason`）。
 pub const WITHHELD_REASON: &str = "truncated:record_limit";
 
@@ -66,15 +68,23 @@ pub struct UplinkGate<'a> {
     agent_id: &'a str,
     observed_at: &'a str,
     input_id: &'a str,
+    /// 这条输入的来源身份（面 + 目录单元）：随记录进帧。空 = 非派活来源。
+    origin: InputOrigin,
     withheld: Withheld,
 }
 
 impl<'a> UplinkGate<'a> {
-    pub fn new(agent_id: &'a str, observed_at: &'a str, input_id: &'a str) -> Self {
+    pub fn new(
+        agent_id: &'a str,
+        observed_at: &'a str,
+        input_id: &'a str,
+        origin: InputOrigin,
+    ) -> Self {
         Self {
             agent_id,
             observed_at,
             input_id,
+            origin,
             withheld: Withheld::default(),
         }
     }
@@ -103,6 +113,7 @@ impl<'a> UplinkGate<'a> {
             self.observed_at,
             self.input_id,
             source_path,
+            &self.origin,
             admitted,
             next_seq,
         )
@@ -140,7 +151,12 @@ mod tests {
     }
 
     fn gate() -> UplinkGate<'static> {
-        UplinkGate::new("agent-1", "2026-09-23T00:00:00Z", "input-a")
+        UplinkGate::new(
+            "agent-1",
+            "2026-09-23T00:00:00Z",
+            "input-a",
+            InputOrigin::default(),
+        )
     }
 
     #[test]
