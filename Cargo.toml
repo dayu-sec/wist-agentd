@@ -11,6 +11,8 @@ jumo-derive = "0.1"
 orion-error = { version = "0.8", features = ["derive", "serde_json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# 升级时校验制品摘要（sha256 裸 hex，与网关 install_package 同一算法、同一预期）。
+sha2 = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots"] }
 # 事实摘要的内容摘要（`fact-v1:sha256:…`）现在只有一份实现，在 `wist-contracts::fact_summary`
 # （sha2）。agentd 只转接，所以这里不再直依赖 ring。
@@ -41,3 +43,9 @@ path = "src/main.rs"
 [[bin]]
 name = "wist-exec"
 path = "src/bin/wist-exec/main.rs"
+
+# 升级执行体：与 agentd 同 crate（版本天然锁在一起），但作为**独立二进制**发布 ——
+# 它必须能在 agentd 被换掉的窗口里活着（等新版起来 / 失败回滚），不能进 exec 的生命周期管理。
+[[bin]]
+name = "wist-upgrader"
+path = "src/bin/wist-upgrader.rs"

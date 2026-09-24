@@ -170,9 +170,13 @@ pub(super) async fn process_telemetry_inputs(
     sink: &mut TelemetryRecordSink,
     next_seq: &mut u64,
 ) -> TelemetryTick {
-    let mut outcomes = Vec::new();
-    let mut failures = Vec::new();
-    let mut notifications = Vec::new();
+    // 三个收集器装在一个结构里穿过去：它们本来就是「本 tick 的结果」，分散成三个参数
+    // 只会让每个调用点重复三遍（也正好越过 clippy 的参数上限）。
+    let mut tick = TelemetryTick {
+        outcomes: Vec::new(),
+        failures: Vec::new(),
+        notifications: Vec::new(),
+    };
 
     for input in &config.telemetry.logs.file_inputs {
         process_telemetry_input(
@@ -180,9 +184,7 @@ pub(super) async fn process_telemetry_inputs(
             input,
             &InputOrigin::default(),
             sink,
-            &mut outcomes,
-            &mut failures,
-            &mut notifications,
+            &mut tick,
             next_seq,
         )
         .await;
@@ -193,19 +195,13 @@ pub(super) async fn process_telemetry_inputs(
             &entry.input,
             &InputOrigin::new(entry.family.clone(), entry.unit_id.clone()),
             sink,
-            &mut outcomes,
-            &mut failures,
-            &mut notifications,
+            &mut tick,
             next_seq,
         )
         .await;
     }
 
-    TelemetryTick {
-        outcomes,
-        failures,
-        notifications,
-    }
+    tick
 }
 
 async fn process_telemetry_input<S: RecordSink>(
@@ -213,25 +209,23 @@ async fn process_telemetry_input<S: RecordSink>(
     input: &LogFileInputSection,
     origin: &InputOrigin,
     sink: &mut S,
-    outcomes: &mut Vec<ProcessOutcome>,
-    failures: &mut Vec<TelemetryFailure>,
-    notifications: &mut Vec<TelemetryWorkState>,
+    tick: &mut TelemetryTick,
     next_seq: &mut u64,
 ) {
     // 目标形态先过一道：通配 / `~` / 相对路径今天采不了，要报成“形态不支持”，
     // 而不是拖到下面报“路径不存在”（那会把运维引去查权限）。
     if let Some(failure) = unsupported_target(input) {
-        failures.push(failure);
+        tick.failures.push(failure);
         return;
     }
 
     let source_path = PathBuf::from(&input.path);
     if !source_path.exists() {
-        failures.push(missing_input_failure(input));
+        tick.failures.push(missing_input_failure(input));
         match replay_spool_only(config, input, sink).await {
-            Ok(Some(outcome)) => outcomes.push(outcome),
+            Ok(Some(outcome)) => tick.outcomes.push(outcome),
             Ok(None) => {}
-            Err(err) => failures.push(processing_failure(
+            Err(err) => tick.failures.push(processing_failure(
                 input,
                 format!("failed to replay spool: {err}"),
             )),
@@ -242,7 +236,7 @@ async fn process_telemetry_input<S: RecordSink>(
     match process_input_with_sink(config, input, origin, source_path, sink, next_seq).await {
         Ok(outcome) => {
             if outcome.paused {
-                notifications.push(TelemetryWorkState {
+                tick.notifications.push(TelemetryWorkState {
                     input_id: input.input_id.clone(),
                     state: WorkState::Paused,
                     reason: spool_paused_reason(outcome.spool_bytes),
@@ -253,11 +247,13 @@ async fn process_telemetry_input<S: RecordSink>(
             // 一个持续存在的病态块只报一次，恢复正常后自动清掉。
             // （量放 `magnitude`：它会变，不能进签名，否则每 tick 都算新问题。）
             if let Some(failure) = withheld_failure(input, &outcome.withheld) {
-                failures.push(failure);
+                tick.failures.push(failure);
             }
-            outcomes.push(outcome);
+            tick.outcomes.push(outcome);
         }
-        Err(err) => failures.push(processing_failure(input, err.to_string())),
+        Err(err) => tick
+            .failures
+            .push(processing_failure(input, err.to_string())),
     }
 }
 

@@ -13,6 +13,8 @@ pub mod service;
 pub(crate) mod single_instance;
 pub mod state_store;
 pub(crate) mod telemetry;
+/// 升级执行体（`wist-upgrader` 二进制的全部逻辑；见模块注释里的取向说明）。
+pub mod upgrade;
 
 pub use config::config_runtime;
 pub use control::enrollment;

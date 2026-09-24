@@ -543,9 +543,22 @@ async fn run_daemon(root: PathBuf, config_dir: Option<&Path>) -> AgentdResult<()
     );
     let exec_bin =
         resolve_exec_bin().source_err(AgentdReason::ExecBinUnavailable, "resolve wist-exec")?;
+    // 升级器（同 crate 的另一个二进制）：找不到**不**阻止启动 —— 升级是低频动作，
+    // 采集不该因为它缺席就停；真派下升级时会报 rejected 并写清原因。
+    let upgrader_bin = match crate::upgrade::resolve_upgrader_bin() {
+        Ok(path) => path,
+        Err(detail) => {
+            eprintln!(
+                "warn: {detail}; one-shot work `upgrade` will be rejected until it is installed"
+            );
+            PathBuf::new()
+        }
+    };
     let loop_ctx = daemon::DaemonLoop {
         config: &config,
         exec_bin: &exec_bin,
+        upgrader_bin: &upgrader_bin,
+        config_dir: &config_root,
     };
 
     if std::env::var("WIST_AGENTD_RUN_ONCE").ok().as_deref() == Some("1") {
@@ -723,7 +736,9 @@ fn reported_identity(config: &wist_contracts::agent_config::AgentConfig) -> Repo
         )),
         StateIdentity::Registered(_) | StateIdentity::Absent => None,
     };
-    let agent_id = from_config.or_else(|| match from_state {
+    // 配置里的 agent_id 优先，否则用 state 里的已注册身份。`or`（而非 `or_else`）是 clippy 的要求：
+    // 右侧就是一个廉价的 match，没有值得推迟的副作用。
+    let agent_id = from_config.or(match from_state {
         StateIdentity::Registered(agent_id) => Some(agent_id),
         StateIdentity::Absent | StateIdentity::Unreadable(_) => None,
     });

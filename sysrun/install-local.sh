@@ -39,6 +39,9 @@ CRATE_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 # 与 src/service/mod.rs 的常量一致：改那里就得改这里（不一致的话重启会打到别的服务上）。
 SERVICE_NAME="wist-agentd"
 EXEC_NAME="wist-exec"
+# 升级执行体：与 agentd 同 crate、但作为独立二进制发布（见 src/upgrade.rs 的模块注释）。
+# 它也必须与 agentd / wist-exec 一起换：升级器自己也在制品里，留着旧的那份就失去了「同版本」这个前提。
+UPGRADER_NAME="wist-upgrader"
 LAUNCHD_LABEL="com.dayu-sec.wist-agentd"
 
 SCOPE="${WIST_AGENTD_SCOPE:-system}"
@@ -136,8 +139,10 @@ fi
 
 DEST_BIN="${BIN_DST_DIR}/${SERVICE_NAME}"
 DEST_EXEC="${BIN_DST_DIR}/${EXEC_NAME}"
+DEST_UPGRADER="${BIN_DST_DIR}/${UPGRADER_NAME}"
 SRC_BIN="${BIN_SRC_DIR}/${SERVICE_NAME}"
 SRC_EXEC="${BIN_SRC_DIR}/${EXEC_NAME}"
+SRC_UPGRADER="${BIN_SRC_DIR}/${UPGRADER_NAME}"
 
 short() {
   case "$1" in
@@ -243,6 +248,7 @@ build() {
   if [ "${DRY_RUN}" != "1" ]; then
     [ -x "${SRC_BIN}" ] || die "缺少 ${SRC_BIN}（先 cargo build --release，或用 WIST_AGENTD_BIN_SRC 指定）"
     [ -x "${SRC_EXEC}" ] || die "缺少 ${SRC_EXEC}（wist-exec 必须与 wist-agentd 一起换，版本错配会让执行类任务失败）"
+    [ -x "${SRC_UPGRADER}" ] || die "缺少 ${SRC_UPGRADER}（升级器与 agentd 同 crate，三个二级制必须一起换）"
   fi
 
   # 防“装了一个跟源码不一致的旧产物”：这种假成功最难查。
@@ -281,12 +287,15 @@ swap_binaries() {
   else
     bak_exec=""
   fi
+  if [ -f "${DEST_UPGRADER}" ]; then
+    run ${SUDO} cp -p "${DEST_UPGRADER}" "${DEST_UPGRADER}.bak-${ts}"
+  fi
 
   # 先落 .new 再 mv：mv 是原子改名（换 inode），而原地覆盖旧 inode 踩过坑 ——
   # 运行中的进程/随后 exec 会抓到旧内容。两个二进制都走同一条路径。
   local src_hash
   src_hash="$(sha12 "${SRC_BIN}")"
-  for pair in "${SRC_BIN}:${DEST_BIN}" "${SRC_EXEC}:${DEST_EXEC}"; do
+  for pair in "${SRC_BIN}:${DEST_BIN}" "${SRC_EXEC}:${DEST_EXEC}" "${SRC_UPGRADER}:${DEST_UPGRADER}"; do
     local src="${pair%%:*}" dst="${pair##*:}"
     run ${SUDO} install -m 0755 "${src}" "${dst}.new"
     run ${SUDO} mv -f "${dst}.new" "${dst}"

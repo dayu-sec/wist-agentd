@@ -497,6 +497,10 @@ fn to_agent_work_state_changes(changes: &[TelemetryWorkState]) -> Vec<AgentWorkS
 pub struct DaemonLoop<'a> {
     pub config: &'a AgentConfig,
     pub exec_bin: &'a Path,
+    /// 升级器（同 crate 的另一个二进制）：一次性工作 `upgrade` 由它执行。
+    pub upgrader_bin: &'a Path,
+    /// 配置目录：交给升级器读取（它要用同一份端点与信任锚去取包）。
+    pub config_dir: &'a Path,
 }
 
 pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
@@ -549,7 +553,7 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
         refresh_discovery_policy(loop_ctx.config, &mut discovery_runtime).await;
         // 工作授权同样在采集之前应用：本轮就按新的授权采（或停）。
         refresh_work_grant(
-            loop_ctx.config,
+            &loop_ctx,
             &mut work_runtime,
             &mut last_work_fetch,
             &work_record_path,
@@ -827,11 +831,12 @@ async fn refresh_discovery_policy(config: &AgentConfig, runtime: &mut DiscoveryR
 /// 与发现策略表的差别：这里**会**回报确认。确认只对“真正应用了的工作”发（见
 /// `AppliedWorkGrant::apply`），回报成功才记下版本 —— 否则下一轮会重复回报。
 async fn refresh_work_grant(
-    config: &AgentConfig,
+    loop_ctx: &DaemonLoop<'_>,
     runtime: &mut AppliedWorkGrant,
     last_fetch: &mut Option<Instant>,
     record_path: &Path,
 ) {
+    let config = loop_ctx.config;
     let now = Instant::now();
     if let Some(at) = *last_fetch
         && at.elapsed() < Duration::from_millis(WORK_FETCH_MIN_INTERVAL_MS as u64)
@@ -872,9 +877,45 @@ async fn refresh_work_grant(
     for work_id in &outcome.unexecutable_one_shot {
         // 收到了但不执行：说清楚，否则网关页面上只剩一个无法解释的“派了没确认”。
         eprintln!(
-            "event=OneShotWorkNotExecuted work_id={work_id} detail=\"agentd 尚未实现一次性工作的执行\""
+            "event=OneShotWorkNotExecuted work_id={work_id} detail=\"agentd 尚未实现这个动作的执行\""
         );
     }
+    // 能做的动作：交给升级器（分离进程），并把它的进度/结果同步回本机视图。
+    let mut dispatched_anything = false;
+    for work in &outcome.one_shot_to_dispatch {
+        if runtime.has_upgrade_in_flight() {
+            // 互斥：升级会换掉 agentd 自己，同时跑两件只会两败俱伤。
+            eprintln!(
+                "event=UpgradeBusy work_id={} detail=\"已有一件升级在进行，本轮不派\"",
+                work.work_id
+            );
+            continue;
+        }
+        match dispatch_upgrade(loop_ctx, work) {
+            Ok(pid) => {
+                runtime.mark_one_shot_execution(&work.work_id, "dispatched");
+                eprintln!("event=UpgradeDispatched work_id={} pid={pid}", work.work_id);
+                // 确认只对“真派出去的活”发：起不了进程就不确认，网关页面上「一直没确认」
+                // 正是这种情况该有的样子（与常驻工作“参数读不懂就不确认”同一取舍）。
+                if ack_work(config, &work.work_id, 0).await {
+                    dispatched_anything = true;
+                } else {
+                    eprintln!(
+                        "event=WorkAckFailed work_id={} plan_version=0",
+                        work.work_id
+                    );
+                }
+            }
+            Err(err) => {
+                runtime.mark_one_shot_execution(&work.work_id, "rejected");
+                eprintln!(
+                    "event=UpgradeDispatchFailed work_id={} detail={err}",
+                    work.work_id
+                );
+            }
+        }
+    }
+    let progressed = reconcile_upgrade_record(runtime, Path::new(&loop_ctx.config.paths.state_dir));
     let mut acked_anything = false;
     for (work_id, plan_version) in outcome.to_ack {
         if ack_work(config, &work_id, plan_version).await {
@@ -886,7 +927,7 @@ async fn refresh_work_grant(
     }
     // 有变化（含“确认了某个版本”）才落盘：这份视图是给人看的，不必每 30s 重写一遍。
     // 写失败只记一行日志：一份工作视图不该影响采集本身。
-    if (outcome.changed || acked_anything)
+    if (outcome.changed || acked_anything || dispatched_anything || progressed)
         && let Some(record) = runtime.device_view(&now_rfc3339())
         && let Err(err) = work::store_async(record_path, &record).await
     {
@@ -895,6 +936,65 @@ async fn refresh_work_grant(
             record_path.display()
         );
     }
+}
+
+/// 把一件升级交给升级器执行（分离进程），返回其 pid。
+///
+/// 参数全部从工作参数里取，**不做任何默认**：取哪个包、换到哪一版必须写在 `spec` 里 ——
+/// 让“升级”这件事只有一个证据来源（网关派下来的那份），而不是 agent 自己的猜测。
+fn dispatch_upgrade(
+    loop_ctx: &DaemonLoop<'_>,
+    entry: &wist_contracts::work::OneShotWork,
+) -> Result<u32, String> {
+    // 参数读不懂就不派（也不确认）：网关那边「期望一直没被确认」正是坏参数真被看见的形态。
+    let spec = crate::upgrade::parse_spec(&entry.spec).map_err(|err| err.to_string())?;
+    let target_version = spec.target_version.clone();
+    let agentd_bin =
+        std::env::current_exe().map_err(|err| format!("resolve current exe: {err}"))?;
+    let request = crate::upgrade::UpgradeRequest {
+        work_id: entry.work_id.clone(),
+        target_version: spec.target_version,
+        current_version: env!("CARGO_PKG_VERSION").to_string(),
+        agentd_bin,
+        package_url: spec.package_url,
+        package_sha256: spec.package_sha256,
+    };
+    let launch = crate::upgrade::build_launch(loop_ctx.upgrader_bin, loop_ctx.config_dir, &request);
+    let log_path = Path::new(&loop_ctx.config.paths.log_dir).join("wist-upgrader.log");
+    eprintln!(
+        "event=UpgradeLaunching work_id={} target={} program={} log={}",
+        entry.work_id,
+        target_version,
+        launch.program.display(),
+        log_path.display()
+    );
+    crate::upgrade::launch_detached(&launch, &log_path)
+        .map_err(|err| format!("launch {}: {err}", launch.program.display()))
+}
+
+/// 从升级器落盘的记录里同步进度/结果，返回「本机视图是否因此变了」。
+///
+/// 为什么以它为唯一来源：升级器是**跨过 agentd 重启**的那个进程，而 agentd 重启后没有任何
+/// 内存记忆（`one_shot_execution` 就是从 `state/work.json` 恢复的）。所以「这件活做到哪一步了」
+/// 只能读它落盘的那份记录 —— 拿网关侧的状态当进度会差一个网络往返，而且恰好在这条链上失真。
+fn reconcile_upgrade_record(runtime: &mut AppliedWorkGrant, state_dir: &Path) -> bool {
+    let path = state_dir.join(crate::upgrade::UPGRADE_RECORD_FILE);
+    let Ok(record) = wist_shared::fs::read_json::<crate::upgrade::UpgradeRecord>(&path) else {
+        return false;
+    };
+    let Some(current) = runtime.one_shot_execution(&record.work_id) else {
+        // 不认识这件活（快照里已经了结）：不动本机视图，也不报一行无主的日志。
+        return false;
+    };
+    if current == record.status {
+        return false;
+    }
+    eprintln!(
+        "event=UpgradeProgress work_id={} step={} status={} detail=\"{}\"",
+        record.work_id, record.step, record.status, record.detail
+    );
+    runtime.mark_one_shot_execution(&record.work_id, &record.status);
+    true
 }
 
 async fn refresh_discovery_snapshot(

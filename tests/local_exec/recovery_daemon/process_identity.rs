@@ -142,6 +142,8 @@ fn daemon_run_once_does_not_block_on_mismatched_process_identity() {
     let snapshot = daemon::run_once(&daemon::DaemonLoop {
         config: &config,
         exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("daemon run once");
 

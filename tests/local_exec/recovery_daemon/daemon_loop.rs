@@ -34,6 +34,8 @@ fn daemon_run_once_quarantines_execution_local_failure_without_stopping_loop() {
     let snapshot = daemon::run_once(&daemon::DaemonLoop {
         config: &config,
         exec_bin: &exec_bin,
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("daemon run once");
 
@@ -74,6 +76,8 @@ fn daemon_run_once_returns_error_when_execution_queue_is_corrupt() {
     let err = daemon::run_once(&daemon::DaemonLoop {
         config: &config,
         exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect_err("corrupt queue should be fatal");
 
@@ -127,6 +131,8 @@ fn daemon_run_once_does_not_rerun_live_execution_from_queue() {
     let snapshot = daemon::run_once(&daemon::DaemonLoop {
         config: &config,
         exec_bin: &exec_bin,
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("daemon run once");
 
@@ -181,6 +187,8 @@ fn daemon_run_once_reports_active_when_execution_is_running() {
     let snapshot = daemon::run_once(&daemon::DaemonLoop {
         config: &config,
         exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("daemon run once");
 
@@ -230,6 +238,8 @@ fn daemon_run_once_reports_active_when_reporting_backlog_exists() {
     let snapshot = daemon::run_once(&daemon::DaemonLoop {
         config: &config,
         exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("daemon run once");
 
@@ -270,6 +280,8 @@ fn daemon_run_once_quarantines_corrupt_running_execution_without_rerun() {
     let snapshot = daemon::run_once(&daemon::DaemonLoop {
         config: &config,
         exec_bin: &exec_bin,
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("daemon run once");
 

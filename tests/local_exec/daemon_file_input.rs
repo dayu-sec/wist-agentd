@@ -154,6 +154,8 @@ fn daemon_run_once_processes_configured_file_input() {
     let snapshot = daemon::run_once(&daemon::DaemonLoop {
         config: &config,
         exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("daemon run once");
 
@@ -437,6 +439,8 @@ fn daemon_run_once_can_enable_high_cardinality_discovery_explicitly() {
     let snapshot = daemon::run_once(&daemon::DaemonLoop {
         config: &config,
         exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("daemon run once");
 
@@ -477,6 +481,8 @@ fn daemon_run_once_continues_when_discovery_cache_store_fails() {
     daemon::run_once(&daemon::DaemonLoop {
         config: &config,
         exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("initial daemon run once");
 
@@ -491,6 +497,8 @@ fn daemon_run_once_continues_when_discovery_cache_store_fails() {
     let snapshot = daemon::run_once(&daemon::DaemonLoop {
         config: &config,
         exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("daemon run once with discovery store failure");
 
@@ -528,6 +536,8 @@ fn daemon_run_once_rebuilds_when_discovery_cache_is_corrupt() {
     daemon::run_once(&daemon::DaemonLoop {
         config: &config,
         exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("initial daemon run once");
 
@@ -538,6 +548,8 @@ fn daemon_run_once_rebuilds_when_discovery_cache_is_corrupt() {
     let snapshot = daemon::run_once(&daemon::DaemonLoop {
         config: &config,
         exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("daemon run once after corrupt cache");
 
@@ -583,6 +595,8 @@ fn daemon_run_once_uses_cached_metrics_snapshot_when_target_view_is_missing() {
     daemon::run_once(&daemon::DaemonLoop {
         config: &config,
         exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("initial daemon run once");
 
@@ -604,6 +618,8 @@ fn daemon_run_once_uses_cached_metrics_snapshot_when_target_view_is_missing() {
     let snapshot = daemon::run_once(&daemon::DaemonLoop {
         config: &config,
         exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("daemon run once with missing target view");
 
@@ -737,6 +753,8 @@ fn daemon_run_once_continues_when_one_file_input_fails() {
     let snapshot = daemon::run_once(&daemon::DaemonLoop {
         config: &config,
         exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("daemon run once");
 
@@ -793,6 +811,8 @@ fn daemon_run_once_assigns_globally_monotonic_seq_across_inputs() {
     daemon::run_once(&daemon::DaemonLoop {
         config: &config,
         exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("daemon run once");
 
@@ -834,6 +854,8 @@ fn daemon_run_once_marks_active_when_only_file_input_fails() {
     let snapshot = daemon::run_once(&daemon::DaemonLoop {
         config: &config,
         exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("daemon run once");
 
@@ -866,6 +888,8 @@ fn daemon_run_once_marks_active_when_configured_file_is_missing() {
     let snapshot = daemon::run_once(&daemon::DaemonLoop {
         config: &config,
         exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("daemon run once");
 
@@ -929,6 +953,8 @@ fn daemon_run_once_replays_existing_spool_even_when_source_file_is_missing() {
     let snapshot = daemon::run_once(&daemon::DaemonLoop {
         config: &config,
         exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("daemon run once");
 
@@ -998,6 +1024,8 @@ fn daemon_run_once_sends_raw_log_lines_to_tcp_output() {
         &daemon::DaemonLoop {
             config: &config,
             exec_bin: &test_exec_bin(&root),
+            upgrader_bin: ::std::path::Path::new(""),
+            config_dir: ::std::path::Path::new(""),
         },
         &work,
     )
@@ -1080,6 +1108,8 @@ fn daemon_run_once_without_granted_metrics_work_skips_the_metrics_frame() {
     daemon::run_once(&daemon::DaemonLoop {
         config: &config,
         exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("daemon run once");
 
@@ -1143,6 +1173,8 @@ fn a_granted_log_work_collects_the_glob_without_any_config_file_input() {
             &daemon::DaemonLoop {
                 config: &config,
                 exec_bin: &test_exec_bin(&root),
+                upgrader_bin: ::std::path::Path::new(""),
+                config_dir: ::std::path::Path::new(""),
             },
             &work,
         )
@@ -1199,6 +1231,8 @@ fn daemon_run_once_replays_spool_when_tcp_output_recovers() {
     let first_snapshot = daemon::run_once(&daemon::DaemonLoop {
         config: &failing_config,
         exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("first daemon run once");
     let spool_path = root
@@ -1249,6 +1283,8 @@ fn daemon_run_once_replays_spool_when_tcp_output_recovers() {
     let second_snapshot = daemon::run_once(&daemon::DaemonLoop {
         config: &recovered_config,
         exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("second daemon run once");
     let payload = server.join().expect("join server");
@@ -1302,6 +1338,8 @@ fn daemon_run_once_exposes_paused_input_and_recovers_in_health_snapshot() {
     let first_snapshot = daemon::run_once(&daemon::DaemonLoop {
         config: &failing_config,
         exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("first daemon run once");
     assert!(first_snapshot.paused_inputs.is_empty());
@@ -1310,6 +1348,8 @@ fn daemon_run_once_exposes_paused_input_and_recovers_in_health_snapshot() {
     let paused_snapshot = daemon::run_once(&daemon::DaemonLoop {
         config: &failing_config,
         exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("paused daemon run once");
     assert_eq!(paused_snapshot.paused_inputs, vec!["app".to_string()]);
@@ -1348,6 +1388,8 @@ fn daemon_run_once_exposes_paused_input_and_recovers_in_health_snapshot() {
     let recovered_snapshot = daemon::run_once(&daemon::DaemonLoop {
         config: &recovered_config,
         exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     })
     .expect("recovered daemon run once");
     let _payload = server.join().expect("join server");
@@ -1373,6 +1415,8 @@ fn daemon_restart_recovers_checkpoint_without_loss_or_duplication() {
     let daemon_loop = daemon::DaemonLoop {
         config: &config,
         exec_bin: &exec_bin,
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
     };
 
     // 第一次运行：处理初始两行，并持久化 checkpoint 到磁盘。

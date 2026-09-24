@@ -104,6 +104,24 @@ pub struct ApplyOutcome {
     /// 为什么要单独列出来而不是直接忽略：收下却不说，运维在网关页面上看到的就是
     /// “派了活但一直没确认”，而具体原因（agent 还不支持）无处可查。
     pub unexecutable_one_shot: Vec<String>,
+    /// 本机**能执行**、且还没派出去的一次性工作（今天只有 `upgrade`）。
+    ///
+    /// 与 `unexecutable_one_shot` 分开列：一个是「我不会做」，一个是「我该做但还没动手」，
+    /// 调用方的动作完全不同（前者只能记日志，后者要真去起进程）。
+    pub one_shot_to_dispatch: Vec<OneShotWork>,
+}
+
+/// 一次性工作的本机执行状态：还没派出去。
+pub const ONE_SHOT_UNEXECUTED: &str = "unexecuted";
+
+/// agentd 今天**真的能执行**的一次性工作动作（其余如实报成 `unexecutable`）。
+///
+/// 只列 `upgrade`：它由 `wist-upgrader`（agentd crate 内的独立二进制、分离进程）执行。
+/// 动作目录就位前不猜别的动作 —— 报成「不支持」让运维看得见，而不是假装在做。
+pub const EXECUTABLE_ONE_SHOT_ACTIONS: &[&str] = &["upgrade"];
+
+pub fn is_executable_one_shot_action(action: &str) -> bool {
+    EXECUTABLE_ONE_SHOT_ACTIONS.contains(&action.trim())
 }
 
 /// 当前持有与在执行的工作（跨 tick 活着）。
@@ -116,6 +134,13 @@ pub struct AppliedWorkGrant {
     one_shot_works: BTreeMap<String, OneShotWork>,
     /// 收到但**未执行**的一次性工作 id（已排序）：留在这里是为了每轮只报一次新增的。
     unexecutable_one_shot: Vec<String>,
+    /// 一次性工作的**本机执行状态**（`work_id` → 状态）：`unexecuted` / `dispatched` /
+    /// `running` / `succeeded` / `failed` / `rolled_back` / `rejected`。
+    ///
+    /// 为什么必须跨 tick 留着：快照每 30s 重复一次，只有它能把「已经派出去/正在做」
+    /// 与「刚收到」区分开 —— 否则每轮都会重新起一个升级进程。
+    /// 它也是**互斥**的依据：升级期间不许再派第二件。
+    one_shot_execution: BTreeMap<String, String>,
 }
 
 impl AppliedWorkGrant {
@@ -191,32 +216,71 @@ impl AppliedWorkGrant {
             }
         }
 
-        // 一次性工作：**收到了但还不会执行**。不假装收到就完事（不确认），
-        // 也不能不说 —— 列出来，让调用方打一行日志，让网关页面上的“一直没确认”有个解释。
-        let one_shot_now: Vec<String> = grant
+        // 一次性工作分两路：
+        //   * 本机**能执行**的动作（今天只有 upgrade）：交给执行体，而且只派一次 ——
+        //     靠 execution 状态防重复派发（快照每 30s 会重复送到）；
+        //   * 其余动作：如实报成「收到了但不会执行」，既不确认也不装看不见 ——
+        //     否则网关页面上只剩一个无法解释的「派了没确认」。
+        let one_shot_now: Vec<OneShotWork> = grant
             .one_shot
             .iter()
             .filter(|work| work.is_outstanding())
-            .map(|work| work.work_id.clone())
+            .cloned()
             .collect();
-        for work_id in &one_shot_now {
-            if !self.unexecutable_one_shot.contains(work_id) {
-                outcome.unexecutable_one_shot.push(work_id.clone());
+        let mut unexecutable_now: Vec<String> = Vec::new();
+        // 状态表跟着快照重建，且**每件持有的活都占一格**（`unexecuted` 也写进去）：
+        // 这样「我有这件活但还没派」与「我不认识这件活」才分得开 —— 后者是别人落盘的记录，
+        // 不该被当成我的活去更新视图。
+        let mut next_execution: BTreeMap<String, String> = BTreeMap::new();
+        for work in &one_shot_now {
+            let execution = self
+                .one_shot_execution
+                .get(&work.work_id)
+                .cloned()
+                .unwrap_or_else(|| ONE_SHOT_UNEXECUTED.to_string());
+            if is_executable_one_shot_action(&work.action) {
+                if execution == ONE_SHOT_UNEXECUTED {
+                    outcome.one_shot_to_dispatch.push(work.clone());
+                }
+                next_execution.insert(work.work_id.clone(), execution);
+                continue;
             }
+            unexecutable_now.push(work.work_id.clone());
+            if !self.unexecutable_one_shot.contains(&work.work_id) {
+                outcome.unexecutable_one_shot.push(work.work_id.clone());
+            }
+            next_execution.insert(work.work_id.clone(), execution);
         }
-        self.unexecutable_one_shot = one_shot_now;
+        self.unexecutable_one_shot = unexecutable_now;
+        self.one_shot_execution = next_execution;
 
         self.sequence = grant.sequence;
         self.works = next;
         // 「我手里有哪些一次性工作」跟快照走（快照只带**未了结**的活）。全量替换：
         // 了结的活不该继续留在本机工作视图里 —— 那会让人以为还在等它做什么。
-        self.one_shot_works = grant
-            .one_shot
-            .iter()
-            .filter(|work| work.is_outstanding())
-            .map(|work| (work.work_id.clone(), work.clone()))
+        self.one_shot_works = one_shot_now
+            .into_iter()
+            .map(|work| (work.work_id.clone(), work))
             .collect();
         outcome
+    }
+
+    /// 记下某件一次性工作的本机执行状态（派发时 / 从升级器记录同步时调）。
+    pub fn mark_one_shot_execution(&mut self, work_id: &str, execution: &str) {
+        self.one_shot_execution
+            .insert(work_id.to_string(), execution.to_string());
+    }
+
+    /// 读某件一次性工作的本机执行状态；不认识这件活则返回 `None`。
+    pub fn one_shot_execution(&self, work_id: &str) -> Option<String> {
+        self.one_shot_execution.get(work_id).cloned()
+    }
+
+    /// 有没有一件升级正在做（已派出去、还没到终态）—— 升级之间必须互斥。
+    pub fn has_upgrade_in_flight(&self) -> bool {
+        self.one_shot_execution
+            .values()
+            .any(|state| matches!(state.as_str(), "dispatched" | "running"))
     }
 
     /// 记下某份工作已回报的版本（HTTP 确认成功之后调）。
@@ -274,8 +338,12 @@ impl AppliedWorkGrant {
                 action: work.action.clone(),
                 spec: work.spec.clone(),
                 status: work.status.clone(),
-                // 本机执行状态：网关派发的活还没做（agentd 尚未实现一次性工作的执行）。
-                execution: "unexecuted".to_string(),
+                // 本机执行状态：默认“还没做”，派出去/做完之后由 agentd 更新（跨 tick 活着）。
+                execution: self
+                    .one_shot_execution
+                    .get(&work.work_id)
+                    .cloned()
+                    .unwrap_or_else(|| ONE_SHOT_UNEXECUTED.to_string()),
                 scheduled_at: work.scheduled_at.clone(),
                 deadline_at: work.deadline_at.clone(),
                 timeout_seconds: work.timeout_seconds,
@@ -364,7 +432,13 @@ impl AppliedWorkGrant {
                     issued_at: String::new(),
                 },
             );
-            if !runtime.unexecutable_one_shot.contains(&entry.work_id) {
+            runtime
+                .one_shot_execution
+                .insert(entry.work_id.clone(), entry.execution.clone());
+            // 不支持的动件才进「收到但不执行」名单；支持的动作靠 execution 状态防重复派发。
+            if !is_executable_one_shot_action(&entry.action)
+                && !runtime.unexecutable_one_shot.contains(&entry.work_id)
+            {
                 runtime.unexecutable_one_shot.push(entry.work_id.clone());
             }
         }
@@ -977,16 +1051,13 @@ mod tests {
         assert!(applied.is_empty());
     }
 
-    #[test]
-    fn an_outstanding_one_shot_work_is_reported_as_unexecutable() {
-        // agentd 还没实现一次性工作的执行：收到了就**说出来**（不确认、也不装看不见）。
-        let mut applied = AppliedWorkGrant::default();
-        let mut snapshot = grant(1, Vec::new());
-        snapshot.one_shot = vec![wist_contracts::work::OneShotWork {
-            work_id: "work-upgrade".to_string(),
+    /// 一件一次性工作（默认字段跟实测一致；只改关心的那几个）。
+    fn one_shot(work_id: &str, action: &str, spec: &str) -> wist_contracts::work::OneShotWork {
+        wist_contracts::work::OneShotWork {
+            work_id: work_id.to_string(),
             agent_id: "agent-1".to_string(),
-            action: "upgrade".to_string(),
-            spec: "0.1.4".to_string(),
+            action: action.to_string(),
+            spec: spec.to_string(),
             scheduled_at: "2026-09-23T00:00:00Z".to_string(),
             deadline_at: "2026-09-24T00:00:00Z".to_string(),
             timeout_seconds: 600,
@@ -999,10 +1070,19 @@ mod tests {
             attempt: 0,
             issued_by: "admin".to_string(),
             issued_at: "2026-09-23T00:00:00Z".to_string(),
-        }];
+        }
+    }
+
+    #[test]
+    fn an_unsupported_one_shot_action_is_reported_but_not_dispatched() {
+        // 不支持的动作：收到了就**说出来**（不确认、也不装看不见）。
+        let mut applied = AppliedWorkGrant::default();
+        let mut snapshot = grant(1, Vec::new());
+        snapshot.one_shot = vec![one_shot("work-snapshot", "snapshot", "{}")];
 
         let outcome = applied.apply(&snapshot);
-        assert_eq!(outcome.unexecutable_one_shot, vec!["work-upgrade"]);
+        assert_eq!(outcome.unexecutable_one_shot, vec!["work-snapshot"]);
+        assert!(outcome.one_shot_to_dispatch.is_empty());
         assert!(outcome.to_ack.is_empty(), "不确认没执行的活");
         assert!(applied.summary().contains("one_shot_pending=1"));
 
@@ -1013,6 +1093,100 @@ mod tests {
         let outcome = applied.apply(&grant(2, Vec::new()));
         assert!(!outcome.changed || outcome.unexecutable_one_shot.is_empty());
         assert!(applied.summary().contains("one_shot_pending=0"));
+    }
+
+    #[test]
+    fn an_upgrade_one_shot_is_dispatched_once_and_only_once() {
+        // 快照每 30s 重复送到：防重复派发靠的是**执行状态**，不是「这条是新来的」——
+        // 后者在 agentd 重启后会重新起一个升级进程。
+        let mut applied = AppliedWorkGrant::default();
+        let mut snapshot = grant(1, Vec::new());
+        snapshot.one_shot = vec![one_shot("work-upgrade", "upgrade", "0.1.4")];
+
+        let outcome = applied.apply(&snapshot);
+        assert_eq!(outcome.one_shot_to_dispatch.len(), 1);
+        assert_eq!(outcome.one_shot_to_dispatch[0].work_id, "work-upgrade");
+        assert!(outcome.unexecutable_one_shot.is_empty());
+        assert!(outcome.to_ack.is_empty(), "确认由派发方在真起了进程之后发");
+
+        // 派出去之后（daemon 会 mark）就不再重复派；到了终态同理。
+        applied.mark_one_shot_execution("work-upgrade", "dispatched");
+        assert!(applied.apply(&snapshot).one_shot_to_dispatch.is_empty());
+        applied.mark_one_shot_execution("work-upgrade", "succeeded");
+        assert!(applied.apply(&snapshot).one_shot_to_dispatch.is_empty());
+
+        // 派发失败（rejected）也不重试：重试会把「参数坏了」变成「每 30s 再试一次」。
+        applied.mark_one_shot_execution("work-upgrade", "rejected");
+        assert!(applied.apply(&snapshot).one_shot_to_dispatch.is_empty());
+    }
+
+    #[test]
+    fn the_local_execution_state_drives_the_view_and_mutual_exclusion() {
+        let mut applied = AppliedWorkGrant::default();
+        let mut snapshot = grant(1, Vec::new());
+        snapshot.one_shot = vec![one_shot("work-upgrade", "upgrade", "0.1.4")];
+        applied.apply(&snapshot);
+        assert!(!applied.has_upgrade_in_flight(), "还没派出去就不算在做");
+        assert_eq!(
+            applied.one_shot_execution("work-upgrade").as_deref(),
+            Some("unexecuted")
+        );
+        assert_eq!(applied.one_shot_execution("work-nope"), None);
+
+        applied.mark_one_shot_execution("work-upgrade", "running");
+        assert!(applied.has_upgrade_in_flight(), "在做 = 不许再派第二件");
+        let view = applied.device_view("t0").expect("view");
+        assert_eq!(view.one_shot[0].execution, "running");
+
+        applied.mark_one_shot_execution("work-upgrade", "rolled_back");
+        assert!(
+            !applied.has_upgrade_in_flight(),
+            "回了回滚后的终态就不再占着"
+        );
+        assert_eq!(
+            applied.device_view("t1").expect("view").one_shot[0].execution,
+            "rolled_back"
+        );
+    }
+
+    #[test]
+    fn restore_keeps_the_execution_state_so_a_finished_upgrade_is_not_redispatched() {
+        // 重启后靠落盘的工作视图恢复：一件已成功的升级不能被当成「刚收到」再派一次。
+        let record = crate::state_store::work::WorkRecord {
+            schema_version: SCHEMA_VERSION_V1.to_string(),
+            recorded_at: "t".to_string(),
+            gateway_sequence: 3,
+            standing: Vec::new(),
+            one_shot: vec![crate::state_store::work::OneShotWorkRecord {
+                work_id: "work-upgrade".to_string(),
+                action: "upgrade".to_string(),
+                spec: "0.1.4".to_string(),
+                status: "accepted".to_string(),
+                execution: "succeeded".to_string(),
+                scheduled_at: "2026-09-23T00:00:00Z".to_string(),
+                deadline_at: "2026-09-24T00:00:00Z".to_string(),
+                timeout_seconds: 600,
+            }],
+            metrics_interval_seconds: None,
+        };
+
+        let mut restored = AppliedWorkGrant::restore(&record);
+        assert_eq!(
+            restored.one_shot_execution("work-upgrade").as_deref(),
+            Some("succeeded")
+        );
+        assert!(
+            restored.unexecutable_one_shot().is_empty(),
+            "能执行的动作不该进「收到但不执行」名单"
+        );
+        assert!(!restored.has_upgrade_in_flight(), "终态 = 没有在做");
+
+        let mut snapshot = grant(4, Vec::new());
+        snapshot.one_shot = vec![one_shot("work-upgrade", "upgrade", "0.1.4")];
+        assert!(
+            restored.apply(&snapshot).one_shot_to_dispatch.is_empty(),
+            "已成功的升级不该在重启后再派一次"
+        );
     }
 
     #[test]
