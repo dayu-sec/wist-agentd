@@ -1,6 +1,7 @@
 use super::{
-    enrollment_report_lines, init_config_message, parse_command, resolve_config_dir_arg,
-    resolve_exec_bin_from, run_from_args, sync_runtime_identity, usage_message,
+    enrollment_report_lines, init_config_message, initialize_runtime_state_async, parse_command,
+    refresh_runtime_version, resolve_config_dir_arg, resolve_exec_bin_from, run_from_args,
+    sync_runtime_identity, usage_message,
 };
 use crate::enrollment::EnrollmentDecision;
 use crate::state_store::agent_runtime;
@@ -764,6 +765,94 @@ fn sync_runtime_identity_rejects_config_agent_id_conflicting_with_enrolled_ident
 
     assert!(err.to_string().contains("conflicts"));
     assert_eq!(runtime.agent_id, "agent-a");
+}
+
+// ---- 启动时把运行态版本刷成当前二进制版本 ----
+
+// ---- 启动时把运行态版本刷成当前二进制版本 ----
+
+#[test]
+fn refresh_runtime_version_reports_the_running_binary_and_keeps_credentials() {
+    // 陈旧值与「比当前还新」的值都要被刷成当前版本：写的是「现在在跑哪一版」，不是取最大。
+    for persisted in ["0.0.1-stale", "9.9.9-newer"] {
+        let mut state = AgentRuntimeState::new(
+            "agent-a".to_string(),
+            "instance-a".to_string(),
+            persisted.to_string(),
+            RuntimeMode::Normal,
+            "2026-09-21T00:00:00Z".to_string(),
+        );
+        state.credential_id = Some("cred-1".to_string());
+        state.bearer_token = Some("bearer-secret".to_string());
+
+        refresh_runtime_version(&mut state);
+
+        assert_eq!(state.version, env!("CARGO_PKG_VERSION"));
+        // 刷新版本不该动身份与凭据（注册结果就存在这份状态里）。
+        assert_eq!(state.agent_id, "agent-a");
+        assert_eq!(state.instance_id, "instance-a");
+        assert_eq!(state.credential_id.as_deref(), Some("cred-1"));
+        assert_eq!(state.bearer_token.as_deref(), Some("bearer-secret"));
+    }
+}
+
+#[test]
+fn initialize_runtime_state_refreshes_the_running_version() {
+    let root = temp_dir("refresh-version");
+    let state_dir = root.join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    // 预置一份「首次注册时写下的」运行态：启动时应把它刷成当前二进制版本。不刷新的话，
+    // 升级器的就绪判据会永远读到旧版本，导致合法升级被回滚。
+    let runtime_path = agent_runtime::path_for(&state_dir);
+    let stale = AgentRuntimeState::new(
+        "agent-a".to_string(),
+        "instance-a".to_string(),
+        "0.0.1-stale".to_string(),
+        RuntimeMode::Normal,
+        "2026-09-21T00:00:00Z".to_string(),
+    );
+    agent_runtime::store(&runtime_path, &stale).expect("store stale state");
+
+    let config = AgentConfig::new(
+        AgentSection {
+            agent_id: None,
+            environment_id: None,
+            instance_name: None,
+        },
+        ControlPlaneSection {
+            enabled: false,
+            endpoint: None,
+            enrollment_token: None,
+            credential_request: None,
+            credential_id: None,
+            bearer_token: None,
+            credential_expires_at: None,
+            tls_mode: None,
+            trust_bundle: None,
+            auth_mode: None,
+        },
+        PathsSection {
+            root_dir: ".".to_string(),
+            run_dir: "run".to_string(),
+            state_dir: "state".to_string(),
+            log_dir: "log".to_string(),
+        },
+        ExecutionSection {
+            max_running_actions: 1,
+            cancel_grace_ms: 5_000,
+            default_stdout_limit_bytes: 1,
+            default_stderr_limit_bytes: 1,
+        },
+    );
+
+    block_on(initialize_runtime_state_async(&state_dir, &config))
+        .expect("initialize runtime state");
+
+    let refreshed = agent_runtime::load_or_default(&runtime_path).expect("load runtime state");
+    assert_eq!(refreshed.version, env!("CARGO_PKG_VERSION"));
+    // 刷新版本不该动已注册的身份。
+    assert_eq!(refreshed.agent_id, "agent-a");
+    assert_eq!(refreshed.instance_id, "instance-a");
 }
 
 // ---- 注册结果报告：`agent_id=` 只在本安装真已注册时出现 ----

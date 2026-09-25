@@ -11,7 +11,7 @@
 //! 版本 → 换件 → 重启 → 等新版 → 失败回滚）能在任何机器上完整跑一遍：不要 root，
 //! 不碰服务管理器，也不用连网关（包走本地路径）。
 //!
-//! 真机上的那一段（真实 launchd/systemd 拉起、真实服务重启）仍由 `sysrun/` 下的脚本负责。
+//! 真机上的那一段（真实 launchd/systemd 拉起、真实服务重启）仍由 `dev/` 下的脚本负责。
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -98,6 +98,15 @@ impl Sandbox {
         (archive, hex(&bytes))
     }
 
+    /// 造一个「裸包」制品（单个 `wist-agentd` 裸二进制，不打 tarball）——
+    /// 这是网关内置默认包的形态，与 `package_with` 的发布 tarball 是两条解包路径。
+    fn bare_package(&self, version: &str) -> (PathBuf, String) {
+        let path = self.root.join("bare-agentd");
+        write_fake_binary(&path, AGENTD_BIN_NAME, version);
+        let bytes = std::fs::read(&path).expect("read bare package");
+        (path, hex(&bytes))
+    }
+
     /// 写一个「重启」桩，返回可以交给 `apply` 的重启计划。
     ///
     /// * `ok`   —— 模拟「新版起来了」：把它自报的版本写进 runtime state
@@ -131,13 +140,7 @@ impl Sandbox {
         }
     }
 
-    async fn run(
-        &self,
-        package: &Path,
-        sha256: &str,
-        restart: RestartPlan,
-        ready_wait: Duration,
-    ) -> UpgradeRecord {
+    fn config(&self) -> AgentConfig {
         let mut config = AgentConfig::new(
             AgentSection::default(),
             ControlPlaneSection::default(),
@@ -145,14 +148,29 @@ impl Sandbox {
             Default::default(),
         );
         config.paths.state_dir = self.state_dir().display().to_string();
-        let request = UpgradeRequest {
+        config
+    }
+
+    fn request(&self, package: &Path, sha256: &str) -> UpgradeRequest {
+        UpgradeRequest {
             work_id: "work-upgrade-1".to_string(),
-            target_version: TO.to_string(),
+            target_version: Some(TO.to_string()),
             current_version: FROM.to_string(),
             agentd_bin: self.bin_dir().join(AGENTD_BIN_NAME),
             package_url: package.display().to_string(),
             package_sha256: sha256.to_string(),
-        };
+        }
+    }
+
+    async fn run(
+        &self,
+        package: &Path,
+        sha256: &str,
+        restart: RestartPlan,
+        ready_wait: Duration,
+    ) -> UpgradeRecord {
+        let config = self.config();
+        let request = self.request(package, sha256);
         let options = UpgradeOptions {
             dry_run: false,
             ready_wait,
@@ -383,6 +401,44 @@ async fn a_partial_artifact_is_refused_before_the_installed_binaries_are_touched
     assert!(!sandbox.backup_of(AGENTD_BIN_NAME).exists(), "不该留下备份");
 }
 
+/// 裸包（网关内置默认包，单个裸二进制）盖在三件套机器上：升级只装不删，那两个兄弟件
+/// 会留在旧版本，于是换完 agentd 就是新版、它们还是旧版 —— 必须拒掉。
+/// 这与「漏件 tarball」是**两条解包路径**（裸包不进 tar），但要防的是同一件事：混合版本。
+#[tokio::test]
+async fn a_bare_package_over_a_three_binary_machine_is_refused() {
+    let sandbox = Sandbox::new("bare-over-full", &ALL_BINS);
+    sandbox.seed_running_version(FROM);
+    let (package, sha) = sandbox.bare_package(TO);
+
+    let record = sandbox
+        .run(
+            &package,
+            &sha,
+            sandbox.restart_stub("ok", TO),
+            Duration::from_secs(10),
+        )
+        .await;
+
+    assert_eq!(record.status, "failed", "{record:?}");
+    assert_eq!(record.step, "verify_artifact", "换件之前就该停住");
+    assert!(
+        record.detail.contains("artifact_invalid"),
+        "{}",
+        record.detail
+    );
+    // 三件仍是旧版，一点没动。
+    assert_eq!(sandbox.installed_agentd_version(), FROM);
+    assert_eq!(
+        sandbox.version_of(&sandbox.bin_dir().join(EXEC_BIN_NAME)),
+        FROM
+    );
+    assert_eq!(
+        sandbox.version_of(&sandbox.bin_dir().join(UPGRADER_BIN_NAME)),
+        FROM
+    );
+    assert!(!sandbox.backup_of(AGENTD_BIN_NAME).exists(), "不该留下备份");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 还没换件就失败：不该动盘上的东西
 // ─────────────────────────────────────────────────────────────────────────────
@@ -406,6 +462,50 @@ async fn a_digest_mismatch_fails_before_touching_the_installed_binaries() {
     assert_eq!(record.step, "verify_digest");
     assert_eq!(sandbox.installed_agentd_version(), FROM, "没换过件");
     assert!(!sandbox.backup_of(AGENTD_BIN_NAME).exists(), "不该留下备份");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 升级进行中的可观察性
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 升级进行中，记录里的 `step` 要跟着往前写：进程被 kill / 掉电后，agentd 判死要报
+/// 「停在哪一步」。这里用「重启成功但新版永远起不来」让升级停在 `wait_ready`，
+/// 再从盘上读到这一步 —— 没有这份持久化，盘上记录会一直停在开头的 `fetch`。
+#[tokio::test]
+async fn the_record_persists_its_step_while_the_upgrade_is_in_flight() {
+    let sandbox = Sandbox::new("step-persist", &ALL_BINS);
+    sandbox.seed_running_version(FROM);
+    let (package, sha) = sandbox.package(TO);
+
+    let config = sandbox.config();
+    let request = sandbox.request(&package, &sha);
+    let options = UpgradeOptions {
+        dry_run: false,
+        ready_wait: Duration::from_secs(5),
+        restart: sandbox.restart_stub("noop", TO),
+    };
+    let handle = tokio::spawn(async move { apply(&config, &request, &options).await });
+
+    // 轮询盘上的记录，直到它走到 `wait_ready`（升级此刻还「在飞」，没到终态）。
+    let record_path = sandbox.state_dir().join(UPGRADE_RECORD_FILE);
+    let mut observed_step = None;
+    for _ in 0..200 {
+        if let Ok(record) = read_json::<UpgradeRecord>(&record_path)
+            && record.step == "wait_ready"
+        {
+            observed_step = Some(record.step);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let record = handle.await.expect("apply task");
+    assert_eq!(record.status, "rolled_back", "{record:?}");
+    assert_eq!(
+        observed_step.as_deref(),
+        Some("wait_ready"),
+        "盘上的记录该在升级进行中推进到 wait_ready，而不是停在 fetch"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

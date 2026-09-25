@@ -952,15 +952,19 @@ async fn refresh_work_grant(
 
 /// 把一件升级交给升级器执行（分离进程），返回其 pid。
 ///
-/// 参数全部从工作参数里取，**不做任何默认**：取哪个包、换到哪一版必须写在 `spec` 里 ——
-/// 让“升级”这件事只有一个证据来源（网关派下来的那份），而不是 agent 自己的猜测。
+/// 参数全部从工作参数里取，**不做任何默认**：取哪个包必须写在 `spec` 里 ——
+/// 让「升级」这件事只有一个证据来源（网关派下来的那份），而不是 agent 自己的猜测。
+/// 目标版本例外：它可以不写（那就以**包内 agentd 自报的版本**为准）。
 fn dispatch_upgrade(
     loop_ctx: &DaemonLoop<'_>,
     entry: &wist_contracts::work::OneShotWork,
 ) -> Result<u32, String> {
     // 参数读不懂就不派（也不确认）：网关那边「期望一直没被确认」正是坏参数真被看见的形态。
     let spec = crate::upgrade::parse_spec(&entry.spec).map_err(|err| err.to_string())?;
-    let target_version = spec.target_version.clone();
+    let target_label = spec
+        .target_version
+        .clone()
+        .unwrap_or_else(|| "(由包内自报)".to_string());
     let agentd_bin =
         std::env::current_exe().map_err(|err| format!("resolve current exe: {err}"))?;
     let request = crate::upgrade::UpgradeRequest {
@@ -976,7 +980,7 @@ fn dispatch_upgrade(
     eprintln!(
         "event=UpgradeLaunching work_id={} target={} program={} log={}",
         entry.work_id,
-        target_version,
+        target_label,
         launch.program.display(),
         log_path.display()
     );
@@ -1068,7 +1072,12 @@ async fn reconcile_upgrade_record(
 fn work_result_of(record: &crate::upgrade::UpgradeRecord) -> Option<(&'static str, String)> {
     match record.status.as_str() {
         "running" => Some(("running", format!("正在 {}", record.step))),
-        "succeeded" => Some(("succeeded", String::new())),
+        // 成功也要带一句「从哪一版升到哪一版」：`target_version` 现在可以不写（由包里自报决定），
+        // 这个值只有升级器知道 —— 不报回去，页面上就看不到到底升到了哪一版。
+        "succeeded" => Some((
+            "succeeded",
+            format!("{} -> {}", record.from_version, record.to_version),
+        )),
         "failed" => Some(("failed", record.detail.clone())),
         "rolled_back" => Some((
             "failed",
@@ -2073,12 +2082,11 @@ mod tests {
                 .0,
             "running"
         );
-        assert_eq!(
-            work_result_of(&upgrade_record_at("succeeded", "done", ""))
-                .unwrap()
-                .0,
-            "succeeded"
-        );
+        let (status, detail) = work_result_of(&upgrade_record_at("succeeded", "done", ""))
+            .expect("succeeded 是能映射的");
+        assert_eq!(status, "succeeded");
+        // 目标版本由包里决定，所以成功时必须把「从哪一版到哪一版」带回去。
+        assert_eq!(detail, "0.1.3 -> 0.1.4");
         assert_eq!(
             work_result_of(&upgrade_record_at("failed", "install", "boom"))
                 .unwrap()
@@ -2194,5 +2202,26 @@ mod tests {
             Some("running")
         );
         assert!(runtime.has_upgrade_in_flight(), "还在做，互斥照旧");
+    }
+
+    /// 升级器落盘的记录若是本机工作视图里没有的活（不属于这台机的视图）：不认它、也不报 ——
+    /// 既不编一个网关会拒的取值，也不动本机视图。
+    #[tokio::test]
+    async fn an_upgrade_record_for_a_work_outside_the_view_is_ignored() {
+        let state_dir = fact_summary_state_dir("upgrade-unknown");
+        // endpoint 是没人监听的地址：真要报也报不出去；这里断言的是它**根本不去报**。
+        let config = test_config();
+        let mut record = upgrade_record_at("succeeded", "done", "");
+        record.work_id = "someone-elses-work".to_string();
+        write_upgrade_record(&state_dir, &record);
+
+        let mut runtime = grant_holding_the_upgrade();
+        assert!(!reconcile_upgrade_record(&config, &mut runtime, &state_dir).await);
+        // 本机视图一点没动：那件活仍停在 dispatched，互斥照旧。
+        assert_eq!(
+            runtime.one_shot_execution("work-upgrade").as_deref(),
+            Some("dispatched")
+        );
+        assert!(runtime.has_upgrade_in_flight());
     }
 }

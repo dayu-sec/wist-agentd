@@ -73,9 +73,13 @@ const MAX_ARTIFACT_DEPTH: usize = 3;
 /// `package_url` / `package_sha256` 由网关在派活时按**当前分发端点**与**实际缓存制品**填入，
 /// 而不是让运维手抄：摘要必须与真正会被分发出去的那份字节同源，否则升级会变成
 /// 「谁写这个字段谁决定装什么」。
+///
+/// `target_version` **可省**（空串等同于没给）：版本本来就是「那份包里 agentd 自报的版本」，
+/// 缺省时由升级器解包后从二进制读出来 —— 让运维手抄只会多一个「填错就 version_mismatch」的坑。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct UpgradeSpec {
-    pub target_version: String,
+    #[serde(default)]
+    pub target_version: Option<String>,
     pub package_url: String,
     pub package_sha256: String,
 }
@@ -85,7 +89,8 @@ pub struct UpgradeSpec {
 pub struct UpgradeRequest {
     /// 触发这次升级的一次性工作 id（结果要挂回它）。
     pub work_id: String,
-    pub target_version: String,
+    /// 目标版本：`Some` = 显式要求（必须与包内自报版本一致）；`None` = 由包决定。
+    pub target_version: Option<String>,
     /// agentd 自报的版本（来自它自己的 `CARGO_PKG_VERSION`，不是从文件名猜的）。
     pub current_version: String,
     /// 要替换的 `wist-agentd` 路径（agentd 传自己的 `current_exe`）。
@@ -157,7 +162,8 @@ impl UpgradeRecord {
         Self {
             work_id: request.work_id.clone(),
             from_version: request.current_version.clone(),
-            to_version: request.target_version.clone(),
+            // 目标版本要等解包读到包内自报版本才能定；这里先落显式给的那个（可能为空）。
+            to_version: request.target_version.clone().unwrap_or_default(),
             step: "validate".to_string(),
             status: "running".to_string(),
             detail: String::new(),
@@ -201,20 +207,29 @@ fn fail(reason: &'static str, detail: impl Into<String>) -> UpgradeError {
 }
 
 /// 解析工作参数。形状不对就直接拒（宁可不升，也不要猜参数）。
+///
+/// `target_version` 可省：空串等同于「没给」，交给包内自报的版本决定（见
+/// [`resolve_target_version`]）。
 pub fn parse_spec(text: &str) -> Result<UpgradeSpec, UpgradeError> {
-    let spec: UpgradeSpec = serde_json::from_str(text).map_err(|err| {
+    let mut spec: UpgradeSpec = serde_json::from_str(text).map_err(|err| {
         fail(
             "spec_invalid",
             format!(
-                "expected JSON {{\"target_version\":\"…\",\"package_url\":\"…\",\"package_sha256\":\"…\"}}, got: {err}"
+                "expected JSON {{\"package_url\":\"…\",\"package_sha256\":\"…\"}} (optional \"target_version\":\"…\"), got: {err}"
             ),
         )
     })?;
-    if spec.target_version.trim().is_empty() {
-        return Err(fail("spec_invalid", "target_version is empty"));
-    }
     if spec.package_url.trim().is_empty() {
         return Err(fail("spec_invalid", "package_url is empty"));
+    }
+    if spec
+        .target_version
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
+        spec.target_version = None;
     }
     Ok(spec)
 }
@@ -257,29 +272,65 @@ fn validate_request(request: &UpgradeRequest) -> Result<(), UpgradeError> {
     if request.work_id.trim().is_empty() {
         return Err(fail("spec_invalid", "work_id is empty"));
     }
-    match version_is_newer(&request.target_version, &request.current_version) {
-        Some(true) => {}
-        Some(false) => {
-            return Err(fail(
-                "not_newer",
-                format!(
-                    "target {} is not newer than running {} (downgrade and reinstall are refused)",
-                    request.target_version, request.current_version
-                ),
-            ));
-        }
-        None => {
-            return Err(fail(
-                "version_uncomparable",
-                format!(
-                    "cannot compare {} with {} as dotted numeric versions",
-                    request.target_version, request.current_version
-                ),
-            ));
-        }
+    // 显式给了目标版本就先比一次（早失败）；没给就跳过 —— 它要等解包、读到包内
+    // agentd 自报的版本才能比（见 `resolve_target_version`）。
+    if let Some(target) = provided_target(request) {
+        ensure_newer(target, &request.current_version)?;
     }
     digest_hex(&request.package_sha256)?;
     Ok(())
+}
+
+/// 请求里**显式给的**目标版本（空串当作没给）。
+fn provided_target(request: &UpgradeRequest) -> Option<&str> {
+    request
+        .target_version
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// 只前进：目标必须比当前运行版本新（降级与重装一律拒），且两者都得是点分数字。
+fn ensure_newer(target: &str, current: &str) -> Result<(), UpgradeError> {
+    match version_is_newer(target, current) {
+        Some(true) => Ok(()),
+        Some(false) => Err(fail(
+            "not_newer",
+            format!(
+                "target {target} is not newer than running {current} (downgrade and reinstall are refused)"
+            ),
+        )),
+        None => Err(fail(
+            "version_uncomparable",
+            format!("cannot compare {target} with {current} as dotted numeric versions"),
+        )),
+    }
+}
+
+/// 定下这次升级的**目标版本**：
+///
+/// * 显式给了就用它，但要求与包内 agentd 自报的版本**一致**（不一致 = 说的与装的是两回事）；
+/// * 没给（常见）就**以包内自报的版本为准** —— 版本本来就是那份包里的版本;
+///
+/// 无论哪条，最后都要比当前运行版本新（只前进）。
+fn resolve_target_version(
+    request: &UpgradeRequest,
+    reported: &str,
+) -> Result<String, UpgradeError> {
+    let target = match provided_target(request) {
+        Some(target) => {
+            if target != reported {
+                return Err(fail(
+                    "version_mismatch",
+                    format!("package reports {reported:?}, target is {target:?}"),
+                ));
+            }
+            target.to_string()
+        }
+        None => reported.to_string(),
+    };
+    ensure_newer(&target, &request.current_version)?;
+    Ok(target)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -518,10 +569,11 @@ fn parse_version_output(stdout: &str) -> Option<String> {
         .map(|token| token.trim().to_string())
 }
 
-/// 校验暂存件**自称的版本**：摘要对了不代表版本对（例如把旧包重新压了一遍）。
+/// 让包里的 agentd **自报版本**并返回 —— 这就是这次升级的目标版本。
 ///
-/// 这是「装上去之前唯一能问的一句」：让新二进制自己报版本，与目标比对。
-fn verify_staged_agentd(staged: &[StagedBinary], target_version: &str) -> Result<(), UpgradeError> {
+/// 摘要对了不代表版本对（例如把旧包重新压了一遍），所以换件前要问一句「你到底自称哪一版」。
+/// 调用方拿这个值去定目标版本（见 `resolve_target_version`），并等新版起来后与运行态对账。
+fn verify_staged_agentd(staged: &[StagedBinary]) -> Result<String, UpgradeError> {
     let agentd = staged
         .iter()
         .find(|item| item.name == AGENTD_BIN_NAME)
@@ -547,13 +599,13 @@ fn verify_staged_agentd(staged: &[StagedBinary], target_version: &str) -> Result
     }
     let reported =
         parse_version_output(&String::from_utf8_lossy(&output.stdout)).unwrap_or_default();
-    if reported != target_version {
+    if reported.trim().is_empty() {
         return Err(fail(
-            "version_mismatch",
-            format!("package reports {reported:?}, target is {target_version:?}"),
+            "artifact_invalid",
+            format!("{} did not report a version", agentd.path.display()),
         ));
     }
-    Ok(())
+    Ok(reported)
 }
 
 /// 一件被换掉的二进制及其备份。
@@ -851,27 +903,33 @@ pub struct UpgradeLaunch {
 ///
 /// 参数全部**显式**给（包括 `--bin`：默认值会猜成「升级器自己」，那就换错对象了），
 /// 且一律带 `--apply`：预演是人在终端里做的事，agentd 派下来的活就是要求执行。
+/// `--target-version` 只在**显式给了**时才传：不给就让升级器从包里自报的版本取。
 pub fn build_launch(program: &Path, config_dir: &Path, request: &UpgradeRequest) -> UpgradeLaunch {
+    let mut args = vec![
+        "apply".to_string(),
+        "--config-dir".to_string(),
+        config_dir.display().to_string(),
+        "--bin".to_string(),
+        request.agentd_bin.display().to_string(),
+        "--work-id".to_string(),
+        request.work_id.clone(),
+    ];
+    if let Some(target) = provided_target(request) {
+        args.push("--target-version".to_string());
+        args.push(target.to_string());
+    }
+    args.extend([
+        "--current-version".to_string(),
+        request.current_version.clone(),
+        "--package-url".to_string(),
+        request.package_url.clone(),
+        "--package-sha256".to_string(),
+        request.package_sha256.clone(),
+        "--apply".to_string(),
+    ]);
     UpgradeLaunch {
         program: program.to_path_buf(),
-        args: vec![
-            "apply".to_string(),
-            "--config-dir".to_string(),
-            config_dir.display().to_string(),
-            "--bin".to_string(),
-            request.agentd_bin.display().to_string(),
-            "--work-id".to_string(),
-            request.work_id.clone(),
-            "--target-version".to_string(),
-            request.target_version.clone(),
-            "--current-version".to_string(),
-            request.current_version.clone(),
-            "--package-url".to_string(),
-            request.package_url.clone(),
-            "--package-sha256".to_string(),
-            request.package_sha256.clone(),
-            "--apply".to_string(),
-        ],
+        args,
     }
 }
 
@@ -960,19 +1018,29 @@ async fn apply_inner(
 
     let staging_dir = state_dir.join(UPGRADE_WORK_DIR);
     record.step("fetch");
-    // 先落一条「我在做」再开干：agentd 每 tick 读这份记录来更新本机工作视图，
-    // 也是「升级进行中、不许再派第二件」的唯一依据 —— 进程活着却不落盘，外面就没人知道。
+    // 每一步都落盘，不只开头那一条：agentd 每 tick 读这份记录来更新本机工作视图，
+    // 它也是「升级进行中、不许再派第二件」的唯一依据 —— 进程活着却不落盘，外面就没人知道。
+    // 更重要的是「判死」要报「停在哪一步」：`step` 只在内存里推进的话，进程被 kill / 掉电后
+    // 留下的记录永远停在「fetch」，判死说明会把「换到一半」误说成「还没开始」。
     let _ = store_record(state_dir, record);
     let bytes = fetch_package(config, &request.package_url).await?;
 
     record.step("verify_digest");
+    let _ = store_record(state_dir, record);
     verify_digest(&bytes, &request.package_sha256)?;
 
     record.step("stage");
+    let _ = store_record(state_dir, record);
     let staged = stage_package(&bytes, &staging_dir)?;
 
     record.step("verify_artifact");
-    verify_staged_agentd(&staged, &request.target_version)?;
+    let _ = store_record(state_dir, record);
+    // 让包里的 agentd 自报版本 —— **目标版本以它为准**（没显式给就是它）；
+    // 显式给了则要求两者一致（说的与装的是两回事就拒）。
+    let reported = verify_staged_agentd(&staged)?;
+    let target_version = resolve_target_version(request, &reported)?;
+    record.to_version = target_version.clone();
+    let _ = store_record(state_dir, record);
     // 制品本身没问题，还要看它与**这台机器**组合起来能不能落地（见函数注释）——
     // 与「验制品」同一步：都是换件之前的体检，都只读不写。
     let bin_dir = request
@@ -988,12 +1056,14 @@ async fn apply_inner(
     check_upgrade_keeps_bin_directory_consistent(&staged, &bin_dir)?;
 
     record.step("install");
+    let _ = store_record(state_dir, record);
     let backups = install_binaries(&staged, &bin_dir, &request.current_version, options.dry_run)?;
     if options.dry_run {
         return Ok(());
     }
 
     record.step("restart");
+    let _ = store_record(state_dir, record);
     if let Err(err) = run_restart(&options.restart) {
         // 换件已经发生但没重启：先回滚，否则机器上会留一个「装着新版、跑着旧版」的中间态。
         let rollback = restore_backups(&backups, &bin_dir).err();
@@ -1019,7 +1089,8 @@ async fn apply_inner(
     }
 
     record.step("wait_ready");
-    if !wait_for_version(state_dir, &request.target_version, options.ready_wait).await {
+    let _ = store_record(state_dir, record);
+    if !wait_for_version(state_dir, &target_version, options.ready_wait).await {
         let rollback = restore_backups(&backups, &bin_dir).err();
         let retry = run_restart(&options.restart).err();
         // 同 `restart` 那条：回退没成就不算 `rolled_back`。
@@ -1030,7 +1101,7 @@ async fn apply_inner(
             "not_ready",
             format!(
                 "new version did not report {} within {:?}{}{}",
-                request.target_version,
+                target_version,
                 options.ready_wait,
                 rollback
                     .map(|err| format!("; rollback failed: {err}"))
@@ -1080,7 +1151,7 @@ mod tests {
     fn request(agentd_bin: PathBuf) -> UpgradeRequest {
         UpgradeRequest {
             work_id: "work-upgrade-1".to_string(),
-            target_version: "0.1.4".to_string(),
+            target_version: Some("0.1.4".to_string()),
             current_version: "0.1.3".to_string(),
             agentd_bin,
             package_url: "/nonexistent/package.tar.gz".to_string(),
@@ -1108,7 +1179,7 @@ mod tests {
             r#"{"target_version":"0.1.4","package_url":"https://gw/api/v1/agent/packages/current","package_sha256":"sha256:abc"}"#,
         )
         .expect("parse");
-        assert_eq!(spec.target_version, "0.1.4");
+        assert_eq!(spec.target_version.as_deref(), Some("0.1.4"));
         assert_eq!(spec.package_url, "https://gw/api/v1/agent/packages/current");
         assert_eq!(spec.package_sha256, "sha256:abc");
     }
@@ -1125,7 +1196,7 @@ mod tests {
         let dir = temp_dir("validate-downgrade");
         for (target, current) in [("0.1.3", "0.1.3"), ("0.1.2", "0.1.3")] {
             let mut request = request(dir.join(AGENTD_BIN_NAME));
-            request.target_version = target.to_string();
+            request.target_version = Some(target.to_string());
             request.current_version = current.to_string();
             let err = validate_request(&request).expect_err("must refuse");
             assert_eq!(err.reason, "not_newer", "{err}");
@@ -1153,11 +1224,92 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// 版本比较只看数字段：带 `-pre` / `+meta` 后缀也认；多段按数值比而不是按字符串比；
+    /// 认不出来的宁可拒绝也不猜（返回 `None`）。
+    #[test]
+    fn version_is_newer_handles_suffixes_and_multi_segment_versions() {
+        assert_eq!(version_is_newer("0.1.4-pre", "0.1.3"), Some(true));
+        assert_eq!(version_is_newer("0.1.4+meta", "0.1.3"), Some(true));
+        // 多段按数值比：0.10 比 0.9 新，不能拿字符串比成 0.10 < 0.9。
+        assert_eq!(version_is_newer("0.10.0", "0.9.9"), Some(true));
+        assert_eq!(version_is_newer("1.0.0", "0.9.9"), Some(true));
+        // 前缀关系：0.1.0 看成 0.1 的补零补丁，比 0.1 新。
+        assert_eq!(version_is_newer("0.1.0", "0.1"), Some(true));
+        // 认不出来的版本：宁可拒绝也不猜大小。
+        assert_eq!(version_is_newer("dev", "0.1.3"), None);
+        assert_eq!(version_is_newer("0.1.3", "dev"), None);
+        assert_eq!(version_is_newer("v0.1.4", "0.1.3"), None);
+    }
+
+    #[test]
+    fn parse_spec_treats_the_target_version_as_optional() {
+        // 包地址空 → 拒（它必须有）。
+        let err =
+            parse_spec(r#"{"target_version":"0.1.4","package_url":"","package_sha256":"abc"}"#)
+                .expect_err("empty url must fail");
+        assert_eq!(err.reason, "spec_invalid");
+
+        // 目标版本空/缺 → **可以**：空串归一成 None，由包内自报的版本决定。
+        for text in [
+            r#"{"target_version":"","package_url":"https://gw/x","package_sha256":"abc"}"#,
+            r#"{"package_url":"https://gw/x","package_sha256":"abc"}"#,
+        ] {
+            let spec = parse_spec(text).expect("target_version is optional");
+            assert_eq!(spec.target_version, None);
+            assert_eq!(spec.package_url, "https://gw/x");
+        }
+
+        // 包地址/摘要键缺失仍是形状不对（宁可不升，也不拿默认值猜参数）。
+        let err = parse_spec(r#"{"target_version":"0.1.4"}"#).expect_err("missing fields");
+        assert_eq!(err.reason, "spec_invalid");
+    }
+
+    #[test]
+    fn resolve_target_version_derives_from_the_package_or_checks_the_explicit_one() {
+        let dir = temp_dir("resolve-target");
+
+        // 没显式给 → 以包内自报为准。
+        let mut req = request(dir.join(AGENTD_BIN_NAME));
+        req.target_version = None;
+        assert_eq!(
+            resolve_target_version(&req, "0.1.4").expect("derive"),
+            "0.1.4"
+        );
+
+        // 显式给了且一致 → 用它。
+        req.target_version = Some("0.1.4".to_string());
+        assert_eq!(
+            resolve_target_version(&req, "0.1.4").expect("explicit matches"),
+            "0.1.4"
+        );
+
+        // 显式给了但对不上 → version_mismatch。
+        let err = resolve_target_version(&req, "0.1.5").expect_err("mismatch must fail");
+        assert_eq!(err.reason, "version_mismatch");
+
+        // 推导出来的版本也得比当前运行的新。
+        req.target_version = None;
+        let err = resolve_target_version(&req, "0.1.3").expect_err("not newer");
+        assert_eq!(err.reason, "not_newer");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn validate_request_rejects_an_empty_work_id() {
+        let dir = temp_dir("validate-work-id");
+        let mut request = request(dir.join(AGENTD_BIN_NAME));
+        request.work_id = "   ".to_string();
+        let err = validate_request(&request).expect_err("empty work_id must fail");
+        assert_eq!(err.reason, "spec_invalid");
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn build_launch_passes_every_fact_explicitly() {
         let request = UpgradeRequest {
             work_id: "work-upgrade-1".to_string(),
-            target_version: "0.1.4".to_string(),
+            target_version: Some("0.1.4".to_string()),
             current_version: "0.1.3".to_string(),
             agentd_bin: PathBuf::from("/usr/local/bin/wist-agentd"),
             package_url: "https://gw/api/v1/agent/packages/current".to_string(),
@@ -1360,7 +1512,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_staged_agentd_compares_the_reported_version() {
+    fn verify_staged_agentd_reports_the_version_the_package_claims() {
         let dir = temp_dir("verify-version");
         let staging = dir.join("staging");
         fs::create_dir_all(&staging).expect("staging");
@@ -1370,9 +1522,8 @@ mod tests {
             path: bin,
         }];
 
-        verify_staged_agentd(&staged, "0.1.4").expect("same version passes");
-        let err = verify_staged_agentd(&staged, "0.1.5").expect_err("different version must fail");
-        assert_eq!(err.reason, "version_mismatch");
+        // 现在它只负责「问一句你自称哪一版」；与目标对不对由 `resolve_target_version` 判。
+        assert_eq!(verify_staged_agentd(&staged).expect("reports"), "0.1.4");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1430,6 +1581,24 @@ mod tests {
             !bin_dir.join(EXEC_BIN_NAME).exists(),
             "回滚后该回到「本来没有」"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// `existed` 但备份文件不在（备份那一步没成功 / 被占位）：回滚必须报 `rollback_failed`，
+    /// 而不是假装放回了旧件 —— 否则机器停在一个没人核对过的状态，却对外声称「已回到原样」。
+    #[test]
+    fn restore_backups_reports_a_missing_backup() {
+        let dir = temp_dir("restore-missing-backup");
+        let bin_dir = dir.join("bin");
+        fs::create_dir_all(&bin_dir).expect("bin dir");
+        fs::write(bin_dir.join(AGENTD_BIN_NAME), "new").expect("write installed");
+        let backup = Backup {
+            installed: bin_dir.join(AGENTD_BIN_NAME),
+            backup: bin_dir.join(format!("{AGENTD_BIN_NAME}.bak-0.1.3")),
+            existed: true,
+        };
+        let err = restore_backups(&[backup], &bin_dir).expect_err("must refuse");
+        assert_eq!(err.reason, "rollback_failed");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1589,6 +1758,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_derives_the_target_version_from_the_package_when_not_given() {
+        let dir = temp_dir("apply-derived");
+        let state_dir = dir.join("state");
+        let bin_dir = dir.join("bin");
+        fs::create_dir_all(&state_dir).expect("state dir");
+        fs::create_dir_all(&bin_dir).expect("bin dir");
+        let installed = fake_agentd(&bin_dir, "0.1.3");
+        let artifact = dir.join("artifact");
+        fs::create_dir_all(&artifact).expect("artifact dir");
+        let packaged = artifact.join(AGENTD_BIN_NAME);
+        fs::write(&packaged, "#!/bin/sh\necho \"wist-agentd 0.1.4\"\n").expect("write artifact");
+        let bytes = fs::read(&packaged).expect("read artifact");
+
+        let config = config_with_state(&state_dir);
+        let mut request = request(installed);
+        request.target_version = None; // 没给 → 以包内 agentd 自报的版本为准
+        request.package_url = packaged.display().to_string();
+        request.package_sha256 = sha256_hex(&bytes);
+
+        let record = apply(&config, &request, &UpgradeOptions::default()).await;
+        assert_eq!(record.status, "succeeded", "{record:?}");
+        assert_eq!(record.to_version, "0.1.4", "目标版本应从包里推出来");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn wait_for_version_reads_the_running_state() {
         let dir = temp_dir("wait-ready");
         let state_dir = dir.join("state");
@@ -1611,6 +1806,34 @@ mod tests {
             !wait_for_version(&state_dir, "9.9.9", Duration::from_millis(200)).await,
             "other version must time out"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn running_version_requires_a_readable_runtime_state() {
+        let dir = temp_dir("running-version");
+        let state_dir = dir.join("state");
+        fs::create_dir_all(&state_dir).expect("state dir");
+        let path = state_dir.join(wist_shared::paths::AGENT_RUNTIME_FILE);
+
+        // 没有文件：无从判断 —— 不能当成「已经是新版」。
+        assert_eq!(running_version(&state_dir), None);
+
+        // 文件在但内容坏了：同样不认。就绪判据宁可判「没起来」，也不拿坏数据当依据。
+        fs::write(&path, b"{ not json").expect("write garbage");
+        assert_eq!(running_version(&state_dir), None);
+
+        // 正常一份：读出它的 `version` —— 这也是启动时被刷新的那个字段。
+        let state = AgentRuntimeState::new(
+            "agent-a".to_string(),
+            "instance-a".to_string(),
+            "0.1.5".to_string(),
+            RuntimeMode::Normal,
+            now_rfc3339(),
+        );
+        write_json_atomic(&path, &state).expect("store runtime state");
+        assert_eq!(running_version(&state_dir).as_deref(), Some("0.1.5"));
+
         let _ = fs::remove_dir_all(dir);
     }
 

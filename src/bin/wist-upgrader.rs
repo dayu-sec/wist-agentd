@@ -18,13 +18,15 @@ use wist_contracts::agent_config::AgentConfig;
 
 const USAGE: &str = "\
 Usage:
-  wist-upgrader apply --config-dir <dir> --work-id <id> --target-version <v> --current-version <v>
+  wist-upgrader apply --config-dir <dir> --work-id <id> --current-version <v>
                       --package-url <url> --package-sha256 <sha>
-                      [--bin <agentd path>] [--apply] [--scope system|user] [--ready-wait-secs <n>]
+                      [--target-version <v>] [--bin <agentd path>] [--apply]
+                      [--scope system|user] [--ready-wait-secs <n>]
   wist-upgrader version
   wist-upgrader help
 
 Options:
+  --target-version <v>   目标版本（**可选**：不给就以包内 agentd 自报的版本为准）
   --apply                真的换件并重启（不加 = 演练：取包/验摘要/解包/验版本，不动已装二进制）
   --bin <path>           要替换的 wist-agentd 路径（默认：本可执行文件同级的 wist-agentd）
   --scope <system|user>  服务作用域（默认：配置目录在 /etc/wist-agentd 下即 system）
@@ -36,7 +38,8 @@ struct Args {
     config_dir: PathBuf,
     bin: Option<PathBuf>,
     work_id: String,
-    target_version: String,
+    /// 目标版本：`Some` = 显式要求（必须与包内自报一致）；`None` = 由包内自报的版本决定。
+    target_version: Option<String>,
     current_version: String,
     package_url: String,
     package_sha256: String,
@@ -125,7 +128,7 @@ where
         config_dir: config_dir.ok_or("missing --config-dir")?,
         bin,
         work_id: work_id.ok_or("missing --work-id")?,
-        target_version: target_version.ok_or("missing --target-version")?,
+        target_version,
         current_version: current_version.ok_or("missing --current-version")?,
         package_url: package_url.ok_or("missing --package-url")?,
         package_sha256: package_sha256.ok_or("missing --package-sha256")?,
@@ -211,6 +214,22 @@ mod tests {
     fn parse_requires_the_upgrade_facts() {
         let err = parse(&["--config-dir", "/etc/wist-agentd"]).expect_err("missing flags");
         assert!(err.contains("--work-id"), "{err}");
+
+        // `--target-version` **不是**必填了：不给就以包内自报的版本为准。
+        let args = parse(&[
+            "--config-dir",
+            "/etc/wist-agentd",
+            "--work-id",
+            "w",
+            "--current-version",
+            "0.1.3",
+            "--package-url",
+            "/x",
+            "--package-sha256",
+            "abc",
+        ])
+        .expect("target version is optional");
+        assert_eq!(args.target_version, None);
     }
 
     #[test]

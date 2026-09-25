@@ -1036,12 +1036,23 @@ async fn initialize_runtime_state_async(
     let mut runtime_state =
         state_store::agent_runtime::load_or_default_async(&runtime_path).await?;
     sync_runtime_identity(&mut runtime_state, config)?;
+    refresh_runtime_version(&mut runtime_state);
     state_store::agent_runtime::store_async(&runtime_path, &runtime_state).await?;
 
     let queue_path = state_store::execution_queue::path_for(state_dir);
     let queue_state = state_store::execution_queue::load_or_default_async(&queue_path).await?;
     state_store::execution_queue::store_async(&queue_path, &queue_state).await?;
     Ok(())
+}
+
+/// 把运行态里的 `version` 刷成**当前这份二进制**的版本。
+///
+/// 版本不是注册时一次性的属性，而是「此刻在跑的是哪一版」这个事实：升级器换了件之后，它就绪
+/// 判据读的正是这个字段（见 `crate::upgrade::running_version`）。只 `load_or_default` 再原样回写，
+/// 它会永远停在**首次注册**写下的那一版 —— 机器上明明已经跑起新版，判定却仍是「没起来」，
+/// 于是一次合法升级被回滚（`not_ready`）。
+fn refresh_runtime_version(runtime_state: &mut wist_contracts::agent_state::AgentRuntimeState) {
+    runtime_state.version = env!("CARGO_PKG_VERSION").to_string();
 }
 
 fn resolve_exec_bin() -> io::Result<PathBuf> {
