@@ -20,12 +20,12 @@
 | 长期运行不出现重复实例 | state 目录 `flock` 单实例锁（进程退出即自动释放） |
 | 配置 / 数据 / 日志分离 | 配置在 `/etc/wist-agentd`，数据（含采集输出 `data/`）落 `/var/lib/wist-agentd`，日志落 `/var/log/wist-agentd`（FHS） |
 | 可升级、可回滚 | 原地替换二进制 + 重启服务；执行中的计划由 crash recovery 承接 |
-| 验收可重复 | `sysrun/verify-system-install.sh`（需 root 的一次性验收机）自动断言定义/自启/running/落点/采集输出/拉起/单实例 |
+| 验收可重复 | `dev/verify-system-install.sh`（需 root 的一次性验收机）自动断言定义/自启/running/落点/采集输出/拉起/单实例 |
 
 **非目标（本方案不做）**：
 
 - 不做 `fork` / `double-fork` daemonize。前台运行是服务管理器的前提，也避免了“谁持有 PID”的歧义。
-- 不代替 `sysrun/start.sh`。`sysrun/` 仍是**开发机联调**脚本（`&` + `disown` + pidfile）；
+- 不代替 `dev/start.sh`。`dev/` 仍是**开发机联调**脚本（`&` + `disown` + pidfile）；
   生产常驻一律走 `service install`。
 - 不创建专用系统账号、不装 root helper。需要提权采集（audit / TCC / 统一日志）时，
   按 [macos-agent-uplink-to-warp-parse.md](./macos-agent-uplink-to-warp-parse.md) 的 root helper 方案另议。
@@ -72,7 +72,7 @@ flowchart TD
 
 **为什么不自带 daemonize。** 常驻托管有两条路：自己 `fork` 脱离终端（传统 daemon），或前台运行交给
 supervisor。后者让“谁在管、怎么重启、日志去哪”都有唯一答案，也避免了 `fork` 之后 PID/日志/信号
-处理的常见坑；`sysrun/start.sh` 那种 `&` + `disown` 只是开发机权宜。
+处理的常见坑；`dev/start.sh` 那种 `&` + `disown` 只是开发机权宜。
 
 **为什么用 flock 而不是 pidfile 判重复。** pidfile 有“stale 文件要清理、PID 被复用误判”的问题；
 `flock` 挂在打开的文件描述符上，进程退出（含 `kill -9`）即由内核释放，覆盖 `start.sh`、`--foreground`、

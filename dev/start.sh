@@ -6,7 +6,7 @@
 # 出问题怎么排查：docs/usage/README.md。
 #
 # 运行布局：
-#   仓库 sysrun/           只放启停脚本（start.sh / stop.sh）
+#   仓库 dev/           只放启停脚本（start.sh / stop.sh）
 #   ~/.wist-agentd/        配置 agentd.toml + tasks/ + 运行时数据 run|state|log/
 #
 # 用法：
@@ -21,7 +21,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-# 本脚本位于 wist-agentd/sysrun/，crate 根（含 target/debug）是上一级目录。
+# 本脚本位于 wist-agentd/dev/，crate 根（含 target/debug）是上一级目录。
 CRATE_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 AGENTD_HOME="${WIST_AGENTD_HOME:-${HOME}/.wist-agentd}"

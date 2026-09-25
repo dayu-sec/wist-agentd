@@ -79,7 +79,7 @@ install -m 0755 target/release/wist-agentd target/release/wist-exec ~/bin/   # �
 ./target/release/wist-agentd --config-dir ./dev-conf
 
 # 仓库自带的开发机后台脚本（& + disown + pidfile，无自启/无崩溃拉起）
-cd sysrun && ./start.sh && ./stop.sh
+cd dev && ./start.sh && ./stop.sh
 
 # 需要“登录即起 + 崩溃拉起”时，装成用户级常驻（仍不需要 sudo）
 ./target/release/wist-agentd service install --user \
@@ -128,7 +128,7 @@ WIST_AGENTD_RUN_ONCE=1 ./target/release/wist-agentd --config-dir ./dev-conf     
 | 配置 / 数据（含采集输出）/ 日志分离 | `[paths]` 与采集输出的默认推导 | ✅ 已实现 |
 | 幂等注册、重复执行安全 | 已注册时直接返回 `already enrolled` | ✅ 已实现 |
 | 安装脚本 / 网关下发 | 网关 `wist-gateway/src/api/install.sh`（签名 + 摘要校验 + `service install`） | ✅ 已实现 |
-| 发布制品打包 | `sysrun/package-agentd.sh`（三件齐 + 打完演练） | ✅ 已实现 |
+| 发布制品打包 | `dev/package-agentd.sh`（三件齐 + 打完演练）；本地升级测试用 `dev/package-local-upgrade.sh`（临时提版 + 表单三值） | ✅ 已实现 |
 | 升级通道（网关下发） | 一次性工作 `action=upgrade` → `wist-upgrader` 取包/校验/换件/重启/回滚 | ✅ 已实现 |
 | 系统包 / 批量编排 | deb/rpm/brew、`--no-activate` + CM | ❌ TODO |
 
@@ -136,10 +136,10 @@ WIST_AGENTD_RUN_ONCE=1 ./target/release/wist-agentd --config-dir ./dev-conf     
 
 - [x] 网关侧：主机授权、一次性 token 生成/回收、安装指令生成；
 - [x] 安装脚本：下载 + 校验（哈希/签名）、放二进制、`init-config`、`service install --enrollment-token`、自检；
-- [~] 发行形态：tarball 已有打包脚本（`sysrun/package-agentd.sh`，三件齐、打完自己演练一遍）；
+- [~] 发行形态：tarball 已有打包脚本（`dev/package-agentd.sh`，三件齐、打完自己演练一遍）；
       deb/rpm/brew 与 systemd unit / launchd plist 模板仍未做（`service print --for <platform>` 已能输出）；
 - [x] 升级通道：网关下发新版本（一次性工作 `action=upgrade`）+ 校验 + 重启 + 失败回滚
-      （执行体 `wist-upgrader`；链路验收 `sysrun/verify-upgrade.sh`）；
+      （执行体 `wist-upgrader`；链路验收 `dev/verify-upgrade.sh`）；
 - [ ] 批量/无人值守：`--no-activate` + CM 分发定义文件的编排方式。
 
 ### 3.4 过渡做法：手工系统级安装（网关可用前）
@@ -170,7 +170,7 @@ launchctl print system/com.dayu-sec.wist-agentd
 
 装完的服务自身日志：Linux 进 journald，macOS 进 `/var/log/wist-agentd/agentd.{out,err}`（轮转见 §7.1）。
 
-这套手工步骤的一键版本（含目录落点、崩溃拉起、单实例断言）见 §8 的 `sysrun/verify-system-install.sh`。
+这套手工步骤的一键版本（含目录落点、崩溃拉起、单实例断言）见 §8 的 `dev/verify-system-install.sh`。
 
 ## 4. 配置
 
@@ -300,7 +300,7 @@ echo <token> | sudo wist-agentd enroll --token-stdin
 | 方式 | 开机自启 | 崩溃拉起 | 日志 | 适用 |
 | --- | --- | --- | --- | --- |
 | 5.1 前台 | ✗ | ✗ | 终端 | 联调 |
-| 5.2 `sysrun/start.sh` | ✗ | ✗ | `~/.wist-agentd/log/agentd.out` | 开发机挂着跑 |
+| 5.2 `dev/start.sh` | ✗ | ✗ | `~/.wist-agentd/log/agentd.out` | 开发机挂着跑 |
 | 5.3 `service install --user` | ✓（登录起） | ✓ | journald `--user` / `~/Library/Logs/wist-agentd` | 用户级常驻（开发机/个人机） |
 | 5.3 `service install --system` | ✓（开机起） | ✓ | journald / `/var/log/wist-agentd` | **生产常驻** |
 
@@ -322,10 +322,10 @@ wist-agentd 0.1.2 starting: config=/Users/me/.wist-agentd/agentd.toml mode=manag
 
 `Ctrl-C` 退出。想看逐轮全量日志：`WIST_AGENTD_LOG_HEARTBEAT_SECS=0 wist-agentd --config-dir ~/.wist-agentd`。
 
-### 5.2 开发机后台（`sysrun/start.sh`）
+### 5.2 开发机后台（`dev/start.sh`）
 
 ```bash
-cd wist-agentd/sysrun
+cd wist-agentd/dev
 ./start.sh               # 后台 + disown，pid/log 落 ~/.wist-agentd/log/
 ./start.sh --foreground  # 前台，看日志
 ./stop.sh
@@ -525,11 +525,11 @@ sudo wist-agentd service uninstall --system    # 用户级：wist-agentd service
 
 ```bash
 cargo build --release
-sudo sysrun/verify-system-install.sh                 # 定义/自启/running/目录落点/采集输出/崩溃拉起/单实例
-sudo sysrun/verify-system-install.sh --keep          # 保留安装；重启后：
-sudo sysrun/verify-system-install.sh --after-reboot  # 复检“自启 + 仍在跑”
-sudo sysrun/verify-system-install.sh --cleanup       # 清理它装的东西
-# 非 root 只看将执行的命令：WIST_VERIFY_DRY_RUN=1 sysrun/verify-system-install.sh
+sudo dev/verify-system-install.sh                 # 定义/自启/running/目录落点/采集输出/崩溃拉起/单实例
+sudo dev/verify-system-install.sh --keep          # 保留安装；重启后：
+sudo dev/verify-system-install.sh --after-reboot  # 复检“自启 + 仍在跑”
+sudo dev/verify-system-install.sh --cleanup       # 清理它装的东西
+# 非 root 只看将执行的命令：WIST_VERIFY_DRY_RUN=1 dev/verify-system-install.sh
 ```
 
 脚本会轮询等服务/目录/锁就绪（launchd、systemd 都是异步拉起进程），**有 FAIL 时保留现场**并自动 dump

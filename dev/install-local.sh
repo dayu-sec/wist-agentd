@@ -3,7 +3,7 @@
 #
 # 与两个邻居的分工，别混：
 #   install.sh（网关签发的那份）  从网关下载包 → 校验摘要 → 写初始配置 → 注册服务。生产/批量用。
-#   sysrun/start.sh               开发态后台跑（pidfile + disown，**无自启、无崩溃拉起**），
+#   dev/start.sh               开发态后台跑（pidfile + disown，**无自启、无崩溃拉起**），
 #                                 配置读 ~/.wist-agentd —— 不是服务，`re-enroll.sh` 配的是这一套。
 #   本脚本                        把 <crate>/target/release 里刚编出来的二进制装成**常驻服务**
 #                                 并重启，供“我想让本机跑的就是我刚改的代码”用。
@@ -12,10 +12,10 @@
 # （state 是 schema 化 JSON，不丢 checkpoint）。
 #
 # 用法：
-#   sysrun/install-local.sh                  # 构建 → 备份旧二进制 → 换上 → 重启服务 → 验证
-#   sysrun/install-local.sh --dry-run        # 只打印将执行的命令，不落任何字
-#   sysrun/install-local.sh --rollback       # 换回最近一次备份并重启
-#   SKIP_BUILD=1 sysrun/install-local.sh     # 不重新构建，用现有产物
+#   dev/install-local.sh                  # 构建 → 备份旧二进制 → 换上 → 重启服务 → 验证
+#   dev/install-local.sh --dry-run        # 只打印将执行的命令，不落任何字
+#   dev/install-local.sh --rollback       # 换回最近一次备份并重启
+#   SKIP_BUILD=1 dev/install-local.sh     # 不重新构建，用现有产物
 #
 # 前置：请以**普通用户**运行（不要 sudo）。需要 root 的步骤脚本自己提权 ——
 # 若整个脚本以 root 跑，`cargo build` 会让 target/ 变成 root 属主，之后普通用户就构建不动了。
@@ -218,7 +218,7 @@ preflight() {
 
   if ! service_definition_present; then
     note "没找到服务定义：这是一次**首次安装**（换二进制 + 注册服务，不写初始配置、不注册身份）"
-    note "      要完成注册请用网关签发的 install.sh；dev 栈那套（~/.wist-agentd + sysrun/start.sh）是另一回事"
+    note "      要完成注册请用网关签发的 install.sh；dev 栈那套（~/.wist-agentd + dev/start.sh）是另一回事"
   fi
 
   # 系统级布局的前提：配置目录必须是 /etc/wist-agentd。落到别处 agentd 就不再当系统级

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # 在**开发环境**打一份可发布的 agent 制品（tarball）。
 #
-#   sysrun/package-agentd.sh                                       # 构建 release → 打包 → 校验
-#   WIST_PACKAGE_BIN_DIR=target/release sysrun/package-agentd.sh   # 用已有产物，不重新构建
-#   WIST_PACKAGE_OUT_DIR=/tmp/dist sysrun/package-agentd.sh        # 换个产出目录
+#   dev/package-agentd.sh                                       # 构建 release → 打包 → 校验
+#   WIST_PACKAGE_BIN_DIR=target/release dev/package-agentd.sh   # 用已有产物，不重新构建
+#   WIST_PACKAGE_OUT_DIR=/tmp/dist dev/package-agentd.sh        # 换个产出目录
 #
 # 产出：<crate>/target/package/wist-agentd-<版本>-<host triple>.tar.gz
 #       包里一层同名目录，放着 wist-agentd / wist-exec / wist-upgrader 三件。
@@ -17,7 +17,7 @@
 # 打完会自己验一遍：把制品喂给升级器做一次**演练**（取包 → 验摘要 → 解包 → 让新件自报版本），
 # 确认「解出来的 agentd 自报的版本」就是包名里那个。演练不动任何已装二进制。
 #
-# 相关：sysrun/verify-upgrade.sh（升级链路验收）、sysrun/install-local.sh（本机装/换）。
+# 相关：dev/verify-upgrade.sh（升级链路验收）、dev/install-local.sh（本机装/换）。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

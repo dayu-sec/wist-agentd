@@ -32,7 +32,7 @@ systemctl status wist-agentd                      # Linux 平台侧
 | --- | --- | --- |
 | 托管 `--system` | ✓ 开机起 | `systemctl stop` / `launchctl bootout system/…`（§1.2） |
 | 托管 `--user` | ✓ 登录起 | 同上；macOS 域换 `gui/$(id -u)`，systemd 加 `--user` |
-| `sysrun/start.sh` | ✗ | `sysrun/stop.sh`（日志 `~/.wist-agentd/log/agentd.out`） |
+| `dev/start.sh` | ✗ | `dev/stop.sh`（日志 `~/.wist-agentd/log/agentd.out`） |
 | 前台 | ✗ | Ctrl-C |
 
 四者共用同一 state 目录，靠 `<state_dir>/.agentd.lock` 的 `flock` 互斥：**同时只能一个实例**，
@@ -101,7 +101,7 @@ journalctl -u wist-agentd -f
 
 ```bash
 pgrep -fl wist-agentd          # 有几个、各读哪份配置
-sysrun/stop.sh                 # 停掉手工那份
+dev/stop.sh                 # 停掉手工那份
 wist-agentd service status --user | grep running=
 ```
 
@@ -220,7 +220,7 @@ tail -1 /var/log/wist-agentd/agentd.err      # macOS 启动行；Linux：journal
 
 升级**拒绝把机器变成混合版本**，所以在换件之前就会失败，页面上写的是 `artifact_invalid`。两种情形：
 
-- **制品不完整**（tarball 漏打了某个件）：自己用 `bash sysrun/package-agentd.sh` 重打一份，
+- **制品不完整**（tarball 漏打了某个件）：自己用 `bash dev/package-agentd.sh` 重打一份，
   它以「三件齐全」为前提，打完还会自己演练一遍；
 - **裸包盖在三件套机器上**：网关内置的默认包只有 `wist-agentd`，而机器上已经有
   `wist-exec` / `wist-upgrader` —— 升级只装不删，那两件会留在旧版本。去网关「设置」页把
@@ -250,18 +250,23 @@ wist-agentd version
   `service install --force` 只管定义与进程，不拷贝二进制。
 - 别用 `systemctl enable --now` 代替 restart（在已 active 的 unit 上是 no-op，会留旧进程跑旧二进制）。
 - 回滚：换回旧二进制 + 重建服务进程；state 是 schema 化 JSON，不丢 checkpoint。
-- 全升级链路（取包 → 校验 → 换件 → 重启 → 失败回滚）可在本机一键验：`bash sysrun/verify-upgrade.sh`
-- 发布制品（tarball）自己打：`bash sysrun/package-agentd.sh` —— 三个件必须同版本、必须一起进包；
+- 全升级链路（取包 → 校验 → 换件 → 重启 → 失败回滚）可在本机一键验：`bash dev/verify-upgrade.sh`
+- 发布制品（tarball）自己打：`bash dev/package-agentd.sh` —— 三个件必须同版本、必须一起进包；
   脚本打完会自己演练一遍（把包喂给升级器走一遍取包/验摘要/解包/验证）。
   用法：把它作为网关「设置」页的**安装包来源地址**（绝对路径或 https 链接都行，网关会下载到
   自己的缓存并按缓存那份字节算摘要，摘要不用手抄）。
+- **本地升级测试**（打一份能升上去的制品，并给出要填进网关「Agent 升级」表单的三个值）：
+  `bash dev/package-local-upgrade.sh [--version <新版本>] [--from <现装版本>]`。
+  升级器只前进：目标版本必须比目标机现装的 agentd 新 —— `--version` 会**临时**改 crate 版本构建、
+  打完自动还原；`--from` 用真实现装版本再让升级器演练一遍。它打印的「包地址」是**目标 Agent 主机**
+  上的绝对路径（升级器直接读本机文件；离线/联调把制品放到目标机）。
 
-C（开发机：就是用**本机刚编出来的**二进制）：`sysrun/install-local.sh` [--dry-run|--rollback]
+C（开发机：就是用**本机刚编出来的**二进制）：`dev/install-local.sh` [--dry-run|--rollback]
 
 ```bash
-sysrun/install-local.sh            # 取 target/release → 备份 → 换上 → 重启服务 → 验证
-sysrun/install-local.sh --dry-run  # 只打印将执行的命令
-sysrun/install-local.sh --rollback # 换回最近一次备份
+dev/install-local.sh            # 取 target/release → 备份 → 换上 → 重启服务 → 验证
+dev/install-local.sh --dry-run  # 只打印将执行的命令
+dev/install-local.sh --rollback # 换回最近一次备份
 ```
 
 - 把上面 A/B 的手工步骤（构建、备份、换 inode、重启、验证）封成一条命令，并补上 A/B 没做的两步：
@@ -283,7 +288,7 @@ sysrun/install-local.sh --rollback # 换回最近一次备份
 ### 3.3 手工跑 → 托管
 
 ```bash
-sysrun/stop.sh                       # 必须先停，见 §2.2
+dev/stop.sh                       # 必须先停，见 §2.2
 wist-agentd service install --user --bin ~/bin/wist-agentd --config-dir ~/.wist-agentd
 wist-agentd service status --user | grep -E 'definition_present|running='
 ```

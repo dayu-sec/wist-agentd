@@ -14,7 +14,7 @@
   不落盘；重复注册是幂等空操作。
 - 新增 `init-config [--stdout]`、`version`、`help` 子命令。
 - file sink 不再要求显式声明路径：未声明的采集输出默认落到 `<数据根>/data/wist-records.ndjson`。
-- `sysrun/verify-system-install.sh`：服务托管真机验收脚本（服务定义、开机自启、running、目录落点、采集输出、
+- `dev/verify-system-install.sh`：服务托管真机验收脚本（服务定义、开机自启、running、目录落点、采集输出、
   崩溃拉起、单实例），失败时保留现场并自动 dump 诊断。
 - 新增文档：`docs/agentd-install-and-usage.md`（按安装方式组织的安装与使用手册）、
   `docs/agentd-service-deployment.md`（后台长期运行方案设计说明）。

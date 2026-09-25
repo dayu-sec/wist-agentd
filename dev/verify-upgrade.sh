@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 升级链路的验收入口：单元 + 集成两层一次跑完。
 #
-#   bash sysrun/verify-upgrade.sh
+#   bash dev/verify-upgrade.sh
 #
 # 覆盖：
 #   * 单元（`src/upgrade.rs` 的 tests）：取包 / 验摘要 / 解包 / 让新件自报版本 / 换件 / 回滚
@@ -11,7 +11,7 @@
 #     回退自己失败时报 failed 而不是 rolled_back。
 #
 # **不覆盖**（刻意）真机上那一段：真实 launchd / systemd 拉起与重启。
-# 那需要一个服务管理器与（走网关时）一次真实派活，见 `sysrun/verify-system-install.sh`
+# 那需要一个服务管理器与（走网关时）一次真实派活，见 `dev/verify-system-install.sh`
 # 与网关的 `admin/agents/{id}/work` 端点；本脚本全程在临时目录里跑假件，不要 root。
 #
 # 为什么要桩掉「重启」：`wist-upgrader apply --apply` 默认的重启手段是**本机的
@@ -37,4 +37,4 @@ step "集成：整条链路（tests/upgrade_e2e.rs）"
 cargo test --test upgrade_e2e -- --nocapture
 
 printf '\n升级链路验收通过：单元 + 集成全绿。\n'
-printf '真机上的那一段（服务管理器真实重启）请另跑 sysrun/verify-system-install.sh。\n'
+printf '真机上的那一段（服务管理器真实重启）请另跑 dev/verify-system-install.sh。\n'

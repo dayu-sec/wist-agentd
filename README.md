@@ -60,7 +60,7 @@ wist-agentd service print --system
 wist-agentd service status --system
 ```
 
-开发机联调：[`sysrun/start.sh`](sysrun/start.sh)（`&` + `disown`，非生产）。
+开发机联调：[`dev/start.sh`](dev/start.sh)（`&` + `disown`，非生产）。
 
 ### 快速开始
 

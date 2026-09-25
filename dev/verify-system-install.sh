@@ -7,10 +7,10 @@
 #      /var/log/wist-agentd 日志
 #
 # 用法：
-#   sudo sysrun/verify-system-install.sh                 # 全量验收（装服务 → 轮询就绪 → 断言 → 清理）
-#   sudo sysrun/verify-system-install.sh --keep          # 验收后保留安装（不自动清理）
-#   sudo sysrun/verify-system-install.sh --after-reboot  # 重启后复检“自启 + 仍在跑”
-#   sudo sysrun/verify-system-install.sh --cleanup       # 清理本脚本安装的东西
+#   sudo dev/verify-system-install.sh                 # 全量验收（装服务 → 轮询就绪 → 断言 → 清理）
+#   sudo dev/verify-system-install.sh --keep          # 验收后保留安装（不自动清理）
+#   sudo dev/verify-system-install.sh --after-reboot  # 重启后复检“自启 + 仍在跑”
+#   sudo dev/verify-system-install.sh --cleanup       # 清理本脚本安装的东西
 #
 # 可覆盖 env：
 #   WIST_VERIFY_BIN_DIR    release 二进制目录（默认 <crate>/target/release）
@@ -189,7 +189,7 @@ write_marker() {
   [ "${DRY_RUN}" = "1" ] && return 0
   mkdir -p "${CONFIG_DIR}"
   {
-    echo "# 由 sysrun/verify-system-install.sh 写入；--cleanup 据此清理。"
+    echo "# 由 dev/verify-system-install.sh 写入；--cleanup 据此清理。"
     echo "binaries=${BIN_DST_DIR}/${SERVICE_NAME},${BIN_DST_DIR}/wist-exec,${BIN_DST_DIR}/wist-upgrader"
     echo "config_dir=${CONFIG_DIR}"
     echo "data_dir=${DATA_DIR}"
