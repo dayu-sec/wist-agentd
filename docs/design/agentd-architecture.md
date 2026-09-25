@@ -122,7 +122,7 @@
 - `state_store/` — 本地持久状态（execution_queue / running / history / log_checkpoint_state / reporting）
 - `telemetry/` — metrics 与日志采集上送：`metrics`、`logs`（文件输入在 `logs/files`）、`spool`、`warp_parse`
 
-升级执行体在独立 crate `wist-upgrader`（见 §11），agentd 只做编排入口；
+升级执行体是同 crate 的第二个 bin `wist-upgrader`（独立进程，见 §11），agentd 只做编排入口；
 审计类事件不设独立模块（见 §5）。
 
 ---
@@ -190,7 +190,7 @@ rotate / multiline / spool 重放）、断连缓冲与重试、上送帧（JSON 
 
 ### 5.10 升级与审计（非独立模块）
 
-- 升级：执行体在独立 crate `wist-upgrader`，agentd 侧仅调度入口与互斥约束（见 §11）；
+- 升级：执行体是同 crate 的独立 bin `wist-upgrader`，agentd 侧仅调度入口与互斥约束（见 §11）；
   standalone 下本地升级辅助不应阻断 agent 正常运行；
 - 审计：计划接收/拒绝、进程启动、取消与 kill、结果归档等关注点不设独立模块，
   由事件与 `self_observability`/`telemetry` 承担。
@@ -405,13 +405,33 @@ outcome 判定（第 8 行使用）：
 
 ## 11. 与 wist-upgrader 的关系
 
-`wist-agentd` 应是 `wist-upgrader` 的调度入口，但不是升级执行体。
+`wist-agentd` 是 `wist-upgrader` 的调度入口，但不是升级执行体。
+
+为什么同 crate 却分进程：升级要换的就是 agentd 自己的二进制，版本必须与 agentd 锁死
+（同一个 crate、同一个版本号，不可能对不上）；但升级必须**跳出 agentd 的生命周期** ——
+agentd 对 `wist-exec` 一类动作有超时杀/取消/回收，升级若挂在同一条管理链上，
+就会被杀死在“已换件、未重启”的中间态。所以它是 agentd crate 内的第二个 bin，独立运行。
+
+（历史文档曾写“独立 crate”：那会带来两个版本号需要对齐，与“升级恰好就是换这个二进制”相孛。）
 
 建议原则：
 
 - `wist-agentd` 负责升级计划接收与互斥判断
 - `wist-upgrader` 负责升级下载、校验、切换、回滚
 - `wist-agentd` 负责升级结果汇总与上报
+- **制品与机器必须相容**：升级只装不删，所以「制品带了哪几件」得对得上「这台机器有哪几件」，
+  否则会留下「agentd 新版 + 执行器/升级器旧版」的混合版本。合法形态只有两种：三件齐全
+  （发布 tarball），或只有 `wist-agentd`（网关内置的裸包）。换件**之前**就拦，摘要校验兜不住这件事。
+
+### 11.1 心跳：agentd 怎么知道升级器死了
+
+升级器是分离进程，agentd 有调度权、没有生命周期权。它只在落盘那一刻留下痕迹，而升级里有
+**合法的长静默**（等新版起来默认 60s、取包最多 300s）—— 只看进度文件的新鲜度会把正常升级误判成
+死掉的进程，然后放行第二个升级器去换同一个二进制（正是互斥要防的事）。
+
+所以升级器活着就每 10s 写一次 `state/upgrade.heartbeat`（内容只是当前时间，判新旧看文件时间戳），
+agentd 发现进度停在 `running` 而心跳超过 60s 没动，就判定这个进程已经没了（被 kill / 崩溃 / 卡死），
+把结果报成 `failed`（说明里写清“判定已死，机器可能停在中间态”），并解开互斥锁，让新的升级能派下去。
 
 ---
 

@@ -44,10 +44,23 @@ pub const UPGRADER_BIN_NAME: &str = "wist-upgrader";
 
 /// 升级进度/结果落盘（放 agentd 的 state 目录下）：agentd 重启后据此回报并识别「有一件在做」。
 pub const UPGRADE_RECORD_FILE: &str = "upgrade.json";
+/// 升级器的**心跳**文件：活着就持续写，agentd 据此判定「那个进程还在不在」。
+///
+/// 为什么不看升级记录的 `updated_at`：正常升级里有**合法的长静默**（`wait_ready` 默认等 60s、
+/// 取包最多 300s），那段时间记录本来就不动。心跳是另一条持续在写的线，
+/// 于是「60s 没动静」才真的等于「进程没了（被 kill / 卡死）」。
+pub const UPGRADE_HEARTBEAT_FILE: &str = "upgrade.heartbeat";
 /// 下载与暂存的子目录（放 state 下而不是 run 下：它要跨重启留着，便于事后取证）。
 pub const UPGRADE_WORK_DIR: &str = "upgrade";
 /// 换件后等新版起来的默认上限。
 pub const DEFAULT_READY_WAIT: Duration = Duration::from_secs(60);
+/// 心跳间隔：要明显小于 [`UPGRADER_DEAD_AFTER`]，否则任务调度抖动会被误判成死亡。
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+/// 升级器多久没心跳就**当它死了**（被 kill / 崩溃 / 卡死）。
+///
+/// 为什么由 agentd 判：升级器是**分离进程**，agentd 对它有调度权、没有生命周期权。
+/// 不判就会有件活永远占着「有升级在飞」这把互斥锁，之后再派升级都不做。
+pub const UPGRADER_DEAD_AFTER: Duration = Duration::from_secs(60);
 /// 取包超时：制品几十 MB，给足时间但不能无限等。
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// 等新版起来的轮询间隔。
@@ -387,6 +400,56 @@ fn find_binaries(root: &Path) -> Result<Vec<StagedBinary>, UpgradeError> {
 /// 把下载到的字节摊成可安装的二进制：tarball 解包，裸二进制就当作 `wist-agentd`。
 ///
 /// 每次升级都**重建暂存目录**：上一次失败留下的半截文件绝不能被当成本次的件。
+/// 升级**不许把机器变成混合版本**。两条一起看：
+///
+///   1. **制品形态**只能是两种之一：「三件齐全」（发布 tarball）或「只有 `wist-agentd`」
+///      （网关内置的裸包）。带两件不带第三件不是任何正规产出，直接拒。
+///   2. **盘上已有的件，制品必须也带了**：升级只装不删，制品没带的那个件会原样留着 ——
+///      于是 agentd 换成了新版、它还是旧版，而升级器去换的正是 agentd 自己。
+///
+/// 为什么必须在换件**之前**拦：换完才发现就晚了（得回滚）。而**摘要校验拦不住**：
+/// 网关按它自己缓存的那份字节算摘要，漏打包的包自己跟自己对得上。
+///
+/// 为什么不能只查制品形态：**裸包盖在三件套机器上**同样会留混合版本 ——
+/// 制品的形态完全合法，问题出在「它与这台机器」的组合上。
+fn check_upgrade_keeps_bin_directory_consistent(
+    staged: &[StagedBinary],
+    bin_dir: &Path,
+) -> Result<(), UpgradeError> {
+    let brings = |name: &str| staged.iter().any(|item| item.name == name);
+    let exec = brings(EXEC_BIN_NAME);
+    let upgrader = brings(UPGRADER_BIN_NAME);
+
+    // 1) 制品形态：两个兄弟件要么都在，要么都不在。
+    if exec != upgrader {
+        return Err(fail(
+            "artifact_invalid",
+            format!(
+                "the artifact carries {EXEC_BIN_NAME}={exec}, {UPGRADER_BIN_NAME}={upgrader}: \
+                 a package must carry all three binaries, or only {AGENTD_BIN_NAME}"
+            ),
+        ));
+    }
+    // 2) 三件齐全：缺的那两件自己也换新，没有什么可挑的。
+    if exec {
+        return Ok(());
+    }
+    // 3) 只带 agentd：盘上不能已经有那两件 —— 升级只装不删，它们会留在旧版本。
+    for name in [EXEC_BIN_NAME, UPGRADER_BIN_NAME] {
+        if bin_dir.join(name).exists() {
+            return Err(fail(
+                "artifact_invalid",
+                format!(
+                    "{name} already exists in {}: the artifact must carry it too, \
+                     otherwise the upgrade would leave it at the old version",
+                    bin_dir.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn stage_package(bytes: &[u8], staging_dir: &Path) -> Result<Vec<StagedBinary>, UpgradeError> {
     if staging_dir.exists() {
         std::fs::remove_dir_all(staging_dir).map_err(|err| {
@@ -498,6 +561,10 @@ fn verify_staged_agentd(staged: &[StagedBinary], target_version: &str) -> Result
 pub struct Backup {
     pub installed: PathBuf,
     pub backup: PathBuf,
+    /// 换之前这个位置**有没有东西**：回滚时据此决定「放回旧件」还是「删掉新件」。
+    /// 不能靠「备份文件在不在」推断：`.bak-<版本>` 是刻意保留的，_上一次_升级留下的备份
+    /// 会让一个本来就不存在的文件看起来像「有过旧件」。
+    pub existed: bool,
 }
 
 fn run_command(program: &str, args: &[String]) -> Result<(), UpgradeError> {
@@ -518,6 +585,11 @@ fn run_command(program: &str, args: &[String]) -> Result<(), UpgradeError> {
 ///
 /// 为什么不原地覆盖：运行中的进程持有旧 inode，原地改写等于给「正在跑的那个」投毒；
 /// 改名换的是 inode，运行中的进程不受影响，重启后自然拿到新件。
+/// 换件：备份 → 落新件 → 原子换入（`install` + `mv`，不直接覆写正在跑的二进制）。
+///
+/// **失败时自己收尾**：换到一半出错，就把已经换掉的那几个放回去再返回错误。
+/// 半套制品（agentd 新版 + exec 旧版）比整套旧版更危险，而调用方拿不到「换成功了哪几个」
+/// （`Err` 里没有 `backups`），所以这副收尾只能在这里做。
 fn install_binaries(
     staged: &[StagedBinary],
     bin_dir: &Path,
@@ -529,32 +601,59 @@ fn install_binaries(
         let installed = bin_dir.join(&item.name);
         let backup = bin_dir.join(format!("{}.bak-{current_version}", item.name));
         let new_path = bin_dir.join(format!("{}.new", item.name));
+        // 先问「换之前有没有」，再动手 —— 动手之后这个判断就没了。
+        let existed = installed.exists();
         if dry_run {
-            backups.push(Backup { installed, backup });
+            backups.push(Backup {
+                installed,
+                backup,
+                existed,
+            });
             continue;
         }
-        if installed.exists() && !backup.exists() {
-            std::fs::copy(&installed, &backup).map_err(|err| {
-                fail(
-                    "install_failed",
-                    format!("backup {}: {err}", installed.display()),
-                )
-            })?;
+
+        let attempt = (|| -> Result<(), UpgradeError> {
+            if existed && !backup.exists() {
+                std::fs::copy(&installed, &backup).map_err(|err| {
+                    fail(
+                        "install_failed",
+                        format!("backup {}: {err}", installed.display()),
+                    )
+                })?;
+            }
+            let mode_args = vec![
+                "-m".to_string(),
+                "0755".to_string(),
+                item.path.display().to_string(),
+                new_path.display().to_string(),
+            ];
+            run_command("install", &mode_args)?;
+            let move_args = vec![
+                "-f".to_string(),
+                new_path.display().to_string(),
+                installed.display().to_string(),
+            ];
+            run_command("mv", &move_args)
+        })();
+
+        if let Err(err) = attempt {
+            // 换到一半失败：把**已经换掉的那几个**先放回去。否则盘上会留一个
+            // 「agentd 是新版、exec 还是旧版」的半套制品 —— 两个件版本不一致正是
+            // 「一起换」要防的事，而这一刻还没人知道。
+            // 当前这个件没换成功（它还没进 `backups`），所以只回滚前面几个。
+            let note = match restore_backups(&backups, bin_dir) {
+                Ok(()) => "; already-replaced binaries were rolled back".to_string(),
+                Err(rollback_err) => {
+                    format!("; rollback of the already-replaced binaries failed: {rollback_err}")
+                }
+            };
+            return Err(fail(err.reason, format!("{}{note}", err.detail)));
         }
-        let mode_args = vec![
-            "-m".to_string(),
-            "0755".to_string(),
-            item.path.display().to_string(),
-            new_path.display().to_string(),
-        ];
-        run_command("install", &mode_args)?;
-        let move_args = vec![
-            "-f".to_string(),
-            new_path.display().to_string(),
-            installed.display().to_string(),
-        ];
-        run_command("mv", &move_args)?;
-        backups.push(Backup { installed, backup });
+        backups.push(Backup {
+            installed,
+            backup,
+            existed,
+        });
     }
     Ok(backups)
 }
@@ -562,6 +661,20 @@ fn install_binaries(
 /// 回滚：把备份放回去（备份本身保留，事后要能取证）。
 fn restore_backups(backups: &[Backup], bin_dir: &Path) -> Result<(), UpgradeError> {
     for backup in backups {
+        if !backup.existed {
+            // 换之前这个位置**本来就没有**（例如裸包装的机器升到三件套制品）：
+            // 「回到原样」就是把它删掉，而不是去找一份不存在的备份。
+            // 留一个没人核对过的新件，比什么都没有更危险。
+            if backup.installed.is_file() {
+                std::fs::remove_file(&backup.installed).map_err(|err| {
+                    fail(
+                        "rollback_failed",
+                        format!("remove {}: {err}", backup.installed.display()),
+                    )
+                })?;
+            }
+            continue;
+        }
         if !backup.backup.is_file() {
             return Err(fail(
                 "rollback_failed",
@@ -616,6 +729,43 @@ async fn wait_for_version(state_dir: &Path, target_version: &str, limit: Duratio
 
 fn store_record(state_dir: &Path, record: &UpgradeRecord) -> std::io::Result<()> {
     write_json_atomic(&state_dir.join(UPGRADE_RECORD_FILE), record)
+}
+
+/// 跳一次心跳（内容给人看“现在几点”，判新旧看的是文件时间戳 —— 就是 `touch` 的语义）。
+pub fn touch_heartbeat(state_dir: &Path) -> std::io::Result<()> {
+    write_json_atomic(&state_dir.join(UPGRADE_HEARTBEAT_FILE), &now_rfc3339())
+}
+
+/// 心跳还新不新。读不到心跳文件也算「没在跳」：没有证据就不能当成活着。
+pub fn heartbeat_is_fresh(state_dir: &Path, now: std::time::SystemTime) -> bool {
+    let Ok(modified) =
+        std::fs::metadata(state_dir.join(UPGRADE_HEARTBEAT_FILE)).and_then(|meta| meta.modified())
+    else {
+        return false;
+    };
+    match now.duration_since(modified) {
+        Ok(age) => age < UPGRADER_DEAD_AFTER,
+        // 时间戳在未来（时钟回拨 / 跨机拷贝）：不拿它当死亡证据。
+        Err(_) => true,
+    }
+}
+
+/// 只要进程活着就每隔 [`HEARTBEAT_INTERVAL`] 写一次心跳。
+///
+/// 它跑在自己的任务里，所以**不管升级走到哪一步都在跳** —— 取包、解包、换件、等新版起来
+/// 都不会留下让 agentd 误判的静默。
+fn spawn_heartbeat(state_dir: PathBuf) {
+    // 先**同步**跳一次再交给任务循环：从「记录写成 running」到「心跳任务第一次被调度」
+    // 之间有一段窗口，agentd 若恰好在那时来看，会把一份陈旧（或缺席）的心跳当成
+    // 「那个进程已经没了」。写一次是原子的，代价可以忽略。
+    let _ = touch_heartbeat(&state_dir);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+            // 写失败只忽略：心跳是尽力而为的存活性信号，不该反过来把升级弄挂。
+            let _ = touch_heartbeat(&state_dir);
+        }
+    });
 }
 
 /// 按平台给默认重启手段。
@@ -776,6 +926,8 @@ pub async fn apply(
     options: &UpgradeOptions,
 ) -> UpgradeRecord {
     let state_dir = PathBuf::from(&config.paths.state_dir);
+    // 心跳跟本次进程同生共死：不需要收尾，进程一走心跳自然就旧了。
+    spawn_heartbeat(state_dir.clone());
     let mut record = UpgradeRecord::new(request);
     match apply_inner(config, request, options, &state_dir, &mut record).await {
         Ok(()) => record.finish("succeeded", ""),
@@ -821,8 +973,8 @@ async fn apply_inner(
 
     record.step("verify_artifact");
     verify_staged_agentd(&staged, &request.target_version)?;
-
-    record.step("install");
+    // 制品本身没问题，还要看它与**这台机器**组合起来能不能落地（见函数注释）——
+    // 与「验制品」同一步：都是换件之前的体检，都只读不写。
     let bin_dir = request
         .agentd_bin
         .parent()
@@ -833,6 +985,9 @@ async fn apply_inner(
             )
         })?
         .to_path_buf();
+    check_upgrade_keeps_bin_directory_consistent(&staged, &bin_dir)?;
+
+    record.step("install");
     let backups = install_binaries(&staged, &bin_dir, &request.current_version, options.dry_run)?;
     if options.dry_run {
         return Ok(());
@@ -843,7 +998,12 @@ async fn apply_inner(
         // 换件已经发生但没重启：先回滚，否则机器上会留一个「装着新版、跑着旧版」的中间态。
         let rollback = restore_backups(&backups, &bin_dir).err();
         let retry = run_restart(&options.restart).err();
-        record.status = "rolled_back".to_string();
+        // `rolled_back` 的含义是「机器已回到原样」—— **回退真成了**才敢这么写。
+        // 回退也失败就落成 `failed`：控制面该看到的是「这台机器停在一个说不清的状态」，
+        // 而不是一个听起来很干净的「已回滚」。
+        if rollback.is_none() {
+            record.status = "rolled_back".to_string();
+        }
         return Err(fail(
             "restart_failed",
             format!(
@@ -862,7 +1022,10 @@ async fn apply_inner(
     if !wait_for_version(state_dir, &request.target_version, options.ready_wait).await {
         let rollback = restore_backups(&backups, &bin_dir).err();
         let retry = run_restart(&options.restart).err();
-        record.status = "rolled_back".to_string();
+        // 同 `restart` 那条：回退没成就不算 `rolled_back`。
+        if rollback.is_none() {
+            record.status = "rolled_back".to_string();
+        }
         return Err(fail(
             "not_ready",
             format!(
@@ -1240,6 +1403,122 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// 换之前**本来不存在**的位置：回滚要把它删掉（回到原样），
+    /// 而不是去找一份不存在的备份、把整轮回滚卡在那儿。
+    #[test]
+    fn restoring_a_binary_that_did_not_exist_before_removes_it() {
+        let dir = temp_dir("restore-missing");
+        let bin_dir = dir.join("bin");
+        fs::create_dir_all(&bin_dir).expect("bin dir");
+        let staged = dir.join("staged");
+        fs::create_dir_all(&staged).expect("staged");
+        let new_bin = staged.join(EXEC_BIN_NAME);
+        fs::write(&new_bin, "#!/bin/sh\nexit 0\n").expect("write staged exec");
+        // 只带来执行器，而机器上本来没有它（裸包装升到三件套制品）。
+        let items = vec![StagedBinary {
+            name: EXEC_BIN_NAME.to_string(),
+            path: new_bin,
+        }];
+
+        let backups = install_binaries(&items, &bin_dir, "0.1.3", false).expect("install");
+        assert!(bin_dir.join(EXEC_BIN_NAME).is_file(), "新件该被装上");
+        assert!(!backups[0].backup.exists(), "本来没有的件不该有备份");
+        assert!(!backups[0].existed);
+
+        restore_backups(&backups, &bin_dir).expect("rollback");
+        assert!(
+            !bin_dir.join(EXEC_BIN_NAME).exists(),
+            "回滚后该回到「本来没有」"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// 换到一半失败：**已经换掉的那几个**必须放回去。否则盘上会留一个
+    /// 「agentd 是新版、exec 还是旧版」的半套制品 —— 两个件版本不一致正是「一起换」要防的事，
+    /// 而这一刻还没人知道。
+    #[test]
+    fn a_failure_halfway_through_install_rolls_back_what_was_already_replaced() {
+        let dir = temp_dir("install-partial");
+        let bin_dir = dir.join("bin");
+        fs::create_dir_all(&bin_dir).expect("bin dir");
+        let installed_agentd = fake_agentd(&bin_dir, "0.1.3");
+        let staged = dir.join("staged");
+        fs::create_dir_all(&staged).expect("staged");
+        let new_agentd = fake_agentd(&staged, "0.1.4");
+        let items = vec![
+            StagedBinary {
+                name: AGENTD_BIN_NAME.to_string(),
+                path: new_agentd,
+            },
+            // 第二个件的实体不在（制品不完整 / 文件半途丢了）：`install` 这一步会失败。
+            StagedBinary {
+                name: EXEC_BIN_NAME.to_string(),
+                path: staged.join("not-here"),
+            },
+        ];
+
+        let err = install_binaries(&items, &bin_dir, "0.1.3", false).expect_err("必须失败");
+        assert_eq!(err.reason, "command_failed", "{err:?}");
+        assert!(err.detail.contains("rolled back"), "{}", err.detail);
+
+        // 第一个件已经换过，必须回滚；第二个件从没被换上。
+        let restored = fs::read_to_string(&installed_agentd).expect("read agentd");
+        assert!(restored.contains("0.1.3"), "{restored}");
+        assert!(!bin_dir.join(EXEC_BIN_NAME).exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// 「升级不许把机器变成混合版本」：只有「换完三件齐全」与「换完只有 agentd」两种放行。
+    #[test]
+    fn an_upgrade_must_not_leave_a_mixed_set_of_binaries() {
+        let dir = temp_dir("mixed-bins");
+        let bin_dir = dir.join("bin");
+        let staged_dir = dir.join("staged");
+        fs::create_dir_all(&bin_dir).expect("bin dir");
+        fs::create_dir_all(&staged_dir).expect("staged dir");
+
+        let staged = |names: &[&str]| -> Vec<StagedBinary> {
+            names
+                .iter()
+                .map(|name| StagedBinary {
+                    name: (*name).to_string(),
+                    path: staged_dir.join(name),
+                })
+                .collect()
+        };
+
+        let full: &[&str] = &[AGENTD_BIN_NAME, EXEC_BIN_NAME, UPGRADER_BIN_NAME];
+        let bare: &[&str] = &[AGENTD_BIN_NAME];
+        let no_upgrader: &[&str] = &[AGENTD_BIN_NAME, EXEC_BIN_NAME];
+
+        // (盘上原本有谁, 制品带了谁, 该不该放行)
+        let cases: [(&[&str], &[&str], bool); 6] = [
+            (bare, full, true),         // 裸机升三件套：补全，放行
+            (full, full, true),         // 三件套升三件套
+            (bare, bare, true),         // 裸机升裸包（网关内置的形态）
+            (full, bare, false),        // 裸包盖三件套：会留下 agentd 新版 + 另两件旧版
+            (full, no_upgrader, false), // 漏件的制品
+            (bare, no_upgrader, false), // 会有 exec 而没有 upgrader：将来没人能换 agentd
+        ];
+        for (installed, artifact, allowed) in cases {
+            let _ = fs::remove_dir_all(&bin_dir);
+            fs::create_dir_all(&bin_dir).expect("bin dir");
+            for name in installed {
+                fs::write(bin_dir.join(name), b"old").expect("write installed");
+            }
+            let outcome = check_upgrade_keeps_bin_directory_consistent(&staged(artifact), &bin_dir);
+            assert_eq!(
+                outcome.is_ok(),
+                allowed,
+                "installed={installed:?} artifact={artifact:?}: {outcome:?}"
+            );
+            if let Err(err) = outcome {
+                assert_eq!(err.reason, "artifact_invalid");
+            }
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn install_binaries_dry_run_touches_nothing() {
         let dir = temp_dir("install-dry");
@@ -1332,6 +1611,28 @@ mod tests {
             !wait_for_version(&state_dir, "9.9.9", Duration::from_millis(200)).await,
             "other version must time out"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn heartbeat_freshness_ages_out() {
+        let dir = temp_dir("heartbeat");
+        // 没有心跳文件 = 没在跳：没有证据就不能当成活着。
+        assert!(!heartbeat_is_fresh(&dir, SystemTime::now()));
+
+        touch_heartbeat(&dir).expect("touch heartbeat");
+        assert!(heartbeat_is_fresh(&dir, SystemTime::now()));
+        // 阈值：过了它就旧。
+        assert!(!heartbeat_is_fresh(
+            &dir,
+            SystemTime::now() + UPGRADER_DEAD_AFTER + Duration::from_secs(1)
+        ));
+        // 时间戳在未来（时钟回拨 / 跨机拷贝）不拿它当死亡证据。
+        assert!(heartbeat_is_fresh(
+            &dir,
+            SystemTime::now() - Duration::from_secs(5)
+        ));
+
         let _ = fs::remove_dir_all(dir);
     }
 }

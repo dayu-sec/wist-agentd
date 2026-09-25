@@ -216,6 +216,18 @@ tail -1 /var/log/wist-agentd/agentd.err      # macOS 启动行；Linux：journal
 # 启动行形如 wist-agentd 0.1.3 starting: config=… mode=managed run_dir=… state_dir=… log_dir=…
 ```
 
+### 2.9 升级被拒：`artifact_invalid`（制品与这台机器不匹配）
+
+升级**拒绝把机器变成混合版本**，所以在换件之前就会失败，页面上写的是 `artifact_invalid`。两种情形：
+
+- **制品不完整**（tarball 漏打了某个件）：自己用 `bash sysrun/package-agentd.sh` 重打一份，
+  它以「三件齐全」为前提，打完还会自己演练一遍；
+- **裸包盖在三件套机器上**：网关内置的默认包只有 `wist-agentd`，而机器上已经有
+  `wist-exec` / `wist-upgrader` —— 升级只装不删，那两件会留在旧版本。去网关「设置」页把
+  「安装包来源地址」指到一份三件齐全的制品。
+
+（摘要校验拦不住这两种：网关按它自己缓存的那份字节算摘要，漏打包的包自己跟自己对得上。）
+
 ## 3. 标准操作
 
 ### 3.1 升级二进制
@@ -224,8 +236,8 @@ A（推荐）：重跑安装命令（校摘要 → 换二进制 → 重写配置
 B（离线/手工）：先换二进制，再重建。
 
 ```bash
-# 前提：新版本已解到当前目录（wist-agentd.new / wist-exec.new）
-for b in wist-agentd wist-exec; do
+# 前提：新版本已解到当前目录（wist-agentd.new / wist-exec.new / wist-upgrader.new）
+for b in wist-agentd wist-exec wist-upgrader; do
   cp -f $b.new /usr/local/bin/$b.new
   chmod 0755 /usr/local/bin/$b.new
   mv -f /usr/local/bin/$b.new /usr/local/bin/$b
@@ -234,9 +246,15 @@ wist-agentd service install --force --system --bin /usr/local/bin/wist-agentd --
 wist-agentd version
 ```
 
-- 两个二进制一起换（版本错配会让执行类任务失败）；`service install --force` 只管定义与进程，不拷贝二进制。
+- 三个二进制一起换（版本错配会让执行类任务失败，而升级器本身就是去换 agentd 自己的那个件）；
+  `service install --force` 只管定义与进程，不拷贝二进制。
 - 别用 `systemctl enable --now` 代替 restart（在已 active 的 unit 上是 no-op，会留旧进程跑旧二进制）。
 - 回滚：换回旧二进制 + 重建服务进程；state 是 schema 化 JSON，不丢 checkpoint。
+- 全升级链路（取包 → 校验 → 换件 → 重启 → 失败回滚）可在本机一键验：`bash sysrun/verify-upgrade.sh`
+- 发布制品（tarball）自己打：`bash sysrun/package-agentd.sh` —— 三个件必须同版本、必须一起进包；
+  脚本打完会自己演练一遍（把包喂给升级器走一遍取包/验摘要/解包/验证）。
+  用法：把它作为网关「设置」页的**安装包来源地址**（绝对路径或 https 链接都行，网关会下载到
+  自己的缓存并按缓存那份字节算摘要，摘要不用手抄）。
 
 C（开发机：就是用**本机刚编出来的**二进制）：`sysrun/install-local.sh` [--dry-run|--rollback]
 

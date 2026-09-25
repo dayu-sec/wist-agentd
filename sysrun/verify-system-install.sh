@@ -33,6 +33,9 @@ CONFIG_DIR="/etc/wist-agentd"
 DATA_DIR="/var/lib/wist-agentd"
 LOG_DIR="/var/log/wist-agentd"
 SERVICE_NAME="wist-agentd"
+# 与 agentd 同级发布、必须**一起换**的另外两个二进制：执行器与升级器。
+# 升级器去换的正是 agentd 自己，版本错配就没有「同版本」前提。
+SIBLING_BINS="wist-exec wist-upgrader"
 LAUNCHD_LABEL="com.dayu-sec.wist-agentd"
 MARKER_FILE="${CONFIG_DIR}/.verify-script"
 SAMPLE_LOG="/var/tmp/wist-verify-sample.log"
@@ -108,10 +111,12 @@ preflight() {
   fi
   info "platform=${PLATFORM} uid=$(id -u) dry_run=${DRY_RUN}"
 
-  if [ ! -x "${BIN_SRC_DIR}/${SERVICE_NAME}" ] || [ ! -x "${BIN_SRC_DIR}/wist-exec" ]; then
-    echo "缺少可执行文件：${BIN_SRC_DIR}/{${SERVICE_NAME},wist-exec}（先 cargo build --release，或用 WIST_VERIFY_BIN_DIR 指定）" >&2
-    exit 2
-  fi
+  for bin_name in ${SERVICE_NAME} ${SIBLING_BINS}; do
+    if [ ! -x "${BIN_SRC_DIR}/${bin_name}" ]; then
+      echo "缺少可执行文件：${BIN_SRC_DIR}/${bin_name}（先 cargo build --release，或用 WIST_VERIFY_BIN_DIR 指定）" >&2
+      exit 2
+    fi
+  done
 
   # 防止验收一个跟源码不一致的旧二进制（假失败/假成功都很难查）。
   local stale_src
@@ -185,7 +190,7 @@ write_marker() {
   mkdir -p "${CONFIG_DIR}"
   {
     echo "# 由 sysrun/verify-system-install.sh 写入；--cleanup 据此清理。"
-    echo "binaries=${BIN_DST_DIR}/${SERVICE_NAME},${BIN_DST_DIR}/wist-exec"
+    echo "binaries=${BIN_DST_DIR}/${SERVICE_NAME},${BIN_DST_DIR}/wist-exec,${BIN_DST_DIR}/wist-upgrader"
     echo "config_dir=${CONFIG_DIR}"
     echo "data_dir=${DATA_DIR}"
     echo "log_dir=${LOG_DIR}"
@@ -204,7 +209,8 @@ install_service() {
 
 phase_install() {
   step "安装（系统级）"
-  run install -m 0755 "${BIN_SRC_DIR}/${SERVICE_NAME}" "${BIN_SRC_DIR}/wist-exec" "${BIN_DST_DIR}/"
+  run install -m 0755 "${BIN_SRC_DIR}/${SERVICE_NAME}" "${BIN_SRC_DIR}/wist-exec" \
+    "${BIN_SRC_DIR}/wist-upgrader" "${BIN_DST_DIR}/"
   run "${AGENTD_BIN}" init-config --config-dir "${CONFIG_DIR}"
   write_marker
 
@@ -438,9 +444,9 @@ phase_cleanup() {
   fi
   run "${AGENTD_BIN}" service uninstall --system || true
   info "将删除本脚本创建的：${CONFIG_DIR} ${DATA_DIR} ${LOG_DIR}"
-  info "以及 ${BIN_DST_DIR}/${SERVICE_NAME} ${BIN_DST_DIR}/wist-exec ${SAMPLE_LOG}"
+  info "以及 ${BIN_DST_DIR}/${SERVICE_NAME} ${BIN_DST_DIR}/wist-exec ${BIN_DST_DIR}/wist-upgrader ${SAMPLE_LOG}"
   run rm -rf "${CONFIG_DIR}" "${DATA_DIR}" "${LOG_DIR}"
-  run rm -f "${BIN_DST_DIR}/${SERVICE_NAME}" "${BIN_DST_DIR}/wist-exec" "${SAMPLE_LOG}"
+  run rm -f "${BIN_DST_DIR}/${SERVICE_NAME}" "${BIN_DST_DIR}/wist-exec" "${BIN_DST_DIR}/wist-upgrader" "${SAMPLE_LOG}"
   printf '\ncleanup done\n'
 }
 

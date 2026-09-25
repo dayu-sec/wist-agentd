@@ -22,7 +22,8 @@ use std::time::Duration;
 use wist_contracts::agent_config::{AgentConfig, LogFileInputSection};
 use wist_contracts::work::{
     ACK_WORK_KIND, AckWork, EXECUTABLE_SOURCE_KINDS, OneShotWork, POLL_WORK_KIND, PollWork,
-    StandingWork, WorkAccepted, WorkGrant, WorkSpec, WorkSpecSource,
+    REPORT_WORK_RESULT_KIND, ReportWorkResult, StandingWork, WorkAccepted, WorkGrant,
+    WorkResultAccepted, WorkSpec, WorkSpecSource,
 };
 use wist_shared::time::now_rfc3339;
 
@@ -113,6 +114,14 @@ pub struct ApplyOutcome {
 
 /// 一次性工作的本机执行状态：还没派出去。
 pub const ONE_SHOT_UNEXECUTED: &str = "unexecuted";
+
+/// 本机执行状态是否「**还在做**」：已派出去、结果还没回来。
+///
+/// 两处共用这一个口径：互斥判断（`has_upgrade_in_flight`）与「快照里消失但本机还在做」
+/// 的保留规则（`apply`）—— 分开写迟早会漂移，而漂移的代价是并起两个升级器。
+fn is_one_shot_execution_in_flight(execution: &str) -> bool {
+    matches!(execution, "dispatched" | "running")
+}
 
 /// agentd 今天**真的能执行**的一次性工作动作（其余如实报成 `unexecutable`）。
 ///
@@ -252,16 +261,38 @@ impl AppliedWorkGrant {
             next_execution.insert(work.work_id.clone(), execution);
         }
         self.unexecutable_one_shot = unexecutable_now;
-        self.one_shot_execution = next_execution;
+        // 快照里已经消失、但本机**还在做**的活不能跟着丢（撤回，或网关判定到期，都走这条）。
+        // 丢了有两个后果：升级做完了没人上报（「它成了」永远到不了网关），
+        // 且「有升级在飞」这把互斥锁失效 —— 那会并起第二个升级器去换同一个二进制。
+        // 保留范围就是「还在做」那两档：还没派的（快照没了就是没了）与已有终态的（已上报过）都放手。
+        for (work_id, execution) in &self.one_shot_execution {
+            if next_execution.contains_key(work_id) || !is_one_shot_execution_in_flight(execution) {
+                continue;
+            }
+            next_execution.insert(work_id.clone(), execution.clone());
+        }
 
         self.sequence = grant.sequence;
         self.works = next;
         // 「我手里有哪些一次性工作」跟快照走（快照只带**未了结**的活）。全量替换：
         // 了结的活不该继续留在本机工作视图里 —— 那会让人以为还在等它做什么。
-        self.one_shot_works = one_shot_now
+        // （唯一例外见下：**还在做**的活即使快照不再下发，也要留。）
+        let mut next_works: BTreeMap<String, OneShotWork> = one_shot_now
             .into_iter()
             .map(|work| (work.work_id.clone(), work))
             .collect();
+        // 上面那批「快照没了但还在做」的活，工作内容也要留一份：本机视图（`state/work.json`）
+        // 是它跨重启的唯一凭据 —— 不留，一次重启就把在飞的升级记录丢了，结果永远报不回去。
+        for work_id in next_execution.keys() {
+            if next_works.contains_key(work_id) {
+                continue;
+            }
+            if let Some(previous) = self.one_shot_works.get(work_id) {
+                next_works.insert(work_id.clone(), previous.clone());
+            }
+        }
+        self.one_shot_works = next_works;
+        self.one_shot_execution = next_execution;
         outcome
     }
 
@@ -280,7 +311,7 @@ impl AppliedWorkGrant {
     pub fn has_upgrade_in_flight(&self) -> bool {
         self.one_shot_execution
             .values()
-            .any(|state| matches!(state.as_str(), "dispatched" | "running"))
+            .any(|state| is_one_shot_execution_in_flight(state))
     }
 
     /// 记下某份工作已回报的版本（HTTP 确认成功之后调）。
@@ -751,6 +782,87 @@ pub(crate) async fn ack_work(config: &AgentConfig, work_id: &str, plan_version: 
     }
 }
 
+/// 把一次性工作的**执行结果**（进度/终态）报给网关。
+///
+/// 与 [`ack_work`] 的分工：确认回答「我收到了」，这里回答「我做得怎么样了」。
+/// 分开的理由是失效代价不同 —— 确认丢了只是页面晚一拍，结果丢了则意味着
+/// 「一件改变机器状态的活做完了，而控制面永远不知道它成没成」。
+///
+/// 返回值与业务状态无关：`accepted` / `stale` / `unknown` 都算**报出去了**
+/// （`stale` = 网关那边已经了结，`unknown` = 这件活不归它管）—— 重发改变不了结论，
+/// 只会白跑一趟。只有「根本没送到」才返回 `false`，交给下一轮重试。
+pub(crate) async fn report_work_result(
+    config: &AgentConfig,
+    work_id: &str,
+    status: &str,
+    detail: &str,
+) -> bool {
+    let Some(endpoint) = config.control_plane.endpoint.as_deref() else {
+        return false;
+    };
+    let Some(bearer_token) = config.control_plane.bearer_token.as_deref() else {
+        return false;
+    };
+    let Some(agent_id) = config.agent.agent_id.as_deref() else {
+        return false;
+    };
+    let request = ReportWorkResult {
+        api_version: wist_contracts::API_VERSION_V1.to_string(),
+        kind: REPORT_WORK_RESULT_KIND.to_string(),
+        agent_id: agent_id.to_string(),
+        instance_id: config
+            .agent
+            .instance_name
+            .as_deref()
+            .unwrap_or_default()
+            .to_string(),
+        work_id: work_id.to_string(),
+        status: status.to_string(),
+        detail: detail.to_string(),
+        reported_at: now_rfc3339(),
+    };
+    let client = match enrollment_http_client(config) {
+        Ok(client) => client,
+        Err(err) => {
+            eprintln!("wist-agentd work result: failed to build client: {err}");
+            return false;
+        }
+    };
+    let url = format!(
+        "{}/api/v1/agent/work:result",
+        endpoint.trim_end_matches('/')
+    );
+    match client
+        .post(&url)
+        .timeout(WORK_REQUEST_TIMEOUT)
+        .bearer_auth(bearer_token)
+        .json(&request)
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            match response.json::<WorkResultAccepted>().await {
+                Ok(_) => true,
+                Err(err) => {
+                    eprintln!("wist-agentd work result failed: invalid response: {err}");
+                    false
+                }
+            }
+        }
+        Ok(response) => {
+            eprintln!(
+                "wist-agentd work result failed: HTTP {} from {endpoint}",
+                response.status()
+            );
+            false
+        }
+        Err(err) => {
+            eprintln!("wist-agentd work result failed: {err}");
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1147,6 +1259,56 @@ mod tests {
             applied.device_view("t1").expect("view").one_shot[0].execution,
             "rolled_back"
         );
+    }
+
+    #[test]
+    fn an_in_flight_upgrade_survives_its_work_leaving_the_snapshot() {
+        // 撤回、或网关判定到期，都会让这件活从快照里消失 —— 但本机的升级进程还在跑。
+        // 丢了执行状态有两个后果：升级做完了没人上报（「它成了」永远到不了网关），
+        // 且「有升级在飞」这把互斥锁失效（会并起第二个升级器换同一个二进制）。
+        let mut applied = AppliedWorkGrant::default();
+        let mut snapshot = grant(1, Vec::new());
+        snapshot.one_shot = vec![one_shot("work-upgrade", "upgrade", "0.1.4")];
+        applied.apply(&snapshot);
+        applied.mark_one_shot_execution("work-upgrade", "dispatched");
+
+        applied.apply(&grant(2, Vec::new()));
+        assert_eq!(
+            applied.one_shot_execution("work-upgrade").as_deref(),
+            Some("dispatched"),
+            "在飞的升级不能因为工作离开快照就丢掉"
+        );
+        assert!(applied.has_upgrade_in_flight(), "互斥锁必须继续有效");
+
+        // 本机视图（落盘）也要留着它 —— 那是跨重启的唯一凭据，丢了结果就永远报不回去。
+        let view = applied.device_view("t1").expect("view");
+        assert_eq!(view.one_shot.len(), 1);
+        assert_eq!(view.one_shot[0].work_id, "work-upgrade");
+        assert_eq!(view.one_shot[0].execution, "dispatched");
+        let mut restored = AppliedWorkGrant::restore(&view);
+        assert_eq!(
+            restored.one_shot_execution("work-upgrade").as_deref(),
+            Some("dispatched")
+        );
+        // 重启后再收到一份「没有这件活」的快照，它仍然在飞。
+        restored.apply(&grant(3, Vec::new()));
+        assert!(restored.has_upgrade_in_flight());
+
+        // 结果回来、也报出去了（终态）才放手。
+        applied.mark_one_shot_execution("work-upgrade", "succeeded");
+        applied.apply(&grant(4, Vec::new()));
+        assert_eq!(applied.one_shot_execution("work-upgrade"), None);
+        assert!(applied.device_view("t2").expect("view").one_shot.is_empty());
+
+        // 还没派出去的活跟着快照走：快照没了就是没这回事。
+        let mut idle = AppliedWorkGrant::default();
+        idle.apply(&snapshot);
+        assert_eq!(
+            idle.one_shot_execution("work-upgrade").as_deref(),
+            Some("unexecuted")
+        );
+        idle.apply(&grant(2, Vec::new()));
+        assert_eq!(idle.one_shot_execution("work-upgrade"), None);
     }
 
     #[test]
@@ -1740,6 +1902,31 @@ mod tests {
             r#"{"work_id":"w1","status":"stale","accepted_at":"t"}"#,
         );
         assert!(!ack_work(&test_config(endpoint), "w1", 2).await);
+        server.join().expect("join server");
+    }
+
+    #[tokio::test]
+    async fn report_work_result_posts_the_status_and_detail() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let body = r#"{"work_id":"w1","status":"accepted","accepted_at":"t"}"#;
+        let server = serve_once(listener, body);
+        assert!(report_work_result(&test_config(endpoint), "w1", "failed", "已回滚到 0.1.3").await);
+        let request = server.join().expect("join server");
+        assert!(request.contains("/api/v1/agent/work:result"));
+        assert!(request.contains("\"kind\":\"report_work_result\""));
+        assert!(request.contains("\"work_id\":\"w1\""));
+        assert!(request.contains("\"status\":\"failed\""));
+        assert!(request.contains("已回滚到 0.1.3"));
+
+        // `stale` 也算「报出去了」：一件活只能有一个终态，重发改变不了结论，只会白跑一趟。
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = serve_once(
+            listener,
+            r#"{"work_id":"w1","status":"stale","accepted_at":"t"}"#,
+        );
+        assert!(report_work_result(&test_config(endpoint), "w1", "succeeded", "").await);
         server.join().expect("join server");
     }
 }

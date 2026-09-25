@@ -20,7 +20,7 @@
 | W2 | **可以正确上报** | 采集与状态记录能正确上送：帧/批量/重试/顺序/去重正确，失败可恢复 | 进行中 |
 | W3 | **收到指标** | agent 能采集并上送指标（Batch A：host/process 等），数据面可查到 | 待收口 |
 | W4 | **指标扩展机制** | 新增一类指标/目标只需“加 spec + 映射（+ 可选 provider）”，不重编核心 | 基本落地（spec/映射/provider 三层已接；脚本型 opcode 后续） |
-| W5 | **完成可升级** | 升级闭环：计划接收→互斥→下载校验→拉起 `wist-upgrader`→结果/版本上报→失败回滚 | 待启动 |
+| W5 | **完成可升级** | 升级闭环：计划接收→互斥→下载校验→拉起 `wist-upgrader`→结果/版本上报→失败回滚 | 进行中（派发/互斥/心跳判死/结果上报/e2e（成功 · 校验失败 · 回滚）已落地；真机服务管理器重启与中断恢复待验） |
 
 ```mermaid
 flowchart LR
@@ -192,7 +192,7 @@ provider（`MetricProvider` + 静态注册表）三层已落地，Batch A 已走
 
 ### W5 完成可升级
 
-- 范围：`control/`（升级计划接收与结果上报）、`runtime/scheduler`（互斥与编排）、`wist-upgrader`（执行体，独立 crate）。
+- 范围：`control/`（升级计划接收与结果上报）、`runtime/scheduler`（互斥与编排）、`wist-upgrader`（执行体：同 crate 的独立 bin，见架构 §11）。
 - 闭环步骤：
   1. 接收升级计划/指令（managed；standalone 走本地辅助）；
   2. 与远程动作互斥（升级进行中不并发执行其他动作）；

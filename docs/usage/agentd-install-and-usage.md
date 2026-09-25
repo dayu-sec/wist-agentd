@@ -112,7 +112,8 @@ WIST_AGENTD_RUN_ONCE=1 ./target/release/wist-agentd --config-dir ./dev-conf     
      "https://<gateway>/api/v1/agent/install/<arch>/install.sh" -o s && sh s
    ```
 
-3. 安装脚本负责：下载安装包并校验摘要 → 放二进制（tarball 形态连 `wist-exec` 一起）→ 下载
+3. 安装脚本负责：下载安装包并校验摘要 → 放二进制（tarball 形态连 `wist-exec`、`wist-upgrader` 一起，
+   三者同版本才能升级）→ 下载
    initial-config 写 `agentd.toml` → `service install --system --enrollment-token <token>`
    （普通用户执行时为 `--user`）→ 交给 launchd / systemd 拉起；
 4. 注册结果（`agent_id`、凭据）落 state，网关侧能看到该主机上线。
@@ -127,14 +128,18 @@ WIST_AGENTD_RUN_ONCE=1 ./target/release/wist-agentd --config-dir ./dev-conf     
 | 配置 / 数据（含采集输出）/ 日志分离 | `[paths]` 与采集输出的默认推导 | ✅ 已实现 |
 | 幂等注册、重复执行安全 | 已注册时直接返回 `already enrolled` | ✅ 已实现 |
 | 安装脚本 / 网关下发 | 网关 `wist-gateway/src/api/install.sh`（签名 + 摘要校验 + `service install`） | ✅ 已实现 |
-| 系统包 / 升级通道 / 批量编排 | deb/rpm/brew、网关下发新版本、`--no-activate` + CM | ❌ TODO |
+| 发布制品打包 | `sysrun/package-agentd.sh`（三件齐 + 打完演练） | ✅ 已实现 |
+| 升级通道（网关下发） | 一次性工作 `action=upgrade` → `wist-upgrader` 取包/校验/换件/重启/回滚 | ✅ 已实现 |
+| 系统包 / 批量编排 | deb/rpm/brew、`--no-activate` + CM | ❌ TODO |
 
 ### 3.3 剩余 TODO（离线场景仍可用手工过渡做法，见 §3.4）
 
 - [x] 网关侧：主机授权、一次性 token 生成/回收、安装指令生成；
 - [x] 安装脚本：下载 + 校验（哈希/签名）、放二进制、`init-config`、`service install --enrollment-token`、自检；
-- [ ] 发行形态：deb/rpm/brew 或 tarball（含 systemd unit / launchd plist 的模板，`service print --for <platform>` 已能输出）；
-- [ ] 升级通道：网关下发新版本 + 校验 + 重启（当前手工替换二进制，见 §7.3）；
+- [~] 发行形态：tarball 已有打包脚本（`sysrun/package-agentd.sh`，三件齐、打完自己演练一遍）；
+      deb/rpm/brew 与 systemd unit / launchd plist 模板仍未做（`service print --for <platform>` 已能输出）；
+- [x] 升级通道：网关下发新版本（一次性工作 `action=upgrade`）+ 校验 + 重启 + 失败回滚
+      （执行体 `wist-upgrader`；链路验收 `sysrun/verify-upgrade.sh`）；
 - [ ] 批量/无人值守：`--no-activate` + CM 分发定义文件的编排方式。
 
 ### 3.4 过渡做法：手工系统级安装（网关可用前）

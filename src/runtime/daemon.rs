@@ -19,7 +19,7 @@ use crate::enrollment::enrollment_http_client;
 
 use crate::error::RuntimeResult;
 
-use crate::control::work::{AppliedWorkGrant, ack_work, fetch_work_grant};
+use crate::control::work::{AppliedWorkGrant, ack_work, fetch_work_grant, report_work_result};
 use crate::discovery::DiscoveryProbe;
 use crate::discovery::container::ContainerDiscoveryProbe;
 use crate::discovery::endpoint::EndpointDiscoveryProbe;
@@ -907,7 +907,17 @@ async fn refresh_work_grant(
                 }
             }
             Err(err) => {
+                // 起不了进程 = 这次活**做不成**：报结果说清楚。确认依旧不发（我们并没有真的在
+                // 执行它），但「没成」必须到网关 —— 否则页面上只剩一个无法解释的「派了没确认」，
+                // 运维要等到期判定才能知道它没做成，而原因（参数坏了 / 升级器不在）完全看不到。
                 runtime.mark_one_shot_execution(&work.work_id, "rejected");
+                let detail = format!("agentd 未能启动升级器：{err}");
+                if !report_work_result(config, &work.work_id, "failed", &detail).await {
+                    eprintln!(
+                        "event=WorkResultReportFailed work_id={} status=failed",
+                        work.work_id
+                    );
+                }
                 eprintln!(
                     "event=UpgradeDispatchFailed work_id={} detail={err}",
                     work.work_id
@@ -915,7 +925,9 @@ async fn refresh_work_grant(
             }
         }
     }
-    let progressed = reconcile_upgrade_record(runtime, Path::new(&loop_ctx.config.paths.state_dir));
+    let progressed =
+        reconcile_upgrade_record(config, runtime, Path::new(&loop_ctx.config.paths.state_dir))
+            .await;
     let mut acked_anything = false;
     for (work_id, plan_version) in outcome.to_ack {
         if ack_work(config, &work_id, plan_version).await {
@@ -977,24 +989,93 @@ fn dispatch_upgrade(
 /// 为什么以它为唯一来源：升级器是**跨过 agentd 重启**的那个进程，而 agentd 重启后没有任何
 /// 内存记忆（`one_shot_execution` 就是从 `state/work.json` 恢复的）。所以「这件活做到哪一步了」
 /// 只能读它落盘的那份记录 —— 拿网关侧的状态当进度会差一个网络往返，而且恰好在这条链上失真。
-fn reconcile_upgrade_record(runtime: &mut AppliedWorkGrant, state_dir: &Path) -> bool {
+async fn reconcile_upgrade_record(
+    config: &AgentConfig,
+    runtime: &mut AppliedWorkGrant,
+    state_dir: &Path,
+) -> bool {
     let path = state_dir.join(crate::upgrade::UPGRADE_RECORD_FILE);
     let Ok(record) = wist_shared::fs::read_json::<crate::upgrade::UpgradeRecord>(&path) else {
         return false;
     };
     let Some(current) = runtime.one_shot_execution(&record.work_id) else {
-        // 不认识这件活（快照里已经了结）：不动本机视图，也不报一行无主的日志。
+        // 本机没有这件活的执行状态：不认它（比如升级器留下了一份不属于本机工作视图的记录）。
+        // 不动本机视图，也不报一行无主的日志。
         return false;
     };
-    if current == record.status {
+    // 升级器是**分离进程**，agentd 有调度权、没有生命周期权。记录停在 `running` 而心跳已经旧了，
+    // 说明那个进程没了（被 kill / 崩溃 / 卡死）—— 这件事不会自己往前走。
+    // 不在这里结掉，它就会永久占着「有升级在飞」那把互斥锁：之后再派升级都不做。
+    let dead = record.status == "running"
+        && !crate::upgrade::heartbeat_is_fresh(state_dir, std::time::SystemTime::now());
+    // 本机视图记的档位（与报给控制面的取值可能不同：回滚本地记 `rolled_back`，报出去是 `failed`）。
+    let local_status = if dead {
+        "failed"
+    } else {
+        record.status.as_str()
+    };
+    if current == local_status {
         return false;
     }
     eprintln!(
         "event=UpgradeProgress work_id={} step={} status={} detail=\"{}\"",
         record.work_id, record.step, record.status, record.detail
     );
-    runtime.mark_one_shot_execution(&record.work_id, &record.status);
+    let mapped = if dead {
+        // 要报成 failed；说明里必须写清“是被判死的”，否则页面上只是一个无法解释的失败。
+        eprintln!(
+            "event=UpgradeDeclaredDead work_id={} step={}",
+            record.work_id, record.step
+        );
+        Some((
+            "failed",
+            format!(
+                "升级器 {}s 没有心跳，判定已死（步骤 {}）；机器可能停在中间态",
+                crate::upgrade::UPGRADER_DEAD_AFTER.as_secs(),
+                record.step
+            ),
+        ))
+    } else {
+        work_result_of(&record)
+    };
+    let Some((status, detail)) = mapped else {
+        // 升级器写了本机视图认得、控制面却不认的状态：不动视图也不报，
+        // 免得编一个网关会拒的取值，把“状态闭集不一致”变成一个无限重试。
+        eprintln!(
+            "event=UpgradeResultUnmappable work_id={} status={}",
+            record.work_id, record.status
+        );
+        return false;
+    };
+    // 先报控制面、再推进本机视图：报不出去就**不推进**，下一 tick 读到同一份记录会重试。
+    // 反过来（先推进）会让一次网络抖动把“升级做完了”永久留在机器上，而控制面永远停在“已接受”。
+    if !report_work_result(config, &record.work_id, status, &detail).await {
+        eprintln!(
+            "event=WorkResultReportFailed work_id={} status={status}",
+            record.work_id
+        );
+        return false;
+    }
+    runtime.mark_one_shot_execution(&record.work_id, local_status);
     true
+}
+
+/// 把升级记录折算成**控制面认得的**工作状态与说明。
+///
+/// 关键映射是回滚：升级器把 “换件后又退回去” 记为 `rolled_back`，但网关的一次性工作状态闭集里
+/// 没有这个取值（那是**授权**状态，agent 无权新增）。回滚 = 这次升级没成、机器已回到原样，
+/// 在控制面上它就是 `failed`；但说明必须写清 “已回滚到哪一版”—— 否则页面上只剩一个无法解释的失败。
+fn work_result_of(record: &crate::upgrade::UpgradeRecord) -> Option<(&'static str, String)> {
+    match record.status.as_str() {
+        "running" => Some(("running", format!("正在 {}", record.step))),
+        "succeeded" => Some(("succeeded", String::new())),
+        "failed" => Some(("failed", record.detail.clone())),
+        "rolled_back" => Some((
+            "failed",
+            format!("已回滚到 {}：{}", record.from_version, record.detail),
+        )),
+        _ => None,
+    }
 }
 
 async fn refresh_discovery_snapshot(
@@ -1906,5 +1987,212 @@ mod tests {
         let second = cpu_ticks().expect("cpu_ticks on macos");
         assert!(second >= first, "cpu time should not decrease");
         assert_eq!(ticks_per_sec(), 1_000_000);
+    }
+
+    // ── 一次性工作的执行结果上报 ──────────────────────────────────────
+
+    fn upgrade_record_at(status: &str, step: &str, detail: &str) -> crate::upgrade::UpgradeRecord {
+        crate::upgrade::UpgradeRecord {
+            work_id: "work-upgrade".to_string(),
+            from_version: "0.1.3".to_string(),
+            to_version: "0.1.4".to_string(),
+            step: step.to_string(),
+            status: status.to_string(),
+            detail: detail.to_string(),
+            agentd_bin: "/opt/bin/wist-agentd".to_string(),
+            updated_at: "2026-09-24T00:00:00Z".to_string(),
+        }
+    }
+
+    /// 一份「手里正拿着一件升级、已派出去还没回来了」的本机工作视图。
+    fn grant_holding_the_upgrade() -> AppliedWorkGrant {
+        let record = crate::state_store::work::WorkRecord {
+            schema_version: crate::state_store::work::SCHEMA_VERSION_V1.to_string(),
+            recorded_at: "t".to_string(),
+            gateway_sequence: 1,
+            standing: Vec::new(),
+            one_shot: vec![crate::state_store::work::OneShotWorkRecord {
+                work_id: "work-upgrade".to_string(),
+                action: "upgrade".to_string(),
+                spec: "0.1.4".to_string(),
+                status: "accepted".to_string(),
+                execution: "dispatched".to_string(),
+                scheduled_at: "t".to_string(),
+                deadline_at: "2026-09-25T00:00:00Z".to_string(),
+                timeout_seconds: 600,
+            }],
+            metrics_interval_seconds: None,
+        };
+        AppliedWorkGrant::restore(&record)
+    }
+
+    fn write_upgrade_record(state_dir: &std::path::Path, record: &crate::upgrade::UpgradeRecord) {
+        std::fs::write(
+            state_dir.join(crate::upgrade::UPGRADE_RECORD_FILE),
+            serde_json::to_vec(record).expect("serialize record"),
+        )
+        .expect("write record");
+    }
+
+    /// 收一次 POST 后回一份 JSON，返回收到的请求原文。
+    fn json_server_once(
+        listener: TcpListener,
+        body: &'static str,
+    ) -> tokio::task::JoinHandle<String> {
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let request = read_http_request(&mut socket).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+            request
+        })
+    }
+
+    /// 回滚在控制面上就是「失败」，但说明必须写清回到哪一版 —— 否则页面上只剩一个无法解释的失败。
+    #[test]
+    fn work_result_of_maps_upgrade_statuses_onto_the_control_plane_closed_set() {
+        let (status, detail) = work_result_of(&upgrade_record_at(
+            "rolled_back",
+            "wait_ready",
+            "new version did not report 0.1.4",
+        ))
+        .expect("rolled_back 是能映射的");
+        assert_eq!(status, "failed");
+        assert!(detail.starts_with("已回滚到 0.1.3"), "{detail}");
+
+        assert_eq!(
+            work_result_of(&upgrade_record_at("running", "fetch", ""))
+                .unwrap()
+                .0,
+            "running"
+        );
+        assert_eq!(
+            work_result_of(&upgrade_record_at("succeeded", "done", ""))
+                .unwrap()
+                .0,
+            "succeeded"
+        );
+        assert_eq!(
+            work_result_of(&upgrade_record_at("failed", "install", "boom"))
+                .unwrap()
+                .0,
+            "failed"
+        );
+        // 控制面不认的状态不编：宁可不动也不发一个会被 400 掉的取值。
+        assert!(work_result_of(&upgrade_record_at("bogus", "?", "")).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_terminal_upgrade_is_reported_before_the_local_view_moves() {
+        let state_dir = fact_summary_state_dir("upgrade-report-ok");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let mut config = test_config();
+        config.control_plane.endpoint = Some(endpoint);
+        let server = json_server_once(
+            listener,
+            r#"{"work_id":"work-upgrade","status":"accepted","accepted_at":"t"}"#,
+        );
+        write_upgrade_record(
+            &state_dir,
+            &upgrade_record_at(
+                "rolled_back",
+                "wait_ready",
+                "new version did not report 0.1.4",
+            ),
+        );
+
+        let mut runtime = grant_holding_the_upgrade();
+        assert!(reconcile_upgrade_record(&config, &mut runtime, &state_dir).await);
+
+        let request = server.await.expect("server");
+        assert!(request.contains("/api/v1/agent/work:result"));
+        assert!(request.contains("\"status\":\"failed\""));
+        assert!(request.contains("已回滚到 0.1.3"));
+        // 报出去之后才推进本机视图（存的是升级器原样的终态，视图仍看得出“这是回滚”）。
+        assert_eq!(
+            runtime.one_shot_execution("work-upgrade").as_deref(),
+            Some("rolled_back")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_undeliverable_upgrade_result_is_retried_and_does_not_move_the_local_view() {
+        let state_dir = fact_summary_state_dir("upgrade-report-retry");
+        // test_config 的 endpoint 是个没人监听的地址：这一轮必然报不出去。
+        let config = test_config();
+        write_upgrade_record(&state_dir, &upgrade_record_at("succeeded", "done", ""));
+
+        let mut runtime = grant_holding_the_upgrade();
+        assert!(!reconcile_upgrade_record(&config, &mut runtime, &state_dir).await);
+        // 本机视图停在旧状态：下一 tick 读到同一份记录会重投，而不是「报过就忘」。
+        assert_eq!(
+            runtime.one_shot_execution("work-upgrade").as_deref(),
+            Some("dispatched")
+        );
+    }
+
+    /// 心跳停了 = 升级器进程没了（被 kill / 卡死）：当它死了报 `failed`，把互斥锁解开。
+    #[tokio::test]
+    async fn a_silent_upgrader_is_declared_dead_and_reported_as_failed() {
+        let state_dir = fact_summary_state_dir("upgrade-dead");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let mut config = test_config();
+        config.control_plane.endpoint = Some(endpoint);
+        let server = json_server_once(
+            listener,
+            r#"{"work_id":"work-upgrade","status":"accepted","accepted_at":"t"}"#,
+        );
+        write_upgrade_record(&state_dir, &upgrade_record_at("running", "wait_ready", ""));
+        // 故意不写心跳文件（= 心跳早就停了）。
+
+        let mut runtime = grant_holding_the_upgrade();
+        assert!(reconcile_upgrade_record(&config, &mut runtime, &state_dir).await);
+
+        let request = server.await.expect("server");
+        assert!(request.contains("\"status\":\"failed\""), "{request}");
+        assert!(request.contains("判定已死"), "{request}");
+        assert!(!request.contains("已回滚"), "判死不该被当成回滚：{request}");
+        // 本机记的是 `failed`（不是升级器那个 `running`），互斥锁由此解开。
+        assert_eq!(
+            runtime.one_shot_execution("work-upgrade").as_deref(),
+            Some("failed")
+        );
+        assert!(!runtime.has_upgrade_in_flight());
+    }
+
+    /// 心跳还在跳就不该判死：`wait_ready` 这类**合法静默**（默认整整 60s）不能当死亡。
+    #[tokio::test]
+    async fn a_heartbeating_upgrader_is_not_declared_dead() {
+        let state_dir = fact_summary_state_dir("upgrade-alive");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let mut config = test_config();
+        config.control_plane.endpoint = Some(endpoint);
+        let server = json_server_once(
+            listener,
+            r#"{"work_id":"work-upgrade","status":"accepted","accepted_at":"t"}"#,
+        );
+        write_upgrade_record(&state_dir, &upgrade_record_at("running", "wait_ready", ""));
+        crate::upgrade::touch_heartbeat(&state_dir).expect("touch heartbeat");
+
+        let mut runtime = grant_holding_the_upgrade();
+        assert!(reconcile_upgrade_record(&config, &mut runtime, &state_dir).await);
+
+        let request = server.await.expect("server");
+        assert!(request.contains("\"status\":\"running\""), "{request}");
+        assert_eq!(
+            runtime.one_shot_execution("work-upgrade").as_deref(),
+            Some("running")
+        );
+        assert!(runtime.has_upgrade_in_flight(), "还在做，互斥照旧");
     }
 }
