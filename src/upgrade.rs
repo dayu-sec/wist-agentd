@@ -63,6 +63,11 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 pub const UPGRADER_DEAD_AFTER: Duration = Duration::from_secs(60);
 /// 取包超时：制品几十 MB，给足时间但不能无限等。
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+/// 取包**大小**上限：制品几十 MB，这是远高于正常值的天花板。
+///
+/// 少了它，`response.bytes()` 是无界的 —— 一个坏掉的 / 被投毒的网关（或它重定向到的
+/// 第三方）就能让 agentd 把内存吃光。
+const MAX_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
 /// 等新版起来的轮询间隔。
 const READY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// 在解包目录里找二进制时最多往下走几层（制品常带一层 `wist-agentd-<ver>-<target>/`）。
@@ -280,6 +285,11 @@ fn validate_request(request: &UpgradeRequest) -> Result<(), UpgradeError> {
     if request.work_id.trim().is_empty() {
         return Err(fail("spec_invalid", "work_id is empty"));
     }
+    // 与 `parse_spec` 同口径：空地址在这里就拒。少了这道，空地址会一路走到 `fetch_package`
+    // 才以一条费解的 HTTP 错误暴露（而 `build_launch` 的路径不经过 `parse_spec`）。
+    if request.package_url.trim().is_empty() {
+        return Err(fail("spec_invalid", "package_url is empty"));
+    }
     // 显式给了目标版本就先比一次（早失败）；没给就跳过 —— 它要等解包、读到包内
     // agentd 自报的版本才能比（见 `resolve_target_version`）。
     if let Some(target) = provided_target(request) {
@@ -390,16 +400,32 @@ async fn fetch_package(config: &AgentConfig, source: &str) -> Result<Vec<u8>, Up
             format!("GET {source}: HTTP {}", response.status()),
         ));
     }
-    response
-        .bytes()
-        .await
-        .map(|bytes| bytes.to_vec())
-        .map_err(|err| {
-            fail(
-                "package_unavailable",
-                format!("read body from {source}: {err}"),
-            )
-        })
+    // 大小上限拦两道：先看响应头（不必为一个已知超大的响应去读体），读完再按实际长度兜底
+    // （头可能缺席或是撒谎）。`response.bytes()` 是无界的，见 [`MAX_PACKAGE_BYTES`]。
+    if let Some(len) = response.content_length()
+        && len > MAX_PACKAGE_BYTES
+    {
+        return Err(fail(
+            "package_too_large",
+            format!("GET {source}: content-length {len} exceeds {MAX_PACKAGE_BYTES} bytes"),
+        ));
+    }
+    let bytes = response.bytes().await.map_err(|err| {
+        fail(
+            "package_unavailable",
+            format!("read body from {source}: {err}"),
+        )
+    })?;
+    if bytes.len() as u64 > MAX_PACKAGE_BYTES {
+        return Err(fail(
+            "package_too_large",
+            format!(
+                "GET {source}: body of {} bytes exceeds {MAX_PACKAGE_BYTES} bytes",
+                bytes.len()
+            ),
+        ));
+    }
+    Ok(bytes.to_vec())
 }
 
 /// 制品里被认出来的一个二进制。
@@ -446,13 +472,32 @@ fn find_binaries(root: &Path) -> Result<Vec<StagedBinary>, UpgradeError> {
             })?;
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
+            // 符号链接不认：`install` 会**跟随**它，把链接指向的东西（甚至制品之外的文件）
+            // 当成本件装进去。已知件名上出现链接直接拒；其它链接与安装无关，跳过。
+            if path.is_symlink() {
+                if is_known_binary(&name) {
+                    return Err(fail(
+                        "artifact_invalid",
+                        format!("{name} is a symlink ({})", path.display()),
+                    ));
+                }
+                continue;
+            }
             if path.is_dir() {
                 if depth < MAX_ARTIFACT_DEPTH {
                     queue.push((path, depth + 1));
                 }
                 continue;
             }
-            if is_known_binary(&name) && !found.iter().any(|item| item.name == name) {
+            if is_known_binary(&name) {
+                // 同名多份：制品有歧义（哪一份才是要装的？），正规产出不会这样 —— 拒，
+                // 而不是「先遍历到谁就装谁」。
+                if found.iter().any(|item| item.name == name) {
+                    return Err(fail(
+                        "artifact_invalid",
+                        format!("artifact carries more than one {name}"),
+                    ));
+                }
                 found.push(StagedBinary { name, path });
             }
         }
@@ -579,12 +624,17 @@ fn stage_package(bytes: &[u8], staging_dir: &Path) -> Result<Vec<StagedBinary>, 
     find_binaries(&unpacked)
 }
 
-/// 版本号输出形如 `wist-agentd 0.1.3`，也可能只是 `0.1.3`：取最后一个像版本号的词。
+/// 版本号输出形如 `wist-agentd 0.1.3`，也可能只是 `0.1.3`：取最后一个**像版本号**的词。
+///
+/// 「像版本号」= **至少两段点分数字**（`0.1.11`）。只要求「含点」不够：输出里若在版本后面
+/// 又跟了别的带点词（`…T16:05:49.090849Z` 这种时间戳也含点），会被误当版本 —— 而
+/// [`version_parts`] 把时间戳读成 `[2026]`，于是「目标版本 = 2026」、`ensure_newer` 恒成立。
+/// 找不到多段数字就当「没报版本」（`None`）：宁可拒升级，也不要猜。
 fn parse_version_output(stdout: &str) -> Option<String> {
     stdout
         .split_whitespace()
         .rev()
-        .find(|token| token.contains('.'))
+        .find(|token| version_parts(token).is_some_and(|parts| parts.len() >= 2))
         .map(|token| token.trim().to_string())
 }
 
@@ -1437,6 +1487,20 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// 空 / 空白的 `package_url` 在 `validate_request` 就被拒 —— 与 `parse_spec` 同口径。
+    /// 少了这道，空地址会一路走到 `fetch_package` 才以一条费解的 HTTP 错误暴露
+    /// （而 `build_launch` 那条路径不经过 `parse_spec`）。
+    #[test]
+    fn validate_request_rejects_an_empty_package_url() {
+        let dir = temp_dir("validate-package-url");
+        let mut request = request(dir.join(AGENTD_BIN_NAME));
+        request.package_url = "   ".to_string();
+        let err = validate_request(&request).expect_err("empty package_url must fail");
+        assert_eq!(err.reason, "spec_invalid", "{err:?}");
+        assert!(err.detail.contains("package_url"), "{}", err.detail);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn build_launch_passes_every_fact_explicitly() {
         let request = UpgradeRequest {
@@ -1598,6 +1662,22 @@ mod tests {
         assert_eq!(parse_version_output("no version here"), None);
     }
 
+    /// 挑版本词必须认「多段点分数字」，不能被版本后面跟的时间戳骗到：
+    /// `…T16:05:49.090849Z` 也含点、也能被 `version_parts` 读成 `[2026]` —— 选错会让「目标版本」
+    /// 变成 2026、`ensure_newer` 恒成立（包里的东西是什么就不重要了）。
+    #[test]
+    fn parse_version_output_ignores_a_trailing_dotted_timestamp() {
+        assert_eq!(
+            parse_version_output("wist-agentd 0.1.11 built 2026-09-27T16:05:49.090849Z").as_deref(),
+            Some("0.1.11")
+        );
+        // 只有单段数字的词（时间戳 / 日期）时**不猜**：当作没报版本，让升级器拒掉。
+        assert_eq!(
+            parse_version_output("built 2026-09-27T16:05:49.090849Z"),
+            None
+        );
+    }
+
     #[test]
     fn verify_digest_accepts_with_and_without_prefix() {
         let bytes = b"package-bytes";
@@ -1665,6 +1745,36 @@ mod tests {
         let bytes = fs::read(&archive).expect("read archive");
         let err = stage_package(&bytes, &dir.join("upgrade")).expect_err("must refuse");
         assert_eq!(err.reason, "artifact_invalid");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// 制品里的 `wist-agentd` 如果是**符号链接**必须拒：`install` 会跟随它，把链接指向的东西
+    /// （可能在制品之外）当成本件装进去。
+    #[test]
+    fn find_binaries_rejects_a_symlinked_agentd() {
+        let dir = temp_dir("find-symlink");
+        let outside = dir.join("outside-binary");
+        fs::write(&outside, "#!/bin/sh\necho pwned\n").expect("write target");
+        std::os::unix::fs::symlink(&outside, dir.join(AGENTD_BIN_NAME)).expect("symlink");
+
+        let err = find_binaries(&dir).expect_err("symlink must be refused");
+        assert_eq!(err.reason, "artifact_invalid", "{err:?}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// 制品里出现**两份**同名已知件是有歧义的（哪一份才是要装的？），正规产出不会这样 —— 拒，
+    /// 而不是「先遍历到谁就装谁」。
+    #[test]
+    fn find_binaries_rejects_a_duplicate_known_binary() {
+        let dir = temp_dir("find-duplicate");
+        let nested = dir.join("nested");
+        fs::create_dir_all(&nested).expect("nested");
+        fs::write(dir.join(AGENTD_BIN_NAME), "#!/bin/sh\necho a\n").expect("write a");
+        fs::write(nested.join(AGENTD_BIN_NAME), "#!/bin/sh\necho b\n").expect("write b");
+
+        let err = find_binaries(&dir).expect_err("duplicate must be refused");
+        assert_eq!(err.reason, "artifact_invalid", "{err:?}");
+        assert!(err.detail.contains("more than one"), "{}", err.detail);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2075,6 +2185,47 @@ mod tests {
         server.await.expect("server task");
 
         assert_eq!(bytes, b"PKG");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// 取包有大小上限：对端报一个超过上限的 `content-length` 时**先拦**，不去读那个体。
+    /// 没有这道，`response.bytes()` 无界 —— 坏掉 / 被投毒的网关能把 agentd 内存吃光。
+    #[tokio::test]
+    async fn fetch_package_rejects_an_oversized_content_length() {
+        let dir = temp_dir("fetch-too-large");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let source = format!("http://{}/package", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request_bytes = Vec::new();
+            loop {
+                let mut chunk = [0u8; 1024];
+                let read = socket.read(&mut chunk).await.expect("read");
+                if read == 0 {
+                    break;
+                }
+                request_bytes.extend_from_slice(&chunk[..read]);
+                if request_bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            // 只发头、不发体：要钉的正是「在读到 body 之前就按 content-length 拒掉」。
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 900000000000\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write response");
+            // 留一会儿再关，免得 RST 抢在客户端读到头之前。
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+
+        let config = config_with_state(&dir);
+        let err = fetch_package(&config, &source)
+            .await
+            .expect_err("must refuse");
+        assert_eq!(err.reason, "package_too_large", "{err:?}");
+        server.await.expect("server task");
         let _ = fs::remove_dir_all(dir);
     }
 
