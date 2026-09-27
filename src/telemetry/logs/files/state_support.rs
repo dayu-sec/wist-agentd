@@ -58,4 +58,10 @@ pub(super) struct DeliveryOutcome {
     pub(super) records_processed: usize,
     pub(super) emitted_directly: usize,
     pub(super) spooled: usize,
+    /// 直发这一步失败的原因（已含目标地址）；记录已转入 spool。
+    ///
+    /// 为什么要带出来：这一层过去把 sink 的错误吞在 `Err(_) => spool` 里，导致**第一次**
+    /// 出口失败完全不可见（只有下一轮的回放失败才会报）。目标现在由控制面下发，填错常见，
+    /// 不能等到 spool 涨到上限才 `pause` 才看得见。
+    pub(super) sink_error: Option<String>,
 }

@@ -27,6 +27,40 @@ where
     }
 }
 
+/// 出口写失败的**标记**：把「写出口失败」与「读 / 解析失败」分开。
+///
+/// 为什么要一个专用类型：上层（daemon）要把两者归到不同失败类（出口失败 vs 处理失败），
+/// 而靠错误**文本**嗅探是不行的 —— 文本是给人看的，会被改动。
+#[derive(Debug)]
+pub(crate) struct UplinkWriteError {
+    detail: String,
+}
+
+impl std::fmt::Display for UplinkWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for UplinkWriteError {}
+
+/// 把出口错误包成带标记的 `io::Error`。
+///
+/// **保留 `kind()`**：退避窗口的 `WouldBlock` 等语义不能丢（测试也钉着它）。
+fn uplink_write_error(err: io::Error) -> io::Error {
+    let detail = err.to_string();
+    io::Error::new(err.kind(), UplinkWriteError { detail })
+}
+
+/// 若这个错误来自出口写入，取出它的可读原因（含目标地址）。
+///
+/// 供 daemon 把回放阶段的出口失败也归到出口失败类（而不是含混的「处理失败」）。
+pub(crate) fn uplink_write_detail(err: &io::Error) -> Option<&str> {
+    err.get_ref()?
+        .downcast_ref::<UplinkWriteError>()
+        .map(|marker| marker.detail.as_str())
+}
+
 #[derive(Debug)]
 pub(crate) enum TelemetryRecordSink {
     File(FileRecordSink),
@@ -97,6 +131,16 @@ impl TelemetryRecordSink {
             Self::Tcp(sink) => sink.write_fact(envelope, body).await,
         }
     }
+
+    /// 这条 sink 到底**能不能**承载事实帧。
+    ///
+    /// 事实帧只有数据面 TCP 一条通道；file sink 只承载日志（本地调试）。与 [`Self::write_fact`]
+    /// 的 `Err` 不同，这个是给调用方在**发送前**判断用的：生效输出是 file（本机调试）时，
+    /// 事实本就不该上送，也就不该走 `write_fact` 的 `Err` 分支 —— 否则正常状态会被报成故障。
+    /// （`write_fact` 的 `Err` 保留，作为真正误配时的兜底。）
+    pub(crate) fn carries_fact_frames(&self) -> bool {
+        matches!(self, Self::Tcp(_))
+    }
 }
 
 #[derive(Debug, Clone, ::jumo_derive::Jumo)]
@@ -116,7 +160,14 @@ impl RecordSink for FileRecordSink {
         if records.is_empty() {
             return Ok(());
         }
+        self.write_records_inner(records)
+            .await
+            .map_err(uplink_write_error)
+    }
+}
 
+impl FileRecordSink {
+    async fn write_records_inner(&mut self, records: &[TelemetryRecord]) -> io::Result<()> {
         ensure_parent(&self.path)?;
         let mut file = OpenOptions::new()
             .create(true)
@@ -192,8 +243,20 @@ impl TcpRecordSink {
         self.next_attempt_at = Some(Instant::now() + self.backoff);
     }
 
-    fn backoff_error() -> io::Error {
-        io::Error::new(io::ErrorKind::WouldBlock, "tcp uplink in backoff")
+    /// 给出口错误挂上**目标地址**。
+    ///
+    /// 为什么必须挂：目标现在由控制面下发（见 `agent-uplink-authorization.md`），填错是常见故障；
+    /// 而 OS 的 "Connection refused (os error 61)" 只说“连不上”，不说“连谁”——
+    /// 运维看到第一行必须能知道是哪个 `host:port`。
+    fn tag_target(&self, err: io::Error) -> io::Error {
+        io::Error::new(err.kind(), format!("{}: {err}", self.target_addr))
+    }
+
+    fn backoff_error(&self) -> io::Error {
+        self.tag_target(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "tcp uplink in backoff",
+        ))
     }
 
     /// 确保连接可用：无连接则先 connect（带超时）；退避窗口内直接失败交给 spool。
@@ -202,7 +265,7 @@ impl TcpRecordSink {
             return Ok(());
         }
         if self.in_backoff() {
-            return Err(Self::backoff_error());
+            return Err(self.backoff_error());
         }
         match timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(&self.target_addr)).await {
             Ok(Ok(stream)) => {
@@ -213,14 +276,14 @@ impl TcpRecordSink {
             }
             Ok(Err(err)) => {
                 self.schedule_backoff();
-                Err(err)
+                Err(self.tag_target(err))
             }
             Err(_) => {
                 self.schedule_backoff();
-                Err(io::Error::new(
+                Err(self.tag_target(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "tcp connect timed out",
-                ))
+                )))
             }
         }
     }
@@ -237,15 +300,15 @@ impl TcpRecordSink {
             Ok(Err(err)) => {
                 self.stream = None;
                 self.schedule_backoff();
-                Err(err)
+                Err(self.tag_target(err))
             }
             Err(_) => {
                 self.stream = None;
                 self.schedule_backoff();
-                Err(io::Error::new(
+                Err(self.tag_target(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "tcp write timed out",
-                ))
+                )))
             }
         }
     }
@@ -288,7 +351,9 @@ impl RecordSink for TcpRecordSink {
             payload.extend_from_slice(&build_payload_bytes(&frame, self.framing));
         }
 
-        self.write_payload(&payload).await
+        self.write_payload(&payload)
+            .await
+            .map_err(uplink_write_error)
     }
 }
 
@@ -456,14 +521,27 @@ mod tests {
             .with_backoff(Duration::from_millis(10));
 
         // 第一次 connect 失败，进入退避（10ms → 20ms）。
-        assert!(sink.write_records(&[record("a")]).await.is_err());
+        let err = sink
+            .write_records(&[record("a")])
+            .await
+            .expect_err("connect refused");
+        // 错误必须挂上**目标地址**：OS 只说“连不上”，不说“连谁”；
+        // 而目标现在由控制面下发，运维看到第一行就得知道是哪个 `host:port`。
+        assert!(
+            err.to_string().contains(&format!("127.0.0.1:{port}:")),
+            "出口错误必须带目标地址：{err}"
+        );
 
-        // 退避窗口内：快速返回 WouldBlock，不再尝试 connect。
+        // 退避窗口内：快速返回 WouldBlock，不再尝试 connect；同样带目标。
         let err = sink
             .write_records(&[record("b")])
             .await
             .expect_err("backoff");
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            err.to_string().contains(&format!("127.0.0.1:{port}:")),
+            "退避错误也要能看出目标：{err}"
+        );
 
         // 越过退避窗口：重新尝试 connect（仍失败，退避翻倍到 40ms）。
         tokio::time::sleep(Duration::from_millis(30)).await;

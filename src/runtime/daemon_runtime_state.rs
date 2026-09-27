@@ -37,6 +37,15 @@ pub(super) fn emit_telemetry_failure(failure: &TelemetryFailure) {
                 failure.input_id, failure.path, failure.detail
             );
         }
+        // 出口写失败：`magnitude` 里带目标地址与底层原因（`TcpRecordSink` 已挂 `host:port`）——
+        // 运维看到这一行就该知道是哪个数据面目标连不上。
+        TelemetryFailureKind::OutputWriteFailed => {
+            let magnitude = failure.magnitude.as_deref().unwrap_or("n/a");
+            eprintln!(
+                "telemetry output write failed input_id={} path={} detail={} magnitude={magnitude}",
+                failure.input_id, failure.path, failure.detail
+            );
+        }
     }
 }
 

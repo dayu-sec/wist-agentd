@@ -1,22 +1,27 @@
 use std::io;
 use std::path::PathBuf;
 
-use wist_contracts::agent_config::{AgentConfig, LogFileInputSection};
+use wist_contracts::agent_config::{AgentConfig, LogFileInputSection, LogsOutputSection};
 use wist_shared::time::now_rfc3339;
 
 use crate::control::work::AppliedWorkGrant;
 use crate::telemetry::logs::InputOrigin;
 use crate::telemetry::logs::files::{FileInputProcessor, ProcessOutcome};
-use crate::telemetry::warp_parse::{RecordSink, TcpFraming, TelemetryRecordSink};
+use crate::telemetry::warp_parse::{
+    RecordSink, TcpFraming, TelemetryRecordSink, uplink_write_detail,
+};
 
 #[path = "daemon_telemetry_support.rs"]
 mod support;
 
 use support::{
     build_file_input_config, build_record_sink, invalid_output_failure, missing_input_failure,
-    processing_failure, replay_spool_only, spool_paused_reason, unsupported_target,
+    processing_failure, replay_spool_only, spool_paused_reason, unsupported_target, uplink_failure,
     withheld_failure,
 };
+
+// 生效输出解析要给主循环用（它在短路前算），所以在同一层再导出一次。
+pub(super) use support::effective_output;
 
 #[derive(::jumo_derive::Jumo)]
 #[jumo(kind = "struct", domain = "Reporting", module = "Reporting.Health")]
@@ -35,6 +40,12 @@ pub(super) enum TelemetryFailureKind {
     /// 有记录因**内容不全**被挡下不转发（边界判据在这个文件上没起作用）。
     /// 不是"采集失败"，但必须说出来 —— 否则一条永不结束的块会静默消失。
     RecordWithheld,
+    /// **出口写失败**：记录已安全进 spool 等重发，但「写出口」这一步没成功。
+    ///
+    /// 单列一类是因为它与「读文件失败」的处置完全不同：输入没问题，是出口（数据面目标）
+    /// 连不上 / 写了就断，或本地输出盘坏。身份串是**固定**的，目标与原因在 `magnitude`
+    /// （见 `uplink_failure`）—— 否则同一次故障会因为「退避 / 拒绝」两种形态交替重报。
+    OutputWriteFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ::jumo_derive::Jumo)]
@@ -70,6 +81,18 @@ pub(super) struct TelemetryWorkState {
 }
 
 impl TelemetryTick {
+    /// 完全静默的一轮：没有产出、没有失败、没有通知。
+    ///
+    /// 用于生效输出被关闸（`enabled = false`）时：不是「采集失败」，而是「本就不该产出」——
+    /// 既要零产出，也要零告警（把正常待命报成失败正是旧实现的毛病）。
+    pub(super) fn silent() -> Self {
+        Self {
+            outcomes: Vec::new(),
+            failures: Vec::new(),
+            notifications: Vec::new(),
+        }
+    }
+
     pub(super) fn is_active(&self) -> bool {
         !self.failures.is_empty()
             || self.outcomes.iter().any(|outcome| {
@@ -81,19 +104,54 @@ impl TelemetryTick {
     }
 }
 
+/// 出口健康的**跨 tick 记忆**：只用来在「失败 → 恢复」时补一行。
+///
+/// 为什么需要：失败本身每 tick 现算（失败面与 `is_active` 都对），但**恢复**没有任何一轮的失败面
+/// 能表达 —— 没有它，运维看到 `output write failed …` 之后就无法知道「什么时候可以放下」。
+///
+/// 它**不臆造健康**：只有真的发出去了（直发或回放成功）才宣告恢复；源文件安静且无积压时
+/// 既不尝试、也不宣告 —— 「没试就不知道」是诚实的，不是遗漏。
+#[derive(Debug, Default)]
+pub(super) struct UplinkHealth {
+    failing: bool,
+}
+
+impl UplinkHealth {
+    /// 最近的出口写失败是否**尚未恢复**。
+    ///
+    /// 只读，且刻意不参与任何迁移：状态上报（每 3s）会读它，但**不能**因为上报本身
+    /// 就改变健康记忆 —— 唯一的状态迁移点仍是 `note_tick`（由真正的产出轮驱动）。
+    pub(super) fn is_failing(&self) -> bool {
+        self.failing
+    }
+
+    /// 记一轮的产出情况，返回**该打的一行**（只有恢复时才有）。
+    pub(super) fn note_tick(&mut self, failed: bool, sent_something: bool) -> Option<&'static str> {
+        if failed {
+            self.failing = true;
+            return None;
+        }
+        if self.failing && sent_something {
+            self.failing = false;
+            return Some("event=UplinkRecovered detail=\"出口写失败已恢复\"");
+        }
+        None
+    }
+}
+
 /// 分帧**必须**升到 `len` 时返回是谁要求的（`input_id`）；`None` = 照配置即可。
 ///
 /// 抽成纯函数是为了能直接测这个判定：它错了会让日志静默丢进 miss（续行没有信封、
 /// 匹配不上任何规则），而端到端测试很难稳定复现“恰好掉在 miss 里”。
 ///
-/// 只看 tcp + `line`：file sink 逐条 JSON 编码，换行天然安全；`len` 对单行同样合法。
+/// 只看 `tcp` + `line`：file sink 逐条 JSON 编码，换行天然安全；`len` 对单行同样合法。
+/// 注意这里看的是**生效输出**（grant 合流后），不是原始本机配置 —— grant 可能把本机
+/// `file` 覆盖成 tcp，此时分帧升级的判定必须跟着走。
 pub(super) fn len_framing_required<'a>(
-    config: &AgentConfig,
+    output: &LogsOutputSection,
     mut inputs: impl Iterator<Item = &'a LogFileInputSection>,
 ) -> Option<&'a str> {
-    if config.telemetry.logs.output.kind != "tcp"
-        || config.telemetry.logs.output.tcp.framing == "len"
-    {
+    if output.kind != "tcp" || output.tcp.framing == "len" {
         return None;
     }
     inputs
@@ -108,25 +166,28 @@ pub(super) fn len_framing_required<'a>(
 /// 独立行；那些行没有信封、匹配不上任何规则，**静默掉进 miss**（实测复现过）。
 ///
 /// 所以这里不靠人去配对配置，而是按本轮真要采什么定：有这种输入就升到 `len` 并说清是谁要求的。
+/// 分帧取的是**生效输出**（`[telemetry.logs.output]` 与 grant 合流后的结论，见
+/// [`effective_output`]），因此 grant 把本机 `file` 覆盖成 tcp 时也照样升级。
 pub(super) fn build_telemetry_sink(
     config: &AgentConfig,
     work: &AppliedWorkGrant,
+    output: &LogsOutputSection,
 ) -> io::Result<TelemetryRecordSink> {
     let from_work = work.log_inputs();
     let required = len_framing_required(
-        config,
+        output,
         from_work
             .iter()
             .map(|entry| &entry.input)
             .chain(config.telemetry.logs.file_inputs.iter()),
     );
     let Some(input_id) = required else {
-        return build_record_sink(config, None);
+        return build_record_sink(output, None);
     };
     eprintln!(
         "event=UplinkFramingEscalated from=line to=len input_id={input_id} reason=\"该输入声明多行读法，折叠出的正文可能含换行（协议 §3：line 只用于单行）\""
     );
-    build_record_sink(config, Some(TcpFraming::Len))
+    build_record_sink(output, Some(TcpFraming::Len))
 }
 
 /// 当 sink 无法构建（非法输出配置）时，为每个输入生成一条 `InvalidOutput` 失败。
@@ -249,11 +310,23 @@ async fn process_telemetry_input<S: RecordSink>(
             if let Some(failure) = withheld_failure(input, &outcome.withheld) {
                 tick.failures.push(failure);
             }
+            // 出口写失败：记录已安全进 spool，但**写出口**没成。必须说出来 ——
+            // 旧行为里第一次失败是完全静默的（只有下一轮的回放失败才会报），
+            // 而目标现在由控制面下发 —— 填错必须当场看得见，不能等 spool 涨到上限才 `pause`。
+            if let Some(detail) = outcome.sink_error.as_deref() {
+                tick.failures
+                    .push(uplink_failure(input, detail, Some(outcome.spooled)));
+            }
             tick.outcomes.push(outcome);
         }
-        Err(err) => tick
-            .failures
-            .push(processing_failure(input, err.to_string())),
+        Err(err) => match uplink_write_detail(&err) {
+            // 回放阶段的出口失败也要归到出口失败类（而不是含混的「处理失败」）：
+            // 靠 `UplinkWriteError` 标记分辨（`warp_parse`），不靠错误文本。
+            Some(detail) => tick.failures.push(uplink_failure(input, detail, None)),
+            None => tick
+                .failures
+                .push(processing_failure(input, err.to_string())),
+        },
     }
 }
 
@@ -274,22 +347,45 @@ async fn process_input_with_sink<S: RecordSink>(
 
 #[cfg(test)]
 mod tests {
-    use super::len_framing_required;
+    use super::{UplinkHealth, len_framing_required};
+
+    #[test]
+    fn uplink_health_reports_recovery_once_and_only_after_a_real_send() {
+        let mut health = UplinkHealth::default();
+
+        // 安静且没失败：不宣告任何事（“没试就不知道”）。
+        assert!(health.note_tick(false, false).is_none());
+        // 真的发出去过、也没失败：同样不宣告。
+        assert!(health.note_tick(false, true).is_none());
+
+        // 失败 → 只有**真的发出去了**才算恢复。
+        assert!(health.note_tick(true, false).is_none());
+        assert!(
+            health.note_tick(false, false).is_none(),
+            "没试就不算恢复（不能臆造健康）"
+        );
+        let recovery = health.note_tick(false, true).expect("recovery line");
+        assert!(recovery.contains("UplinkRecovered"), "{recovery}");
+        // 只报一次。
+        assert!(health.note_tick(false, true).is_none());
+
+        // 再次失败 → 恢复 → 再报一次（跳动的出口不该静默）。
+        assert!(health.note_tick(true, true).is_none());
+        assert!(health.note_tick(false, true).is_some());
+    }
     use wist_contracts::agent_config::{
-        AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, LogFileInputSection,
-        PathsSection,
+        LogFileInputSection, LogsOutputSection, LogsTcpOutputSection,
     };
 
-    fn config(kind: &str, framing: &str) -> AgentConfig {
-        let mut config = AgentConfig::new(
-            AgentSection::default(),
-            ControlPlaneSection::default(),
-            PathsSection::default(),
-            ExecutionSection::default(),
-        );
-        config.telemetry.logs.output.kind = kind.to_string();
-        config.telemetry.logs.output.tcp.framing = framing.to_string();
-        config
+    fn output(kind: &str, framing: &str) -> LogsOutputSection {
+        LogsOutputSection {
+            kind: kind.to_string(),
+            tcp: LogsTcpOutputSection {
+                framing: framing.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     fn input(id: &str, multiline: &str) -> LogFileInputSection {
@@ -301,38 +397,38 @@ mod tests {
         }
     }
 
-    fn required(config: &AgentConfig, inputs: &[LogFileInputSection]) -> Option<String> {
-        len_framing_required(config, inputs.iter()).map(str::to_string)
+    fn required(output: &LogsOutputSection, inputs: &[LogFileInputSection]) -> Option<String> {
+        len_framing_required(output, inputs.iter()).map(str::to_string)
     }
 
     #[test]
     fn a_folding_input_forces_length_framing_on_a_line_uplink() {
         // `line` 分帧靠 `\n` 切帧；折叠出的正文自带换行 → 续行会被当成独立行、掉进 miss。
         // 所以只要有一个输入要归并，就必须升到 `len`，而且要报出是谁要求的。
-        let config = config("tcp", "line");
+        let output = output("tcp", "line");
         assert_eq!(
-            required(&config, &[input("a", "none"), input("b", "indented")]),
+            required(&output, &[input("a", "none"), input("b", "indented")]),
             Some("b".to_string())
         );
     }
 
     #[test]
     fn all_single_line_inputs_leave_the_configured_framing_alone() {
-        let config = config("tcp", "line");
-        assert_eq!(required(&config, &[input("a", "none")]), None);
+        let output = output("tcp", "line");
+        assert_eq!(required(&output, &[input("a", "none")]), None);
     }
 
     #[test]
     fn an_explicit_length_uplink_needs_no_escalation() {
         // 配置已经写了 `len`：对单行同样合法，不必（也不该）再报一次升级。
-        let config = config("tcp", "len");
-        assert_eq!(required(&config, &[input("a", "indented")]), None);
+        let output = output("tcp", "len");
+        assert_eq!(required(&output, &[input("a", "indented")]), None);
     }
 
     #[test]
     fn a_file_uplink_needs_no_escalation() {
         // file sink 逐条 JSON 编码，换行天然安全 —— 没有“被切开”这回事。
-        let config = config("file", "line");
-        assert_eq!(required(&config, &[input("a", "indented")]), None);
+        let output = output("file", "line");
+        assert_eq!(required(&output, &[input("a", "indented")]), None);
     }
 }

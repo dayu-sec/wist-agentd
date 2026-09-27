@@ -1,7 +1,8 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use wist_contracts::agent_config::{AgentConfig, LogFileInputSection};
+use wist_contracts::agent_config::{AgentConfig, LogFileInputSection, LogsOutputSection};
+use wist_contracts::agent_uplink::AgentUplinkGrant;
 
 use crate::telemetry::logs::InputOrigin;
 use crate::telemetry::logs::files::file_reader::ReadLimits;
@@ -16,11 +17,59 @@ use super::{TelemetryFailure, TelemetryFailureKind};
 
 pub(super) const SPOOL_REPLAY_BATCH_SIZE: usize = 128;
 
-pub(super) fn build_record_sink(
+/// 本轮该用哪个输出 —— 本机 `[telemetry.logs.output]` 与控制面 grant 合流后的结论。
+///
+/// 返回的是一份**覆盖后的 `LogsOutputSection`**，用它表达三态：
+///   * `enabled = false` → **完全静默**（不读源、不写、不上送）；
+///   * `enabled = true` + `kind = "file"` / `"tcp"` → 照常产出到本地文件 / 数据面 TCP。
+///
+/// 用「覆盖后的配置段」而不是另造一个枚举：下游的 sink 构建、分帧升级、kind 校验（未知
+/// kind → `InvalidOutput`）全都按 `LogsOutputSection` 工作，覆盖后原地复用，行为与从前一致。
+///
+/// 生效规则（控制面 grant 优先于本机配置，严格按契约语义）：
+///   1. 未下发（`None`：未入网 / 旧网关 404 / 网络失败 / 解析失败）→ 用本机配置；
+///   2. 下发 `enabled = false` → 静默；
+///   3. 下发 `enabled = true` 且带 `host`/`port` → **强制** `tcp(host, port)`，覆盖本机 `kind`
+///      （本机即使是 `file` 也改成 tcp，`enabled` 也随之上开）；
+///   4. 下发 `enabled = true` 但没给目标 → 沿用本机 `kind`（本机 `enabled = false` 则仍静默）。
+///
+/// 注意 `kind` 与 `enabled` 正交：grant 只改「写到哪」（`kind`/目标），不改「怎么分帧」
+/// （`tcp.framing` 仍是本机的事实，由下游 `build_telemetry_sink` 按本轮输入决定要不要升 `len`）。
+pub fn effective_output(
     config: &AgentConfig,
+    grant: Option<&AgentUplinkGrant>,
+) -> LogsOutputSection {
+    let mut output = config.telemetry.logs.output.clone();
+
+    if let Some(grant) = grant {
+        if !grant.enabled {
+            // 控制面明确关掉：总闸归零，与 kind 无关。
+            output.enabled = false;
+            return output;
+        }
+        if let Some((host, port)) = grant.target() {
+            // 强制 tcp：覆盖本机 kind（本机 file 也改 tcp）与目标；enabled 随之上开。
+            output.enabled = true;
+            output.kind = "tcp".to_string();
+            output.tcp.addr = host.to_string();
+            output.tcp.port = port;
+            return output;
+        }
+        // enabled 但没给目标：沿用本机 kind，继续往下按本机总闸判定。
+    }
+
+    // 本机总闸：与 kind 正交，false 即静默。
+    if !output.enabled {
+        return output;
+    }
+    output
+}
+
+pub(super) fn build_record_sink(
+    output: &LogsOutputSection,
     framing: Option<TcpFraming>,
 ) -> io::Result<TelemetryRecordSink> {
-    TelemetryRecordSink::from_logs_output(&config.telemetry.logs.output, framing)
+    TelemetryRecordSink::from_logs_output(output, framing)
 }
 
 pub(super) async fn replay_spool_only<S: RecordSink>(
@@ -119,6 +168,34 @@ pub(super) fn processing_failure(input: &LogFileInputSection, detail: String) ->
     }
 }
 
+/// 记录已进 spool（等重发），但**写出口**这一步失败了。
+///
+/// **身份必须稳定**：同一次出口故障在一次 tick 里可能以两种形态被看到 —— 先行上送的指标
+/// 把连接打进退避后，日志侧看到 `tcp uplink in backoff`；而没有指标的 tick 真的去连，看到
+/// `Connection refused`。把这种易变的原文放进 `detail`，两者就成了**两个签名**、交替重报
+/// （实测退化成每 tick 一行）。所以：
+///   * `detail` 用**固定**身份串（同一次出口故障永远同一行）；
+///   * 目标与底层原因（含 `host:port`）放 `magnitude` —— 会变、不参与签名，但照常打出来。
+///
+/// `spooled` 为 `None` = 本次不是「直发失败入 spool」，而是回放阶段失败（记录本就在 spool 里）。
+pub(super) fn uplink_failure(
+    input: &LogFileInputSection,
+    raw_detail: &str,
+    spooled: Option<usize>,
+) -> TelemetryFailure {
+    let magnitude = match spooled {
+        Some(spooled) => format!("records={spooled} cause={raw_detail}"),
+        None => format!("cause={raw_detail}"),
+    };
+    TelemetryFailure {
+        kind: TelemetryFailureKind::OutputWriteFailed,
+        input_id: input.input_id.clone(),
+        path: input.path.clone(),
+        detail: "output write failed; records buffered to spool".to_string(),
+        magnitude: Some(magnitude),
+    }
+}
+
 /// 有记录因**内容不全**被挡下。什么都没挡下就返回 `None`。
 ///
 /// 身份用 `Withheld::detail`（稳定，参与去重），量用 `Withheld::magnitude`（会变，不参与）。
@@ -166,8 +243,8 @@ fn startup_position_for(input: &LogFileInputSection) -> StartupPosition {
 #[cfg(test)]
 mod tests {
     use super::{
-        InputOrigin, Withheld, build_file_input_config, startup_position_for, unsupported_target,
-        withheld_failure,
+        InputOrigin, TelemetryFailureKind, Withheld, build_file_input_config, effective_output,
+        startup_position_for, unsupported_target, uplink_failure, withheld_failure,
     };
     use crate::telemetry::logs::files::file_watcher::StartupPosition;
     use std::path::PathBuf;
@@ -175,6 +252,7 @@ mod tests {
         AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, LogFileInputSection,
         PathsSection,
     };
+    use wist_contracts::agent_uplink::AgentUplinkGrant;
 
     fn config_with_agent(agent_id: Option<&str>) -> AgentConfig {
         AgentConfig::new(
@@ -336,8 +414,140 @@ mod tests {
     }
 
     #[test]
+    fn an_output_write_failure_keeps_a_stable_identity_and_puts_the_target_in_the_magnitude() {
+        // 同一次出口故障在一次 tick 里可能以两种形态出现：指标先失败把连接打进退避，
+        // 日志侧看到 `tcp uplink in backoff`；没有指标的 tick 真的去连，看到 `Connection refused`。
+        // 两者**必须同一签名**，否则交替重报（实测退化成每 tick 一行）。
+        let input = input();
+        let in_backoff = uplink_failure(&input, "10.0.1.9:9000: tcp uplink in backoff", Some(3));
+        let refused = uplink_failure(
+            &input,
+            "10.0.1.9:9000: Connection refused (os error 61)",
+            Some(5),
+        );
+
+        use crate::runtime::daemon::runtime_state_support::{
+            failure_signatures, filter_new_failures,
+        };
+        let seen = failure_signatures(std::slice::from_ref(&in_backoff));
+        assert!(
+            filter_new_failures(std::slice::from_ref(&refused), &seen).is_empty(),
+            "同一目标、只是错误形态不同，必须是同一签名"
+        );
+        assert_eq!(in_backoff.detail, refused.detail, "身份串必须是固定的");
+
+        // 目标与底层原因仍要看得见（走 magnitude）。
+        assert_eq!(in_backoff.kind, TelemetryFailureKind::OutputWriteFailed);
+        let magnitude = in_backoff.magnitude.as_deref().expect("magnitude");
+        assert!(magnitude.contains("10.0.1.9:9000"), "{magnitude}");
+        assert!(magnitude.contains("backoff"), "{magnitude}");
+        assert!(magnitude.contains("records=3"), "{magnitude}");
+
+        // 回放阶段（本轮没有入 spool 的量）也要能报，并同样保持同一身份。
+        let replayed = uplink_failure(&input, "10.0.1.9:9000: tcp connect timed out", None);
+        assert_eq!(replayed.detail, in_backoff.detail);
+        let magnitude = replayed.magnitude.as_deref().expect("magnitude");
+        assert!(magnitude.contains("timed out"), "{magnitude}");
+        assert!(
+            !magnitude.contains("records="),
+            "回放轮没有本轮入 spool 的量：{magnitude}"
+        );
+    }
+
+    #[test]
     fn nothing_withheld_means_no_failure_at_all() {
         // 什么都没挡下就不该造一条 failure：空 failure 会被当成"这个输入有问题"而进健康快照。
         assert!(withheld_failure(&input(), &Withheld::default()).is_none());
+    }
+
+    // ── 生效输出（本机配置 ⊕ 控制面 grant）────────────────────────
+
+    fn config_with_output(kind: &str, enabled: bool) -> AgentConfig {
+        let mut config = config_with_agent(Some("agent-x"));
+        config.telemetry.logs.output.kind = kind.to_string();
+        config.telemetry.logs.output.enabled = enabled;
+        config.telemetry.logs.output.tcp.addr = "127.0.0.1".to_string();
+        config.telemetry.logs.output.tcp.port = 9000;
+        config
+    }
+
+    fn grant_enabled(host: &str, port: u16) -> AgentUplinkGrant {
+        AgentUplinkGrant::enabled_at(host.to_string(), port, "2026-09-26T00:00:00Z".to_string())
+    }
+
+    fn standby() -> AgentUplinkGrant {
+        AgentUplinkGrant::standby("2026-09-26T00:00:00Z".to_string())
+    }
+
+    #[test]
+    fn without_a_grant_the_local_config_decides() {
+        // 未下发（未入网 / 旧网关 404 / 网络失败）→ 用本机配置，一字不改。
+        let config = config_with_output("file", true);
+        let resolved = effective_output(&config, None);
+        assert!(resolved.enabled);
+        assert_eq!(resolved.kind, "file");
+        assert_eq!(resolved.file.path, config.telemetry.logs.output.file.path);
+    }
+
+    #[test]
+    fn a_standby_grant_silences_the_output() {
+        // 控制面明确关掉：不管本机 kind 是什么，总闸归零。
+        let config = config_with_output("tcp", true);
+        let resolved = effective_output(&config, Some(&standby()));
+        assert!(!resolved.enabled);
+    }
+
+    #[test]
+    fn an_enabled_grant_with_a_target_forces_tcp_over_the_local_kind() {
+        // 本机 kind = file，grant 给了目标 → 强制 tcp(host, port)，覆盖本机 kind。
+        let config = config_with_output("file", true);
+        let resolved = effective_output(&config, Some(&grant_enabled("dp.example", 9100)));
+        assert!(resolved.enabled);
+        assert_eq!(resolved.kind, "tcp");
+        assert_eq!(resolved.tcp.addr, "dp.example");
+        assert_eq!(resolved.tcp.port, 9100);
+    }
+
+    #[test]
+    fn an_enabled_grant_with_a_target_also_overrides_a_locally_disabled_gate() {
+        // grant 优先于本机总闸：本机 enabled=false 也挡不住控制面的 enabled=true + 目标。
+        let config = config_with_output("file", false);
+        let resolved = effective_output(&config, Some(&grant_enabled("dp.example", 9100)));
+        assert!(resolved.enabled);
+        assert_eq!(resolved.kind, "tcp");
+    }
+
+    #[test]
+    fn an_enabled_grant_without_a_target_follows_the_local_kind() {
+        // enabled 但没给目标：沿用本机 kind（本机 file 就仍是 file）。
+        let config = config_with_output("file", true);
+        let mut grant = grant_enabled("ignored.example", 1);
+        grant.host = None;
+        grant.port = None;
+        grant.enabled = true;
+        let resolved = effective_output(&config, Some(&grant));
+        assert!(resolved.enabled);
+        assert_eq!(resolved.kind, "file");
+    }
+
+    #[test]
+    fn a_locally_disabled_gate_silences_the_output_without_a_grant() {
+        // 本机总闸：与 kind 正交，false 即静默。
+        let config = config_with_output("tcp", false);
+        let resolved = effective_output(&config, None);
+        assert!(!resolved.enabled);
+    }
+
+    #[test]
+    fn an_enabled_grant_without_a_target_respects_a_locally_disabled_gate() {
+        // 契约 §3 第 4 行括号里的子句：`enabled = true` 但没给目标 → 沿用本机 kind；
+        // 而**本机总闸关着**时仍是静默 —— grant 的 `enabled` 只表示「控制面允许」，
+        // 没有目标就不构成一次有效的目标覆盖，不该把本机总闸撬开。
+        let config = config_with_output("file", false);
+        let mut grant = grant_enabled("ignored.example", 1);
+        grant.host = None;
+        grant.port = None;
+        let resolved = effective_output(&config, Some(&grant));
+        assert!(!resolved.enabled, "没有目标时不得攤开本机总闸");
     }
 }

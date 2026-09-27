@@ -103,7 +103,19 @@ pub async fn replay_records_async<S: RecordSink>(
         if line.trim().is_empty() {
             continue;
         }
-        batch.push(parse_record_line(&line)?);
+        // 一行读不动的 JSON 不能让整个输入**永久卡死**：过去它会让回放永远失败、spool 永不清空，
+        // 该输入从此既不产出、也报不出新东西（唯一一种“行永不消失”的故障）。
+        // 把坏行**隔离**到 `{spool}.ndjson.bad`（留证，不静默丢）后跳过，队列才能继续往前排。
+        match parse_record_line(&line) {
+            Ok(record) => batch.push(record),
+            Err(err) => {
+                quarantine_line(path, &line).await?;
+                eprintln!(
+                    "telemetry spool: quarantined an unreadable record from {}: {err}",
+                    path.display()
+                );
+            }
+        }
         if batch.len() >= batch.capacity() {
             sink.write_records(&batch).await?;
             replayed += batch.len();
@@ -117,6 +129,25 @@ pub async fn replay_records_async<S: RecordSink>(
     }
     clear_async(path).await?;
     Ok(replayed)
+}
+
+/// 把一行读不动的 spool 记录挪到 `{spool}.ndjson.bad`：留证，但不再挡着后面的记录。
+///
+/// 为什么不是丢掉：这一行可能就是唯一的证据（写入端 bug / 磁盘损坏）。
+/// 为什么不直接失败：失败会把整个输入钉死（回放永远不过 → spool 永不清空 → 不再产出）。
+async fn quarantine_line(path: &Path, line: &str) -> io::Result<()> {
+    let bad_path = path.with_extension("ndjson.bad");
+    ensure_parent(&bad_path)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&bad_path)
+        .await?;
+    file.write_all(line.as_bytes()).await?;
+    if !line.ends_with('\n') {
+        file.write_all(b"\n").await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -222,6 +253,39 @@ mod tests {
 
         assert!(size(&path).expect("size present") > 0);
         fs::remove_file(path).ok();
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_spool_line_is_quarantined_instead_of_wedging_the_input() {
+        // 过去：一行坏 JSON 让回放永远失败 ⇒ spool 永不清空 ⇒ 该输入从此既不产出、
+        // 也报不出新东西（唯一一种「行永不消失」的故障）。
+        // 现在：坏行挪到 `{spool}.ndjson.bad`（留证）后跳过，后面的记录照常发出。
+        let path = temp_file("corrupt");
+        let good_before = serde_json::to_string(&record("before")).expect("encode");
+        let good_after = serde_json::to_string(&record("after")).expect("encode");
+        fs::write(&path, format!("{good_before}\n{{ not json\n{good_after}\n")).expect("seed");
+
+        let mut sink = TestSink::default();
+        let replayed = replay_records_async(&path, &mut sink, 128)
+            .await
+            .expect("replay must not fail on a corrupt line");
+
+        assert_eq!(replayed, 2, "坏行之外的两条要照常发出");
+        assert!(sink.records.len() == 2);
+        assert!(
+            !has_records_async(&path).await.expect("has records"),
+            "队列要能排空，否则这个输入被一行坏数据钉死"
+        );
+
+        let bad_path = path.with_extension("ndjson.bad");
+        let quarantined = fs::read_to_string(&bad_path).expect("quarantine file");
+        assert!(
+            quarantined.contains("not json"),
+            "坏行要留证：{quarantined:?}"
+        );
+
+        fs::remove_file(&path).ok();
+        fs::remove_file(&bad_path).ok();
     }
 
     #[derive(Default)]

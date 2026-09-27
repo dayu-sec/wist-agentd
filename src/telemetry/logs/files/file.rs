@@ -77,6 +77,8 @@ pub struct ProcessOutcome {
     pub records_processed: usize,
     pub emitted_directly: usize,
     pub spooled: usize,
+    /// **上送**这一步的失败原因（已含目标地址）；记录已安全进 spool。`None` = 没失败过。
+    pub sink_error: Option<String>,
     pub checkpoint_offset: u64,
     pub replayed_spool: usize,
     pub truncated: bool,
@@ -107,6 +109,7 @@ impl ProcessOutcome {
             records_processed: delivery.records_processed,
             emitted_directly: delivery.emitted_directly,
             spooled: delivery.spooled,
+            sink_error: delivery.sink_error,
             checkpoint_offset,
             replayed_spool,
             truncated,
@@ -124,6 +127,7 @@ impl ProcessOutcome {
             records_processed: 0,
             emitted_directly: 0,
             spooled: 0,
+            sink_error: None,
             checkpoint_offset: 0,
             replayed_spool,
             truncated: false,
@@ -136,12 +140,16 @@ impl ProcessOutcome {
     }
 
     /// spool 超限暂停结果。
-    pub(crate) fn paused(spool_bytes: u64) -> Self {
+    ///
+    /// `sink_error` 要跟着一起留下来：spool 涨满**不是**根因的消失 —— 根因通常是出口写不出去。
+    /// 这里若把它丢掉，日志就从「目标连不上」退化成「spool 超限」，而目标地址恰恰是运维要的。
+    pub(crate) fn paused(spool_bytes: u64, sink_error: Option<String>) -> Self {
         Self {
             kind: ProcessOutcomeKind::SpoolPaused,
             records_processed: 0,
             emitted_directly: 0,
             spooled: 0,
+            sink_error,
             checkpoint_offset: 0,
             replayed_spool: 0,
             truncated: false,
@@ -182,7 +190,7 @@ where
             Err(err) => {
                 // 回放失败：若 spool 已达上限则进入暂停（保完整、不丢数据），
                 // 否则维持原有错误语义。
-                return match self.paused_outcome_async().await? {
+                return match self.paused_outcome_async(Some(&err)).await? {
                     Some(paused) => Ok(paused),
                     None => Err(err),
                 };
@@ -271,10 +279,17 @@ where
     ///
     /// `spool_over_limit` 校验收敛为仅 `pause`（保完整、不丢数据）；`drop_oldest`
     /// 留待后续按 input 优先级丢弃落地。
-    async fn paused_outcome_async(&self) -> io::Result<Option<ProcessOutcome>> {
+    async fn paused_outcome_async(
+        &self,
+        replay_error: Option<&io::Error>,
+    ) -> io::Result<Option<ProcessOutcome>> {
         let spool_bytes = spool::size_async(&self.config.spool_path).await?;
         if spool_bytes >= self.config.spool_max_bytes {
-            Ok(Some(ProcessOutcome::paused(spool_bytes)))
+            // 只把**出口写失败**带进暂停结果（读/解析错误不算出口失败，别张冠李戴）。
+            let sink_error = replay_error
+                .and_then(crate::telemetry::warp_parse::uplink_write_detail)
+                .map(str::to_string);
+            Ok(Some(ProcessOutcome::paused(spool_bytes, sink_error)))
         } else {
             Ok(None)
         }

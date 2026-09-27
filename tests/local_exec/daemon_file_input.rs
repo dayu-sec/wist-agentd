@@ -1067,6 +1067,253 @@ fn daemon_run_once_sends_raw_log_lines_to_tcp_output() {
     assert!(!root.join("log").join("wist-records.ndjson").exists());
 }
 
+/// 输出总闸关闭（`enabled = false`）→ **只发事实摘要，不发别的**。
+///
+/// 待命指「不产出**主机内容**」：不读源、不上送日志/指标、不推进 log checkpoint。但**事实摘要
+/// 照发** —— 新装机器靠它把进程列表推给网关，否则连「该派什么活」都定不下来（实测的死锁）。
+///
+/// 关键回归点：待命期不能推进 log checkpoint —— 否则重新启用后从新 offset 续读，
+/// 待命期间写入的行会被永久丢掉。
+#[test]
+fn daemon_run_once_with_output_disabled_only_reports_facts() {
+    let root = temp_dir("daemon-output-disabled");
+    let run_dir = root.join("run");
+    let state_dir = root.join("state");
+    let log_dir = root.join("log");
+    let input_path = root.join("app.log");
+    bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
+    fs::write(&input_path, "alpha\nbeta\n").expect("write input log");
+
+    let Some(listener) = bind_tcp_listener("127.0.0.1:0") else {
+        return;
+    };
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("listener addr").port();
+
+    // 目标齐全但总闸关闭：连接里只该有事实帧。
+    let mut config =
+        standalone_config_with_tcp_file_input(&root, &input_path, "127.0.0.1", port, "line");
+    config.telemetry.logs.output.enabled = false;
+
+    daemon::run_once_with_work(
+        &daemon::DaemonLoop {
+            config: &config,
+            exec_bin: &test_exec_bin(&root),
+            upgrader_bin: ::std::path::Path::new(""),
+            config_dir: ::std::path::Path::new(""),
+        },
+        &granted_metrics_work(),
+    )
+    .expect("daemon run once");
+
+    // 待命期**会**建连接（推进程列表），但连接里只有事实帧。
+    let payload = accept_and_drain(&listener);
+    assert!(
+        payload.contains(" OBSFACT: "),
+        "待命必须仍把进程列表推出去: {payload}"
+    );
+    assert!(!payload.contains(" LOGRAW: "), "待命不发日志帧: {payload}");
+    assert!(!payload.contains(" METRICS: "), "待命不发指标帧: {payload}");
+    assert!(!root.join("log").join("wist-records.ndjson").exists());
+
+    // 源文件 offset 不前进：待命期根本不读源，checkpoint 不该被创建/推进。
+    let checkpoint_path = wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "app");
+    assert!(
+        !checkpoint_path.exists(),
+        "待命期不该推进 log checkpoint：{}",
+        checkpoint_path.display()
+    );
+}
+
+/// 接受待命期的那条上行连接并把它读尽（sink 在轮次末断开，所以能读到 EOF）。
+///
+/// 待命期**会**建连接（推进程列表），所以不能再断言「无连接」—— 要断言的是**连接里装了什么**。
+fn accept_and_drain(listener: &TcpListener) -> String {
+    // 有上限地等：连接在 `run_once` 返回前就已排队，正常第一轮就 accept 到；
+    // 上限只是防止回归时挂死。
+    let mut socket = None;
+    for _ in 0..250 {
+        if let Ok((accepted, _)) = listener.accept() {
+            socket = Some(accepted);
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let mut socket = socket.expect("待命期必须建立上行连接推进程列表");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    let mut payload = String::new();
+    let mut chunk = [0u8; 512];
+    loop {
+        match socket.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => payload.push_str(&String::from_utf8_lossy(&chunk[..n])),
+            Err(_) => break,
+        }
+    }
+    payload
+}
+
+/// 跑一轮 `run_once`，把这一轮上送出去的**日志原文**收集回来（按 ` LOGRAW: ` 帧切分）。
+///
+/// 用于跨轮断言：`run_once` 每轮自己建 sink、连一次、写完整轮、断开，所以“这一轮发了什么”
+/// 就是一次 accept + 读到 EOF。
+#[cfg(unix)]
+fn run_once_collecting_tcp(
+    root: &std::path::Path,
+    input_path: &std::path::Path,
+    enabled: bool,
+) -> Vec<String> {
+    let Some(listener) = bind_tcp_listener("127.0.0.1:0") else {
+        return Vec::new();
+    };
+    let port = listener.local_addr().expect("listener addr").port();
+    let reader = thread::spawn(move || {
+        let Ok((mut socket, _)) = listener.accept() else {
+            return Vec::new();
+        };
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 256];
+        loop {
+            match socket.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        raw_body_sections(&String::from_utf8_lossy(&buf))
+    });
+
+    let mut config =
+        standalone_config_with_tcp_file_input(root, input_path, "127.0.0.1", port, "line");
+    config.telemetry.logs.output.enabled = enabled;
+    daemon::run_once_with_work(
+        &daemon::DaemonLoop {
+            config: &config,
+            exec_bin: &test_exec_bin(root),
+            upgrader_bin: ::std::path::Path::new(""),
+            config_dir: ::std::path::Path::new(""),
+        },
+        &granted_metrics_work(),
+    )
+    .expect("daemon run once");
+    reader.join().expect("reader thread")
+}
+
+/// 关闸（`enabled = false`）不是「没数据」：它**不该动 spool**。
+///
+/// 待命期若照常回放 spool，就是拿「上次没发出去的记录」在**未被授权**时再试着发一次；
+/// 反过来若把 spool 当垃圾清掉，则是静默丢数据。两种都不能发生 —— 这份文件要原样留着，
+/// 等重新启用时按原顺序发。
+#[cfg(unix)]
+#[test]
+fn daemon_standby_leaves_the_spool_untouched() {
+    let root = temp_dir("daemon-standby-keeps-spool");
+    let run_dir = root.join("run");
+    let state_dir = root.join("state");
+    let log_dir = root.join("log");
+    let input_path = root.join("app.log");
+    bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
+    fs::write(&input_path, "alpha\n").expect("write input log");
+
+    // 预置一份「上次没发出去」的 spool。
+    let spool_path = state_dir.join("spool").join("logs").join("app.ndjson");
+    fs::create_dir_all(spool_path.parent().expect("spool parent")).expect("mkdir spool");
+    let spooled = "{\"agent_id\":\"agent-001\",\"raw\":\"beta\"}\n";
+    fs::write(&spool_path, spooled).expect("seed spool");
+    let before = fs::read(&spool_path).expect("read spool");
+
+    let Some(listener) = bind_tcp_listener("127.0.0.1:0") else {
+        return;
+    };
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("listener addr").port();
+
+    let mut config =
+        standalone_config_with_tcp_file_input(&root, &input_path, "127.0.0.1", port, "line");
+    config.telemetry.logs.output.enabled = false;
+
+    daemon::run_once_with_work(
+        &daemon::DaemonLoop {
+            config: &config,
+            exec_bin: &test_exec_bin(&root),
+            upgrader_bin: ::std::path::Path::new(""),
+            config_dir: ::std::path::Path::new(""),
+        },
+        &granted_metrics_work(),
+    )
+    .expect("daemon run once");
+
+    thread::sleep(Duration::from_millis(200));
+    // 待命**会**建连接推进程列表，但它不该回放 spool：上行里不能有日志帧（` LOGRAW: `）。
+    let payload = accept_and_drain(&listener);
+    assert!(
+        !payload.contains(" LOGRAW: "),
+        "待命期不该回放 spool（上行里不该有日志帧）: {payload}"
+    );
+    let after = fs::read(&spool_path).expect("read spool");
+    assert_eq!(
+        before, after,
+        "待命期不该回放、也不该清理 spool：它要原样留到重新启用"
+    );
+}
+
+/// 待命期**不读源** ⇒ 不推进 checkpoint。所以「启用 → 关闸 → 再启用」不该丢待命期写入的行，
+/// 也不该把已经很早发出去的行重复发一遍。
+#[cfg(unix)]
+#[test]
+fn daemon_reenable_after_standby_resumes_from_the_previous_checkpoint() {
+    let root = temp_dir("daemon-reenable-resumes");
+    let run_dir = root.join("run");
+    let state_dir = root.join("state");
+    let log_dir = root.join("log");
+    let input_path = root.join("app.log");
+    bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
+    fs::write(&input_path, "alpha\n").expect("write input log");
+
+    // 第一轮：启用，把 alpha 发出去，checkpoint 前进到文件尾。
+    let first = run_once_collecting_tcp(&root, &input_path, true);
+    assert!(first.iter().any(|body| body.contains("alpha")), "{first:?}");
+
+    // 追加 beta，然后**关闸**跑一轮：不该有任何连接（也不该推进 checkpoint）。
+    fs::write(&input_path, "alpha\nbeta\n").expect("append input log");
+    let Some(listener) = bind_tcp_listener("127.0.0.1:0") else {
+        return;
+    };
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("listener addr").port();
+    let mut gated =
+        standalone_config_with_tcp_file_input(&root, &input_path, "127.0.0.1", port, "line");
+    gated.telemetry.logs.output.enabled = false;
+    daemon::run_once_with_work(
+        &daemon::DaemonLoop {
+            config: &gated,
+            exec_bin: &test_exec_bin(&root),
+            upgrader_bin: ::std::path::Path::new(""),
+            config_dir: ::std::path::Path::new(""),
+        },
+        &granted_metrics_work(),
+    )
+    .expect("gated run");
+    thread::sleep(Duration::from_millis(200));
+    assert!(listener.accept().is_err(), "关闸那一轮不该建立连接");
+
+    // 再启用：beta 必须发出来（从旧 offset 续读，没丢），alpha 不该重复发。
+    let resumed = run_once_collecting_tcp(&root, &input_path, true);
+    assert!(
+        resumed.iter().any(|body| body.contains("beta")),
+        "重新启用后待命期写入的行不能丢：{resumed:?}"
+    );
+    assert!(
+        !resumed.iter().any(|body| body.contains("alpha")),
+        "checkpoint 不该回退：已发过的行不能重复发：{resumed:?}"
+    );
+}
+
 /// 没有授权的指标工作 → **不上送指标**，但配置里的日志采集照旧。
 ///
 /// 这是“不做任务工作的 Agent”在数据面上的具体含义：默认不发指标；

@@ -7,10 +7,14 @@ use std::time::{Duration, Instant};
 
 use crate::telemetry::warp_parse::TelemetryRecordSink;
 use wist_contracts::agent_config::AgentConfig;
+use wist_contracts::agent_uplink::AgentUplinkState;
 use wist_contracts::discovery_policy::DiscoveryAspectPolicySet;
 use wist_contracts::gateway::{
     AgentStatusReport, AgentWorkState, AgentWorkStateChange, DiscoveryPoliciesReturned,
     POLL_DISCOVERY_POLICIES_KIND, PollDiscoveryPolicies, ReportAgentFactSummary,
+};
+use wist_contracts::local_work::{
+    AgentLocalOneShotWork, AgentLocalStandingWork, AgentLocalTask, AgentLocalWork,
 };
 use wist_contracts::telemetry_record::DataFrame;
 use wist_shared::time::{now_rfc3339, now_ts_ms};
@@ -19,6 +23,7 @@ use crate::enrollment::enrollment_http_client;
 
 use crate::error::RuntimeResult;
 
+use crate::control::uplink::{AppliedUplink, fetch_uplink_grant};
 use crate::control::work::{AppliedWorkGrant, ack_work, fetch_work_grant, report_work_result};
 use crate::discovery::DiscoveryProbe;
 use crate::discovery::container::ContainerDiscoveryProbe;
@@ -204,6 +209,112 @@ fn cpu_percent_since(previous: &CpuSample, now: Instant, ticks_per_sec: u64) -> 
     Some(tick_delta as f64 / wall / ticks_per_sec as f64 * 100.0)
 }
 
+/// 构造上报用的**本机工作内容视图**：`state/work.json` 的同形子集 + 本机配置里手工加的日志输入。
+///
+/// 两处数据缺一不可 —— 网关要回答「这台机器到底在采哪些文件」，一半是本机授权折算出的采集
+/// 任务（`device_view`），另一半是配置里手工加的输入（`telemetry.logs.file_inputs`）；后者
+/// **不在**工作视图里，网关无从得知。
+///
+/// 没收到过任何授权快照时（`device_view` 返回 `None`）也要上报：授权那半为空
+/// （空 standing/one_shot、序号 0），但配置里那半必须照报 —— 它独立于网关。
+/// 这里没有可错的输入，构造**不会失败**，所以直接返回 `AgentLocalWork`。
+fn build_local_work(
+    config: &AgentConfig,
+    work: &AppliedWorkGrant,
+    recorded_at: &str,
+) -> AgentLocalWork {
+    let view = work.device_view(recorded_at);
+    let standing = view
+        .as_ref()
+        .map(|view| {
+            view.standing
+                .iter()
+                .map(|work| AgentLocalStandingWork {
+                    work_id: work.work_id.clone(),
+                    family: work.family.clone(),
+                    status: work.status.clone(),
+                    plan_version: work.plan_version,
+                    acknowledged_version: work.acknowledged_version,
+                    effective_from: work.effective_from.clone(),
+                    // `units`（工作内容）刻意不带：那是网关发下去的，网关自己有。
+                    tasks: work
+                        .tasks
+                        .iter()
+                        .map(|task| AgentLocalTask {
+                            input_id: task.input_id.clone(),
+                            path: task.path.clone(),
+                            startup_position: task.startup_position.clone(),
+                        })
+                        .collect(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let one_shot = view
+        .as_ref()
+        .map(|view| {
+            view.one_shot
+                .iter()
+                .map(|work| AgentLocalOneShotWork {
+                    work_id: work.work_id.clone(),
+                    action: work.action.clone(),
+                    status: work.status.clone(),
+                    execution: work.execution.clone(),
+                    scheduled_at: work.scheduled_at.clone(),
+                    deadline_at: work.deadline_at.clone(),
+                    timeout_seconds: work.timeout_seconds,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    AgentLocalWork {
+        recorded_at: recorded_at.to_string(),
+        gateway_sequence: view.as_ref().map_or(0, |view| view.gateway_sequence),
+        standing,
+        one_shot,
+        // 本机配置里手工加的日志输入（运维逃生舱）：不来自任何采集面，只能由 agent 自报。
+        local_inputs: config
+            .telemetry
+            .logs
+            .file_inputs
+            .iter()
+            .map(|input| AgentLocalTask {
+                input_id: input.input_id.clone(),
+                path: input.path.clone(),
+                startup_position: input.startup_position.clone(),
+            })
+            .collect(),
+        metrics_interval_seconds: view.and_then(|view| view.metrics_interval_seconds),
+    }
+}
+
+/// 构造上报用的**本机实际生效的上送状态**：`AgentUplinkGrant` 与本机配置合流后的结论。
+///
+/// 为什么必须由 agent 自报、且必须复用 [`effective_output`]：网关知道自己**下发**了
+/// 「启用 + 目标」，但不知道 agent **生效**成了什么 —— grant 可能还没拉到、可能被本机总闸
+/// 拦住、可能是「enabled 但没带目标」而回落本机 kind。这里刻意**不**自己重算覆盖规则，
+/// 只把真正出效果的那份解析结果翻译成上报字段；否则平台看到的是一份与实际行为不符的假状态。
+/// 与 [`build_local_work`] 同风格：纯函数、无 IO、不会失败。
+fn build_uplink_state(
+    config: &AgentConfig,
+    uplink: &AppliedUplink,
+    health: &UplinkHealth,
+) -> AgentUplinkState {
+    let grant = uplink.grant();
+    let effective = effective_output(config, grant);
+    AgentUplinkState {
+        enabled: effective.enabled,
+        kind: effective.kind.clone(),
+        // 目标只在 tcp 下有：file 输出没有 `host:port`，tcp 无目标时也无可报的目标。
+        target: (effective.kind == "tcp")
+            .then(|| format!("{}:{}", effective.tcp.addr, effective.tcp.port)),
+        // 来源只看 grant **在不在**（而不是它是否启用）：`grant` + `enabled = false` 是
+        // 「控制面明确关掉」，与「本机配置关掉」是两种事实，平台要靠它区分。
+        source: if grant.is_some() { "grant" } else { "local" }.to_string(),
+        output_write_failing: health.is_failing(),
+    }
+}
+
 /// Best-effort status heartbeat to the admin control plane. Returns the measured
 /// round-trip latency in milliseconds when the report succeeded.
 ///
@@ -214,17 +325,34 @@ fn cpu_percent_since(previous: &CpuSample, now: Instant, ticks_per_sec: u64) -> 
 /// `cpu_cores` 是**本机逻辑核数**：`cpu_percent` 是单核口径（100% = 占满一个核），
 /// 网关要用核数才能把它换算成「整台机器的百分之几」。换算**不在 agent 做** ——
 /// agent 只交原始事实（自己的 CPU 时间、自己的核数），派生值只留一处实现。
+///
+/// `work` 用来构造上报里的本机工作内容视图（[`build_local_work`]）。
+///
+/// `uplink` / `uplink_health` 用来构造**本机实际生效的上送状态**（[`build_uplink_state`]）：
+/// 同样是「网关不知道我生效成了什么」的那类事实，与 `discovery_policy_version` 同口径。
+// 参数多但每一个来源不同（采样值 / 差量 / 策略版本 / 两份期望状态），
+// 打包成结构体只会把构造点与调用点都弄长 —— 与 `run_once_with_failure_cache` 同一取舍。
+#[allow(clippy::too_many_arguments)]
 async fn report_status_to_control_plane(
     config: &AgentConfig,
     cpu_percent: Option<f64>,
     last_latency_ms: Option<u64>,
     work_state_changes: Option<Vec<AgentWorkStateChange>>,
     discovery_policy_version: Option<i64>,
+    work: &AppliedWorkGrant,
+    uplink: &AppliedUplink,
+    uplink_health: &UplinkHealth,
 ) -> Option<u64> {
     let endpoint = config.control_plane.endpoint.as_deref()?;
     let bearer_token = config.control_plane.bearer_token.as_deref()?;
     let agent_id = config.agent.agent_id.as_deref()?;
     let instance_id = config.agent.instance_name.as_deref().unwrap_or_default();
+    // 本机工作视图是 best-effort：它只决定页面能不能看见「在采哪些文件」，
+    // 构造不出来也不该影响状态上报本身，所以始终送 `Some(...)`（没快照时授权那半为空）。
+    let local_work = Some(build_local_work(config, work, &now_rfc3339()));
+    // 生效上送状态同样是 best-effort 的**声明**：没有可错的输入，所以始终送 `Some(...)`
+    // （`None` 的语义是「本次没带」，与本机工作视图同口径，留给旧版本 agent）。
+    let uplink_state = Some(build_uplink_state(config, uplink, uplink_health));
     let report = AgentStatusReport {
         agent_id: agent_id.to_string(),
         instance_id: instance_id.to_string(),
@@ -235,6 +363,8 @@ async fn report_status_to_control_plane(
         admin_latency_ms: last_latency_ms,
         work_state_changes,
         discovery_policy_version,
+        local_work,
+        uplink_state,
     };
     let client = match enrollment_http_client(config) {
         Ok(client) => client,
@@ -369,6 +499,31 @@ async fn report_fact_summary(
     Ok(true)
 }
 
+/// 发一次事实摘要，并把它该打的那一行打出来（成功 / 失败各一行；`Ok(false)` = 还在最小间隔内，静默）。
+///
+/// 抽出来是因为两条路都要发它：**启用**时（与指标/日志同一轮）和**待命**时（只有它）——
+/// 「这台机器是什么」不需要授权就能决定该派什么活，见 `run_once_with_failure_cache`。
+async fn send_fact_summary(
+    sink: &mut TelemetryRecordSink,
+    config: &AgentConfig,
+    state_dir: &Path,
+    summary: &fact_summary::FactSummaryDraft,
+    next_seq: &mut u64,
+    global_seq_path: &Path,
+) {
+    match report_fact_summary(sink, config, state_dir, summary, next_seq, global_seq_path).await {
+        Ok(true) => eprintln!(
+            "event=FactSummaryReported digest={} processes={} executables={} ports={}",
+            summary.content_digest(),
+            summary.process_count,
+            summary.process_executables.len(),
+            summary.listen_ports.len()
+        ),
+        Ok(false) => {}
+        Err(err) => eprintln!("wist-agentd fact summary uplink failed: {err}"),
+    }
+}
+
 /// 是否还在事实摘要上送的最小间隔内（即应当跳过）。
 ///
 /// 节流必须 **fail-open**：宁可多发一次，不可因为时钟问题永远不发。
@@ -473,8 +628,8 @@ use runtime_state_support::{
     work_state_changes,
 };
 use telemetry_support::{
-    TelemetryWorkState, WorkState, build_telemetry_sink, invalid_output_tick,
-    process_telemetry_inputs,
+    TelemetryFailureKind, TelemetryTick, TelemetryWorkState, UplinkHealth, WorkState,
+    build_telemetry_sink, effective_output, invalid_output_tick, process_telemetry_inputs,
 };
 
 fn to_agent_work_state_changes(changes: &[TelemetryWorkState]) -> Vec<AgentWorkStateChange> {
@@ -536,6 +691,11 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
         }
     };
     let mut last_work_fetch: Option<Instant> = None;
+    // 数据面上送启用同样跨 tick 活着：上一次已应用的 grant 就在里面（拉取失败保留它）。
+    let mut uplink_runtime = AppliedUplink::default();
+    let mut last_uplink_fetch: Option<Instant> = None;
+    // 出口健康的跨 tick 记忆（只在「失败 → 恢复」时补一行）。
+    let mut uplink_health = UplinkHealth::default();
     let mut last_metrics_uplink: Option<Instant> = None;
     let mut previous_telemetry_failures = BTreeSet::new();
     let mut previous_metrics_failures = BTreeSet::new();
@@ -551,6 +711,9 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
         // 到达拉取间隔就拉一次策略表并应用（启动首轮即拉）。必须在 refresh_due 之前，
         // 这样本轮采集就用上新周期。
         refresh_discovery_policy(loop_ctx.config, &mut discovery_runtime).await;
+        // 上送启用要**先于**工作授权与采集：否则会出现「工作已应用、上送还关着」的一个 tick
+        // —— 派活后第一轮采到了却发不出去。上送开关是采集的前置条件。
+        refresh_uplink_grant(loop_ctx.config, &mut uplink_runtime, &mut last_uplink_fetch).await;
         // 工作授权同样在采集之前应用：本轮就按新的授权采（或停）。
         refresh_work_grant(
             &loop_ctx,
@@ -581,6 +744,8 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
             Some(&mut previous_telemetry_paused),
             &mut discovery_runtime,
             &work_runtime,
+            &uplink_runtime,
+            Some(&mut uplink_health),
             send_metrics,
         )
         .await?;
@@ -608,6 +773,13 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                 changes,
                 // 还没拿到策略表时为 None（网关据此区分「在用内建默认周期」）。
                 discovery_runtime.policy_version(),
+                // 本机工作视图的来源：授权折算 + 配置里手工加的输入（见 `build_local_work`）。
+                &work_runtime,
+                // 上送状态的来源：已应用 grant + 本机配置合流（见 `build_uplink_state`）。
+                // `uplink_health` 上面的 `run_once_with_failure_cache` 只借用它一轮（`&mut`），
+                // 到这里那次可变借用早已结束，所以这里用 `&` 不会冲突。
+                &uplink_runtime,
+                &uplink_health,
             )
             .await
             {
@@ -622,6 +794,9 @@ pub async fn run_once_async(loop_ctx: &DaemonLoop<'_>) -> RuntimeResult<RuntimeH
     run_once_with_work_async(loop_ctx, &AppliedWorkGrant::default()).await
 }
 
+// 这个函数把「跨 tick 的失败/暂停去重缓存」与「本轮两份期望状态」都收在参数里；
+// 参数虽多但每一个都是不同来源，打包成结构体只会把调用点弄得更长。
+#[allow(clippy::too_many_arguments)]
 async fn run_once_with_failure_cache(
     loop_ctx: &DaemonLoop<'_>,
     previous_telemetry_failures: Option<&mut BTreeSet<String>>,
@@ -630,6 +805,10 @@ async fn run_once_with_failure_cache(
     discovery_runtime: &mut DiscoveryRuntime,
     // 当前持有的工作授权：日志任务由它折算而来，指标上送由它开关。
     work: &AppliedWorkGrant,
+    // 当前已应用的数据面上送 grant：它与本机配置合流出「本轮该用哪个输出」。
+    uplink: &AppliedUplink,
+    // 出口健康的跨 tick 记忆（只在「失败 → 恢复」时补一行）；一次性路径传 `None`。
+    uplink_health: Option<&mut UplinkHealth>,
     // 本轮要不要上送指标（由调用方按授权与周期定；一次性路径按授权定）。
     send_metrics: bool,
 ) -> RuntimeResult<(RuntimeHealthSnapshot, Vec<TelemetryWorkState>)> {
@@ -657,58 +836,100 @@ async fn run_once_with_failure_cache(
     let mut next_seq = log_seq_state::load_or_default_async(&global_seq_path)
         .await
         .unwrap_or(0);
-    let telemetry_tick = match build_telemetry_sink(loop_ctx.config, work) {
+    let effective = effective_output(loop_ctx.config, uplink.grant());
+    let telemetry_tick = match build_telemetry_sink(loop_ctx.config, work, &effective) {
         Ok(mut sink) => {
-            // 指标优先：先上送指标帧（与日志共用同一 sink/连接 + 同一个全局 seq），再处理日志。
-            //
-            // 但只在**授权允许且到了周期**时才发：没有指标工作就没有指标上送，
-            // 这是“不做任务工作的 Agent”在数据面上的具体含义。
-            if let Some(snapshot) = metrics_tick.snapshot.as_ref()
-                && send_metrics
-            {
-                match write_metrics_uplink(
-                    &mut sink,
-                    agent_id,
-                    snapshot,
-                    &mut next_seq,
-                    &global_seq_path,
-                )
-                .await
-                {
-                    // 成功也记一行：否则“指标到底发没发”只能靠间接迹象去猜，
-                    // 而运维问的第一个问题往往是这个（尤其是刚授权完）。
-                    Ok(()) => eprintln!(
-                        "event=MetricsUplinkSent agent_id={agent_id} targets={}",
-                        snapshot.total_targets
-                    ),
-                    Err(err) => eprintln!("wist-agentd metrics uplink failed: {err}"),
+            if !effective.enabled {
+                // 待命（本机 `enabled = false`，或控制面 grant 明确 `enabled = false`）：
+                // 不读源、不写本地采集输出、不发指标/日志帧、不推进 log checkpoint。
+                // 关键在**位置**：这一切排在读任何源文件之前，否则待命期会推进 log
+                // checkpoint，重新启用后就从新 offset 续读，把待命期间写入的行永久丢掉。
+                //
+                // 但**事实摘要照发** —— 它不是主机内容，而是让平台能推断“这台机器是什么”的
+                // 最小元数据（进程列表 / 监听端口 / os / arch）。没有它，新装机器在网关侧一片
+                // 空白，连「该派什么活」都定不下来 —— 这正是“新装了什么也干不了”的死锁。
+                //
+                // 只有 tcp 能承载事实帧：本机 file 输出（未设上送地址）时事实无处可去，
+                // 静默跳过 —— 否则会走 `write_fact` 的 `Err` 分支，把正常状态报成故障
+                // （旧实现每 5 分钟一行 `fact summary uplink failed` 的毛病，别再引回）。
+                if sink.carries_fact_frames() {
+                    send_fact_summary(
+                        &mut sink,
+                        loop_ctx.config,
+                        state_dir,
+                        &fact_summary,
+                        &mut next_seq,
+                        &global_seq_path,
+                    )
+                    .await;
                 }
+                TelemetryTick::silent()
+            } else {
+                // 指标优先：先上送指标帧（与日志共用同一 sink/连接 + 同一个全局 seq），再处理日志。
+                //
+                // 但只在**授权允许且到了周期**时才发：没有指标工作就没有指标上送，
+                // 这是“不做任务工作的 Agent”在数据面上的具体含义。
+                if let Some(snapshot) = metrics_tick.snapshot.as_ref()
+                    && send_metrics
+                {
+                    match write_metrics_uplink(
+                        &mut sink,
+                        agent_id,
+                        snapshot,
+                        &mut next_seq,
+                        &global_seq_path,
+                    )
+                    .await
+                    {
+                        // 成功也记一行：否则“指标到底发没发”只能靠间接迹象去猜，
+                        // 而运维问的第一个问题往往是这个（尤其是刚授权完）。
+                        Ok(()) => eprintln!(
+                            "event=MetricsUplinkSent agent_id={agent_id} targets={}",
+                            snapshot.total_targets
+                        ),
+                        Err(err) => eprintln!("wist-agentd metrics uplink failed: {err}"),
+                    }
+                }
+                // 事实摘要在**指标之后**发：同样共用这条连接与全局 `seq`，只是帧标记不同。
+                if sink.carries_fact_frames() {
+                    send_fact_summary(
+                        &mut sink,
+                        loop_ctx.config,
+                        state_dir,
+                        &fact_summary,
+                        &mut next_seq,
+                        &global_seq_path,
+                    )
+                    .await;
+                }
+                process_telemetry_inputs(loop_ctx.config, work, &mut sink, &mut next_seq).await
             }
-            // 事实摘要在**指标之后**发：同样共用这条连接与全局 `seq`，只是帧标记不同。
-            match report_fact_summary(
-                &mut sink,
-                loop_ctx.config,
-                state_dir,
-                &fact_summary,
-                &mut next_seq,
-                &global_seq_path,
-            )
-            .await
-            {
-                Ok(true) => eprintln!(
-                    "event=FactSummaryReported digest={} processes={} executables={} ports={}",
-                    fact_summary.content_digest(),
-                    fact_summary.process_count,
-                    fact_summary.process_executables.len(),
-                    fact_summary.listen_ports.len()
-                ),
-                Ok(false) => {}
-                Err(err) => eprintln!("wist-agentd fact summary uplink failed: {err}"),
-            }
-            process_telemetry_inputs(loop_ctx.config, work, &mut sink, &mut next_seq).await
         }
-        Err(err) => invalid_output_tick(loop_ctx.config, work, err.to_string()),
+        Err(err) => {
+            // 待命时 sink 建不起来（例如本机 `kind` 非法）也只是“没有可发的目标”，静默即可 ——
+            // 不能报成故障（待命本就是正常态）。只有启用后才把输出配置错误报出来。
+            if effective.enabled {
+                invalid_output_tick(loop_ctx.config, work, err.to_string())
+            } else {
+                TelemetryTick::silent()
+            }
+        }
     };
+    // 出口恢复：上一轮报过出口写失败、这一轮真的发出去了 → 补一行（见 `UplinkHealth`）。
+    // 位置在失败行之后：先报错、再报好，读日志时顺序与因果一致。
+    if let Some(health) = uplink_health {
+        let failed = telemetry_tick
+            .failures
+            .iter()
+            .any(|failure| failure.kind == TelemetryFailureKind::OutputWriteFailed);
+        let sent_something = telemetry_tick
+            .outcomes
+            .iter()
+            .any(|outcome| outcome.emitted_directly > 0 || outcome.replayed_spool > 0);
+        if let Some(line) = health.note_tick(failed, sent_something) {
+            eprintln!("{line}");
+        }
+    }
     if let Some(previous) = previous_telemetry_failures {
         for failure in filter_new_failures(&telemetry_tick.failures, previous) {
             emit_telemetry_failure(failure);
@@ -717,8 +938,21 @@ async fn run_once_with_failure_cache(
     } else {
         emit_telemetry_failures(&telemetry_tick.failures);
     }
-    let current_paused = paused_input_signatures(&telemetry_tick.notifications);
-    let tick_changes = if let Some(previous) = previous_telemetry_paused {
+    // 关闸（`enabled = false`）那一轮的 tick 是**静默**的（零通知）。此时照常做暂停差量是错的：
+    // 静默 tick 没有通知，差量会把「上次因 spool 超限暂停」的输入全判成「已恢复」并回报给控制面
+    // （reason 还会写成 `spool replay recovered`）—— 那是把「被关闸」误报成「恢复正常」。
+    // 所以关闸期两条都不动：不产生通知，也不推进 `previous_telemetry_paused`。
+    let current_paused = if effective.enabled {
+        paused_input_signatures(&telemetry_tick.notifications)
+    } else {
+        previous_telemetry_paused
+            .as_deref()
+            .cloned()
+            .unwrap_or_default()
+    };
+    let tick_changes = if !effective.enabled {
+        Vec::new()
+    } else if let Some(previous) = previous_telemetry_paused {
         let changes = work_state_changes(previous, &telemetry_tick.notifications, &current_paused);
         for change in &changes {
             emit_work_state_notification(change);
@@ -823,6 +1057,31 @@ async fn refresh_discovery_policy(config: &AgentConfig, runtime: &mut DiscoveryR
                 "event=DiscoveryPolicyApplied policy_version={policy_version} aspects={aspects}{adjustments}"
             );
         }
+    }
+}
+
+/// 拉取并应用数据面上送启用（启动首轮即拉，之后按最小间隔节流）。
+///
+/// 用与工作授权相同的 30s 节流：它同样是一个**期望状态**（派活 / 撤回都期望尽快生效），
+/// 但也不该把网关当心跳打。先记「尝试」再发，失败保留上次已应用的 grant。
+async fn refresh_uplink_grant(
+    config: &AgentConfig,
+    runtime: &mut AppliedUplink,
+    last_fetch: &mut Option<Instant>,
+) {
+    let now = Instant::now();
+    if let Some(at) = *last_fetch
+        && at.elapsed() < Duration::from_millis(WORK_FETCH_MIN_INTERVAL_MS as u64)
+    {
+        return;
+    }
+    // 先记“尝试”再发：失败也要被节流，否则网关宕机时会每 tick（3s）重试。
+    *last_fetch = Some(now);
+    // 拿不到（未入网 / 旧网关 404 / 网络失败）就**保留上次已应用的 grant**：
+    // 与工作授权同一取舍 —— 失败清空会把一次网络抖动放大成采集中断。
+    // 「该不该打日志」交给 `observe`：预期内（未入网 / 404）静默，异常按签名去重。
+    if let Some(line) = runtime.observe(fetch_uplink_grant(config).await) {
+        eprintln!("{line}");
     }
 }
 
@@ -1361,6 +1620,8 @@ async fn run_once_with_work_async(
     let mut discovery_runtime = DiscoveryRuntime::new(discovery_probes(loop_ctx.config));
     // 只跑一轮，所以“到没到周期”没有意义：授权允许就发。
     let send_metrics = work.metrics_interval().is_some();
+    // 一次性路径不拉 grant：按「未下发」处理，输出完全由本机配置决定。
+    let uplink = AppliedUplink::default();
     run_once_with_failure_cache(
         loop_ctx,
         None,
@@ -1368,6 +1629,8 @@ async fn run_once_with_work_async(
         None,
         &mut discovery_runtime,
         work,
+        &uplink,
+        None,
         send_metrics,
     )
     .await
@@ -1396,7 +1659,9 @@ mod tests {
         AgentSection, ControlPlaneSection, ExecutionSection, PathsSection,
     };
 
+    use crate::control::uplink::UplinkFetch;
     use crate::telemetry::warp_parse::{FileRecordSink, TcpFraming, TcpRecordSink};
+    use wist_contracts::agent_uplink::AgentUplinkGrant;
 
     fn test_config() -> AgentConfig {
         AgentConfig::new(
@@ -1430,6 +1695,66 @@ mod tests {
                 default_stderr_limit_bytes: 1,
             },
         )
+    }
+
+    /// 关闸轮（`enabled = false`）**不参与暂停差量**：静默 tick 没有通知，若照常做差量，
+    /// 上次因 spool 超限暂停的输入会被判成「已恢复」并回报给控制面 —— 把「被关闸」误报成
+    /// 「恢复正常」。这一层决策是私有的，只有同文件测试能直接碰。
+    #[tokio::test]
+    async fn a_gated_tick_neither_reports_resumed_inputs_nor_drops_the_paused_set() {
+        let root = local_state_dir("gated-paused-diff");
+        let mut config = test_config();
+        config.paths.root_dir = root.display().to_string();
+        config.paths.run_dir = root.join("run").display().to_string();
+        config.paths.state_dir = root.join("state").display().to_string();
+        config.paths.log_dir = root.join("log").display().to_string();
+        config.telemetry.logs.output.enabled = false;
+
+        let loop_ctx = DaemonLoop {
+            config: &config,
+            exec_bin: ::std::path::Path::new(""),
+            upgrader_bin: ::std::path::Path::new(""),
+            config_dir: ::std::path::Path::new(""),
+        };
+        let mut discovery_runtime = DiscoveryRuntime::new(discovery_probes(&config));
+        let mut telemetry_failures = BTreeSet::new();
+        let mut metrics_failures = BTreeSet::new();
+        let mut paused = BTreeSet::from(["app".to_string()]);
+
+        let (_health, changes) = run_once_with_failure_cache(
+            &loop_ctx,
+            Some(&mut telemetry_failures),
+            Some(&mut metrics_failures),
+            Some(&mut paused),
+            &mut discovery_runtime,
+            &AppliedWorkGrant::default(),
+            &AppliedUplink::default(),
+            None,
+            false,
+        )
+        .await
+        .expect("gated tick");
+
+        assert!(
+            changes.is_empty(),
+            "关闸轮不该产生任何 work-state 变更（更不该报 Resumed）"
+        );
+        assert_eq!(
+            paused,
+            BTreeSet::from(["app".to_string()]),
+            "关闸轮不该推进暂停集合：留着上次已知的暂停事实，而不是报成空"
+        );
+    }
+
+    /// 给上面这个测试用的临时 state 目录（别写进仓目录）。
+    fn local_state_dir(name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("duration")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("warp-insight-{name}-{suffix}"));
+        std::fs::create_dir_all(&dir).expect("create state dir");
+        dir
     }
 
     async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
@@ -1499,8 +1824,17 @@ mod tests {
 
         let mut config = test_config();
         config.control_plane.endpoint = Some(endpoint);
-        let latency =
-            report_status_to_control_plane(&config, Some(12.5), Some(3), None, Some(7)).await;
+        let latency = report_status_to_control_plane(
+            &config,
+            Some(12.5),
+            Some(3),
+            None,
+            Some(7),
+            &AppliedWorkGrant::default(),
+            &AppliedUplink::default(),
+            &UplinkHealth::default(),
+        )
+        .await;
         server.await.expect("server task");
         assert!(latency.is_some());
     }
@@ -1525,7 +1859,129 @@ mod tests {
 
         let mut config = test_config();
         config.control_plane.endpoint = Some(endpoint);
-        let latency = report_status_to_control_plane(&config, None, None, None, None).await;
+        let latency = report_status_to_control_plane(
+            &config,
+            None,
+            None,
+            None,
+            None,
+            &AppliedWorkGrant::default(),
+            &AppliedUplink::default(),
+            &UplinkHealth::default(),
+        )
+        .await;
+        server.await.expect("server task");
+        assert!(latency.is_some());
+    }
+
+    // ── 实际生效的上送状态上报 ───────────────────────────────────────
+
+    /// 造一份「已应用了某个 grant」的运行时（同 `control/uplink.rs` 里测试的用法）。
+    fn applied_uplink(grant: AgentUplinkGrant) -> AppliedUplink {
+        let mut applied = AppliedUplink::default();
+        applied.observe(UplinkFetch::Granted(grant));
+        applied
+    }
+
+    /// 控制面**明确待命**（`enabled = false`）：生效总闸关，且来源是 `grant`（而不是 `local`）。
+    /// 平台要靠这个来源区分「控制面没启用」与「启用了但 agent 没听从」（后者才是故障）。
+    #[test]
+    fn a_standby_grant_reports_source_grant_and_no_target() {
+        let config = test_config();
+        let uplink = applied_uplink(AgentUplinkGrant::standby(
+            "2026-09-26T00:00:00Z".to_string(),
+        ));
+        let state = build_uplink_state(&config, &uplink, &UplinkHealth::default());
+        assert!(!state.enabled);
+        assert_eq!(state.source, "grant");
+        assert_eq!(state.target, None);
+    }
+
+    /// 授权带目标时**强制 tcp**：即使本机 `kind = "file"`，生效的也是 tcp，目标就是 grant 给的
+    /// `host:port`。这与 `effective_output` 的覆盖规则必须是同一份，否则平台看到的是假状态。
+    #[test]
+    fn an_enabled_grant_forces_tcp_over_a_local_file_output() {
+        let mut config = test_config();
+        config.telemetry.logs.output.kind = "file".to_string();
+        let uplink = applied_uplink(AgentUplinkGrant::enabled_at(
+            "10.0.1.9".to_string(),
+            9000,
+            "2026-09-26T00:00:00Z".to_string(),
+        ));
+        let state = build_uplink_state(&config, &uplink, &UplinkHealth::default());
+        assert!(state.enabled);
+        assert_eq!(state.source, "grant");
+        assert_eq!(state.kind, "tcp");
+        assert_eq!(state.target.as_deref(), Some("10.0.1.9:9000"));
+    }
+
+    /// 未下发（`AppliedUplink::default()`）：来源是 `local`，输出完全由本机配置决定 ——
+    /// 本机 `file` 时没有 tcp 目标可报。
+    #[test]
+    fn without_a_grant_the_local_config_is_the_source() {
+        let mut config = test_config();
+        config.telemetry.logs.output.kind = "file".to_string();
+        let state =
+            build_uplink_state(&config, &AppliedUplink::default(), &UplinkHealth::default());
+        assert_eq!(state.source, "local");
+        assert_eq!(state.kind, "file");
+        assert_eq!(state.target, None);
+    }
+
+    /// 出口写失败是否**尚未恢复**随状态上报：记过失败 → true；真的又发出去了 → false。
+    #[test]
+    fn the_uplink_state_reflects_an_unrecovered_write_failure() {
+        let config = test_config();
+        let uplink = AppliedUplink::default();
+
+        let mut health = UplinkHealth::default();
+        health.note_tick(true, false);
+        let failing = build_uplink_state(&config, &uplink, &health);
+        assert!(failing.output_write_failing);
+
+        // 只有「真的发出去了」才算恢复（`note_tick(false, true)`），与 `UplinkHealth` 的语义一致。
+        health.note_tick(false, true);
+        let recovered = build_uplink_state(&config, &uplink, &health);
+        assert!(!recovered.output_write_failing);
+    }
+
+    /// 生效上送状态必须**真的进入**上送的报告体（不是构造了却忘了接上 `AgentStatusReport`）。
+    #[tokio::test]
+    async fn report_status_carries_the_effective_uplink_state() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let request = read_http_request(&mut socket).await;
+            assert!(
+                request.contains(
+                    "\"uplink_state\":{\"enabled\":true,\"kind\":\"tcp\",\"target\":\"10.0.1.9:9000\",\"source\":\"grant\",\"output_write_failing\":false}"
+                ),
+                "{request}"
+            );
+            let response =
+                "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let mut config = test_config();
+        config.control_plane.endpoint = Some(endpoint);
+        let uplink = applied_uplink(AgentUplinkGrant::enabled_at(
+            "10.0.1.9".to_string(),
+            9000,
+            "2026-09-26T00:00:00Z".to_string(),
+        ));
+        let latency = report_status_to_control_plane(
+            &config,
+            None,
+            None,
+            None,
+            None,
+            &AppliedWorkGrant::default(),
+            &uplink,
+            &UplinkHealth::default(),
+        )
+        .await;
         server.await.expect("server task");
         assert!(latency.is_some());
     }
@@ -1703,6 +2159,99 @@ mod tests {
         );
         // 这次尝试仍然被记下：配置错也不会变成每 3s 一条日志。
         assert!(loaded_attempt(&state_dir).await > 0);
+    }
+
+    /// 待命（`enabled = false`）**也要推进程列表**。
+    ///
+    /// 为什么必须钉住：新装的机器在被派活之前，网关只能靠事实摘要推断「这台机器是什么」，
+    /// 否则连「该派什么活」都定不下来 —— 实测就是「新装了什么也干不了」的死锁。
+    /// 上送目标（tcp）在安装时就已设好，所以待命期也能把它发出去。
+    #[tokio::test]
+    async fn a_standby_tick_still_reports_the_fact_summary() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = frame_server(listener);
+
+        let root = local_state_dir("standby-fact");
+        let mut config = test_config();
+        config.paths.root_dir = root.display().to_string();
+        config.paths.run_dir = root.join("run").display().to_string();
+        config.paths.state_dir = root.join("state").display().to_string();
+        config.paths.log_dir = root.join("log").display().to_string();
+        // 待命：本机总闸关掉（安装模板就是这个），且控制面没派活。
+        config.telemetry.logs.output.enabled = false;
+        // 但上送地址已在（安装时管理面已设），事实帧就得靠它出去。
+        config.telemetry.logs.output.kind = "tcp".to_string();
+        config.telemetry.logs.output.tcp.addr = "127.0.0.1".to_string();
+        config.telemetry.logs.output.tcp.port = port;
+
+        let loop_ctx = DaemonLoop {
+            config: &config,
+            exec_bin: ::std::path::Path::new(""),
+            upgrader_bin: ::std::path::Path::new(""),
+            config_dir: ::std::path::Path::new(""),
+        };
+        let mut discovery_runtime = DiscoveryRuntime::new(discovery_probes(&config));
+        run_once_with_failure_cache(
+            &loop_ctx,
+            None,
+            None,
+            None,
+            &mut discovery_runtime,
+            &AppliedWorkGrant::default(),
+            &AppliedUplink::default(),
+            None,
+            false,
+        )
+        .await
+        .expect("standby tick");
+
+        let frame = server.await.expect("server task");
+        assert!(
+            frame.contains(" OBSFACT: "),
+            "待命必须仍把进程列表推出去: {frame}"
+        );
+        assert!(frame.contains("\"agent_id\":\"agent-x\""));
+    }
+
+    /// 待命 + 本机 `file` 输出（连上送地址都没设）：事实无处可去，**静默跳过**而不是报错 ——
+    /// 旧实现正是这里每 5 分钟一行 `fact summary uplink failed`（把正常待命报成故障）。
+    #[tokio::test]
+    async fn a_standby_tick_with_a_file_output_sends_nothing() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+
+        let root = local_state_dir("standby-file");
+        let mut config = test_config();
+        config.paths.root_dir = root.display().to_string();
+        config.paths.run_dir = root.join("run").display().to_string();
+        config.paths.state_dir = root.join("state").display().to_string();
+        config.paths.log_dir = root.join("log").display().to_string();
+        config.telemetry.logs.output.enabled = false;
+        // `test_config()` 默认 kind = "file"：没有可发的目标。
+        assert_eq!(config.telemetry.logs.output.kind, "file");
+
+        let loop_ctx = DaemonLoop {
+            config: &config,
+            exec_bin: ::std::path::Path::new(""),
+            upgrader_bin: ::std::path::Path::new(""),
+            config_dir: ::std::path::Path::new(""),
+        };
+        let mut discovery_runtime = DiscoveryRuntime::new(discovery_probes(&config));
+        run_once_with_failure_cache(
+            &loop_ctx,
+            None,
+            None,
+            None,
+            &mut discovery_runtime,
+            &AppliedWorkGrant::default(),
+            &AppliedUplink::default(),
+            None,
+            false,
+        )
+        .await
+        .expect("standby tick");
+
+        assert_no_request(&listener).await;
     }
 
     #[tokio::test]
@@ -1973,8 +2522,105 @@ mod tests {
             reason: "spool over limit".to_string(),
             at: "now".to_string(),
         }]);
-        let latency =
-            report_status_to_control_plane(&config, Some(12.5), Some(3), changes, None).await;
+        let latency = report_status_to_control_plane(
+            &config,
+            Some(12.5),
+            Some(3),
+            changes,
+            None,
+            &AppliedWorkGrant::default(),
+            &AppliedUplink::default(),
+            &UplinkHealth::default(),
+        )
+        .await;
+        server.await.expect("server task");
+        assert!(latency.is_some());
+    }
+
+    /// 一份「手里在采一份日志工作」的本机工作视图（授权折算出一条采集任务）。
+    fn grant_with_a_log_task() -> AppliedWorkGrant {
+        use wist_contracts::work::{WorkSpecSource, WorkSpecUnit};
+
+        let record = crate::state_store::work::WorkRecord {
+            schema_version: crate::state_store::work::SCHEMA_VERSION_V1.to_string(),
+            recorded_at: "2026-09-24T00:00:00Z".to_string(),
+            gateway_sequence: 9,
+            standing: vec![crate::state_store::work::StandingWorkRecord {
+                work_id: "work-l".to_string(),
+                family: "CrashPanic".to_string(),
+                status: "active".to_string(),
+                plan_version: 1,
+                acknowledged_version: Some(1),
+                effective_from: "2026-09-23T00:00:00Z".to_string(),
+                units: vec![WorkSpecUnit {
+                    unit_id: "mac-crash".to_string(),
+                    capability: "collect_logs".to_string(),
+                    rule_ref: "r".to_string(),
+                    requires_privilege: "none".to_string(),
+                    sources: vec![WorkSpecSource {
+                        kind: "FileGlob".to_string(),
+                        target: "/Library/Logs/DiagnosticReports/crash.ips".to_string(),
+                        multiline: "none".to_string(),
+                    }],
+                }],
+                tasks: Vec::new(),
+            }],
+            one_shot: Vec::new(),
+            metrics_interval_seconds: Some(15),
+        };
+        AppliedWorkGrant::restore(&record)
+    }
+
+    /// 状态上报必须带上**本机工作内容视图**：授权折算出的采集任务 + 配置里手工加的输入，
+    /// 两半合起来才是「这台机器在采哪些文件」（见 `build_local_work`）。
+    #[tokio::test]
+    async fn report_status_carries_the_local_work_view_and_configured_inputs() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let request = read_http_request(&mut socket).await;
+            assert!(request.contains("\"local_work\":{"), "{request}");
+            // 授权那半：工作折算出的采集任务（任务 id + 盯的路径）。
+            assert!(
+                request.contains(
+                    "\"tasks\":[{\"input_id\":\"work-CrashPanic-mac-crash\",\"path\":\"/Library/Logs/DiagnosticReports/crash.ips\""
+                ),
+                "{request}"
+            );
+            // 配置那半：手工加的日志输入（不在 work.json 里）。
+            assert!(
+                request.contains(
+                    "\"local_inputs\":[{\"input_id\":\"manual-app\",\"path\":\"/var/log/manual.log\""
+                ),
+                "{request}"
+            );
+            let response =
+                "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let mut config = test_config();
+        config.control_plane.endpoint = Some(endpoint);
+        config.telemetry.logs.file_inputs =
+            vec![wist_contracts::agent_config::LogFileInputSection {
+                input_id: "manual-app".to_string(),
+                path: "/var/log/manual.log".to_string(),
+                startup_position: "tail".to_string(),
+                multiline_mode: "none".to_string(),
+            }];
+        let grant = grant_with_a_log_task();
+        let latency = report_status_to_control_plane(
+            &config,
+            Some(12.5),
+            Some(3),
+            None,
+            None,
+            &grant,
+            &AppliedUplink::default(),
+            &UplinkHealth::default(),
+        )
+        .await;
         server.await.expect("server task");
         assert!(latency.is_some());
     }
@@ -1983,7 +2629,17 @@ mod tests {
     async fn report_status_skips_when_not_enrolled() {
         let mut config = test_config();
         config.control_plane.bearer_token = None;
-        let latency = report_status_to_control_plane(&config, None, None, None, None).await;
+        let latency = report_status_to_control_plane(
+            &config,
+            None,
+            None,
+            None,
+            None,
+            &AppliedWorkGrant::default(),
+            &AppliedUplink::default(),
+            &UplinkHealth::default(),
+        )
+        .await;
         assert!(latency.is_none());
     }
 
