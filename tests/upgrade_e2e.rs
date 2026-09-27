@@ -36,6 +36,8 @@ const ALL_BINS: [&str; 3] = [AGENTD_BIN_NAME, EXEC_BIN_NAME, UPGRADER_BIN_NAME];
 /// 一个升级沙箱：`bin/` 是「已装的」二进制，`state/` 是本机状态，制品与桩放根下。
 struct Sandbox {
     root: PathBuf,
+    /// 是否在请求里声明允许降级（缺省关 = 只前进）。
+    allow_downgrade: bool,
 }
 
 impl Sandbox {
@@ -47,7 +49,10 @@ impl Sandbox {
         for name in installed {
             write_fake_binary(&root.join("bin").join(name), name, FROM);
         }
-        Self { root }
+        Self {
+            root,
+            allow_downgrade: false,
+        }
     }
 
     fn bin_dir(&self) -> PathBuf {
@@ -56,6 +61,19 @@ impl Sandbox {
 
     fn state_dir(&self) -> PathBuf {
         self.root.join("state")
+    }
+
+    /// 打开降级开关（缺省关 = 只前进，与 agentd 的 `--allow-downgrade` 缺省一致）。
+    fn allow_downgrade(mut self) -> Self {
+        self.allow_downgrade = true;
+        self
+    }
+
+    /// 把已装的件改写成自报 `version`（降级演练：机器上跑着**更高**的版本）。
+    fn seed_installed_version(&self, version: &str) {
+        for name in ALL_BINS {
+            write_fake_binary(&self.bin_dir().join(name), name, version);
+        }
     }
 
     /// 种一份「这台机器现在跑的是 `version`」的本机状态（真机上是 agentd 一直在写的）。
@@ -159,6 +177,7 @@ impl Sandbox {
             agentd_bin: self.bin_dir().join(AGENTD_BIN_NAME),
             package_url: package.display().to_string(),
             package_sha256: sha256.to_string(),
+            allow_downgrade: self.allow_downgrade,
         }
     }
 
@@ -169,8 +188,18 @@ impl Sandbox {
         restart: RestartPlan,
         ready_wait: Duration,
     ) -> UpgradeRecord {
+        self.run_request(self.request(package, sha256), restart, ready_wait)
+            .await
+    }
+
+    /// 用**给定**的请求跑一次（降级演练要显式控制 `current`/`target` 的方向）。
+    async fn run_request(
+        &self,
+        request: UpgradeRequest,
+        restart: RestartPlan,
+        ready_wait: Duration,
+    ) -> UpgradeRecord {
         let config = self.config();
-        let request = self.request(package, sha256);
         let options = UpgradeOptions {
             dry_run: false,
             ready_wait,
@@ -505,6 +534,92 @@ async fn the_record_persists_its_step_while_the_upgrade_is_in_flight() {
         observed_step.as_deref(),
         Some("wait_ready"),
         "盘上的记录该在升级进行中推进到 wait_ready，而不是停在 fetch"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 显式降级
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 声明了降级（`allow_downgrade`）就能把机器退到**更低**的版本：换件 → 重启 → `wait_ready`
+/// 全过，结果 `succeeded`，记录里 `from` 高 `to` 低 —— 不因为「版本变小」被判失败。
+///
+/// 用显式目标版本走「说好就是这一版」那支；「目标以包内自报为准」的降级另有一条单测。
+#[tokio::test]
+async fn a_declared_downgrade_replaces_binaries_and_reports_success() {
+    let sandbox = Sandbox::new("downgrade-ok", &ALL_BINS).allow_downgrade();
+    // 现装的是更高的版本，目标包是更低的版本。
+    sandbox.seed_installed_version(TO);
+    sandbox.seed_running_version(TO);
+    let (package, sha) = sandbox.package(FROM);
+
+    let mut request = sandbox.request(&package, &sha);
+    request.current_version = TO.to_string();
+    request.target_version = Some(FROM.to_string());
+    assert!(request.allow_downgrade, "沙箱开关要进到请求里");
+
+    let record = sandbox
+        .run_request(
+            request,
+            sandbox.restart_stub("ok", FROM),
+            Duration::from_secs(10),
+        )
+        .await;
+
+    assert_eq!(record.status, "succeeded", "{record:?}");
+    assert_eq!(record.from_version, TO);
+    assert_eq!(record.to_version, FROM, "目标版本是更低的那一版");
+    // 三个件都换成低版本（不是只换 agentd）。
+    assert_eq!(sandbox.installed_agentd_version(), FROM);
+    assert_eq!(
+        sandbox.version_of(&sandbox.bin_dir().join(EXEC_BIN_NAME)),
+        FROM
+    );
+    assert_eq!(
+        sandbox.version_of(&sandbox.bin_dir().join(UPGRADER_BIN_NAME)),
+        FROM
+    );
+    // 换件前的高版本留了备份（名字按 current_version 拼）。
+    assert!(
+        sandbox
+            .bin_dir()
+            .join(format!("{AGENTD_BIN_NAME}.bak-{TO}"))
+            .is_file(),
+        "换掉的高版本要留备份"
+    );
+}
+
+/// 没声明降级（缺省只前进）：目标版本更低 → `not_newer` 拦下，盘上一点没动。
+#[tokio::test]
+async fn a_downgrade_without_the_flag_is_refused_as_not_newer() {
+    let sandbox = Sandbox::new("downgrade-refused", &ALL_BINS);
+    sandbox.seed_installed_version(TO);
+    sandbox.seed_running_version(TO);
+    let (package, sha) = sandbox.package(FROM);
+
+    let mut request = sandbox.request(&package, &sha);
+    request.current_version = TO.to_string();
+    request.target_version = Some(FROM.to_string());
+    assert!(!request.allow_downgrade, "缺省必须是「只前进」");
+
+    let record = sandbox
+        .run_request(
+            request,
+            sandbox.restart_stub("ok", FROM),
+            Duration::from_secs(10),
+        )
+        .await;
+
+    assert_eq!(record.status, "failed", "{record:?}");
+    assert!(record.detail.contains("not_newer"), "{}", record.detail);
+    // 没换件：盘上还是高版本，也没留备份。
+    assert_eq!(sandbox.installed_agentd_version(), TO);
+    assert!(
+        !sandbox
+            .bin_dir()
+            .join(format!("{AGENTD_BIN_NAME}.bak-{TO}"))
+            .exists(),
+        "被拦下就不该留下备份"
     );
 }
 

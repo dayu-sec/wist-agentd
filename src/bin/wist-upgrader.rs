@@ -21,13 +21,14 @@ Usage:
   wist-upgrader apply --config-dir <dir> --work-id <id> --current-version <v>
                       --package-url <url> --package-sha256 <sha>
                       [--target-version <v>] [--bin <agentd path>] [--apply]
-                      [--scope system|user] [--ready-wait-secs <n>]
+                      [--allow-downgrade] [--scope system|user] [--ready-wait-secs <n>]
   wist-upgrader version
   wist-upgrader help
 
 Options:
   --target-version <v>   目标版本（**可选**：不给就以包内 agentd 自报的版本为准）
   --apply                真的换件并重启（不加 = 演练：取包/验摘要/解包/验版本，不动已装二进制）
+  --allow-downgrade      允许同版本/降级（**默认只前进**；要降级必须显式加这个开关）
   --bin <path>           要替换的 wist-agentd 路径（默认：本可执行文件同级的 wist-agentd）
   --scope <system|user>  服务作用域（默认：配置目录在 /etc/wist-agentd 下即 system）
   --ready-wait-secs <n>  换件后等新版起来的秒数（默认 60）
@@ -46,6 +47,8 @@ struct Args {
     scope_is_system: bool,
     scope_explicit: bool,
     dry_run: bool,
+    /// 是否允许同版本/降级。默认 `false`：只前进（见 `--allow-downgrade`）。
+    allow_downgrade: bool,
     ready_wait: Duration,
 }
 
@@ -88,6 +91,7 @@ where
     let mut package_sha256: Option<String> = None;
     let mut scope: Option<String> = None;
     let mut dry_run = true;
+    let mut allow_downgrade = false;
     let mut ready_wait = DEFAULT_READY_WAIT;
 
     while let Some(flag) = args.next() {
@@ -112,6 +116,7 @@ where
                 ready_wait = Duration::from_secs(secs);
             }
             "--apply" => dry_run = false,
+            "--allow-downgrade" => allow_downgrade = true,
             other => return Err(format!("unsupported flag: {other}\n\n{USAGE}")),
         }
     }
@@ -135,6 +140,7 @@ where
         scope_is_system,
         scope_explicit,
         dry_run,
+        allow_downgrade,
         ready_wait,
     })
 }
@@ -168,6 +174,7 @@ async fn execute(args: Args) -> Result<(), String> {
         agentd_bin,
         package_url: args.package_url,
         package_sha256: args.package_sha256,
+        allow_downgrade: args.allow_downgrade,
     };
     let options = UpgradeOptions {
         dry_run: args.dry_run,
@@ -253,6 +260,34 @@ mod tests {
         assert!(!args.scope_explicit);
         assert_eq!(args.ready_wait, Duration::from_secs(60));
         assert_eq!(args.bin, None);
+    }
+
+    /// `--allow-downgrade` 默认关（只前进），显式给了才开。
+    /// 这是传递链的最后一跳：argv 到底有没有带这个事实，就靠 `args.allow_downgrade`。
+    #[test]
+    fn parse_defaults_to_only_forward_and_accepts_allow_downgrade() {
+        let base = [
+            "--config-dir",
+            "/etc/wist-agentd",
+            "--work-id",
+            "work-1",
+            "--current-version",
+            "0.1.3",
+            "--package-url",
+            "/tmp/package.tar.gz",
+            "--package-sha256",
+            "sha256:abc",
+        ];
+
+        // 缺省 = 只前进。
+        let args = parse(&base).expect("parse");
+        assert!(!args.allow_downgrade, "缺省必须是「只前进」");
+
+        // 显式声明降级。
+        let mut with_flag = base.to_vec();
+        with_flag.push("--allow-downgrade");
+        let args = parse(&with_flag).expect("parse");
+        assert!(args.allow_downgrade);
     }
 
     #[test]

@@ -82,6 +82,12 @@ pub struct UpgradeSpec {
     pub target_version: Option<String>,
     pub package_url: String,
     pub package_sha256: String,
+    /// 是否允许同版本/降级。默认 `false`：只前进。
+    ///
+    /// 守卫默认在最严的一侧：降级会真的把机器往回退，所以要**显式**在这里写 `true`，
+    /// 而不是靠缺省字段静默放行（见 [`validate_request`] / [`resolve_target_version`]）。
+    #[serde(default)]
+    pub allow_downgrade: bool,
 }
 
 /// 一次升级请求：把工作参数与「本机现状」凑在一起。
@@ -97,6 +103,8 @@ pub struct UpgradeRequest {
     pub agentd_bin: PathBuf,
     pub package_url: String,
     pub package_sha256: String,
+    /// 是否允许同版本/降级。默认 `false`：只前进（见 [`validate_request`]）。
+    pub allow_downgrade: bool,
 }
 
 impl UpgradeRequest {
@@ -275,7 +283,10 @@ fn validate_request(request: &UpgradeRequest) -> Result<(), UpgradeError> {
     // 显式给了目标版本就先比一次（早失败）；没给就跳过 —— 它要等解包、读到包内
     // agentd 自报的版本才能比（见 `resolve_target_version`）。
     if let Some(target) = provided_target(request) {
-        ensure_newer(target, &request.current_version)?;
+        // 默认只前进；降级要**显式声明** `allow_downgrade` 才放行。
+        if !request.allow_downgrade {
+            ensure_newer(target, &request.current_version)?;
+        }
     }
     digest_hex(&request.package_sha256)?;
     Ok(())
@@ -312,7 +323,8 @@ fn ensure_newer(target: &str, current: &str) -> Result<(), UpgradeError> {
 /// * 显式给了就用它，但要求与包内 agentd 自报的版本**一致**（不一致 = 说的与装的是两回事）；
 /// * 没给（常见）就**以包内自报的版本为准** —— 版本本来就是那份包里的版本;
 ///
-/// 无论哪条，最后都要比当前运行版本新（只前进）。
+/// 无论哪条，最后都要比当前运行版本新（只前进）—— 除非请求**显式声明**了
+/// `allow_downgrade`（同版本/降级才放行；目标版本仍以包内自报为准，这里不改）。
 fn resolve_target_version(
     request: &UpgradeRequest,
     reported: &str,
@@ -329,7 +341,10 @@ fn resolve_target_version(
         }
         None => reported.to_string(),
     };
-    ensure_newer(&target, &request.current_version)?;
+    // 默认只前进；降级要**显式声明** `allow_downgrade` 才放行。
+    if !request.allow_downgrade {
+        ensure_newer(&target, &request.current_version)?;
+    }
     Ok(target)
 }
 
@@ -359,9 +374,13 @@ async fn fetch_package(config: &AgentConfig, source: &str) -> Result<Vec<u8>, Up
     }
     let client = enrollment_http_client(config)
         .map_err(|err| fail("package_unavailable", format!("build http client: {err}")))?;
-    let response = client
-        .get(source)
-        .timeout(DOWNLOAD_TIMEOUT)
+    let mut request = client.get(source).timeout(DOWNLOAD_TIMEOUT);
+    // 网关的分发端点要 agent 凭据：带上 `Authorization: Bearer <token>`。
+    // 没配 token（`None`）就不加这个头 —— 不改错、也不报错，与服务端匿名分发保持兼容。
+    if let Some(token) = config.control_plane.bearer_token.as_deref() {
+        request = request.bearer_auth(token);
+    }
+    let response = request
         .send()
         .await
         .map_err(|err| fail("package_unavailable", format!("GET {source}: {err}")))?;
@@ -918,6 +937,10 @@ pub fn build_launch(program: &Path, config_dir: &Path, request: &UpgradeRequest)
         args.push("--target-version".to_string());
         args.push(target.to_string());
     }
+    // 降级是显式动作：只有请求声明了才把这条事实传给升级器（缺省不带 = 只前进）。
+    if request.allow_downgrade {
+        args.push("--allow-downgrade".to_string());
+    }
     args.extend([
         "--current-version".to_string(),
         request.current_version.clone(),
@@ -1120,6 +1143,8 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     use wist_contracts::agent_config::{
         AgentConfig, AgentSection, ControlPlaneSection, PathsSection,
     };
@@ -1156,6 +1181,7 @@ mod tests {
             agentd_bin,
             package_url: "/nonexistent/package.tar.gz".to_string(),
             package_sha256: "0".repeat(64),
+            allow_downgrade: false,
         }
     }
 
@@ -1214,6 +1240,57 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// 版本比较的边界逐条钉住：相等 / 数值段 / 预发布后缀 / 四段 / `v` 前缀 / 空串 / 非数字。
+    /// 判据只有两档：能比就比出新旧，比不出来一律 `version_uncomparable`（宁可拒绝也不猜）。
+    #[test]
+    fn validate_maps_version_boundaries_to_the_right_codes() {
+        let dir = temp_dir("validate-boundaries");
+        // (target, current, allow_downgrade, 该不该拒)
+        let cases: &[(&str, &str, bool, Option<&str>)] = &[
+            // 数值比较：0.1.10 比 0.1.9 新（不是字典序），反过来旧。
+            ("0.1.10", "0.1.9", false, None),
+            ("0.1.9", "0.1.10", false, Some("not_newer")),
+            // 相等：同版本重装也算「不更新」→ not_newer（不是 uncomparable）。
+            ("0.1.9", "0.1.9", false, Some("not_newer")),
+            // 显式声明降级：同版本/低版本都放行。
+            ("0.1.9", "0.1.9", true, None),
+            ("0.1.9", "0.1.10", true, None),
+            // 预发布后缀只看前面的数字段。
+            ("0.2.0-beta.1", "0.1.9", false, None),
+            // 四段：多一段视为更细的补丁，比三段新。
+            ("0.1.9.1", "0.1.9", false, None),
+            // 空前缀 `v` / 非数字 / 当前版本不可比 → 认不出来，拒。
+            ("v0.1.9", "0.1.9", false, Some("version_uncomparable")),
+            ("abc", "0.1.9", false, Some("version_uncomparable")),
+            ("0.1.9", "dev", false, Some("version_uncomparable")),
+            ("0.1.9", "", false, Some("version_uncomparable")),
+            // 显式声明降级会连同「可比性」一起让开：这是刻意的取舍 ——
+            // 版本来自摘要校验过的包，且没有方向可判时不该替运维对非语义化版本猜大小。
+            ("abc", "0.1.9", true, None),
+        ];
+        for (target, current, allow_downgrade, expected) in cases {
+            let mut request = request(dir.join(AGENTD_BIN_NAME));
+            request.target_version = Some((*target).to_string());
+            request.current_version = (*current).to_string();
+            request.allow_downgrade = *allow_downgrade;
+            let outcome = validate_request(&request);
+            match expected {
+                None => {
+                    outcome.unwrap_or_else(|err| {
+                        panic!("{target} vs {current} (allow={allow_downgrade}) should pass: {err}")
+                    });
+                }
+                Some(code) => {
+                    let err = outcome.expect_err(&format!(
+                        "{target} vs {current} (allow={allow_downgrade}) should be refused"
+                    ));
+                    assert_eq!(err.reason, *code, "{target} vs {current}");
+                }
+            }
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn validate_refuses_a_malformed_digest() {
         let dir = temp_dir("validate-digest");
@@ -1239,6 +1316,33 @@ mod tests {
         assert_eq!(version_is_newer("dev", "0.1.3"), None);
         assert_eq!(version_is_newer("0.1.3", "dev"), None);
         assert_eq!(version_is_newer("v0.1.4", "0.1.3"), None);
+    }
+
+    /// 版本比较的三档结果本身（`Some(true)` / `Some(false)` / `None`）在边界上的取值。
+    ///
+    /// 这条把「相等」显式钉成 `Some(false)`（不是 `None`）：`ensure_newer` 据此报 `not_newer`
+    /// 而不是 `version_uncomparable` —— 同版本重装的错误码靠它定。
+    #[test]
+    fn version_is_newer_boundaries_return_the_right_three_ways() {
+        // 相等 → Some(false)（不是「新」，也不是「比不出来」）。
+        assert_eq!(version_is_newer("0.1.9", "0.1.9"), Some(false));
+        assert_eq!(version_is_newer("1.2.3", "1.2.3"), Some(false));
+        // 数值比较而不是字典序："0.1.10" > "0.1.9"。
+        assert_eq!(version_is_newer("0.1.10", "0.1.9"), Some(true));
+        assert_eq!(version_is_newer("0.1.9", "0.1.10"), Some(false));
+        // 预发布后缀：只看前缀的数字段。
+        assert_eq!(version_is_newer("0.2.0-beta.1", "0.1.9"), Some(true));
+        assert_eq!(version_is_newer("0.2.0-beta.1", "0.2.0"), Some(false));
+        // 四段：段数更多（同一前缀）视为更新。
+        assert_eq!(version_is_newer("0.1.9.1", "0.1.9"), Some(true));
+        assert_eq!(version_is_newer("1.2.3.4", "1.2.3.3"), Some(true));
+        // 空前缀 `v`：不是点分数字 → 不可比（即使数值部分相同也拒）。
+        assert_eq!(version_is_newer("v0.1.9", "0.1.9"), None);
+        assert_eq!(version_is_newer("0.1.9", "v0.1.9"), None);
+        // 空串 / 非数字 → 不可比。
+        assert_eq!(version_is_newer("", "0.1.9"), None);
+        assert_eq!(version_is_newer("0.1.9", ""), None);
+        assert_eq!(version_is_newer("abc", "0.1.9"), None);
     }
 
     #[test]
@@ -1295,6 +1399,34 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// `resolve_target_version` 这条路上的边界：相等 → `not_newer`；包内自报不可比 →
+    /// `version_uncomparable`；显式声明降级后相等也放行。
+    #[test]
+    fn resolve_target_version_handles_equal_and_uncomparable_versions() {
+        let dir = temp_dir("resolve-boundaries");
+        let mut req = request(dir.join(AGENTD_BIN_NAME));
+        req.current_version = "0.1.4".to_string();
+
+        // 同版本（目标 == 当前）默认拒 —— 错码是 `not_newer`，不是 `version_uncomparable`。
+        req.target_version = Some("0.1.4".to_string());
+        let err = resolve_target_version(&req, "0.1.4").expect_err("same version refused");
+        assert_eq!(err.reason, "not_newer");
+
+        // 没显式给时以包内自报为准；自报的版本不可比（空串）→ `version_uncomparable`。
+        req.target_version = None;
+        let err = resolve_target_version(&req, "").expect_err("uncomparable refused");
+        assert_eq!(err.reason, "version_uncomparable");
+
+        // 显式声明降级后，同版本放行。
+        req.target_version = Some("0.1.4".to_string());
+        req.allow_downgrade = true;
+        assert_eq!(
+            resolve_target_version(&req, "0.1.4").expect("declared reinstall"),
+            "0.1.4"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn validate_request_rejects_an_empty_work_id() {
         let dir = temp_dir("validate-work-id");
@@ -1314,6 +1446,7 @@ mod tests {
             agentd_bin: PathBuf::from("/usr/local/bin/wist-agentd"),
             package_url: "https://gw/api/v1/agent/packages/current".to_string(),
             package_sha256: "sha256:abc".to_string(),
+            allow_downgrade: false,
         };
         let launch = build_launch(
             Path::new("/usr/local/bin/wist-upgrader"),
@@ -1337,6 +1470,41 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "sha256:abc"));
         // 派下来的活就是要求执行：预演是人在终端里做的事。
         assert_eq!(args.last().map(String::as_str), Some("--apply"));
+    }
+
+    /// `allow_downgrade` 的传递：只前进时 argv 里**不该**出现该标志（负例），
+    /// 显式声明降级时**必须**带上（否则升级器会按「只前进」把降级拒掉）。
+    #[test]
+    fn build_launch_carries_allow_downgrade_only_when_declared() {
+        let dir = temp_dir("launch-downgrade");
+        let mut request = request(dir.join(AGENTD_BIN_NAME));
+
+        // 缺省 = 只前进：负例 —— 标志不该被“顺手”带上。
+        assert!(!request.allow_downgrade);
+        let launch = build_launch(
+            Path::new("/usr/local/bin/wist-upgrader"),
+            Path::new("/etc/wist-agentd"),
+            &request,
+        );
+        assert!(
+            !launch.args.iter().any(|arg| arg == "--allow-downgrade"),
+            "only-forward launch must not carry the flag: {:?}",
+            launch.args
+        );
+
+        // 显式声明降级：标志必须出现。
+        request.allow_downgrade = true;
+        let launch = build_launch(
+            Path::new("/usr/local/bin/wist-upgrader"),
+            Path::new("/etc/wist-agentd"),
+            &request,
+        );
+        assert!(
+            launch.args.iter().any(|arg| arg == "--allow-downgrade"),
+            "declared downgrade must reach the upgrader: {:?}",
+            launch.args
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1710,6 +1878,291 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn parse_spec_reads_the_optional_allow_downgrade() {
+        // `allow_downgrade` 可省、可显式给：给 `true` 就认，缺字段默认 `false`（只前进）。
+        let spec = parse_spec(
+            r#"{"package_url":"https://gw/x","package_sha256":"abc","allow_downgrade":true}"#,
+        )
+        .expect("parse");
+        assert!(spec.allow_downgrade);
+
+        let spec =
+            parse_spec(r#"{"package_url":"https://gw/x","package_sha256":"abc"}"#).expect("parse");
+        assert!(!spec.allow_downgrade, "缺字段时默认就必须是「只前进」");
+    }
+
+    #[test]
+    fn declared_downgrade_is_allowed() {
+        let dir = temp_dir("allow-downgrade");
+        let mut req = request(dir.join(AGENTD_BIN_NAME));
+        req.current_version = "0.1.5".to_string();
+        req.target_version = Some("0.1.3".to_string());
+        req.allow_downgrade = true;
+
+        // 显式声明降级：校验放行，目标版本仍以（这里的显式值 = 包内自报）为准。
+        validate_request(&req).expect("declared downgrade passes validate");
+        assert_eq!(
+            resolve_target_version(&req, "0.1.3").expect("declared downgrade resolves"),
+            "0.1.3"
+        );
+
+        // 同版本（重装）也放行。
+        req.current_version = "0.1.3".to_string();
+        validate_request(&req).expect("declared reinstall passes validate");
+        assert_eq!(
+            resolve_target_version(&req, "0.1.3").expect("declared reinstall resolves"),
+            "0.1.3"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn downgrade_is_refused_unless_declared() {
+        let dir = temp_dir("refuse-downgrade");
+        let mut req = request(dir.join(AGENTD_BIN_NAME));
+        req.current_version = "0.1.5".to_string();
+        req.target_version = Some("0.1.3".to_string());
+        // 缺省（或显式 `false`）= 只前进：降级与重装照样拒。
+        assert!(!req.allow_downgrade, "默认必须是「只前进」");
+
+        let err = validate_request(&req).expect_err("default must refuse downgrade");
+        assert_eq!(err.reason, "not_newer", "{err}");
+        let err = resolve_target_version(&req, "0.1.3").expect_err("default must refuse downgrade");
+        assert_eq!(err.reason, "not_newer", "{err}");
+
+        // 显式 `false` 与缺省等价。
+        req.allow_downgrade = false;
+        let err = validate_request(&req).expect_err("explicit false must refuse");
+        assert_eq!(err.reason, "not_newer", "{err}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn fetch_package_sends_the_agent_bearer_token() {
+        let dir = temp_dir("fetch-bearer");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let source = format!("http://{}/package", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request_bytes = Vec::new();
+            loop {
+                let mut chunk = [0u8; 1024];
+                let read = socket.read(&mut chunk).await.expect("read");
+                if read == 0 {
+                    break;
+                }
+                request_bytes.extend_from_slice(&chunk[..read]);
+                if request_bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request_bytes);
+            assert!(
+                request
+                    .to_lowercase()
+                    .contains("authorization: bearer wic_package_token"),
+                "{request}"
+            );
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\nconnection: close\r\n\r\nPKG")
+                .await
+                .expect("write response");
+        });
+
+        let mut config = config_with_state(&dir);
+        config.control_plane.bearer_token = Some("wic_package_token".to_string());
+        let bytes = fetch_package(&config, &source).await.expect("fetch");
+        server.await.expect("server task");
+
+        assert_eq!(bytes, b"PKG");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// 取包与**其它控制面 HTTP 调用同口径**：同一份 `config`、明文 `http://` 下都**无条件**带
+    /// `Authorization: Bearer <token>`，不看 URL scheme。
+    ///
+    /// 拿一个代表性的控制面调用 `fetch_work_grant`（`control::work`，work:poll）与取包对拍：
+    /// 两个请求打到同一个明文端点，都必须出现同一个头。其余控制面调用
+    /// （`report_status_to_control_plane` / `fetch_uplink_grant` / `fetch_discovery_policies` /
+    /// `report_work_result`）各自有同形状的单测钉住同样的行为 —— 这条把「跨调用口径」本身钉住。
+    #[tokio::test]
+    async fn fetch_package_matches_the_control_plane_bearer_convention_on_plaintext_http() {
+        let dir = temp_dir("fetch-convention");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut request_bytes = Vec::new();
+                loop {
+                    let mut chunk = [0u8; 1024];
+                    let read = socket.read(&mut chunk).await.expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    request_bytes.extend_from_slice(&chunk[..read]);
+                    if request_bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                seen.push(String::from_utf8_lossy(&request_bytes).to_lowercase());
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\nconnection: close\r\n\r\nPKG",
+                    )
+                    .await
+                    .expect("write response");
+            }
+            seen
+        });
+
+        let mut config = config_with_state(&dir);
+        config.agent.agent_id = Some("agent-x".to_string());
+        config.agent.instance_name = Some("instance-x".to_string());
+        config.control_plane.endpoint = Some(endpoint.clone());
+        config.control_plane.bearer_token = Some("wic_shared_token".to_string());
+
+        // 取包（GET）与控制面的一个代表（POST work:poll）：同一份 config、同一个明文端点。
+        let _ = fetch_package(&config, &format!("{endpoint}/package")).await;
+        let _ = crate::control::work::fetch_work_grant(&config, 0).await;
+
+        let seen = server.await.expect("server task");
+        assert_eq!(seen.len(), 2, "两个调用都该打到这个端点");
+        for request in &seen {
+            assert!(
+                request.contains("authorization: bearer wic_shared_token"),
+                "明文 http 下每个控制面调用都必须带同一份凭据: {request}"
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn fetch_package_omits_authorization_without_a_token() {
+        let dir = temp_dir("fetch-no-bearer");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let source = format!("http://{}/package", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request_bytes = Vec::new();
+            loop {
+                let mut chunk = [0u8; 1024];
+                let read = socket.read(&mut chunk).await.expect("read");
+                if read == 0 {
+                    break;
+                }
+                request_bytes.extend_from_slice(&chunk[..read]);
+                if request_bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request_bytes);
+            // 没配 token 就不该出现这个头（`None` 不是错误，只是不带凭据）。
+            assert!(
+                !request.to_lowercase().contains("authorization:"),
+                "{request}"
+            );
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\nconnection: close\r\n\r\nPKG")
+                .await
+                .expect("write response");
+        });
+
+        let config = config_with_state(&dir);
+        let bytes = fetch_package(&config, &source).await.expect("fetch");
+        server.await.expect("server task");
+
+        assert_eq!(bytes, b"PKG");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// 令牌里的 URL-safe 特殊字符必须**原样**进 header（不能被转义 / 截断 / 丢字符）。
+    #[tokio::test]
+    async fn fetch_package_preserves_a_token_with_special_characters() {
+        let dir = temp_dir("fetch-bearer-special");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let source = format!("http://{}/package", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request_bytes = Vec::new();
+            loop {
+                let mut chunk = [0u8; 1024];
+                let read = socket.read(&mut chunk).await.expect("read");
+                if read == 0 {
+                    break;
+                }
+                request_bytes.extend_from_slice(&chunk[..read]);
+                if request_bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request_bytes).to_lowercase();
+            assert!(
+                request.contains("authorization: bearer wic/tok+en=_.~-"),
+                "{request}"
+            );
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\nconnection: close\r\n\r\nPKG")
+                .await
+                .expect("write response");
+        });
+
+        let mut config = config_with_state(&dir);
+        config.control_plane.bearer_token = Some("wic/tok+en=_.~-".to_string());
+        let bytes = fetch_package(&config, &source).await.expect("fetch");
+        server.await.expect("server task");
+        assert_eq!(bytes, b"PKG");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// 头里塞不进换行的令牌：不能被拼进请求（请求走私），也不能 panic —— 干净地失败。
+    ///
+    /// 服务端只接受一次连接并立即回 200：若 header 真的被拼出去，请求会成功，这条就会挂号；
+    /// header 被客户端拒掉时根本不会建连，服务端 accept 超时后自然结束（不会挂住测试）。
+    #[tokio::test]
+    async fn fetch_package_fails_cleanly_on_a_token_that_cannot_be_a_header() {
+        let dir = temp_dir("fetch-bad-token");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let source = format!("http://{}/package", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let accepted =
+                tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
+            if let Ok(Ok((mut socket, _))) = accepted {
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\nconnection: close\r\n\r\nPKG",
+                    )
+                    .await;
+            }
+        });
+
+        let mut config = config_with_state(&dir);
+        config.control_plane.bearer_token = Some("wic_token\r\nx-evil: 1".to_string());
+        let err = fetch_package(&config, &source)
+            .await
+            .expect_err("must fail");
+        assert_eq!(err.reason, "package_unavailable", "{err}");
+        server.await.expect("server task");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// 本地路径分支不发 HTTP：即便配了 token 也直接读文件，不受凭据影响。
+    #[tokio::test]
+    async fn fetch_package_reads_a_local_path_without_using_the_token() {
+        let dir = temp_dir("fetch-local");
+        let package = dir.join("package.tar.gz");
+        fs::write(&package, b"LOCAL").expect("write package");
+        let mut config = config_with_state(&dir);
+        config.control_plane.bearer_token = Some("wic_unused_token".to_string());
+        let bytes = fetch_package(&config, &package.display().to_string())
+            .await
+            .expect("local read");
+        assert_eq!(bytes, b"LOCAL");
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn apply_reports_an_unreachable_package_without_touching_anything() {
         let dir = temp_dir("apply-fetch");
@@ -1783,6 +2236,53 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// 降级全流程（演练到换件前）：声明降级则落地，记录里 `from` 高 `to` 低，状态仍是成功 ——
+    /// 不因为「版本变小」被判失败。没声明则在验制品这步被 `not_newer` 拦下。
+    #[tokio::test]
+    async fn apply_records_a_declared_downgrade_as_succeeded_high_to_low() {
+        let dir = temp_dir("apply-downgrade");
+        let state_dir = dir.join("state");
+        let bin_dir = dir.join("bin");
+        fs::create_dir_all(&state_dir).expect("state dir");
+        fs::create_dir_all(&bin_dir).expect("bin dir");
+        // 盘上跑的是 0.1.5，包里是更低的 0.1.3。
+        let installed = fake_agentd(&bin_dir, "0.1.5");
+        let artifact = dir.join("artifact");
+        fs::create_dir_all(&artifact).expect("artifact dir");
+        let packaged = artifact.join(AGENTD_BIN_NAME);
+        fs::write(&packaged, "#!/bin/sh\necho \"wist-agentd 0.1.3\"\n").expect("write artifact");
+        let bytes = fs::read(&packaged).expect("read artifact");
+
+        let config = config_with_state(&state_dir);
+        let mut request = request(installed);
+        request.current_version = "0.1.5".to_string();
+        request.target_version = None; // 版本由包内自报决定 → 更低的 0.1.3
+        request.package_url = packaged.display().to_string();
+        request.package_sha256 = sha256_hex(&bytes);
+
+        // 没声明降级：默认只前进，在“验制品”这步被 `not_newer` 拦住（不落件）。
+        let record = apply(&config, &request, &UpgradeOptions::default()).await;
+        assert_eq!(record.status, "failed", "{record:?}");
+        assert_eq!(record.step, "verify_artifact", "{record:?}");
+        assert!(record.detail.contains("not_newer"), "{record:?}");
+
+        // 显式声明降级：放行；演练停在换件前，记录里 from 高 to 低，状态是成功。
+        request.allow_downgrade = true;
+        let record = apply(&config, &request, &UpgradeOptions::default()).await;
+        assert_eq!(record.status, "succeeded", "{record:?}");
+        assert_eq!(record.step, "install", "{record:?}");
+        assert_eq!(record.from_version, "0.1.5");
+        assert_eq!(record.to_version, "0.1.3");
+        // 演练不落件：旧件原样在。
+        let installed_text =
+            fs::read_to_string(bin_dir.join(AGENTD_BIN_NAME)).expect("read installed");
+        assert!(
+            installed_text.contains("0.1.5"),
+            "dry run must not replace: {installed_text}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn wait_for_version_reads_the_running_state() {
         let dir = temp_dir("wait-ready");
@@ -1805,6 +2305,47 @@ mod tests {
         assert!(
             !wait_for_version(&state_dir, "9.9.9", Duration::from_millis(200)).await,
             "other version must time out"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// 降级专用：就绪判据是 `==`，不是「必须比原来更高」。
+    ///
+    /// 场景：原本跑 0.1.5，降级到 0.1.3。重启那一刻盘上的状态还是**高的** 0.1.5，
+    /// 此时等 0.1.3 必须判「还没起来」；新版自报 0.1.3 后才算就绪 —— 这证明判据对低版本同样成立。
+    #[tokio::test]
+    async fn wait_for_version_accepts_a_lower_downgrade_target() {
+        let dir = temp_dir("wait-downgrade");
+        let state_dir = dir.join("state");
+        fs::create_dir_all(&state_dir).expect("state dir");
+        let path = state_dir.join(wist_shared::paths::AGENT_RUNTIME_FILE);
+
+        // 旧（高）版本还在报着：它不等于降级目标，不能当成「新版本起来了」。
+        let old = AgentRuntimeState::new(
+            "agent-a".to_string(),
+            "instance-a".to_string(),
+            "0.1.5".to_string(),
+            RuntimeMode::Normal,
+            now_rfc3339(),
+        );
+        write_json_atomic(&path, &old).expect("store old runtime state");
+        assert!(
+            !wait_for_version(&state_dir, "0.1.3", Duration::from_millis(200)).await,
+            "the still-running higher version must not satisfy a downgrade target"
+        );
+
+        // 降级后的新版自报**低**版本：`==` 成立，判就绪。
+        let downgraded = AgentRuntimeState::new(
+            "agent-a".to_string(),
+            "instance-a".to_string(),
+            "0.1.3".to_string(),
+            RuntimeMode::Normal,
+            now_rfc3339(),
+        );
+        write_json_atomic(&path, &downgraded).expect("store downgraded runtime state");
+        assert!(
+            wait_for_version(&state_dir, "0.1.3", Duration::from_millis(200)).await,
+            "a lower (downgraded) target must count as ready"
         );
         let _ = fs::remove_dir_all(dir);
     }

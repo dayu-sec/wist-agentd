@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::telemetry::warp_parse::TelemetryRecordSink;
@@ -1209,6 +1209,32 @@ async fn refresh_work_grant(
     }
 }
 
+/// 把一件升级的**工作参数**（`entry.spec`）加上本机现状凑成一次升级请求。
+///
+/// 单独抽成纯函数，是为了给「`spec` → 请求」这一跳一个**可直接单测**的缝：它是派发链上
+/// 唯一一处「把网关的话翻译成本机动作」的地方（取哪个包、目标版本是哪一版、允不允许降级），
+/// 翻译错了的表现是「派了一件错的活」，靠集成测试兜太贵、覆盖太窄。
+///
+/// `agentd_bin` 由调用方注入（真机上是 `current_exe`），当前版本取编译期写死的
+/// `CARGO_PKG_VERSION`：要换的是**正在跑的这一份**，不是从文件名猜的。
+fn upgrade_request_for(
+    agentd_bin: PathBuf,
+    entry: &wist_contracts::work::OneShotWork,
+) -> Result<crate::upgrade::UpgradeRequest, String> {
+    // 参数读不懂就返回 Err（调用方据此不派、也不确认）：网关那边「期望一直没被确认」
+    // 正是坏参数真被看见的形态。
+    let spec = crate::upgrade::parse_spec(&entry.spec).map_err(|err| err.to_string())?;
+    Ok(crate::upgrade::UpgradeRequest {
+        work_id: entry.work_id.clone(),
+        target_version: spec.target_version,
+        current_version: env!("CARGO_PKG_VERSION").to_string(),
+        agentd_bin,
+        package_url: spec.package_url,
+        package_sha256: spec.package_sha256,
+        allow_downgrade: spec.allow_downgrade,
+    })
+}
+
 /// 把一件升级交给升级器执行（分离进程），返回其 pid。
 ///
 /// 参数全部从工作参数里取，**不做任何默认**：取哪个包必须写在 `spec` 里 ——
@@ -1218,22 +1244,13 @@ fn dispatch_upgrade(
     loop_ctx: &DaemonLoop<'_>,
     entry: &wist_contracts::work::OneShotWork,
 ) -> Result<u32, String> {
-    // 参数读不懂就不派（也不确认）：网关那边「期望一直没被确认」正是坏参数真被看见的形态。
-    let spec = crate::upgrade::parse_spec(&entry.spec).map_err(|err| err.to_string())?;
-    let target_label = spec
+    let agentd_bin =
+        std::env::current_exe().map_err(|err| format!("resolve current exe: {err}"))?;
+    let request = upgrade_request_for(agentd_bin, entry)?;
+    let target_label = request
         .target_version
         .clone()
         .unwrap_or_else(|| "(由包内自报)".to_string());
-    let agentd_bin =
-        std::env::current_exe().map_err(|err| format!("resolve current exe: {err}"))?;
-    let request = crate::upgrade::UpgradeRequest {
-        work_id: entry.work_id.clone(),
-        target_version: spec.target_version,
-        current_version: env!("CARGO_PKG_VERSION").to_string(),
-        agentd_bin,
-        package_url: spec.package_url,
-        package_sha256: spec.package_sha256,
-    };
     let launch = crate::upgrade::build_launch(loop_ctx.upgrader_bin, loop_ctx.config_dir, &request);
     let log_path = Path::new(&loop_ctx.config.paths.log_dir).join("wist-upgrader.log");
     eprintln!(
@@ -2879,5 +2896,93 @@ mod tests {
             Some("dispatched")
         );
         assert!(runtime.has_upgrade_in_flight());
+    }
+
+    /// 一件 `action = upgrade` 的一次性工作：这一跳只读 `work_id` 与 `spec`，其余字段不参与。
+    fn upgrade_work(spec: &str) -> wist_contracts::work::OneShotWork {
+        wist_contracts::work::OneShotWork {
+            work_id: "work-upgrade-1".to_string(),
+            agent_id: "agent-1".to_string(),
+            action: "upgrade".to_string(),
+            spec: spec.to_string(),
+            scheduled_at: "2026-09-23T00:00:00Z".to_string(),
+            deadline_at: "2026-09-24T00:00:00Z".to_string(),
+            timeout_seconds: 600,
+            interruptible: false,
+            status: "dispatched".to_string(),
+            paused_at: None,
+            paused_total_seconds: 0,
+            current_step: None,
+            completed_steps: Vec::new(),
+            attempt: 0,
+            issued_by: "admin".to_string(),
+            issued_at: "2026-09-23T00:00:00Z".to_string(),
+        }
+    }
+
+    /// 派发链上唯一一处「把网关的话翻译成本机动作」：逐字段钉住 `spec → UpgradeRequest`。
+    ///
+    /// 这一段以前只能靠 `dispatch_upgrade` 整体兜（要真起进程），现在抽成纯函数后直接单测。
+    #[test]
+    fn upgrade_request_for_carries_the_spec_and_the_build_identity() {
+        let bin = PathBuf::from("/opt/wist/wist-agentd");
+        let sha = "a".repeat(64);
+        // allow_downgrade 显式声明 → true，从 spec 原样带出。
+        let spec = format!(
+            r#"{{"target_version":"0.1.4","package_url":"https://gw/api/v1/agent/packages/current","package_sha256":"{sha}","allow_downgrade":true}}"#
+        );
+        let request = upgrade_request_for(bin.clone(), &upgrade_work(&spec)).expect("build");
+
+        assert_eq!(request.work_id, "work-upgrade-1", "work_id 从工作取");
+        assert_eq!(request.target_version.as_deref(), Some("0.1.4"));
+        assert_eq!(
+            request.current_version,
+            env!("CARGO_PKG_VERSION"),
+            "当前版本取正在跑的这一份（编译期写死），不是从文件名猜的"
+        );
+        assert_eq!(request.agentd_bin, bin, "要换的路径由调用方注入");
+        assert_eq!(
+            request.package_url,
+            "https://gw/api/v1/agent/packages/current"
+        );
+        assert_eq!(request.package_sha256, sha);
+        assert!(request.allow_downgrade, "spec 声明了降级就要带出来");
+
+        // 缺字段：默认只前进（false），且没给目标版本就交给包内自报。
+        let spec = format!(r#"{{"package_url":"https://gw/x","package_sha256":"{sha}"}}"#);
+        let request = upgrade_request_for(bin.clone(), &upgrade_work(&spec)).expect("build");
+        assert!(!request.allow_downgrade, "缺字段必须是「只前进」");
+        assert_eq!(request.target_version, None, "没给目标版本就交给包内自报");
+
+        // 显式 `false` 与缺省等价。
+        let spec = format!(
+            r#"{{"package_url":"https://gw/x","package_sha256":"{sha}","allow_downgrade":false}}"#
+        );
+        let request = upgrade_request_for(bin, &upgrade_work(&spec)).expect("build");
+        assert!(!request.allow_downgrade);
+    }
+
+    /// spec 坏（不是 JSON / 缺包地址）→ `Err`，调用方据此**不派发**（也不确认）。
+    #[test]
+    fn upgrade_request_for_refuses_a_broken_spec() {
+        let bin = PathBuf::from("/opt/wist/wist-agentd");
+
+        // 不是 JSON。
+        let err = upgrade_request_for(bin.clone(), &upgrade_work("not json"))
+            .expect_err("unparseable spec must not build a request");
+        assert!(err.contains("spec_invalid"), "{err}");
+
+        // 形状对但包地址为空 —— 同样是坏 spec。
+        let err = upgrade_request_for(
+            bin.clone(),
+            &upgrade_work(r#"{"package_url":"   ","package_sha256":"x"}"#),
+        )
+        .expect_err("empty package_url must not build a request");
+        assert!(err.contains("spec_invalid"), "{err}");
+
+        // 缺必填字段。
+        let err = upgrade_request_for(bin, &upgrade_work(r#"{"package_url":"https://gw/x"}"#))
+            .expect_err("missing sha must not build a request");
+        assert!(err.contains("spec_invalid"), "{err}");
     }
 }

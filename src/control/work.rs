@@ -1891,6 +1891,12 @@ mod tests {
         let request = server.join().expect("join server");
         assert!(request.contains("/api/v1/agent/work:ack"));
         assert!(request.contains("\"kind\":\"ack_work\""));
+        // 与其它控制面调用同口径：明文 http 也无条件带 agent 凭据。
+        assert!(
+            request
+                .to_lowercase()
+                .contains("authorization: bearer wic_test_token")
+        );
         assert!(request.contains("\"work_id\":\"w1\""));
         assert!(request.contains("\"plan_version\":2"));
 
@@ -1915,6 +1921,12 @@ mod tests {
         let request = server.join().expect("join server");
         assert!(request.contains("/api/v1/agent/work:result"));
         assert!(request.contains("\"kind\":\"report_work_result\""));
+        // 与其它控制面调用同口径：明文 http 也无条件带 agent 凭据。
+        assert!(
+            request
+                .to_lowercase()
+                .contains("authorization: bearer wic_test_token")
+        );
         assert!(request.contains("\"work_id\":\"w1\""));
         assert!(request.contains("\"status\":\"failed\""));
         assert!(request.contains("已回滚到 0.1.3"));
