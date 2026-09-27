@@ -154,6 +154,22 @@ fn has_config_identity(config: &AgentConfig) -> bool {
     required_option(config.agent.agent_id.as_deref()).is_some()
 }
 
+/// 把 `state/agent_runtime.json` 里的正式身份与凭据注入配置 —— **只读 state，不联网、不续期**。
+///
+/// 给**升级器**这类独立进程用：daemon 启动时会走 [`ensure_enrolled_with_config_path`] 拿到凭据，
+/// 而凭据（`bearer_token`）**从不写进 `agentd.toml`**、只落在 state；升级器只 `load_from_path`
+/// 就读不到它，https 取包会发不出 `Authorization`（网关回 401）。所以升级器取包前补这一步。
+///
+/// 与 [`ensure_enrolled_with_config_path`] 的差别：即便配置里已有 `agent_id`（`has_config_identity`
+/// 为真，`ensure_enrolled` 会就此早返回）这里也照常从 state 注入，确保凭据一定被带上。
+/// 返回是否读到一份已注册的 state 身份。
+pub fn restore_runtime_identity(
+    config: &mut AgentConfig,
+    state_dir: &Path,
+) -> Result<bool, EnrollmentError> {
+    load_state_identity(config, state_dir)
+}
+
 fn load_state_identity(
     config: &mut AgentConfig,
     state_dir: &Path,
@@ -645,7 +661,7 @@ mod tests {
         EnrollmentDecision, EnrollmentReason, build_enrollment_request, enroll_from_config,
         enroll_with_token, enrollment_http_client, ensure_enrolled,
         ensure_enrolled_with_config_path, hostname_from_sources, is_registered_agent_id,
-        post_enrollment, renew_credential,
+        post_enrollment, renew_credential, restore_runtime_identity,
     };
 
     #[test]
@@ -945,6 +961,37 @@ mod tests {
             Some("2026-08-27T00:00:00Z")
         );
         assert!(config.control_plane.enrollment_token.is_none());
+    }
+
+    /// 升级器场景：配置里**已经有** `agent_id`（`has_config_identity` 为真，`ensure_enrolled` 会
+    /// 就此早返回、不碰凭据），`restore_runtime_identity` 仍必须从 state 注入 `bearer_token`。
+    #[test]
+    fn restore_runtime_identity_injects_credential_despite_config_agent_id() {
+        let state_dir = temp_dir("restore-credential");
+        let runtime_path = crate::state_store::agent_runtime::path_for(&state_dir);
+        let mut runtime = wist_contracts::agent_state::AgentRuntimeState::new(
+            "agent-state".to_string(),
+            "instance-state".to_string(),
+            "0.1.0".to_string(),
+            wist_contracts::agent_state::RuntimeMode::Normal,
+            "2026-07-27T00:00:00Z".to_string(),
+        );
+        runtime.bearer_token = Some("bearer-state".to_string());
+        crate::state_store::agent_runtime::store(&runtime_path, &runtime).expect("store state");
+
+        let mut config = config();
+        // 配置已带 agent_id：这正是「升级器只 load 到配置文件」会落到的形态。
+        config.agent.agent_id = Some("agent-config".to_string());
+        config.control_plane.bearer_token = None;
+
+        let restored = restore_runtime_identity(&mut config, &state_dir).expect("restore");
+
+        assert!(restored);
+        assert_eq!(
+            config.control_plane.bearer_token.as_deref(),
+            Some("bearer-state")
+        );
+        assert_eq!(config.control_plane.auth_mode.as_deref(), Some("bearer"));
     }
 
     #[tokio::test]

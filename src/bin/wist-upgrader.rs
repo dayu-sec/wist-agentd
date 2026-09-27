@@ -7,7 +7,7 @@
 //! **默认只演练**（取包 / 验摘要 / 解包 / 验版本，但不动已装二进制）：第一次在真机上跑升级，
 //! 应该先看清「包里是什么、摘要对不对」，再决定换。真正执行要显式 `--apply`。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use wist_agentd::config_runtime;
@@ -146,16 +146,7 @@ where
 }
 
 async fn execute(args: Args) -> Result<(), String> {
-    // 配置由 agentd 负责生成/维护，升级器只读：没有配置说明这台机器还没装好 agentd。
-    let config_path = config_runtime::resolve_config_path(&args.config_dir);
-    if !config_path.is_file() {
-        return Err(format!(
-            "config not found: {} (install wist-agentd first)",
-            config_path.display()
-        ));
-    }
-    let config: AgentConfig = config_runtime::load_from_path(&config_path)
-        .map_err(|err| format!("load config: {err}"))?;
+    let config = load_upgrader_config(&args.config_dir)?;
 
     let agentd_bin = match args.bin {
         Some(path) => path,
@@ -201,6 +192,30 @@ async fn execute(args: Args) -> Result<(), String> {
     }
 }
 
+/// 加载升级器要用的配置：`agentd.toml` **加上**从 state 注入的正式身份 / 凭据。
+///
+/// 配置由 agentd 负责生成 / 维护，升级器只读：没有配置说明这台机器还没装好 agentd。
+/// 但**凭据只落在 state（`agent_runtime.json`）、从不写进配置文件**，只 `load_from_path` 会
+/// 拿不到 `control_plane.bearer_token` —— 于是 https 取包发不出 `Authorization`，网关回 401。
+/// 这里补上 daemon 启动时同一步（`restore_runtime_identity`），与 agentd 取同样的凭据。
+fn load_upgrader_config(config_dir: &Path) -> Result<AgentConfig, String> {
+    let config_path = config_runtime::resolve_config_path(config_dir);
+    if !config_path.is_file() {
+        return Err(format!(
+            "config not found: {} (install wist-agentd first)",
+            config_path.display()
+        ));
+    }
+    let mut config: AgentConfig = config_runtime::load_from_path(&config_path)
+        .map_err(|err| format!("load config: {err}"))?;
+    let state_dir = PathBuf::from(&config.paths.state_dir);
+    if let Err(err) = wist_agentd::enrollment::restore_runtime_identity(&mut config, &state_dir) {
+        // 注入失败不阻止升级：本地路径包不需要凭据，https 包随后会以 401 如实暴露。
+        eprintln!("wist-upgrader: warning: restore runtime credential from state: {err}");
+    }
+    Ok(config)
+}
+
 /// 默认要替换的 `wist-agentd`：与本可执行文件同级的那个。
 fn default_agentd_bin() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|err| format!("resolve current exe: {err}"))?;
@@ -209,9 +224,11 @@ fn default_agentd_bin() -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, parse_args};
+    use super::{Args, load_upgrader_config, parse_args};
     use std::path::PathBuf;
     use std::time::Duration;
+    use wist_agentd::{config_runtime, state_store::agent_runtime};
+    use wist_contracts::agent_state::{AgentRuntimeState, RuntimeMode};
 
     fn parse(args: &[&str]) -> Result<Args, String> {
         parse_args(args.iter().map(|value| value.to_string()))
@@ -343,5 +360,49 @@ mod tests {
         ])
         .expect_err("bad scope");
         assert!(bad_scope.contains("system or user"), "{bad_scope}");
+    }
+
+    /// 升级器必须带上 agent 凭据：凭据只落在 state（`agent_runtime.json`），`agentd.toml` 里没有
+    /// —— 只 `load_from_path` 会让 https 取包发不出 `Authorization`，网关回 401（现场故障）。
+    #[test]
+    fn load_upgrader_config_restores_the_state_credential() {
+        let dir = unique_dir("upgrader-cred");
+        std::fs::create_dir_all(&dir).expect("create config dir");
+        let config_path = config_runtime::resolve_config_path(&dir);
+        std::fs::write(&config_path, config_runtime::default_config_template())
+            .expect("write default config");
+
+        // 先解一次拿到真实的 state 目录（默认随配置目录而定），再把凭据落进去。
+        let base = config_runtime::load_from_path(&config_path).expect("base config");
+        let state_dir = PathBuf::from(&base.paths.state_dir);
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+        let mut runtime = AgentRuntimeState::new(
+            "agent-cred".to_string(),
+            "instance-cred".to_string(),
+            "0.1.7".to_string(),
+            RuntimeMode::Normal,
+            "2026-01-01T00:00:00Z".to_string(),
+        );
+        runtime.credential_id = Some("cred-1".to_string());
+        runtime.bearer_token = Some("wic_secret".to_string());
+        agent_runtime::store(&agent_runtime::path_for(&state_dir), &runtime)
+            .expect("store runtime state");
+
+        let config = load_upgrader_config(&dir).expect("load upgrader config");
+        assert_eq!(
+            config.control_plane.bearer_token.as_deref(),
+            Some("wic_secret"),
+            "升级器必须从 state 注入 bearer_token，否则 https 取包 401"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn unique_dir(label: &str) -> PathBuf {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("wist-upgrader-{label}-{suffix}"))
     }
 }
