@@ -93,14 +93,47 @@ pub struct ClientCertificateStatus {
     pub validity: CertificateValidity,
 }
 
+/// 读回本地客户端证书 PEM；还没注册时是 `None`。
+pub fn read_client_certificate(paths: &ClientIdentityPaths) -> io::Result<Option<String>> {
+    read_optional(&paths.cert_file)
+}
+
+/// 读回本地私钥 PEM；还没生成时是 `None`。
+pub fn read_client_private_key_pem(paths: &ClientIdentityPaths) -> io::Result<Option<String>> {
+    read_optional(&paths.key_file)
+}
+
+/// 拼成「证书 + 私钥」**单份 PEM** —— reqwest / rustls 出示客户端身份要的就是这一份。
+///
+/// 两者缺一返回 `None`（还没注册，没什么可出示的）。
+pub fn combined_client_identity_pem(paths: &ClientIdentityPaths) -> io::Result<Option<String>> {
+    let Some(certificate) = read_client_certificate(paths)? else {
+        return Ok(None);
+    };
+    let Some(key) = read_client_private_key_pem(paths)? else {
+        return Ok(None);
+    };
+    Ok(Some(format!(
+        "{}\n{}",
+        certificate.trim_end_matches('\n'),
+        key
+    )))
+}
+
+fn read_optional(path: &Path) -> io::Result<Option<String>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    fs::read_to_string(path).map(Some)
+}
+
 /// 读本地证书的有效期状态；还没有证书（未注册）→ `Ok(None)`。
 pub fn client_certificate_status(
     paths: &ClientIdentityPaths,
 ) -> io::Result<Option<ClientCertificateStatus>> {
-    if !paths.cert_file.exists() {
+    let Some(pem) = read_client_certificate(paths)? else {
         return Ok(None);
-    }
-    let pem = fs::read_to_string(&paths.cert_file)?;
+    };
     certificate_status_from_pem(&pem, OffsetDateTime::now_utc().unix_timestamp()).map(Some)
 }
 
@@ -255,6 +288,34 @@ mod tests {
             .expect("status")
             .expect("stored certificate");
         assert_eq!(status.validity, CertificateValidity::Valid);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn combines_certificate_and_key_into_a_single_identity_pem() {
+        let dir = temp_state_dir();
+        let paths = ClientIdentityPaths::under(&dir);
+        assert!(
+            combined_client_identity_pem(&paths)
+                .expect("read")
+                .is_none(),
+            "nothing to present yet"
+        );
+
+        load_or_generate_key_pair(&paths).expect("key");
+        assert!(
+            combined_client_identity_pem(&paths)
+                .expect("read")
+                .is_none(),
+            "key alone is not an identity"
+        );
+
+        store_client_certificate(&paths, &certificate_pem(-1, 37)).expect("store");
+        let combined = combined_client_identity_pem(&paths)
+            .expect("read")
+            .expect("combined identity");
+        assert!(combined.contains("BEGIN CERTIFICATE"), "{combined}");
+        assert!(combined.contains("BEGIN PRIVATE KEY"), "{combined}");
         let _ = fs::remove_dir_all(dir);
     }
 }

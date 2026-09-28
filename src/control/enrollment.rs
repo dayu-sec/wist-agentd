@@ -444,6 +444,11 @@ pub(crate) fn enrollment_http_client(
                 .with_detail(format!("invalid control_plane.tls_mode: {other}")));
         }
     }
+    // mTLS：有本地客户端证书就出示它（docs/design/agent-identity-mtls.md §5.2）。
+    // 证书是**注册后**才有的 —— 首次注册那次请求这里为空，正是「注册前还没有已签发身份」。
+    if let Some(identity) = local_client_identity(config) {
+        builder = builder.identity(identity);
+    }
     builder.build().map_err(|err| {
         if loaded_trust_bundle {
             EnrollmentReason::InvalidTrustBundle
@@ -456,6 +461,30 @@ pub(crate) fn enrollment_http_client(
                 .finish()
         }
     })
+}
+
+/// 组装本地客户端身份（证书 + 私钥）供 reqwest 出示；两者齐备才返回。
+///
+/// 读不出来/解不开只打印一行并返回 `None`：注册与上报不能因为本地证书坏了就断掉 ——
+/// 拿不到证书时还有 bearer 双轨可走。
+fn local_client_identity(config: &AgentConfig) -> Option<reqwest::Identity> {
+    let state_dir = PathBuf::from(&config.paths.state_dir);
+    let paths = state_store::client_identity::ClientIdentityPaths::under(&state_dir);
+    let combined = match state_store::client_identity::combined_client_identity_pem(&paths) {
+        Ok(Some(combined)) => combined,
+        Ok(None) => return None,
+        Err(err) => {
+            eprintln!("wist-agentd cannot read the local client identity: {err}");
+            return None;
+        }
+    };
+    match reqwest::Identity::from_pem(combined.as_bytes()) {
+        Ok(identity) => Some(identity),
+        Err(err) => {
+            eprintln!("wist-agentd cannot load the local client identity for mTLS: {err}");
+            None
+        }
+    }
 }
 
 fn apply_enrollment_result(
@@ -506,6 +535,19 @@ fn apply_enrollment_result(
     let issued_credential = result.credential_bundle.clone();
     if let Some(credential) = issued_credential.as_ref() {
         apply_credential_to_config(config, credential)?;
+        // 带上客户端证书就落盘（0600）：后续所有控制面请求都拿它走 mTLS（§5.2）。
+        // 落到 `identity/` 而不是 state：它是**证书**不是 bearer 凭据，
+        // 且本地自检（`client_certificate_status`）直接读文件（§5.4）。
+        // 注意别 `trim`：证书 PEM 要原样落盘（去掉尾换行会让拼接/平台工具都变脆）。
+        if let Some(certificate_pem) = credential
+            .certificate
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            let paths = state_store::client_identity::ClientIdentityPaths::under(state_dir);
+            state_store::client_identity::store_client_certificate(&paths, certificate_pem)
+                .source_err(EnrollmentReason::Io, "store client certificate")?;
+        }
     }
     config.agent.agent_id = Some(agent_id.clone());
     config.agent.instance_name = Some(instance_id.clone());
@@ -535,6 +577,14 @@ fn apply_credential_to_config(
 ) -> Result<(), EnrollmentError> {
     config.control_plane.credential_id = Some(credential.credential_id.clone());
     match credential.auth_scheme.as_deref() {
+        // 双轨期两种都发：`certificate` 为主（mTLS），bearer 仍然收下当回落。
+        Some("certificate") => {
+            config.control_plane.auth_mode = Some("certificate".to_string());
+            if let Some(token) = required_option(credential.bearer_token.as_deref()) {
+                config.control_plane.bearer_token = Some(token.to_string());
+            }
+            config.control_plane.enrollment_token = None;
+        }
         Some("bearer") | None => {
             let token = credential
                 .bearer_token
@@ -570,6 +620,11 @@ fn apply_credential_to_runtime_state(
 ) {
     runtime_state.credential_id = Some(credential.credential_id);
     match credential.auth_scheme.as_deref() {
+        // `certificate` 与 bearer 一样把凭据存起来：bearer 是回落，证书另有 identity/ 文件。
+        Some("certificate") => {
+            runtime_state.bearer_token = credential.bearer_token;
+            runtime_state.credential_expires_at = credential.not_after;
+        }
         Some("bearer") | None => {
             runtime_state.bearer_token = credential.bearer_token;
             runtime_state.credential_expires_at = credential.not_after;
@@ -1169,10 +1224,112 @@ state_dir = "state"
         assert_eq!(again, EnrollmentDecision::ExistingStateIdentity);
     }
 
+    /// 带客户端证书的注册回包：证书落 `identity/`，且 `certificate` 方案被接受（不再报 unsupported）。
+    #[tokio::test]
+    async fn enroll_with_token_stores_the_issued_client_certificate() {
+        let config_root = temp_dir("enroll-cli-cert");
+        let config_path = config_root.join("agentd.toml");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        fs::write(
+            &config_path,
+            format!(
+                r#"schema_version = "v1"
+
+[control_plane]
+enabled = true
+endpoint = "{endpoint}"
+credential_request = "csr"
+
+[paths]
+root_dir = "."
+state_dir = "state"
+"#
+            ),
+        )
+        .expect("write config");
+
+        let certificate_pem =
+            "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n".to_string();
+        let not_after = "2026-11-04T00:00:00+00:00".to_string();
+        let body = serde_json::to_string(&serde_json::json!({
+            "result": {
+                "status": "accepted",
+                "reason_code": null,
+                "agent_id": "agent-cert",
+                "instance_id": "inst-cert",
+                "issued_identity": null,
+                "credential_bundle": {
+                    "credential_id": "cred-cert",
+                    "agent_id": "agent-cert",
+                    "instance_id": "inst-cert",
+                    "auth_scheme": "certificate",
+                    "bearer_token": "wic-token",
+                    "certificate": certificate_pem,
+                    "private_key_ref": null,
+                    "ca_bundle": null,
+                    "issued_at": "2026-09-28T00:00:00+00:00",
+                    "not_before": "2026-09-28T00:00:00+00:00",
+                    "not_after": not_after,
+                },
+                "initial_config": null,
+                "policy_binding": null,
+            }
+        }))
+        .expect("serialize response");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request_bytes = Vec::new();
+            loop {
+                let mut chunk = [0u8; 1024];
+                let read = socket.read(&mut chunk).await.expect("read");
+                if read == 0 {
+                    break;
+                }
+                request_bytes.extend_from_slice(&chunk[..read]);
+                if request_is_complete(&request_bytes) {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        let decision = enroll_with_token(&config_root, "cli-token".to_string())
+            .await
+            .expect("enroll");
+        server.await.expect("server task");
+        assert_eq!(decision, EnrollmentDecision::Enrolled);
+
+        // 证书落到 `identity/`（不是 state 里的 bearer 凭据）。
+        let paths = crate::state_store::client_identity::ClientIdentityPaths::under(
+            &config_root.join("state"),
+        );
+        assert_eq!(
+            fs::read_to_string(&paths.cert_file).expect("read stored certificate"),
+            certificate_pem
+        );
+        // `certificate` 方案被接受，bearer 作为回落也留下了；到期时间用证书的。
+        let state_path = crate::state_store::agent_runtime::path_for(&config_root.join("state"));
+        let state: wist_contracts::agent_state::AgentRuntimeState =
+            wist_shared::fs::read_json(&state_path).expect("read runtime state");
+        assert_eq!(state.bearer_token.as_deref(), Some("wic-token"));
+        assert_eq!(
+            state.credential_expires_at.as_deref(),
+            Some(not_after.as_str())
+        );
+    }
+
     #[tokio::test]
     async fn enroll_with_token_requires_existing_config() {
         let config_root = temp_dir("enroll-cli-missing-config");
-
         let err = enroll_with_token(&config_root, "cli-token".to_string())
             .await
             .expect_err("missing config must fail");
