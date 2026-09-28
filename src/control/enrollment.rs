@@ -463,13 +463,32 @@ pub(crate) fn enrollment_http_client(
     })
 }
 
-/// 组装本地客户端身份（证书 + 私钥）供 reqwest 出示；两者齐备才返回。
+/// 组装本地客户端身份（证书 + 私钥）供 reqwest 出示；两者齐备**且未过期**才返回。
 ///
 /// 读不出来/解不开只打印一行并返回 `None`：注册与上报不能因为本地证书坏了就断掉 ——
 /// 拿不到证书时还有 bearer 双轨可走。
+///
+/// 已过期也**不出示**：rustls 会把过期证书当作握手失败，那样连「重新注册」都到不了服务端，
+/// 只能人工删文件（见 `docs/design/agent-identity-mtls.md` §4.2 无宽限 / §5.4）。
 fn local_client_identity(config: &AgentConfig) -> Option<reqwest::Identity> {
     let state_dir = PathBuf::from(&config.paths.state_dir);
     let paths = state_store::client_identity::ClientIdentityPaths::under(&state_dir);
+    match state_store::client_identity::client_certificate_status(&paths) {
+        Ok(Some(status))
+            if status.validity == state_store::client_identity::CertificateValidity::Expired =>
+        {
+            eprintln!(
+                "wist-agentd local client certificate expired at {}; not presenting it (re-enroll or reinstall required)",
+                status.not_after
+            );
+            return None;
+        }
+        Ok(_) => {}
+        Err(err) => {
+            eprintln!("wist-agentd cannot read the local client certificate status: {err}");
+            return None;
+        }
+    }
     let combined = match state_store::client_identity::combined_client_identity_pem(&paths) {
         Ok(Some(combined)) => combined,
         Ok(None) => return None,
@@ -1222,6 +1241,46 @@ state_dir = "state"
             .await
             .expect("enroll again");
         assert_eq!(again, EnrollmentDecision::ExistingStateIdentity);
+    }
+
+    /// 有效证书就出示；**过期就不再出示**（否则连重新注册都会被 rustls 握手挡死）。
+    #[test]
+    fn does_not_present_an_expired_client_certificate() {
+        let state_dir = temp_dir("client-cert-presentation");
+        let mut config = config();
+        config.paths.state_dir = state_dir.display().to_string();
+        let paths = crate::state_store::client_identity::ClientIdentityPaths::under(&state_dir);
+
+        let (certificate_pem, key_pem) = self_signed_identity_pem(37);
+        fs::create_dir_all(paths.key_file.parent().expect("parent")).expect("key dir");
+        fs::write(&paths.key_file, &key_pem).expect("write key");
+        crate::state_store::client_identity::store_client_certificate(&paths, &certificate_pem)
+            .expect("store certificate");
+        assert!(
+            super::local_client_identity(&config).is_some(),
+            "a valid certificate must be presented"
+        );
+
+        let (expired_pem, expired_key_pem) = self_signed_identity_pem(-1);
+        fs::write(&paths.key_file, &expired_key_pem).expect("write key");
+        crate::state_store::client_identity::store_client_certificate(&paths, &expired_pem)
+            .expect("store certificate");
+        assert!(
+            super::local_client_identity(&config).is_none(),
+            "an expired certificate must not be presented"
+        );
+
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    /// 自签一对证书/私钥，`not_after` = 现在 + `days`。
+    fn self_signed_identity_pem(days: i64) -> (String, String) {
+        let key = rcgen::KeyPair::generate().expect("client key");
+        let mut params = rcgen::CertificateParams::default();
+        params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+        params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(days);
+        let certificate = params.self_signed(&key).expect("self signed");
+        (certificate.pem(), key.serialize_pem())
     }
 
     /// 带客户端证书的注册回包：证书落 `identity/`，且 `certificate` 方案被接受（不再报 unsupported）。
