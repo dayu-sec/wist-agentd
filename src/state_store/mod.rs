@@ -6,6 +6,7 @@
 //! module to a dedicated `StateStoreReason` once the upper layers are fully migrated.
 
 pub mod agent_runtime;
+pub mod client_identity;
 pub mod execution_queue;
 pub mod fact_report;
 pub mod history;
