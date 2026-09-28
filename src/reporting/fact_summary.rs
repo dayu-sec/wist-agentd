@@ -138,7 +138,8 @@ pub fn build_summary(snapshot: &DiscoverySnapshot) -> FactSummaryDraft {
     }
 
     FactSummaryDraft {
-        revision: i64::try_from(snapshot.revision).unwrap_or(i64::MAX),
+        // 与契约同一口径：`snapshot.revision` 现为 `Int`（i64），不再需要收窄。
+        revision: snapshot.revision,
         observed_at: snapshot.generated_at.clone(),
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),

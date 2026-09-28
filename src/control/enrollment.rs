@@ -141,7 +141,7 @@ async fn ensure_enrolled_with_optional_config_path(
             )
         })?
         .to_string();
-    let request = build_enrollment_request(config, token);
+    let request = build_enrollment_request(config, state_dir, token);
     let returned = post_enrollment(config, &endpoint, &request).await?;
     apply_enrollment_result(config, state_dir, returned.result)?;
     if let Some(config_path) = config_path {
@@ -209,7 +209,11 @@ fn load_state_identity(
     Ok(true)
 }
 
-fn build_enrollment_request(config: &AgentConfig, token: String) -> EnrollmentRequest {
+fn build_enrollment_request(
+    config: &AgentConfig,
+    state_dir: &Path,
+    token: String,
+) -> EnrollmentRequest {
     EnrollmentRequest::new(
         token,
         config
@@ -217,10 +221,33 @@ fn build_enrollment_request(config: &AgentConfig, token: String) -> EnrollmentRe
             .credential_request
             .clone()
             .unwrap_or_else(|| "none".to_string()),
+        local_certificate_signing_request(state_dir),
         build_host_profile(config),
         "wist-agentd:discovery,telemetry,local-exec".to_string(),
         now_rfc3339(),
     )
+}
+
+/// 本地生成（或复用）客户端密钥，并用它生成 CSR：**只交公钥**，主体由网关填（§4.2）。
+///
+/// 生成失败**不阻断注册**：拿不到 CSR 就退回纯 bearer 双轨（返回 `None`），
+/// 而不是让一台机器仅仅因为本地密钥写不出来就注册不上。
+fn local_certificate_signing_request(state_dir: &Path) -> Option<String> {
+    let paths = state_store::client_identity::ClientIdentityPaths::under(state_dir);
+    let key_pair = match state_store::client_identity::load_or_generate_key_pair(&paths) {
+        Ok(key_pair) => key_pair,
+        Err(err) => {
+            eprintln!("wist-agentd cannot prepare a local client key for CSR: {err}");
+            return None;
+        }
+    };
+    match state_store::client_identity::build_certificate_signing_request(&key_pair) {
+        Ok(csr) => Some(csr),
+        Err(err) => {
+            eprintln!("wist-agentd cannot build a certificate signing request: {err}");
+            None
+        }
+    }
 }
 
 fn build_host_profile(config: &AgentConfig) -> HostProfile {
@@ -735,12 +762,22 @@ mod tests {
     #[test]
     fn build_enrollment_request_uses_configured_token_and_instance_name() {
         let config = config();
+        let state_dir = temp_dir("build-request");
 
-        let request = build_enrollment_request(&config, "token-a".to_string());
+        let request = build_enrollment_request(&config, &state_dir, "token-a".to_string());
 
         assert_eq!(request.token, "token-a");
         assert_eq!(request.host_profile.node_id, "host-a");
         assert_eq!(request.credential_request, "none");
+        // CSR 随注册一起上去：本地生成密钥、只交公钥（主体留给网关填）。
+        assert!(
+            request
+                .certificate_signing_request
+                .as_deref()
+                .is_some_and(|csr| csr.contains("BEGIN CERTIFICATE REQUEST")),
+            "enrollment must carry a locally built CSR"
+        );
+        let _ = fs::remove_dir_all(state_dir);
     }
 
     #[test]
@@ -815,7 +852,8 @@ mod tests {
     async fn post_enrollment_to_unreachable_endpoint_returns_error() {
         let mut config = config();
         config.control_plane.endpoint = Some("http://127.0.0.1:1".to_string());
-        let request = build_enrollment_request(&config, "token-a".to_string());
+        let request =
+            build_enrollment_request(&config, &temp_dir("post-enrollment"), "token-a".to_string());
 
         let err = post_enrollment(&config, "http://127.0.0.1:1", &request)
             .await
