@@ -1894,6 +1894,8 @@ mod tests {
             fresh.remaining_seconds > 30 * 24 * 60 * 60,
             "a 37-day certificate must sit outside the 30-day renewal window"
         );
+        // 还没写过续签台账 → 不报（而不是编一份空记录）。
+        assert!(fresh.last_renewal.is_none(), "no ledger yet → no renewal");
 
         // 剩 10 天（落在续期窗内）→ `renew_due`。
         store_identity(&paths, 10);
