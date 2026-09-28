@@ -21,8 +21,10 @@ use crate::state_store;
 const ENROLLMENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const ENROLLMENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const ENROLLMENT_MAX_ATTEMPTS: u32 = 3;
-/// Renew proactively once the credential is inside this window of its expiry.
-const CREDENTIAL_RENEWAL_WINDOW: time::Duration = time::Duration::days(7);
+/// 续期提前量：证书 37 天、保底 30 天 → 剩余 ≤ 30 天就该续（§4.2）。
+/// 与 [`state_store::client_identity::RENEWAL_LEAD_SECONDS`] 同一口径，**只此一处**。
+const RENEWAL_WINDOW: time::Duration =
+    time::Duration::seconds(state_store::client_identity::RENEWAL_LEAD_SECONDS);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnrollmentDecision {
@@ -322,25 +324,129 @@ fn retry_backoff(attempt: u32) -> Duration {
     Duration::from_millis(200 * 2u64.pow(attempt))
 }
 
-/// Best-effort credential rotation when the restored credential is expired or
-/// within [`CREDENTIAL_RENEWAL_WINDOW`] of expiry. Failures are logged and the
-/// existing credential is kept so the daemon still starts.
-async fn renew_state_credential_if_needed(config: &mut AgentConfig, state_dir: &Path) {
+/// 一次续期判定的结果（启动续期与周期性续期共用，也是台账里记的东西）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenewalDecision {
+    /// 还早，什么都不用做。
+    NotDue,
+    /// 续期成功：新凭据已落 state（有证书时新证书也已落盘）。
+    Renewed,
+    /// 落在续期窗内但续期失败 —— 保留旧凭据，下个周期再试。
+    Failed(String),
+    /// 证书已过期：**本地不再重试**，需带 token 重装（§4.2 无宽限）。
+    NeedsReinstall,
+}
+
+impl RenewalDecision {
+    fn ledger_outcome(&self) -> &'static str {
+        match self {
+            RenewalDecision::NotDue => "not_due",
+            RenewalDecision::Renewed => "renewed",
+            RenewalDecision::Failed(_) => "failed",
+            RenewalDecision::NeedsReinstall => "needs_reinstall",
+        }
+    }
+
+    fn ledger_detail(&self) -> String {
+        match self {
+            RenewalDecision::NotDue => "credential is not due for renewal".to_string(),
+            RenewalDecision::Renewed => "credential renewed".to_string(),
+            RenewalDecision::Failed(detail) => detail.clone(),
+            RenewalDecision::NeedsReinstall => {
+                "client certificate expired; re-enroll or reinstall with a token".to_string()
+            }
+        }
+    }
+}
+
+/// 到期就续期；由**启动路径**与**守护进程的周期检查**共同调用（issue #15）。
+///
+/// 判定与结果都落台账（`identity/renewal.json`）：续签是后台动作，不记录就等于又变成静默。
+pub async fn renew_credential_if_due(
+    config: &mut AgentConfig,
+    state_dir: &Path,
+) -> RenewalDecision {
+    let decision = renewal_decision(config, state_dir).await;
+    record_renewal_ledger(state_dir, &decision);
+    decision
+}
+
+async fn renewal_decision(config: &mut AgentConfig, state_dir: &Path) -> RenewalDecision {
+    use state_store::client_identity::CertificateValidity;
+
+    let paths = state_store::client_identity::ClientIdentityPaths::under(state_dir);
+    // ① 有本地客户端证书：**以证书为准** —— mTLS 才是长期身份（§4.2 / §5.4）。
+    match state_store::client_identity::client_certificate_status(&paths) {
+        Ok(Some(status)) => match status.validity {
+            CertificateValidity::Expired => {
+                eprintln!(
+                    "wist-agentd client certificate expired at {}: re-enroll or reinstall required (not retrying)",
+                    status.not_after
+                );
+                return RenewalDecision::NeedsReinstall;
+            }
+            CertificateValidity::Valid => return RenewalDecision::NotDue,
+            CertificateValidity::RenewDue => {}
+        },
+        // 还没有本地证书（只走 bearer 的双轨部署）：回落到凭据到期时间。
+        Ok(None) => return renew_by_credential_expiry(config, state_dir).await,
+        Err(err) => {
+            eprintln!("wist-agentd cannot read the local client certificate status: {err}");
+            return RenewalDecision::Failed(err.to_string());
+        }
+    }
+    renew_now(config, state_dir).await
+}
+
+/// 没有本地证书时（纯 bearer 双轨）的续期判定：按凭据到期时间与同一个提前量。
+async fn renew_by_credential_expiry(config: &mut AgentConfig, state_dir: &Path) -> RenewalDecision {
     let Some(expires_at) = config.control_plane.credential_expires_at.as_deref() else {
-        return;
+        return RenewalDecision::NotDue;
     };
     let Ok(expires_at) =
         time::OffsetDateTime::parse(expires_at, &time::format_description::well_known::Rfc3339)
     else {
-        return;
+        return RenewalDecision::NotDue;
     };
-    if time::OffsetDateTime::now_utc() + CREDENTIAL_RENEWAL_WINDOW < expires_at {
-        return;
+    if time::OffsetDateTime::now_utc() + RENEWAL_WINDOW < expires_at {
+        return RenewalDecision::NotDue;
     }
-    if let Err(err) = renew_credential(config, state_dir).await {
-        eprintln!(
-            "wist-agentd credential renewal failed (continuing with existing credential): {err}"
-        );
+    renew_now(config, state_dir).await
+}
+
+async fn renew_now(config: &mut AgentConfig, state_dir: &Path) -> RenewalDecision {
+    match renew_credential(config, state_dir).await {
+        Ok(()) => RenewalDecision::Renewed,
+        Err(err) => {
+            eprintln!(
+                "wist-agentd credential renewal failed (continuing with existing credential): {err}"
+            );
+            RenewalDecision::Failed(err.to_string())
+        }
+    }
+}
+
+/// 启动时的续期检查（守护进程启动路径用；周期检查在 daemon 循环里）。
+async fn renew_state_credential_if_needed(config: &mut AgentConfig, state_dir: &Path) {
+    let _ = renew_credential_if_due(config, state_dir).await;
+}
+
+/// 把判定结果写到台账；写不动只记一行，**不影响**续期本身。
+fn record_renewal_ledger(state_dir: &Path, decision: &RenewalDecision) {
+    let paths = state_store::client_identity::ClientIdentityPaths::under(state_dir);
+    let not_after = state_store::client_identity::client_certificate_status(&paths)
+        .ok()
+        .flatten()
+        .map(|status| status.not_after)
+        .unwrap_or_default();
+    let ledger = state_store::client_identity::RenewalLedger {
+        checked_at: now_rfc3339(),
+        outcome: decision.ledger_outcome().to_string(),
+        detail: decision.ledger_detail(),
+        not_after,
+    };
+    if let Err(err) = state_store::client_identity::store_renewal_ledger(&paths, &ledger) {
+        eprintln!("wist-agentd cannot record the renewal ledger: {err}");
     }
 }
 
@@ -362,14 +468,18 @@ async fn renew_credential(
     let instance_id = required_option(config.agent.instance_name.as_deref())
         .unwrap_or_default()
         .to_string();
+    let certificate_signing_request = local_certificate_signing_request(state_dir);
     let request = CredentialRenewal::new(
         agent_id.to_string(),
         instance_id,
-        config
-            .control_plane
-            .credential_request
-            .clone()
-            .unwrap_or_else(|| "bearer".to_string()),
+        // 有本地密钥就交 CSR 换新证书（gateway 没配 agent CA 时会忽略）；
+        // 没有就退回旧的 bearer 续期。
+        if certificate_signing_request.is_some() {
+            "csr".to_string()
+        } else {
+            "bearer".to_string()
+        },
+        certificate_signing_request,
         now_rfc3339(),
     );
     let client = enrollment_http_client(config)?;
@@ -557,16 +667,7 @@ fn apply_enrollment_result(
         // 带上客户端证书就落盘（0600）：后续所有控制面请求都拿它走 mTLS（§5.2）。
         // 落到 `identity/` 而不是 state：它是**证书**不是 bearer 凭据，
         // 且本地自检（`client_certificate_status`）直接读文件（§5.4）。
-        // 注意别 `trim`：证书 PEM 要原样落盘（去掉尾换行会让拼接/平台工具都变脆）。
-        if let Some(certificate_pem) = credential
-            .certificate
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            let paths = state_store::client_identity::ClientIdentityPaths::under(state_dir);
-            state_store::client_identity::store_client_certificate(&paths, certificate_pem)
-                .source_err(EnrollmentReason::Io, "store client certificate")?;
-        }
+        store_issued_client_certificate(state_dir, credential)?;
     }
     config.agent.agent_id = Some(agent_id.clone());
     config.agent.instance_name = Some(instance_id.clone());
@@ -585,6 +686,25 @@ fn apply_enrollment_result(
     state_store::agent_runtime::store(&runtime_path, &runtime_state)
         .source_err(EnrollmentReason::Io, "store runtime state")?;
     Ok(())
+}
+
+/// 回包里带客户端证书就落盘（0600）；后续控制面请求都拿它走 mTLS（§5.2）。
+///
+/// 注意别 `trim`：证书 PEM 要原样落盘（去掉尾换行会让拼接/平台工具都变脆）。
+fn store_issued_client_certificate(
+    state_dir: &Path,
+    credential: &wist_contracts::enrollment::CredentialBundle,
+) -> Result<(), EnrollmentError> {
+    let Some(certificate_pem) = credential
+        .certificate
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let paths = state_store::client_identity::ClientIdentityPaths::under(state_dir);
+    state_store::client_identity::store_client_certificate(&paths, certificate_pem)
+        .source_err(EnrollmentReason::Io, "store client certificate")
 }
 
 /// Apply an issued credential bundle to the in-memory agent config. Both the
@@ -1270,6 +1390,68 @@ state_dir = "state"
             "an expired certificate must not be presented"
         );
 
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    /// 证书还新：什么都不做（不联网）。
+    #[tokio::test]
+    async fn renewal_is_not_due_while_the_certificate_is_fresh() {
+        let state_dir = temp_dir("renewal-not-due");
+        let mut config = config();
+        config.paths.state_dir = state_dir.display().to_string();
+        let paths = crate::state_store::client_identity::ClientIdentityPaths::under(&state_dir);
+        let (certificate_pem, key_pem) = self_signed_identity_pem(37);
+        fs::create_dir_all(paths.key_file.parent().expect("parent")).expect("key dir");
+        fs::write(&paths.key_file, &key_pem).expect("write key");
+        crate::state_store::client_identity::store_client_certificate(&paths, &certificate_pem)
+            .expect("store certificate");
+
+        let decision = super::renew_credential_if_due(&mut config, &state_dir).await;
+        assert_eq!(decision, super::RenewalDecision::NotDue);
+        let ledger = crate::state_store::client_identity::read_renewal_ledger(&paths)
+            .expect("read ledger")
+            .expect("ledger written");
+        assert_eq!(ledger.outcome, "not_due");
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    /// 证书已过期：**不再重试**，记 `needs_reinstall`（即使端点可用也不试 —— 见 §4.2 无宽限）。
+    #[tokio::test]
+    async fn expired_certificate_requires_reinstall_and_is_recorded() {
+        let state_dir = temp_dir("renewal-expired");
+        let mut config = config();
+        config.paths.state_dir = state_dir.display().to_string();
+        // 指向一个必然连不上的端点：若它真去续期就会是 `Failed`，而不是 `NeedsReinstall`。
+        config.control_plane.endpoint = Some("http://127.0.0.1:1".to_string());
+        config.control_plane.bearer_token = Some("wic-token".to_string());
+
+        let paths = crate::state_store::client_identity::ClientIdentityPaths::under(&state_dir);
+        let (expired_pem, expired_key_pem) = self_signed_identity_pem(-1);
+        fs::create_dir_all(paths.key_file.parent().expect("parent")).expect("key dir");
+        fs::write(&paths.key_file, &expired_key_pem).expect("write key");
+        crate::state_store::client_identity::store_client_certificate(&paths, &expired_pem)
+            .expect("store certificate");
+
+        let decision = super::renew_credential_if_due(&mut config, &state_dir).await;
+        assert_eq!(decision, super::RenewalDecision::NeedsReinstall);
+        let ledger = crate::state_store::client_identity::read_renewal_ledger(&paths)
+            .expect("read ledger")
+            .expect("ledger written");
+        assert_eq!(ledger.outcome, "needs_reinstall");
+        assert!(!ledger.not_after.is_empty());
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    /// 没有本地证书（纯 bearer 双轨）：回落到凭据到期时间。
+    #[tokio::test]
+    async fn renewal_falls_back_to_credential_expiry_without_a_certificate() {
+        let state_dir = temp_dir("renewal-bearer-only");
+        let mut config = config();
+        config.paths.state_dir = state_dir.display().to_string();
+        config.control_plane.credential_expires_at = Some("2099-01-01T00:00:00Z".to_string());
+
+        let decision = super::renew_credential_if_due(&mut config, &state_dir).await;
+        assert_eq!(decision, super::RenewalDecision::NotDue);
         let _ = fs::remove_dir_all(state_dir);
     }
 

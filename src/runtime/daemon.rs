@@ -69,6 +69,9 @@ const STATUS_REPORT_INTERVAL: Duration = Duration::from_secs(3);
 /// - `drain` 每轮只处理一个队列项且**等它跑完**，因此这个值是空闲轮询间隔，不是执行吞吐上限。
 const TICK_INTERVAL: Duration = Duration::from_secs(3);
 
+/// 凭据续期的检查周期：没必要每 3s 都查，1 小时足够，而续期窗是 30 天。
+const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
 /// 事实上送的最小间隔。
 ///
 /// 为什么需要它：探针目前是**每 tick 全刷**（3s）—— 各探针声明的 `refresh_interval()`
@@ -707,7 +710,41 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     });
     let mut last_latency_ms: Option<u64> = None;
     let mut pending_work_state_changes: Vec<TelemetryWorkState> = Vec::new();
+    // 凭据会在**本进程运行期间**到期，所以这里持有一份**可变**副本：续期成功后替换它，
+    // 本轮往后的调用立刻用上新凭据（`loop_ctx.config` 只是启动时的快照）。
+    // 续期判定本身只读一个文件，但对不上就是“静默卡死”——issue #15。
+    let exec_bin = loop_ctx.exec_bin;
+    let upgrader_bin = loop_ctx.upgrader_bin;
+    let config_dir = loop_ctx.config_dir;
+    let mut runtime_config: AgentConfig = loop_ctx.config.clone();
+    let mut last_renewal_check: Option<Instant> = None;
     loop {
+        // 续期检查**放在建本轮 loop_ctx 之前**：要可变借用 `runtime_config`。
+        if last_renewal_check.is_none_or(|at| at.elapsed() >= RENEWAL_CHECK_INTERVAL) {
+            last_renewal_check = Some(Instant::now());
+            let state_dir = std::path::PathBuf::from(&runtime_config.paths.state_dir);
+            match crate::enrollment::renew_credential_if_due(&mut runtime_config, &state_dir).await
+            {
+                crate::enrollment::RenewalDecision::NotDue => {}
+                crate::enrollment::RenewalDecision::Renewed => {
+                    eprintln!("event=CredentialRenewed detail=\"credential rotated\"");
+                }
+                crate::enrollment::RenewalDecision::Failed(detail) => {
+                    eprintln!("event=CredentialRenewalFailed detail=\"{detail}\"");
+                }
+                crate::enrollment::RenewalDecision::NeedsReinstall => {
+                    eprintln!(
+                        "event=CredentialNeedsReinstall detail=\"client certificate expired; re-enroll or reinstall with a token\""
+                    );
+                }
+            }
+        }
+        let loop_ctx = DaemonLoop {
+            config: &runtime_config,
+            exec_bin,
+            upgrader_bin,
+            config_dir,
+        };
         // 到达拉取间隔就拉一次策略表并应用（启动首轮即拉）。必须在 refresh_due 之前，
         // 这样本轮采集就用上新周期。
         refresh_discovery_policy(loop_ctx.config, &mut discovery_runtime).await;

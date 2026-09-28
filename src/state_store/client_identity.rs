@@ -18,6 +18,8 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 pub const CLIENT_KEY_RELATIVE_PATH: &str = "identity/client.key.pem";
 /// 网关签发的客户端证书（相对 state 目录）。
 pub const CLIENT_CERT_RELATIVE_PATH: &str = "identity/client.crt.pem";
+/// 续期台账（相对 state 目录）：续签是后台动作，不记录就等于又变成静默。
+pub const RENEWAL_LEDGER_RELATIVE_PATH: &str = "identity/renewal.json";
 
 /// 续期提前量：证书 37 天、保底 30 天 → 剩余 ≤ 30 天就该续（§4.2）。
 pub const RENEWAL_LEAD_SECONDS: i64 = 30 * 24 * 60 * 60;
@@ -27,6 +29,7 @@ pub const RENEWAL_LEAD_SECONDS: i64 = 30 * 24 * 60 * 60;
 pub struct ClientIdentityPaths {
     pub key_file: PathBuf,
     pub cert_file: PathBuf,
+    pub renewal_file: PathBuf,
 }
 
 impl ClientIdentityPaths {
@@ -34,6 +37,7 @@ impl ClientIdentityPaths {
         Self {
             key_file: state_dir.join(CLIENT_KEY_RELATIVE_PATH),
             cert_file: state_dir.join(CLIENT_CERT_RELATIVE_PATH),
+            renewal_file: state_dir.join(RENEWAL_LEDGER_RELATIVE_PATH),
         }
     }
 }
@@ -125,6 +129,38 @@ fn read_optional(path: &Path) -> io::Result<Option<String>> {
         return Ok(None);
     }
     fs::read_to_string(path).map(Some)
+}
+
+/// 续期台账：每次续期判定的结果。
+///
+/// 落本机 state（**不是**契约类型 —— 要往网关上"上报"得先动契约，见 M4）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RenewalLedger {
+    /// 本次判定的时刻（RFC3339）。
+    pub checked_at: String,
+    /// `not_due` / `renewed` / `failed` / `needs_reinstall`。
+    pub outcome: String,
+    /// 人读的细节（失败原因、续到了什么时候…）。
+    pub detail: String,
+    /// 最近一次已知的证书到期时间（RFC3339）；没有证书时为空串。
+    pub not_after: String,
+}
+
+pub fn store_renewal_ledger(paths: &ClientIdentityPaths, ledger: &RenewalLedger) -> io::Result<()> {
+    let body = serde_json::to_vec_pretty(ledger).map_err(io::Error::other)?;
+    write_private(&paths.renewal_file, &body)
+}
+
+pub fn read_renewal_ledger(paths: &ClientIdentityPaths) -> io::Result<Option<RenewalLedger>> {
+    let Some(body) = read_optional(&paths.renewal_file)? else {
+        return Ok(None);
+    };
+    serde_json::from_str(&body).map(Some).map_err(|err| {
+        invalid_data(format!(
+            "failed to parse renewal ledger {}: {err}",
+            paths.renewal_file.display()
+        ))
+    })
 }
 
 /// 读本地证书的有效期状态；还没有证书（未注册）→ `Ok(None)`。
@@ -316,6 +352,23 @@ mod tests {
             .expect("combined identity");
         assert!(combined.contains("BEGIN CERTIFICATE"), "{combined}");
         assert!(combined.contains("BEGIN PRIVATE KEY"), "{combined}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn renewal_ledger_round_trips() {
+        let dir = temp_state_dir();
+        let paths = ClientIdentityPaths::under(&dir);
+        assert!(read_renewal_ledger(&paths).expect("read").is_none());
+
+        let ledger = RenewalLedger {
+            checked_at: "2026-09-28T00:00:00+00:00".to_string(),
+            outcome: "renewed".to_string(),
+            detail: "renewed until 2026-11-04T00:00:00+00:00".to_string(),
+            not_after: "2026-11-04T00:00:00+00:00".to_string(),
+        };
+        store_renewal_ledger(&paths, &ledger).expect("store");
+        assert_eq!(read_renewal_ledger(&paths).expect("read"), Some(ledger));
         let _ = fs::remove_dir_all(dir);
     }
 }
