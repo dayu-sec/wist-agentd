@@ -36,6 +36,31 @@ pub enum EnrollmentDecision {
 
 pub use crate::error::{EnrollmentError, EnrollmentReason, EnrollmentResult};
 
+/// 网关控制面响应里可辨识的**终态**信号（§5.4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthRejection {
+    /// 被**吊销**（§5.6）：终态。停下、别重试 —— 重装也没用（得先由运维在网关解除拒绝名单）。
+    Revoked,
+    /// 其它拒绝（未知凭据 / 凭据不匹配 / 过期 / 未带凭据…）：按普通失败处理。
+    NotRevoked,
+}
+
+/// 从一次控制面响应里认出「被吊销」。
+///
+/// `certificate_revoked` 是网关 401 正文里的**稳定标记**（`docs/design/agent-identity-mtls.md` §5.4）：
+/// agentd 据此区分「明确被拒（终态，停）」与其它失败（可重试）。
+pub(crate) fn classify_auth_rejection(status: reqwest::StatusCode, body: &str) -> AuthRejection {
+    if matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) && body.contains("certificate_revoked")
+    {
+        AuthRejection::Revoked
+    } else {
+        AuthRejection::NotRevoked
+    }
+}
+
 pub async fn ensure_enrolled(
     config: &mut AgentConfig,
     state_dir: &Path,
@@ -373,6 +398,11 @@ pub enum RenewalDecision {
     Failed(String),
     /// 证书已过期：**本地不再重试**，需带 token 重装（§4.2 无宽限）。
     NeedsReinstall,
+    /// 被网关**吊销**（§5.6）：终态，本地不再重试。
+    ///
+    /// 与 [`RenewalDecision::NeedsReinstall`] 刻意分开：那个的出路是「带 token 重装」，
+    /// 而对被吊销的 agent **重装也没用** —— 得先由运维在网关解除拒绝名单，再重启 agentd。
+    Revoked,
 }
 
 impl RenewalDecision {
@@ -382,6 +412,7 @@ impl RenewalDecision {
             RenewalDecision::Renewed => "renewed",
             RenewalDecision::Failed(_) => "failed",
             RenewalDecision::NeedsReinstall => "needs_reinstall",
+            RenewalDecision::Revoked => "revoked",
         }
     }
 
@@ -392,6 +423,11 @@ impl RenewalDecision {
             RenewalDecision::Failed(detail) => detail.clone(),
             RenewalDecision::NeedsReinstall => {
                 "client certificate expired; re-enroll or reinstall with a token".to_string()
+            }
+            RenewalDecision::Revoked => {
+                "gateway refused this agent as revoked (denylist); an operator must lift the \
+                 revocation, then restart — reinstalling will not help"
+                    .to_string()
             }
         }
     }
@@ -454,7 +490,13 @@ async fn renew_by_credential_expiry(config: &mut AgentConfig, state_dir: &Path) 
 
 async fn renew_now(config: &mut AgentConfig, state_dir: &Path) -> RenewalDecision {
     match renew_credential(config, state_dir).await {
-        Ok(()) => RenewalDecision::Renewed,
+        Ok(RenewOutcome::Done) => RenewalDecision::Renewed,
+        Ok(RenewOutcome::Revoked) => {
+            eprintln!(
+                "event=AgentRevoked source=renewal detail=\"gateway refused this agent as revoked (denylist); an operator must lift it, then restart — reinstalling will not help\""
+            );
+            RenewalDecision::Revoked
+        }
         Err(err) => {
             eprintln!(
                 "wist-agentd credential renewal failed (continuing with existing credential): {err}"
@@ -491,17 +533,17 @@ fn record_renewal_ledger(state_dir: &Path, decision: &RenewalDecision) {
 async fn renew_credential(
     config: &mut AgentConfig,
     state_dir: &Path,
-) -> Result<(), EnrollmentError> {
+) -> Result<RenewOutcome, EnrollmentError> {
     let Some(endpoint) = required_option(config.control_plane.endpoint.as_deref()) else {
         return Err(EnrollmentReason::MissingEndpoint
             .to_err()
             .with_detail("control_plane.endpoint is required for enrollment"));
     };
     let Some(bearer_token) = required_option(config.control_plane.bearer_token.as_deref()) else {
-        return Ok(());
+        return Ok(RenewOutcome::Done);
     };
     let Some(agent_id) = required_option(config.agent.agent_id.as_deref()) else {
-        return Ok(());
+        return Ok(RenewOutcome::Done);
     };
     let instance_id = required_option(config.agent.instance_name.as_deref())
         .unwrap_or_default()
@@ -529,9 +571,20 @@ async fn renew_credential(
         client.post(&url).bearer_auth(bearer_token).json(&request)
     })
     .await?;
-    let response = response
-        .error_for_status()
-        .source_raw_err(EnrollmentReason::Http, "renewal http error")?;
+    // 不再用 `error_for_status()`：要先读正文，才能把「被吊销（终态）」从普通失败里认出来（§5.4）。
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        if matches!(
+            classify_auth_rejection(status, &body),
+            AuthRejection::Revoked
+        ) {
+            return Ok(RenewOutcome::Revoked);
+        }
+        return Err(EnrollmentReason::Http
+            .to_err()
+            .with_detail(format!("renewal http error: {status} {}", body.trim())));
+    }
     let renewed: CredentialRenewed = response
         .json()
         .await
@@ -547,7 +600,19 @@ async fn renew_credential(
     state_store::agent_runtime::store_async(&runtime_path, &runtime_state)
         .await
         .source_err(EnrollmentReason::Io, "store runtime state")?;
-    Ok(())
+    Ok(RenewOutcome::Done)
+}
+
+/// `renew_credential` 的结果。
+///
+/// 为什么要单独区分 `Revoked`：被吊销是**终态**（§5.6）—— 它不是「这次失败、下次再试」，
+/// 继续按 `Failed` 重试就是静默卡死。用 `Ok(Revoked)`（而不是 `Err`）表达「请求成功、答案是被拒」，
+/// 把「已判明的终态」与「传输 / 落盘失败」两条通道分开。
+enum RenewOutcome {
+    /// 续好了，或本来就没东西可续（缺 token / agent_id，与既有行为一致）。
+    Done,
+    /// 网关明确回了「被吊销」。
+    Revoked,
 }
 
 pub(crate) fn enrollment_http_client(
@@ -1490,6 +1555,93 @@ state_dir = "state"
 
         let decision = super::renew_credential_if_due(&mut config, &state_dir).await;
         assert_eq!(decision, super::RenewalDecision::NotDue);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    /// 只认「被吊销」这个稳定标记，其它 401/403 一律当普通失败（可重试）。
+    #[test]
+    fn classify_auth_rejection_only_treats_certificate_revoked_as_terminal() {
+        use super::{AuthRejection, classify_auth_rejection};
+        use reqwest::StatusCode;
+
+        assert_eq!(
+            classify_auth_rejection(
+                StatusCode::UNAUTHORIZED,
+                "agent identity rejected: certificate_revoked"
+            ),
+            AuthRejection::Revoked
+        );
+        assert_eq!(
+            classify_auth_rejection(StatusCode::FORBIDDEN, "certificate_revoked"),
+            AuthRejection::Revoked
+        );
+        // 其它 401（未知凭据 / 凭据不匹配…）：不是终态。
+        assert_eq!(
+            classify_auth_rejection(
+                StatusCode::UNAUTHORIZED,
+                "agent identity rejected: credential_mismatch"
+            ),
+            AuthRejection::NotRevoked
+        );
+        // 服务端 5xx / 正文里出现这个词但不是 401/403：不当终态（避免误停）。
+        assert_eq!(
+            classify_auth_rejection(StatusCode::INTERNAL_SERVER_ERROR, "certificate_revoked"),
+            AuthRejection::NotRevoked
+        );
+    }
+
+    /// 网关回「被吊销」→ 续期判定是**终态** `Revoked`，且台账记下（不静默）。
+    #[tokio::test]
+    async fn a_revoked_agent_stops_renewing_and_records_it() {
+        let state_dir = temp_dir("renewal-revoked");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request_bytes = Vec::new();
+            loop {
+                let mut chunk = [0u8; 1024];
+                let read = socket.read(&mut chunk).await.expect("read");
+                if read == 0 {
+                    break;
+                }
+                request_bytes.extend_from_slice(&chunk[..read]);
+                if request_is_complete(&request_bytes) {
+                    break;
+                }
+            }
+            assert!(String::from_utf8_lossy(&request_bytes).contains("credentials:renew"));
+            let body = "agent identity rejected: certificate_revoked";
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let mut config = config();
+        config.paths.state_dir = state_dir.display().to_string();
+        config.agent.agent_id = Some("agent-x".to_string());
+        config.control_plane.endpoint = Some(endpoint);
+        config.control_plane.bearer_token = Some("wic_token".to_string());
+        // 已过期的到期时间 → 判定为「该续期」。
+        config.control_plane.credential_expires_at = Some("2026-08-01T00:00:00Z".to_string());
+
+        let decision = super::renew_credential_if_due(&mut config, &state_dir).await;
+        server.await.expect("server task");
+        assert_eq!(decision, super::RenewalDecision::Revoked);
+
+        let paths = crate::state_store::client_identity::ClientIdentityPaths::under(&state_dir);
+        let ledger = crate::state_store::client_identity::read_renewal_ledger(&paths)
+            .expect("read ledger")
+            .expect("ledger written");
+        assert_eq!(ledger.outcome, "revoked");
+        assert!(
+            ledger.detail.contains("lift"),
+            "detail must tell the operator to lift the revocation: {}",
+            ledger.detail
+        );
         let _ = fs::remove_dir_all(state_dir);
     }
 

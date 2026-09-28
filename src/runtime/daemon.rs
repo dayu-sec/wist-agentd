@@ -23,7 +23,7 @@ use crate::enrollment::enrollment_http_client;
 
 use crate::error::RuntimeResult;
 
-use crate::control::uplink::{AppliedUplink, fetch_uplink_grant};
+use crate::control::uplink::{AppliedUplink, UplinkFetch, fetch_uplink_grant};
 use crate::control::work::{AppliedWorkGrant, ack_work, fetch_work_grant, report_work_result};
 use crate::discovery::DiscoveryProbe;
 use crate::discovery::container::ContainerDiscoveryProbe;
@@ -318,6 +318,77 @@ fn build_uplink_state(
     }
 }
 
+/// 本机客户端证书状态（mTLS）。
+///
+/// 只有本机能判：服务端在**握手期**就验完了证书，过期证书根本进不来，
+/// 所以「证书还剩多久 / 是不是该续了」只能由 agent 自己读 `notAfter` 上报。
+/// 读不出来就 `None` —— 不影响上报本身。
+fn local_certificate_status(
+    config: &AgentConfig,
+) -> Option<wist_contracts::gateway::AgentCertificateStatus> {
+    use crate::state_store::client_identity::{CertificateValidity, ClientIdentityPaths};
+
+    let paths = ClientIdentityPaths::under(Path::new(&config.paths.state_dir));
+    let status = crate::state_store::client_identity::client_certificate_status(&paths)
+        .ok()
+        .flatten()?;
+    Some(wist_contracts::gateway::AgentCertificateStatus {
+        not_after: status.not_after,
+        remaining_seconds: status.remaining_seconds,
+        state: match status.validity {
+            CertificateValidity::Valid => "valid",
+            CertificateValidity::RenewDue => "renew_due",
+            CertificateValidity::Expired => "expired",
+        }
+        .to_string(),
+        last_renewal: local_renewal_report(&paths),
+    })
+}
+
+/// 最近一次续签判定（§5.5）：把本地台账（`identity/renewal.json`）**原样**带上去。
+///
+/// 续签是后台动作，不记录就等于静默 —— 失败原因 / 何时续到、何时该重装，都靠它。
+/// 读不出来就 `None`（不影响上报本身）。
+fn local_renewal_report(
+    paths: &crate::state_store::client_identity::ClientIdentityPaths,
+) -> Option<wist_contracts::gateway::AgentCredentialRenewal> {
+    let ledger = crate::state_store::client_identity::read_renewal_ledger(paths)
+        .ok()
+        .flatten()?;
+    Some(wist_contracts::gateway::AgentCredentialRenewal {
+        outcome: ledger.outcome,
+        checked_at: ledger.checked_at,
+        detail: ledger.detail,
+        not_after: ledger.not_after,
+    })
+}
+
+/// 一次状态上报的结果：成功时的往返延迟 + **是否被吊销**（§5.6，终态）。
+///
+/// 为什么要单独带 `revoked`：状态上报是 agentd 与网关最频繁的一次交互（每 3s，`STATUS_REPORT_INTERVAL`），
+/// 也是「被吊销」最快的发现点 —— 认出它才能让守护循环**停下**，而不是每 3s 刷一行失败日志。
+struct StatusReportOutcome {
+    latency_ms: Option<u64>,
+    revoked: bool,
+}
+
+impl StatusReportOutcome {
+    /// 发了但失败（网络 / 5xx…），或本来就没东西可报（缺端点 / 凭据 / 身份）。
+    fn failed() -> Self {
+        Self {
+            latency_ms: None,
+            revoked: false,
+        }
+    }
+
+    fn revoked() -> Self {
+        Self {
+            latency_ms: None,
+            revoked: true,
+        }
+    }
+}
+
 /// Best-effort status heartbeat to the admin control plane. Returns the measured
 /// round-trip latency in milliseconds when the report succeeded.
 ///
@@ -345,10 +416,16 @@ async fn report_status_to_control_plane(
     work: &AppliedWorkGrant,
     uplink: &AppliedUplink,
     uplink_health: &UplinkHealth,
-) -> Option<u64> {
-    let endpoint = config.control_plane.endpoint.as_deref()?;
-    let bearer_token = config.control_plane.bearer_token.as_deref()?;
-    let agent_id = config.agent.agent_id.as_deref()?;
+) -> StatusReportOutcome {
+    let Some(endpoint) = config.control_plane.endpoint.as_deref() else {
+        return StatusReportOutcome::failed();
+    };
+    let Some(bearer_token) = config.control_plane.bearer_token.as_deref() else {
+        return StatusReportOutcome::failed();
+    };
+    let Some(agent_id) = config.agent.agent_id.as_deref() else {
+        return StatusReportOutcome::failed();
+    };
     let instance_id = config.agent.instance_name.as_deref().unwrap_or_default();
     // 本机工作视图是 best-effort：它只决定页面能不能看见「在采哪些文件」，
     // 构造不出来也不该影响状态上报本身，所以始终送 `Some(...)`（没快照时授权那半为空）。
@@ -356,6 +433,9 @@ async fn report_status_to_control_plane(
     // 生效上送状态同样是 best-effort 的**声明**：没有可错的输入，所以始终送 `Some(...)`
     // （`None` 的语义是「本次没带」，与本机工作视图同口径，留给旧版本 agent）。
     let uplink_state = Some(build_uplink_state(config, uplink, uplink_health));
+    // 客户端证书状态（mTLS）：只有本机能判（服务端在握手期就验完了，
+    // 而过期证书根本进不来）。读不出来就是 `None` —— 不影响上报本身。
+    let certificate_status = local_certificate_status(config);
     let report = AgentStatusReport {
         agent_id: agent_id.to_string(),
         instance_id: instance_id.to_string(),
@@ -368,12 +448,13 @@ async fn report_status_to_control_plane(
         discovery_policy_version,
         local_work,
         uplink_state,
+        certificate_status,
     };
     let client = match enrollment_http_client(config) {
         Ok(client) => client,
         Err(err) => {
             eprintln!("wist-agentd status report: failed to build client: {err}");
-            return None;
+            return StatusReportOutcome::failed();
         }
     };
     let url = format!("{}/api/v1/agent/status", endpoint.trim_end_matches('/'));
@@ -385,21 +466,36 @@ async fn report_status_to_control_plane(
         .send()
         .await
     {
-        Ok(response) if response.status().is_success() => {
-            Some(started.elapsed().as_millis() as u64)
-        }
+        Ok(response) if response.status().is_success() => StatusReportOutcome {
+            latency_ms: Some(started.elapsed().as_millis() as u64),
+            revoked: false,
+        },
         Ok(response) => {
-            eprintln!(
-                "wist-agentd status report failed: HTTP {} from {}",
-                response.status(),
-                endpoint
-            );
-            None
+            let status = response.status();
+            // 读正文才能把「被吊销（终态）」从其它 401 里认出来（§5.4 / §5.6）。
+            let body = response.text().await.unwrap_or_default();
+            if matches!(
+                crate::enrollment::classify_auth_rejection(status, &body),
+                crate::enrollment::AuthRejection::Revoked
+            ) {
+                return StatusReportOutcome::revoked();
+            }
+            eprintln!("wist-agentd status report failed: HTTP {status} from {endpoint}");
+            StatusReportOutcome::failed()
         }
         Err(err) => {
             eprintln!("wist-agentd status report failed: {err}");
-            None
+            StatusReportOutcome::failed()
         }
+    }
+}
+
+/// 被吊销后把数据面上送压成待命（§5.6）：即使本轮还在按旧 grant 外发，也立刻停。
+fn force_standby(uplink: &mut AppliedUplink) {
+    if let Some(line) = uplink.observe(UplinkFetch::CredentialRejected(
+        "certificate_revoked".to_string(),
+    )) {
+        eprintln!("{line}");
     }
 }
 
@@ -718,7 +814,18 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     let config_dir = loop_ctx.config_dir;
     let mut runtime_config: AgentConfig = loop_ctx.config.clone();
     let mut last_renewal_check: Option<Instant> = None;
+    // 终态标志（§5.6）：一旦发现被网关吊销，就不再向控制面发任何请求。
+    let mut revoked = false;
     loop {
+        // 终态：被网关吊销。不再向控制面发任何请求（状态 / 工作 / 上送 / 续期），也不再每
+        // tick 刷失败日志。**本机采集也一起停** —— 此刻数据面 ingest 同样会拒（被吊销的
+        // agent 的记录不进库），采了也没人收。**进程留着不退出**：launchd/systemd 的
+        // KeepAlive 会把「退出」变成重启风暴。恢复只有一条路 —— 运维在网关解除拒绝名单，
+        // 然后重启 agentd。
+        if revoked {
+            tokio::time::sleep(TICK_INTERVAL).await;
+            continue;
+        }
         // 续期检查**放在建本轮 loop_ctx 之前**：要可变借用 `runtime_config`。
         if last_renewal_check.is_none_or(|at| at.elapsed() >= RENEWAL_CHECK_INTERVAL) {
             last_renewal_check = Some(Instant::now());
@@ -736,6 +843,12 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                     eprintln!(
                         "event=CredentialNeedsReinstall detail=\"client certificate expired; re-enroll or reinstall with a token\""
                     );
+                }
+                crate::enrollment::RenewalDecision::Revoked => {
+                    // 续期这条路径也认得出「被吊销」（`renew_now` 已打 `event=AgentRevoked`）。
+                    // 这里只需进终态：下一轮起不再打扰控制面。
+                    revoked = true;
+                    force_standby(&mut uplink_runtime);
                 }
             }
         }
@@ -803,7 +916,7 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
             } else {
                 Some(to_agent_work_state_changes(&changes))
             };
-            if let Some(latency) = report_status_to_control_plane(
+            let report = report_status_to_control_plane(
                 loop_ctx.config,
                 cpu_percent,
                 last_latency_ms,
@@ -818,8 +931,14 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                 &uplink_runtime,
                 &uplink_health,
             )
-            .await
-            {
+            .await;
+            if report.revoked {
+                eprintln!(
+                    "event=AgentRevoked source=status_report detail=\"gateway refused this agent as revoked (denylist); an operator must lift it, then restart — reinstalling will not help\""
+                );
+                revoked = true;
+                force_standby(&mut uplink_runtime);
+            } else if let Some(latency) = report.latency_ms {
                 last_latency_ms = Some(latency);
             }
         }
@@ -1751,6 +1870,84 @@ mod tests {
         )
     }
 
+    /// 状态上报里的证书状态：有证书时报 `valid` / `renew_due` / `expired`，无证书时报 `None`。
+    ///
+    /// 这是页面区分「没证书」与「证书还剩多久」的唯一来源（服务端握手期就验完了，拿不到这些）。
+    #[test]
+    fn local_certificate_status_reports_validity_and_absence() {
+        let state_dir = local_state_dir("certificate-status");
+        let mut config = test_config();
+        config.paths.state_dir = state_dir.display().to_string();
+        let paths = crate::state_store::client_identity::ClientIdentityPaths::under(&state_dir);
+
+        // 没有证书（纯 bearer 或尚未签发）→ `None`，不是空 state。
+        assert!(
+            super::local_certificate_status(&config).is_none(),
+            "no certificate must report None"
+        );
+
+        // 37 天（续期窗 30 天之外）→ `valid`，且剩余秒数在窗外。
+        store_identity(&paths, 37);
+        let fresh = super::local_certificate_status(&config).expect("fresh status");
+        assert_eq!(fresh.state, "valid");
+        assert!(
+            fresh.remaining_seconds > 30 * 24 * 60 * 60,
+            "a 37-day certificate must sit outside the 30-day renewal window"
+        );
+
+        // 剩 10 天（落在续期窗内）→ `renew_due`。
+        store_identity(&paths, 10);
+        assert_eq!(
+            super::local_certificate_status(&config)
+                .expect("due status")
+                .state,
+            "renew_due"
+        );
+
+        // 已过期 → `expired`（服务端握手期就会拒，这里只是把事实报上去）。
+        store_identity(&paths, -1);
+        assert_eq!(
+            super::local_certificate_status(&config)
+                .expect("expired status")
+                .state,
+            "expired"
+        );
+
+        // 续签台账（§5.5）：原样带上去 —— 「上次续签什么时候、结果如何」靠它。
+        crate::state_store::client_identity::store_renewal_ledger(
+            &paths,
+            &crate::state_store::client_identity::RenewalLedger {
+                checked_at: "2026-10-08T00:00:00Z".to_string(),
+                outcome: "renewed".to_string(),
+                detail: "credential renewed".to_string(),
+                not_after: "2026-11-04T00:00:00Z".to_string(),
+            },
+        )
+        .expect("store renewal ledger");
+        let renewal = super::local_certificate_status(&config)
+            .expect("status with renewal")
+            .last_renewal
+            .expect("renewal must be carried through");
+        assert_eq!(renewal.outcome, "renewed");
+        assert_eq!(renewal.checked_at, "2026-10-08T00:00:00Z");
+
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    /// 写入一对自签证书/私钥（`not_after` = 现在 + `days`），覆盖已有身份材料。
+    fn store_identity(paths: &crate::state_store::client_identity::ClientIdentityPaths, days: i64) {
+        let key = rcgen::KeyPair::generate().expect("client key");
+        let mut params = rcgen::CertificateParams::default();
+        params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+        params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(days);
+        let certificate = params.self_signed(&key).expect("self signed");
+
+        std::fs::create_dir_all(paths.key_file.parent().expect("parent")).expect("key dir");
+        std::fs::write(&paths.key_file, key.serialize_pem()).expect("write key");
+        crate::state_store::client_identity::store_client_certificate(paths, &certificate.pem())
+            .expect("store certificate");
+    }
+
     /// 关闸轮（`enabled = false`）**不参与暂停差量**：静默 tick 没有通知，若照常做差量，
     /// 上次因 spool 超限暂停的输入会被判成「已恢复」并回报给控制面 —— 把「被关闸」误报成
     /// 「恢复正常」。这一层决策是私有的，只有同文件测试能直接碰。
@@ -1878,7 +2075,7 @@ mod tests {
 
         let mut config = test_config();
         config.control_plane.endpoint = Some(endpoint);
-        let latency = report_status_to_control_plane(
+        let outcome = report_status_to_control_plane(
             &config,
             Some(12.5),
             Some(3),
@@ -1890,7 +2087,7 @@ mod tests {
         )
         .await;
         server.await.expect("server task");
-        assert!(latency.is_some());
+        assert!(outcome.latency_ms.is_some());
     }
 
     #[tokio::test]
@@ -1913,7 +2110,7 @@ mod tests {
 
         let mut config = test_config();
         config.control_plane.endpoint = Some(endpoint);
-        let latency = report_status_to_control_plane(
+        let outcome = report_status_to_control_plane(
             &config,
             None,
             None,
@@ -1925,7 +2122,7 @@ mod tests {
         )
         .await;
         server.await.expect("server task");
-        assert!(latency.is_some());
+        assert!(outcome.latency_ms.is_some());
     }
 
     // ── 实际生效的上送状态上报 ───────────────────────────────────────
@@ -2025,7 +2222,7 @@ mod tests {
             9000,
             "2026-09-26T00:00:00Z".to_string(),
         ));
-        let latency = report_status_to_control_plane(
+        let outcome = report_status_to_control_plane(
             &config,
             None,
             None,
@@ -2037,7 +2234,7 @@ mod tests {
         )
         .await;
         server.await.expect("server task");
-        assert!(latency.is_some());
+        assert!(outcome.latency_ms.is_some());
     }
 
     // ── 事实摘要上送 ─────────────────────────────────────────────────
@@ -2576,7 +2773,7 @@ mod tests {
             reason: "spool over limit".to_string(),
             at: "now".to_string(),
         }]);
-        let latency = report_status_to_control_plane(
+        let outcome = report_status_to_control_plane(
             &config,
             Some(12.5),
             Some(3),
@@ -2588,7 +2785,7 @@ mod tests {
         )
         .await;
         server.await.expect("server task");
-        assert!(latency.is_some());
+        assert!(outcome.latency_ms.is_some());
     }
 
     /// 一份「手里在采一份日志工作」的本机工作视图（授权折算出一条采集任务）。
@@ -2664,7 +2861,7 @@ mod tests {
                 multiline_mode: "none".to_string(),
             }];
         let grant = grant_with_a_log_task();
-        let latency = report_status_to_control_plane(
+        let outcome = report_status_to_control_plane(
             &config,
             Some(12.5),
             Some(3),
@@ -2676,14 +2873,14 @@ mod tests {
         )
         .await;
         server.await.expect("server task");
-        assert!(latency.is_some());
+        assert!(outcome.latency_ms.is_some());
     }
 
     #[tokio::test]
     async fn report_status_skips_when_not_enrolled() {
         let mut config = test_config();
         config.control_plane.bearer_token = None;
-        let latency = report_status_to_control_plane(
+        let outcome = report_status_to_control_plane(
             &config,
             None,
             None,
@@ -2694,7 +2891,45 @@ mod tests {
             &UplinkHealth::default(),
         )
         .await;
-        assert!(latency.is_none());
+        assert!(outcome.latency_ms.is_none());
+    }
+
+    /// 网关回 401 `certificate_revoked` → 上报结果带 `revoked`（守护循环据此进终态，不每 3s 刷日志）。
+    #[tokio::test]
+    async fn report_status_flags_revocation_from_the_gateway() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let _ = read_http_request(&mut socket).await;
+            let body = "agent identity rejected: certificate_revoked";
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let mut config = test_config();
+        config.control_plane.endpoint = Some(endpoint);
+        let outcome = report_status_to_control_plane(
+            &config,
+            None,
+            None,
+            None,
+            None,
+            &AppliedWorkGrant::default(),
+            &AppliedUplink::default(),
+            &UplinkHealth::default(),
+        )
+        .await;
+        server.await.expect("server task");
+        assert!(
+            outcome.revoked,
+            "a 401 certificate_revoked must flag revocation"
+        );
+        assert!(outcome.latency_ms.is_none());
     }
 
     #[cfg(target_os = "macos")]
