@@ -64,6 +64,8 @@ struct EnrollRequest {
     /// `Some` = `--token <value>`；`None` + `stdin` = `--token-stdin`；都没有则走配置/环境变量。
     token: Option<String>,
     token_stdin: bool,
+    /// `--force`：先丢掉本地身份（凭据 state + 已签发的客户端证书）再重新注册。
+    force: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -405,7 +407,7 @@ fn parse_service_request(
     Ok((request, config_dir, index))
 }
 
-/// 解析 `enroll [--token <T> | --token-stdin] [--config-dir <path>]`。
+/// 解析 `enroll [--token <T> | --token-stdin] [--force] [--config-dir <path>]`。
 fn parse_enroll_request(
     args: &[OsString],
     start_index: usize,
@@ -413,6 +415,7 @@ fn parse_enroll_request(
     let mut request = EnrollRequest {
         token: None,
         token_stdin: false,
+        force: false,
     };
     let mut config_dir = None;
     let mut index = start_index;
@@ -432,6 +435,11 @@ fn parse_enroll_request(
         }
         if arg == "--token-stdin" {
             request.token_stdin = true;
+            index += 1;
+            continue;
+        }
+        if arg == "--force" {
+            request.force = true;
             index += 1;
             continue;
         }
@@ -588,9 +596,20 @@ async fn run_enroll(
     };
 
     let decision = match token {
+        // `--force` 只在有 token 时有意义：它做的事就是「把旧身份扔掉、拿 token 重注册」。
+        Some(token) if request.force => {
+            crate::enrollment::enroll_with_token_forced(&config_root, token)
+                .await
+                .conv_err()?
+        }
         Some(token) => crate::enrollment::enroll_with_token(&config_root, token)
             .await
             .conv_err()?,
+        None if request.force => {
+            return Err(AgentdReason::InvalidArgs
+                .to_err()
+                .with_detail("enroll --force requires --token or --token-stdin"));
+        }
         // 未给 token：等价于守护进程启动时的注册（用配置/环境变量里的 token）。
         None => crate::enrollment::enroll_from_config(&config_root)
             .await

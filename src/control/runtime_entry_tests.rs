@@ -394,6 +394,7 @@ fn parse_command_accepts_enroll_flags_after_config_dir() {
         super::Command::Enroll(super::EnrollRequest {
             token: Some("tok-1".to_string()),
             token_stdin: false,
+            force: false,
         })
     );
 }
@@ -443,6 +444,7 @@ fn parse_command_accepts_enroll_with_token_forms() {
         super::Command::Enroll(super::EnrollRequest {
             token: Some("tok-1".to_string()),
             token_stdin: false,
+            force: false,
         })
     );
 
@@ -459,6 +461,7 @@ fn parse_command_accepts_enroll_with_token_forms() {
         super::Command::Enroll(super::EnrollRequest {
             token: None,
             token_stdin: true,
+            force: false,
         })
     );
 
@@ -469,9 +472,23 @@ fn parse_command_accepts_enroll_with_token_forms() {
             command: super::Command::Enroll(super::EnrollRequest {
                 token: None,
                 token_stdin: false,
+                force: false,
             }),
             config_dir: None,
         }
+    );
+}
+
+#[test]
+fn parse_command_accepts_enroll_force() {
+    let parsed = parse_command(["enroll", "--force", "--token", "tok-1"]).expect("parse");
+    assert_eq!(
+        parsed.command,
+        super::Command::Enroll(super::EnrollRequest {
+            token: Some("tok-1".to_string()),
+            token_stdin: false,
+            force: true,
+        })
     );
 }
 

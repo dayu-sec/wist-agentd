@@ -65,17 +65,51 @@ pub async fn enroll_with_token(
     config_root: &Path,
     token: String,
 ) -> EnrollmentResult<EnrollmentDecision> {
-    enroll_with_optional_token(config_root, Some(token)).await
+    enroll_with_optional_token(config_root, Some(token), false).await
+}
+
+/// `enroll --force`：**先丢掉本地身份**（凭据 state + 已签发的客户端证书），再重新注册。
+///
+/// 这是「重装 ≠ 重注册」的补口（§8）：state 里已有身份时注册会被跳过，
+/// 证书过期/被拒、换网关、或本地身份错乱时就需要它把旧身份扔掉。
+pub async fn enroll_with_token_forced(
+    config_root: &Path,
+    token: String,
+) -> EnrollmentResult<EnrollmentDecision> {
+    enroll_with_optional_token(config_root, Some(token), true).await
 }
 
 /// 不带 token 的注册（用配置／环境变量里的 token）；等价于守护进程启动时的注册。
 pub async fn enroll_from_config(config_root: &Path) -> EnrollmentResult<EnrollmentDecision> {
-    enroll_with_optional_token(config_root, None).await
+    enroll_with_optional_token(config_root, None, false).await
+}
+
+/// `--force` 用：丢掉本地**身份**（凭据 state + 已签发的客户端证书 + 续期台账）。
+///
+/// 保留本地私钥：私钥是本机耗材，「身份」是网关签出来的东西 ——
+/// 重注册只要重新交一次 CSR（§4.2）。
+fn discard_local_identity(state_dir: &Path) -> EnrollmentResult<()> {
+    let runtime_path = state_store::agent_runtime::path_for(state_dir);
+    if runtime_path.exists() {
+        fs::remove_file(&runtime_path)
+            .source_raw_err(EnrollmentReason::Io, "discard local credential state")?;
+    }
+    let paths = state_store::client_identity::ClientIdentityPaths::under(state_dir);
+    if paths.cert_file.exists() {
+        fs::remove_file(&paths.cert_file)
+            .source_raw_err(EnrollmentReason::Io, "discard local client certificate")?;
+    }
+    if paths.renewal_file.exists() {
+        fs::remove_file(&paths.renewal_file)
+            .source_raw_err(EnrollmentReason::Io, "discard renewal ledger")?;
+    }
+    Ok(())
 }
 
 async fn enroll_with_optional_token(
     config_root: &Path,
     token: Option<String>,
+    force: bool,
 ) -> EnrollmentResult<EnrollmentDecision> {
     let config_path = crate::config_runtime::resolve_config_path(config_root);
     if !config_path.is_file() {
@@ -99,6 +133,10 @@ async fn enroll_with_optional_token(
     crate::bootstrap::initialize_async(&root_dir, &run_dir, &state_dir, &log_dir)
         .await
         .source_err(EnrollmentReason::Io, "initialize runtime directories")?;
+
+    if force {
+        discard_local_identity(&state_dir)?;
+    }
 
     if let Some(token) = token {
         config.control_plane.enrollment_token = Some(token);
@@ -880,7 +918,7 @@ mod tests {
 
     use super::{
         EnrollmentDecision, EnrollmentReason, build_enrollment_request, enroll_from_config,
-        enroll_with_token, enrollment_http_client, ensure_enrolled,
+        enroll_with_token, enroll_with_token_forced, enrollment_http_client, ensure_enrolled,
         ensure_enrolled_with_config_path, hostname_from_sources, is_registered_agent_id,
         post_enrollment, renew_credential, restore_runtime_identity,
     };
@@ -1463,6 +1501,96 @@ state_dir = "state"
         params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(days);
         let certificate = params.self_signed(&key).expect("self signed");
         (certificate.pem(), key.serialize_pem())
+    }
+
+    /// `--force` 不把「state 里已有身份」当成可以跳过的理由 —— 它真会重新注册。
+    #[tokio::test]
+    async fn forced_enrollment_does_not_skip_an_existing_identity() {
+        let config_root = temp_dir("enroll-force-wiring");
+        let config_path = config_root.join("agentd.toml");
+        // 端点必然连不上：不 force 会直接跳过（不发请求），force 会去发并因此失败。
+        fs::write(
+            &config_path,
+            r#"schema_version = "v1"
+
+[control_plane]
+enabled = true
+endpoint = "http://127.0.0.1:1"
+
+[paths]
+root_dir = "."
+state_dir = "state"
+"#,
+        )
+        .expect("write config");
+
+        let state_dir = config_root.join("state");
+        let runtime_path = crate::state_store::agent_runtime::path_for(&state_dir);
+        let runtime = wist_contracts::agent_state::AgentRuntimeState::new(
+            "agent-old".to_string(),
+            "inst-old".to_string(),
+            "0.1.0".to_string(),
+            wist_contracts::agent_state::RuntimeMode::Normal,
+            "2026-09-01T00:00:00Z".to_string(),
+        );
+        crate::state_store::agent_runtime::store(&runtime_path, &runtime).expect("store state");
+
+        // 不 force：state 里有身份 → 直接跳过，压根不发请求。
+        let skipped = enroll_with_token(&config_root, "cli-token".to_string())
+            .await
+            .expect("enroll");
+        assert_eq!(skipped, EnrollmentDecision::ExistingStateIdentity);
+
+        // force：先丢身份再去注册 → 端点连不上，所以是 Http 失败（而不是 ExistingStateIdentity）。
+        let err = enroll_with_token_forced(&config_root, "cli-token".to_string())
+            .await
+            .expect_err("unreachable endpoint");
+        assert_eq!(err.reason(), &EnrollmentReason::Http);
+        assert!(
+            !runtime_path.exists(),
+            "the forced run must have discarded the local state"
+        );
+    }
+
+    /// `--force` 丢掉**身份**（凭据 state + 证书 + 台账），但保留本地私钥。
+    #[test]
+    fn forced_enrollment_discards_identity_but_keeps_the_private_key() {
+        let state_dir = temp_dir("enroll-force-discard");
+        fs::create_dir_all(&state_dir).expect("state dir");
+        let paths = crate::state_store::client_identity::ClientIdentityPaths::under(&state_dir);
+        fs::create_dir_all(paths.key_file.parent().expect("parent")).expect("key dir");
+        fs::write(&paths.key_file, "key").expect("write key");
+        crate::state_store::client_identity::store_client_certificate(&paths, "cert")
+            .expect("cert");
+        crate::state_store::client_identity::store_renewal_ledger(
+            &paths,
+            &crate::state_store::client_identity::RenewalLedger {
+                checked_at: "2026-09-28T00:00:00+00:00".to_string(),
+                outcome: "renewed".to_string(),
+                detail: String::new(),
+                not_after: String::new(),
+            },
+        )
+        .expect("ledger");
+        let runtime_path = crate::state_store::agent_runtime::path_for(&state_dir);
+        fs::write(&runtime_path, "{}").expect("runtime state");
+
+        super::discard_local_identity(&state_dir).expect("discard");
+
+        assert!(!runtime_path.exists(), "credential state must be dropped");
+        assert!(
+            !paths.cert_file.exists(),
+            "issued certificate must be dropped"
+        );
+        assert!(
+            !paths.renewal_file.exists(),
+            "renewal ledger must be dropped"
+        );
+        assert!(
+            paths.key_file.exists(),
+            "the private key is local consumable material, not identity"
+        );
+        let _ = fs::remove_dir_all(state_dir);
     }
 
     /// 带客户端证书的注册回包：证书落 `identity/`，且 `certificate` 方案被接受（不再报 unsupported）。
