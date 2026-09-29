@@ -196,6 +196,29 @@ fn parse_command_rejects_unknown_command() {
 }
 
 #[test]
+fn parse_command_suggests_the_closest_command_on_typo() {
+    for (typed, expected) in [
+        ("diagose", "diagnose"),
+        ("servce", "service"),
+        ("verison", "version"),
+        ("initconfig", "init-config"),
+    ] {
+        let err = parse_command([typed]).expect_err("typo'd command");
+        assert!(
+            err.to_string()
+                .contains(&format!("did you mean `{expected}`?")),
+            "{typed}: {err}"
+        );
+    }
+}
+
+#[test]
+fn parse_command_does_not_suggest_for_unrelated_gibberish() {
+    let err = parse_command(["zzzzzzzz"]).expect_err("gibberish");
+    assert!(!err.to_string().contains("did you mean"), "{err}");
+}
+
+#[test]
 fn parse_command_rejects_missing_config_dir_value() {
     let err = parse_command(["--config-dir"]).expect_err("missing config dir");
     assert!(err.to_string().contains("missing value for --config-dir"));
@@ -238,6 +261,21 @@ fn run_from_args_init_config_honors_custom_config_dir() {
 }
 
 #[test]
+fn run_doctor_exits_nonzero_when_config_is_missing() {
+    let root = temp_dir("cli-doctor-missing-config");
+
+    let code = run_from_args(
+        root.clone(),
+        ["diagnose", "--offline", "--config-dir", "absent"],
+    )
+    .expect("diagnose runs");
+
+    // 配置都读不出来 ⇒ 必有 FAIL ⇒ 退出码非零（脚本/AI 的门禁就是看这个）。
+    assert_eq!(code, 1, "missing config should be reported as a failure");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn init_config_message_mentions_config_directory_when_created() {
     let path = Path::new("/tmp/project/wist-agentd/agentd.toml");
 
@@ -270,8 +308,84 @@ fn usage_message_lists_supported_commands() {
     assert!(message.contains("wist-agentd help"));
     assert!(message.contains("wist-agentd version"));
     assert!(message.contains("wist-agentd service <print|install|uninstall|status>"));
+    assert!(message.contains("wist-agentd diagnose [--json] [--offline]"));
     assert!(message.contains("Show this help message"));
     assert!(message.contains("--config-dir <path>"));
+}
+
+#[test]
+fn parse_command_accepts_diagnose() {
+    let expected = super::ParsedArgs {
+        command: super::Command::Doctor {
+            json: false,
+            offline: false,
+        },
+        config_dir: None,
+    };
+    assert_eq!(parse_command(["diagnose"]).expect("parse"), expected);
+}
+
+#[test]
+fn parse_command_rejects_the_old_doctor_spelling() {
+    // `doctor` 已不再是命令名（只留 `diagnose`）。
+    let err = parse_command(["doctor"]).expect_err("doctor is no longer accepted");
+    assert!(err.to_string().contains("unknown argument or command"));
+}
+
+#[test]
+fn parse_command_accepts_diagnose_with_flags() {
+    assert_eq!(
+        parse_command(["diagnose", "--json", "--offline"]).expect("parse"),
+        super::ParsedArgs {
+            command: super::Command::Doctor {
+                json: true,
+                offline: true,
+            },
+            config_dir: None,
+        }
+    );
+}
+
+#[test]
+fn parse_command_accepts_diagnose_flags_in_any_order() {
+    let expected = super::ParsedArgs {
+        command: super::Command::Doctor {
+            json: true,
+            offline: true,
+        },
+        config_dir: Some(PathBuf::from("conf")),
+    };
+    assert_eq!(
+        parse_command(["diagnose", "--json", "--offline", "--config-dir", "conf"]).expect("parse"),
+        expected
+    );
+    assert_eq!(
+        parse_command(["--config-dir", "conf", "diagnose", "--offline", "--json"]).expect("parse"),
+        expected
+    );
+}
+
+#[test]
+fn parse_command_rejects_doctor_flags_without_doctor() {
+    for flag in ["--json", "--offline"] {
+        let err = parse_command([flag]).expect_err("flag without diagnose");
+        assert!(
+            err.to_string().contains("only supported with diagnose"),
+            "{flag}: {err}"
+        );
+    }
+}
+
+#[test]
+fn parse_command_rejects_doctor_combined_with_another_command() {
+    let err = parse_command(["diagnose", "version"]).expect_err("diagnose + version");
+    assert!(err.to_string().contains("cannot be combined"));
+}
+
+#[test]
+fn parse_command_rejects_config_dir_followed_by_doctor_flag() {
+    let err = parse_command(["--config-dir", "--json"]).expect_err("config dir followed by flag");
+    assert!(err.to_string().contains("missing value for --config-dir"));
 }
 
 #[test]

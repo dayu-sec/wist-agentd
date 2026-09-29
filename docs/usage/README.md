@@ -4,7 +4,19 @@
 设计取舍 [../design/agentd-service-deployment.md](../design/agentd-service-deployment.md)。
 文中 `wist-agentd` 指本机那份二进制。
 
-## 0. 三条自检
+## 0. 先跑 `diagnose`，再看三条自检
+
+**一屏诊断**：`diagnose` 只读地把「配置 → 身份 → 安装/服务 → 控制面连通 → 数据面（上送）→ 本地工作」
+各探一遍，每项给 `[OK]/[WARN]/[FAIL]` 与**下一步怎么做**；**退出码非零 = 有 FAIL**（可当门禁）。
+它复用守护进程同款判定，不会工具说一套、进程做一套。
+
+```bash
+sudo wist-agentd diagnose          # 人读；读 /etc、/var/log 需要 root
+wist-agentd diagnose --json        # 机器可读：checks[].id/status/hint + summary
+wist-agentd diagnose --offline     # 不碰网络，只查本机配置/身份/服务/落点
+```
+
+先看**第一条 FAIL**，再读该项的 `→` 提示（断点已分层：DNS → TCP → TLS/HTTP/鉴权）；下面三条是更细的自检：
 
 ```bash
 wist-agentd service status --system               # 用户级：--user；只读

@@ -20,8 +20,9 @@ use support::{
     withheld_failure,
 };
 
-// 生效输出解析要给主循环用（它在短路前算），所以在同一层再导出一次。
-pub(super) use support::effective_output;
+// 生效输出解析要给主循环用（它在短路前算），所以在同一层再导出一次；
+// `pub(crate)` 也让 `doctor` 复用同一套判定（工具说一套、进程做一套是没有意义的）。
+pub(crate) use support::effective_output;
 
 #[derive(::jumo_derive::Jumo)]
 #[jumo(kind = "struct", domain = "Reporting", module = "Reporting.Health")]

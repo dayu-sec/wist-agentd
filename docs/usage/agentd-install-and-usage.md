@@ -449,6 +449,7 @@ check=launchctl print gui/501/com.dayu-sec.wist-agentd
 ```bash
 wist-agentd version                       # 已部署版本
 wist-agentd service status --system       # 只读自检（含真实数据/日志落点）
+sudo wist-agentd diagnose                   # 一屏诊断（配置/身份/服务/连通/上送）；退出码非零 = 有 FAIL
 ```
 
 | 平台 | 服务状态 | 日志 |
@@ -560,6 +561,19 @@ sudo dev/verify-system-install.sh --cleanup       # 清理它装的东西
 
 ## 9. 排障
 
+出问题**先跑 `diagnose`**：它只读地把「配置 → 身份 → 安装/服务 → 控制面连通 → 数据面（上送）→ 本地工作」
+各探一遍，每项给 `[OK]/[WARN]/[FAIL]` 与**下一步怎么做**，最后一句总判定；**退出码非零 = 有 FAIL**，
+可当脚本/自动化的门禁。它复用守护进程同款判定（生效上送目标、控制面探测），不会工具说一套、进程做一套。
+
+```bash
+sudo wist-agentd diagnose          # 人读输出；读 /etc/wist-agentd/* 与 /var/log 需要 root
+wist-agentd diagnose --json        # 机器可读：checks[].id/status/hint + summary
+wist-agentd diagnose --offline     # 不碰网络，只查本机配置/身份/服务/落点
+```
+
+先看**第一条 FAIL**（`结论` 行点了它的名字），再读该项的 `→` 提示（断点已分层：DNS → TCP → TLS/HTTP/鉴权）。
+再对照下表看具体现象：
+
 | 现象 | 原因 / 处理 |
 | --- | --- |
 | `another wist-agentd instance is already running (lock file: ...)` | 同一 state 目录已有实例。用 `wist-agentd service status --system`（或 `--user`，看 `running=`）或 `lsof <state>/.agentd.lock` 确认；换运行方式前先停旧实例 |
@@ -574,6 +588,8 @@ sudo dev/verify-system-install.sh --cleanup       # 清理它装的东西
 | 配置或数据写不进去（`Permission denied`） | 系统级部署要 root：配置 `/etc/wist-agentd`、数据 `/var/lib/wist-agentd`、日志 `/var/log/wist-agentd`。非 root 开发请把配置放到非 `/etc` 路径（数据/日志就地，见 §2），或用 `--user` |
 | 不确定数据写到哪了 | 看启动行的 `run_dir= / state_dir= / log_dir=`（解析后的绝对路径），或 `wist-agentd service status` 的 `root_dir/run_dir/state_dir/log_dir` |
 | 想确认跑的是哪份配置/版本 | 启动行 `wist-agentd <version> starting: config=... mode=...`；`wist-agentd service status` 看 `config=` |
+| `diagnose` 报 `network.tcp` FAIL（TCP 连不上 `host:443`） | endpoint 不写端口时按 **443** 连，网关可能发布在别的端口（如 3000）。`config.control_plane` 那项会打出**推导出的 `host:port`**；改 endpoint 为 `https://<域名>:<端口>`（或让网关监听 443） |
+| `diagnose` 报 `network.control_plane` FAIL 且提到 TLS/证书 | 网关是自签/私有 CA，但本机没配信任锚。把网关 CA 写进 `[control_plane] trust_bundle`（安装脚本会自动填；**公有 CA 的网关不需要**，没配 trust_bundle 不算问题） |
 
 ## 10. 相关文档
 

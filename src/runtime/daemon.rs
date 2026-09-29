@@ -54,7 +54,7 @@ mod recovery_support;
 #[path = "daemon_runtime_state.rs"]
 mod runtime_state_support;
 #[path = "daemon_telemetry.rs"]
-mod telemetry_support;
+pub(crate) mod telemetry_support;
 
 /// How often the daemon reports its own status (memory / CPU / admin latency)
 /// to the control plane.

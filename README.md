@@ -58,9 +58,37 @@ wist-agentd service print --system
 
 # 自检：定义 / 二进制 / 配置 / 单实例锁 / 数据与日志落点
 wist-agentd service status --system
+
+# 一屏诊断「这台机器现在有什么问题」（配置/身份/服务/连通/上送）；退出码非零 = 有 FAIL
+sudo wist-agentd diagnose
 ```
 
 开发机联调：[`dev/start.sh`](dev/start.sh)（`&` + `disown`，非生产）。
+
+### 自我诊断（`diagnose`）
+
+出问题先跑 `diagnose`：它**只读**地按「配置 → 身份 → 安装/服务 → 控制面连通 → 数据面（上送）→ 本地工作」
+各探一遍，每项给 `[OK]` / `[WARN]` / `[FAIL]` 与**下一步怎么做**，最后一句总判定。
+**退出码非零 = 有 FAIL**，脚本与 AI 可直接拿它当门禁。
+
+```bash
+sudo wist-agentd diagnose          # 默认人读文本（读 /etc/wist-agentd/* 与 /var/log 需要 root）
+wist-agentd diagnose --json        # 机器可读：checks[].id/status/hint + summary.ok/warn/fail
+wist-agentd diagnose --offline     # 跳过网络探测（控制面/数据面是否可达**未验证**）
+```
+
+它**复用守护进程同款判定**（生效上送目标、控制面探测），所以「`diagnose` 说通」与「守护进程能通」是同一套规则，
+不会工具说一套、进程做一套；它**不发心跳、不改配置**。
+
+TTY 下 `[OK]/[WARN]/[FAIL]` 带颜色（绿/黄/红），一眼扫到 FAIL；重定向与 `--json` **恒为纯文本**，
+`NO_COLOR` 可关色、`CLICOLOR_FORCE=1` 可强制开。
+
+常见问题的三步定位：
+
+1. 看**第一条 FAIL**（`结论` 行点了它的名字）；
+2. 读该项的 `→` 提示（按断点分层：DNS → TCP → TLS/HTTP/鉴权，断在哪层就说哪层）；
+3. 最常见的命中点：`config.control_plane` 会打出**推导出的 `host:port`** —— endpoint 不写端口时实际连 **443**，
+   而网关可能发布在别的端口（如 3000），`network.tcp` 会因此 FAIL 并直接指出这个原因。
 
 ### 快速开始
 
@@ -96,6 +124,8 @@ wist-agentd --config-dir /etc/wist-agentd
 - **Reporting & self-observability** — aggregates execution results and emits health/state
   snapshots.
 - **Run modes** — `standalone` (no control plane) and `managed`.
+- **Self-diagnosis** — `wist-agentd diagnose` probes config / identity / service /
+  connectivity / uplink, prints per-check hints, and exits nonzero when anything FAILs.
 
 ## How the pieces fit
 
@@ -150,6 +180,7 @@ Usage:
   wist-agentd service <print|install|uninstall|status> [--system|--user] [--bin <path>] [--force] [--no-activate] [--config-dir <path>]
   wist-agentd service print --for <systemd|launchd>   (render for another platform)
   wist-agentd enroll [--token <token> | --token-stdin] [--config-dir <path>]
+  wist-agentd diagnose [--json] [--offline] [--config-dir <path>]
 
 Commands:
   help                 Show this help message.
@@ -161,6 +192,8 @@ Commands:
   service uninstall    Stop the service and remove its definition.
   service status       Show definition / binary / config / lock / log status.
   enroll               Enroll with a one-time token; the token is never written to disk.
+  diagnose             Diagnose this host: config / identity / service / connectivity / uplink.
+                       Exits nonzero when anything FAILs, so scripts can gate on it.
 
 Service options (Linux uses systemd, macOS uses launchd):
   --system             Install for the whole host (default; /etc paths, root-owned).
@@ -178,6 +211,8 @@ Enroll options:
 Options:
   --config-dir <path>  Use the specified config directory. Relative paths are resolved from the current working directory.
                        Default: /etc/wist-agentd.
+  --json               Only with `diagnose`: print machine-readable JSON instead of text.
+  --offline            Only with `diagnose`: skip network probes (control plane / data plane).
 ```
 
 ## Long-running deployment

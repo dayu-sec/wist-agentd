@@ -17,7 +17,7 @@ use crate::state_store;
 
 const CONFIG_DIR: &str = "wist-agentd";
 
-pub(crate) async fn run() -> AgentdResult<()> {
+pub(crate) async fn run() -> AgentdResult<i32> {
     let root =
         std::env::current_dir().source_err(AgentdReason::system_error(), "resolve current dir")?;
     run_from_args_async(root, std::env::args_os().skip(1)).await
@@ -28,9 +28,16 @@ enum Command {
     Help,
     Version,
     Run,
-    InitConfig { stdout_only: bool },
+    InitConfig {
+        stdout_only: bool,
+    },
     Service(ServiceRequest),
     Enroll(EnrollRequest),
+    /// 自我诊断：只读地探一遍本机（见 [`crate::doctor`]）。默认人读文本，`--json` 给机器。
+    Doctor {
+        json: bool,
+        offline: bool,
+    },
 }
 
 /// `service` 子命令的动作。
@@ -74,7 +81,7 @@ struct ParsedArgs {
     config_dir: Option<PathBuf>,
 }
 
-async fn run_from_args_async<I, S>(root: PathBuf, args: I) -> AgentdResult<()>
+async fn run_from_args_async<I, S>(root: PathBuf, args: I) -> AgentdResult<i32>
 where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
@@ -87,18 +94,27 @@ where
     match parsed.command {
         Command::Help => {
             print!("{}", usage_message());
-            Ok(())
+            Ok(0)
         }
         Command::Version => {
             println!("wist-agentd {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
+            Ok(0)
         }
-        Command::Run => run_daemon(root, parsed.config_dir.as_deref()).await,
-        Command::Service(request) => run_service(root, parsed.config_dir.as_deref(), request).await,
-        Command::Enroll(request) => run_enroll(root, parsed.config_dir.as_deref(), request).await,
+        Command::Run => {
+            run_daemon(root, parsed.config_dir.as_deref()).await?;
+            Ok(0)
+        }
+        Command::Service(request) => {
+            run_service(root, parsed.config_dir.as_deref(), request).await?;
+            Ok(0)
+        }
+        Command::Enroll(request) => {
+            run_enroll(root, parsed.config_dir.as_deref(), request).await?;
+            Ok(0)
+        }
         Command::InitConfig { stdout_only: true } => {
             print!("{}", crate::config_runtime::default_config_template());
-            Ok(())
+            Ok(0)
         }
         Command::InitConfig { stdout_only: false } => {
             let config_root = match parsed.config_dir.as_deref() {
@@ -111,13 +127,20 @@ where
                 "{}",
                 init_config_message(&ensured.path, ensured.created, data_root.as_deref())
             );
-            Ok(())
+            Ok(0)
+        }
+        Command::Doctor { json, offline } => {
+            let config_root = match parsed.config_dir.as_deref() {
+                Some(path) => resolve_config_dir_arg(&root, path),
+                None => default_config_root(),
+            };
+            crate::doctor::run(&config_root, json, offline).await
         }
     }
 }
 
 #[cfg(test)]
-fn run_from_args<I, S>(root: PathBuf, args: I) -> AgentdResult<()>
+fn run_from_args<I, S>(root: PathBuf, args: I) -> AgentdResult<i32>
 where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
@@ -227,12 +250,63 @@ where
             index += 1;
             continue;
         }
+        if arg == "diagnose" {
+            if command_explicit {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "multiple commands are not supported",
+                ));
+            }
+            command = Command::Doctor {
+                json: false,
+                offline: false,
+            };
+            command_explicit = true;
+            index += 1;
+            continue;
+        }
+        if arg == "--json" {
+            match &mut command {
+                Command::Doctor { json, .. } => {
+                    *json = true;
+                    index += 1;
+                    continue;
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--json is only supported with diagnose",
+                    ));
+                }
+            }
+        }
+        if arg == "--offline" {
+            match &mut command {
+                Command::Doctor { offline, .. } => {
+                    *offline = true;
+                    index += 1;
+                    continue;
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--offline is only supported with diagnose",
+                    ));
+                }
+            }
+        }
 
+        let display = PathBuf::from(arg).display().to_string();
+        // 拼错子命令时给一句「你是不是想输入 X」——比干巴巴一句 unknown 有用得多。
+        let suggestion = arg
+            .to_str()
+            .and_then(suggest_command)
+            .map(|candidate| format!(" (did you mean `{candidate}`?)"))
+            .unwrap_or_default();
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "unknown argument or command: {} (supported: help | version | init-config [--stdout] | service <print|install|uninstall|status> | --config-dir <path>)",
-                PathBuf::from(arg).display()
+                "unknown argument or command: {display}{suggestion} (supported: help | version | init-config [--stdout] | service <print|install|uninstall|status> | enroll | diagnose [--json] [--offline] | --config-dir <path>)",
             ),
         ));
     }
@@ -245,6 +319,54 @@ where
 
 fn config_dir_value(args: &[OsString], value_index: usize) -> io::Result<&OsString> {
     option_value(args, value_index, "--config-dir")
+}
+
+/// 可选子命令名（给拼错时做建议用）。
+const KNOWN_COMMANDS: &[&str] = &[
+    "help",
+    "version",
+    "init-config",
+    "service",
+    "enroll",
+    "diagnose",
+];
+
+/// 拼错的子命令 → 最接近的那个（简单的编辑距离，够用且不引新依赖）。
+///
+/// 只在「明显比乱输更像」时才建议（距离 ≤ 2 且小于候选长度）。
+fn suggest_command(arg: &str) -> Option<&'static str> {
+    let needle = arg.trim_start_matches('-').to_ascii_lowercase();
+    let mut best: Option<(&'static str, usize)> = None;
+    for candidate in KNOWN_COMMANDS {
+        let distance = edit_distance(&needle, candidate);
+        if distance <= 2 && distance < candidate.chars().count() {
+            let better = match best {
+                Some((_, best_distance)) => distance < best_distance,
+                None => true,
+            };
+            if better {
+                best = Some((candidate, distance));
+            }
+        }
+    }
+    best.map(|(candidate, _)| candidate)
+}
+
+/// 字节级 Levenshtein 距离（ASCII 名称足够；非 ASCII 按 `chars` 计数）。
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let substitution = previous[j] + usize::from(ca != cb);
+            current[j + 1] = substitution.min(previous[j + 1] + 1).min(current[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[b.len()]
 }
 
 /// 取 `flag` 后面的取值；缺失或看起来像另一个选项时报错。
@@ -287,6 +409,8 @@ fn looks_like_option(value: &OsString) -> bool {
                 | "--user"
                 | "--force"
                 | "--no-activate"
+                | "--json"
+                | "--offline"
         )
     })
 }
@@ -1002,6 +1126,7 @@ fn usage_message() -> &'static str {
         "  wist-agentd service <print|install|uninstall|status> [--system|--user] [--bin <path>] [--force] [--no-activate] [--config-dir <path>]\n",
         "  wist-agentd service print --for <systemd|launchd>   (render for another platform)\n",
         "  wist-agentd enroll [--token <token> | --token-stdin] [--config-dir <path>]\n",
+        "  wist-agentd diagnose [--json] [--offline] [--config-dir <path>]\n",
         "\n",
         "Commands:\n",
         "  help                 Show this help message.\n",
@@ -1013,6 +1138,8 @@ fn usage_message() -> &'static str {
         "  service uninstall    Stop the service and remove its definition.\n",
         "  service status       Show definition / binary / config / lock / log status.\n",
         "  enroll               Enroll with a one-time token; the token is never written to disk.\n",
+        "  diagnose             Diagnose this host: config / identity / service / connectivity / uplink.\n",
+        "                       Exits nonzero when anything FAILs, so scripts can gate on it.\n",
         "\n",
         "Service options (Linux uses systemd, macOS uses launchd):\n",
         "  --system             Install for the whole host (default; /etc paths, root-owned).\n",
@@ -1030,6 +1157,8 @@ fn usage_message() -> &'static str {
         "Options:\n",
         "  --config-dir <path>  Use the specified config directory. Relative paths are resolved from the current working directory.\n",
         "                       Default: /etc/wist-agentd.\n",
+        "  --json               Only with `diagnose`: print machine-readable JSON instead of text.\n",
+        "  --offline            Only with `diagnose`: skip network probes (control plane / data plane).\n",
     )
 }
 

@@ -3,7 +3,26 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [0.1.3] latest
+## [0.1.16] - 2026-09-29
+
+### 新增
+
+- **自我诊断 `wist-agentd diagnose`**：一屏回答「这台机器现在有什么问题」。只读地按
+  「配置 → 身份 → 安装/服务 → 控制面连通 → 数据面（上送） → 本地工作」逐项自检，每项给出
+  `[OK]/[WARN]/[FAIL]` 与**下一步怎么做**；网络按 DNS → TCP → TLS/HTTP/鉴权**分层报错**，
+  直接指出「端口不对」「证书不受信」这类常见原因。
+- `diagnose --json`：机器可读（`checks[].id/status/hint` + `summary`），供脚本与自动化消费；
+  `diagnose --offline`：跳过网络探测，只查本机配置/身份/服务/落点。
+- **有 FAIL 时退出码非零**：可直接当门禁（`wist-agentd diagnose || 处理`）。
+
+### 变更
+
+- `[OK]/[WARN]/[FAIL]` 在终端上按状态着色（绿/黄/红），一眼扫到 FAIL；重定向与 `--json`
+  恒为纯文本，并支持 `NO_COLOR` / `CLICOLOR_FORCE`。
+- 诊断复用守护进程同款判定（生效上送目标、控制面探测），不会「工具说一套、进程做一套」；
+  全程只读，不改配置、不建目录（唯一副作用是 `paths.writable` 临时建/删一个探针文件）。
+
+## [0.1.3]
 
 ### 新增
 
