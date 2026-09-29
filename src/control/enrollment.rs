@@ -36,28 +36,54 @@ pub enum EnrollmentDecision {
 
 pub use crate::error::{EnrollmentError, EnrollmentReason, EnrollmentResult};
 
+/// 网关 401 正文里代表「**重试也没用、必须运维介入**」的稳定 `code`（`unauthorized_code`）。
+///
+/// 为什么不是「凡 401 即终态」：凭据**过期**（`credential_expired`）与「没带凭据」
+/// （`missing_credential` / `certificate_required`）是可能在配置 / mTLS 到位后自愈的，
+/// 不该让守护进程停死；下面这些才是**确实回不来**的。
+pub(crate) const TERMINAL_AUTH_CODES: &[&str] = &[
+    // 被拒名单（§5.6）：得由运维在网关解除，重装无效。
+    "certificate_revoked",
+    // 库里没有这条凭据（**库被换/重置过**）：只能重新注册（`enroll --force`）。
+    "unknown_credential",
+    // 凭据与这台 agent 对不上 / 已失效 / 证书身份不符：同样回不来。
+    "credential_mismatch",
+    "credential_inactive",
+    "certificate_mismatch",
+];
+
+/// 从 401/403 正文里认出网关的稳定 `code`。
+pub(crate) fn auth_rejection_code(body: &str) -> Option<&'static str> {
+    TERMINAL_AUTH_CODES
+        .iter()
+        .copied()
+        .find(|code| body.contains(code))
+}
+
 /// 网关控制面响应里可辨识的**终态**信号（§5.4）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthRejection {
-    /// 被**吊销**（§5.6）：终态。停下、别重试 —— 重装也没用（得先由运维在网关解除拒绝名单）。
-    Revoked,
-    /// 其它拒绝（未知凭据 / 凭据不匹配 / 过期 / 未带凭据…）：按普通失败处理。
+    /// 需要**运维介入**的终态：带上网关的稳定 code（`unknown_credential` / `certificate_revoked` …），
+    /// 停下、别重试（重装也未必有用）。
+    Terminal(&'static str),
+    /// 其它拒绝（凭据过期 / 未带凭据 / 服务端抖动…）：按普通失败处理（可重试 / 可自愈）。
     NotRevoked,
 }
 
-/// 从一次控制面响应里认出「被吊销」。
+/// 从一次控制面响应里认出「需要停下的终态」。
 ///
-/// `certificate_revoked` 是网关 401 正文里的**稳定标记**（`docs/design/agent-identity-mtls.md` §5.4）：
-/// agentd 据此区分「明确被拒（终态，停）」与其它失败（可重试）。
+/// 稳定 code 见 [`TERMINAL_AUTH_CODES`]；网关在 `agent_ops.rs` 的 `unauthorized_code` 里回它们
+/// （`docs/design/agent-identity-mtls.md` §5.4）。
 pub(crate) fn classify_auth_rejection(status: reqwest::StatusCode, body: &str) -> AuthRejection {
-    if matches!(
+    if !matches!(
         status,
         reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-    ) && body.contains("certificate_revoked")
-    {
-        AuthRejection::Revoked
-    } else {
-        AuthRejection::NotRevoked
+    ) {
+        return AuthRejection::NotRevoked;
+    }
+    match auth_rejection_code(body) {
+        Some(code) => AuthRejection::Terminal(code),
+        None => AuthRejection::NotRevoked,
     }
 }
 
@@ -493,7 +519,7 @@ async fn renew_now(config: &mut AgentConfig, state_dir: &Path) -> RenewalDecisio
         Ok(RenewOutcome::Done) => RenewalDecision::Renewed,
         Ok(RenewOutcome::Revoked) => {
             eprintln!(
-                "event=AgentRevoked source=renewal detail=\"gateway refused this agent as revoked (denylist); an operator must lift it, then restart — reinstalling will not help\""
+                "event=AgentAuthTerminal code=certificate_revoked source=renewal detail=\"gateway refused this agent as revoked (denylist); an operator must lift it, then restart — reinstalling will not help\""
             );
             RenewalDecision::Revoked
         }
@@ -577,7 +603,7 @@ async fn renew_credential(
         let body = response.text().await.unwrap_or_default();
         if matches!(
             classify_auth_rejection(status, &body),
-            AuthRejection::Revoked
+            AuthRejection::Terminal(_)
         ) {
             return Ok(RenewOutcome::Revoked);
         }
@@ -1558,10 +1584,10 @@ state_dir = "state"
         let _ = fs::remove_dir_all(state_dir);
     }
 
-    /// 只认「被吊销」这个稳定标记，其它 401/403 一律当普通失败（可重试）。
+    /// 认出「必须运维介入」的稳定 code；凭据过期这类**不**当终态（避免误停）。
     #[test]
-    fn classify_auth_rejection_only_treats_certificate_revoked_as_terminal() {
-        use super::{AuthRejection, classify_auth_rejection};
+    fn classify_auth_rejection_flags_only_terminal_codes() {
+        use super::{AuthRejection, auth_rejection_code, classify_auth_rejection};
         use reqwest::StatusCode;
 
         assert_eq!(
@@ -1569,18 +1595,29 @@ state_dir = "state"
                 StatusCode::UNAUTHORIZED,
                 "agent identity rejected: certificate_revoked"
             ),
-            AuthRejection::Revoked
+            AuthRejection::Terminal("certificate_revoked")
         );
-        assert_eq!(
-            classify_auth_rejection(StatusCode::FORBIDDEN, "certificate_revoked"),
-            AuthRejection::Revoked
-        );
-        // 其它 401（未知凭据 / 凭据不匹配…）：不是终态。
         assert_eq!(
             classify_auth_rejection(
                 StatusCode::UNAUTHORIZED,
-                "agent identity rejected: credential_mismatch"
+                "agent identity rejected: unknown_credential"
             ),
+            AuthRejection::Terminal("unknown_credential")
+        );
+        assert_eq!(
+            classify_auth_rejection(StatusCode::FORBIDDEN, "certificate_mismatch"),
+            AuthRejection::Terminal("certificate_mismatch")
+        );
+        // 凭据过期 / 没带凭据：可能在配置 / mTLS 到位后自愈 —— 不停。
+        assert_eq!(
+            classify_auth_rejection(
+                StatusCode::UNAUTHORIZED,
+                "agent identity rejected: credential_expired"
+            ),
+            AuthRejection::NotRevoked
+        );
+        assert_eq!(
+            classify_auth_rejection(StatusCode::UNAUTHORIZED, "missing_credential"),
             AuthRejection::NotRevoked
         );
         // 服务端 5xx / 正文里出现这个词但不是 401/403：不当终态（避免误停）。
@@ -1588,6 +1625,7 @@ state_dir = "state"
             classify_auth_rejection(StatusCode::INTERNAL_SERVER_ERROR, "certificate_revoked"),
             AuthRejection::NotRevoked
         );
+        assert_eq!(auth_rejection_code("nothing here"), None);
     }
 
     /// 网关回「被吊销」→ 续期判定是**终态** `Revoked`，且台账记下（不静默）。

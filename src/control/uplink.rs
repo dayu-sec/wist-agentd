@@ -123,7 +123,15 @@ async fn fetch_uplink_grant_with_timeout(
                 reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
             ) =>
         {
-            UplinkFetch::CredentialRejected(format!("http {} from {endpoint}", response.status()))
+            let status = response.status();
+            // 正文里有网关的**稳定 code**（`unknown_credential` / `certificate_revoked` …）：
+            // 捎上它，人和 `diagnose` 才看得出「为什么被拒」。
+            let body = response.text().await.unwrap_or_default();
+            let detail = match crate::enrollment::auth_rejection_code(&body) {
+                Some(code) => format!("http {status} from {endpoint} ({code})"),
+                None => format!("http {status} from {endpoint}"),
+            };
+            UplinkFetch::CredentialRejected(detail)
         }
         Ok(response) => UplinkFetch::Failed(format!("http {} from {endpoint}", response.status())),
         Err(err) => UplinkFetch::Failed(format!("transport: {err}")),
@@ -386,6 +394,36 @@ mod tests {
                 ),
                 other => panic!("{status} must be a credential rejection, got {other:?}"),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_401_with_a_gateway_code_carries_it_in_the_signature() {
+        // 正文里的稳定 code 要揎上：`diagnose`/运维据此分辨「库里没有这条凭据」还是「被拒名单」。
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let _ = read_http_request(&mut socket).await;
+            let body = "agent identity rejected: unknown_credential";
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let config = test_config(&endpoint);
+        let outcome = fetch_uplink_grant(&config).await;
+        server.await.expect("server task");
+
+        match outcome {
+            UplinkFetch::CredentialRejected(signature) => assert!(
+                signature.contains("unknown_credential"),
+                "signature should carry the gateway code: {signature}"
+            ),
+            other => panic!("expected CredentialRejected, got {other:?}"),
         }
     }
 

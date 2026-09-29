@@ -11,7 +11,7 @@
 //!
 //! 断言的是**端到端可观测结果**，不是内部状态：
 //!   1. `state/identity/renewal.json` 记下 `revoked`（§5.5 续签台账）；
-//!   2. stderr 打出 `event=AgentRevoked`（运维按它排查）；
+//!   2. stderr 打出 `event=AgentAuthTerminal`（运维按它排查）；
 //!   3. 终态之后**不再向控制面发任何请求**（用假网关上的请求计数证明「停手」）；
 //!   4. 进程仍在运行（终态 = 定住，不是退出）。
 //!
@@ -130,7 +130,7 @@ fn seed_client_certificate(state_dir: &Path, days: i64) {
     std::fs::write(&paths.cert_file, certificate.pem()).expect("write client certificate");
 }
 
-/// 起真 agentd，stderr 落到文件（结尾要按它断言 `event=AgentRevoked`）。
+/// 起真 agentd，stderr 落到文件（结尾要按它断言 `event=AgentAuthTerminal`）。
 fn spawn_agentd(config_dir: &Path, stderr_path: &Path) -> RunningDaemon {
     let stderr = File::create(stderr_path).expect("create stderr file");
     let child = Command::new(agentd_bin())
@@ -310,10 +310,14 @@ async fn a_renewal_refused_as_certificate_revoked_puts_agentd_into_a_terminal_st
         .expect("续签台账必须记下 outcome=revoked（否则又是静默）");
     assert_eq!(ledger.outcome, "revoked");
 
-    // ② stderr 打出一行可排查的 AgentRevoked。
-    let stderr = wait_for_stderr(&stderr_path, "event=AgentRevoked", Duration::from_secs(10))
-        .await
-        .expect("agentd 必须打出 event=AgentRevoked");
+    // ② stderr 打出一行可排查的终态事件。
+    let stderr = wait_for_stderr(
+        &stderr_path,
+        "event=AgentAuthTerminal code=certificate_revoked",
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("agentd 必须打出 event=AgentAuthTerminal code=certificate_revoked");
 
     // ③ §5.6：终态之后不再向控制面发任何请求。
     assert_control_plane_traffic_settles(&requests).await;
@@ -327,7 +331,7 @@ async fn a_renewal_refused_as_certificate_revoked_puts_agentd_into_a_terminal_st
     // 断言里带上现场，失败时能直接读到线索。
     assert!(
         stderr.contains("reinstall") || stderr.contains("reinstalling"),
-        "AgentRevoked 行应当说明「重装也没用、得先解除拒绝名单」，实际 stderr:\n{stderr}"
+        "AgentAuthTerminal 行应当说明「重装也没用、得先解除拒绝名单」，实际 stderr:\n{stderr}"
     );
 
     drop(daemon);
@@ -363,11 +367,11 @@ async fn a_status_report_refused_as_certificate_revoked_is_also_terminal() {
     // 状态上报在第二个 tick（约 3s）首次发出 → 命中 401 → 终态。
     wait_for_stderr(
         &stderr_path,
-        "event=AgentRevoked source=status_report",
+        "event=AgentAuthTerminal code=certificate_revoked source=status_report",
         Duration::from_secs(30),
     )
     .await
-    .expect("状态上报被拒必须进终态并打 event=AgentRevoked source=status_report");
+    .expect("状态上报被拒必须进终态并打 event=AgentAuthTerminal code=certificate_revoked source=status_report");
 
     // 续期并未到期：台账应停在 `not_due` —— 证明终态确实来自「状态上报」这条路径，
     // 而不是被续期顺带触发的。

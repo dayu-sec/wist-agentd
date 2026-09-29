@@ -274,7 +274,7 @@ async fn diagnose(config_root: &Path, offline: bool) -> Report {
     let mut checks = Vec::new();
     let config_path = config_runtime::resolve_config_path(config_root);
 
-    let config = match load_config(&config_path, &mut checks) {
+    let config = match load_config_with_state_identity(&config_path, &mut checks) {
         Some(config) => config,
         // 配置读不出来，后面的检查都无从谈起（服务状态、凭据、网络目标都来自它）。
         None => return Report { checks },
@@ -359,6 +359,29 @@ fn load_config(path: &Path, checks: &mut Vec<Check>) -> Option<AgentConfig> {
 
 fn config_path_check(path: &Path) -> Check {
     Check::ok("config.file", "配置文件可读", path.display().to_string())
+}
+
+/// 读配置，并**注入 state 里的身份与凭据** —— 与守护进程启动同一步
+/// （`ensure_enrolled_with_config_path` → `load_state_identity`）。
+///
+/// 为什么必须做：**bearer 凭据从不写进 `agentd.toml`，只落 state**。不注入的话
+/// `fetch_uplink_grant` 会因为“配置里没凭据”直接短路成 `NotDispatched`，工具就会把
+/// 「网关应答正常、只是这次没下发授权」假报成「未入网 / 旧网关」—— 正是设计上要避免的
+/// 「工具说一套、进程做一套」。这里只读 state 注入（内存态），不联网、不落盘。
+fn load_config_with_state_identity(
+    config_path: &Path,
+    checks: &mut Vec<Check>,
+) -> Option<AgentConfig> {
+    let mut config = load_config(config_path, checks)?;
+    let state_dir = PathBuf::from(&config.paths.state_dir);
+    if let Err(err) = crate::enrollment::restore_runtime_identity(&mut config, &state_dir) {
+        checks.push(Check::warn(
+            "identity.state",
+            "state 身份读不出来",
+            one_line(&err.display_chain()),
+        ));
+    }
+    Some(config)
 }
 
 /// 控制面配置本身是否自洽：开关、endpoint（含**推导出的端口**）、TLS 形态、信任锚。
@@ -580,6 +603,18 @@ fn credential_check(
             .bearer_token
             .as_deref()
             .is_some_and(|token| !token.trim().is_empty());
+    // 凭据 id（注册时网关下发的那个）：**网关库里查不到它 = 库里没有这条凭据**（换过库/被清），
+    // 这正是 `401 unknown_credential` 的判据 —— 打出来，省得再去查库。
+    let credential_id = config
+        .control_plane
+        .credential_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let with_cred = |detail: String| match credential_id {
+        Some(id) => format!("{detail}；credential_id={id}"),
+        None => detail,
+    };
 
     match (has_token, expires.and_then(parse_time)) {
         (true, Some(expires_at)) => {
@@ -588,33 +623,33 @@ fn credential_check(
                 Check::fail(
                     "identity.credential",
                     "控制面凭据已过期",
-                    format!("到期时间 {}", expires.unwrap_or_default()),
+                    with_cred(format!("到期时间 {}", expires.unwrap_or_default())),
                 )
                 .hint("重新注册（带一次性 token 重装），或确认网关没有把凭据吊销")
             } else if remaining < time::Duration::seconds(EXPIRY_WARN_WINDOW.as_secs() as i64) {
                 Check::warn(
                     "identity.credential",
                     "控制面凭据即将过期",
-                    format!("剩余约 {} 小时", remaining.whole_hours()),
+                    with_cred(format!("剩余约 {} 小时", remaining.whole_hours())),
                 )
                 .hint("重启 agentd 会触发续期；到期未续需要重装")
             } else {
                 Check::ok(
                     "identity.credential",
                     "控制面凭据有效",
-                    format!("剩余约 {} 天", remaining.whole_days()),
+                    with_cred(format!("剩余约 {} 天", remaining.whole_days())),
                 )
             }
         }
         (true, None) => Check::ok(
             "identity.credential",
             "控制面凭据存在（没有到期时间）",
-            "旧版网关不写入过期时间",
+            with_cred("旧版网关不写入过期时间".to_string()),
         ),
         (false, _) => Check::warn(
             "identity.credential",
             "本机没有 bearer 凭据",
-            "若客户端证书有效则仍可上报（mTLS 双轨）；两者都没有就会 401",
+            with_cred("若客户端证书有效则仍可上报（mTLS 双轨）；两者都没有就会 401".to_string()),
         )
         .hint(
             "重新注册拿一份凭据：`wist-agentd service install --system --enrollment-token <token>`",
@@ -957,7 +992,11 @@ fn classify_control_plane_probe(fetch: UplinkFetch) -> (Check, Option<AgentUplin
                 "控制面拒绝了本机凭据（401/403）",
                 detail,
             )
-            .hint("常见原因：凭据被吊销/过期、网关换了库或信任锚（重装或从备份恢复身份）"),
+            .hint(
+                "按正文里的 code 处理：`unknown_credential` = 网关库里没有这条凭据（库被换/重置过）→ \
+                 用一次性 token 重新注册（`enroll --force`）；`certificate_revoked` = 在被拒名单，需先在网关解除；\
+                 两者都对不上时看 `identity.credential` 打出的 `credential_id`",
+            ),
             None,
         ),
         UplinkFetch::Failed(detail) => (
@@ -1661,6 +1700,23 @@ mod tests {
     }
 
     #[test]
+    fn credential_check_prints_the_credential_id() {
+        // 打出凭据 id：与网关库对照就能一眼判断「库里有没有这条」。
+        let state = runtime_state();
+        let mut config = template_config();
+        config.control_plane.bearer_token = Some("tok".to_string());
+        config.control_plane.credential_id = Some("cred_abc123".to_string());
+        config.control_plane.credential_expires_at = Some(rfc3339_in(20 * 24 * 60 * 60));
+
+        let check = credential_check(&config, &state);
+        assert_eq!(check.status, Status::Ok);
+        assert!(
+            check.detail.contains("credential_id=cred_abc123"),
+            "{check:?}"
+        );
+    }
+
+    #[test]
     fn credential_check_reports_the_expiry_even_when_everything_else_is_quiet() {
         // 到期时间只在 config 里（state 里没有）时，失败消息不能打空。
         let state = runtime_state();
@@ -1751,6 +1807,56 @@ mod tests {
             report.checks[0]
         );
         assert_eq!(report.exit_code(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_config_with_state_identity_injects_credentials_from_state() {
+        let root = std::env::temp_dir().join(format!("doctor-inject-{}", std::process::id()));
+        let config_dir = root.join("wist-agentd");
+        let state_dir = config_dir.join("state");
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+        std::fs::write(
+            config_dir.join("agentd.toml"),
+            "schema_version = \"v1\"\n\n[control_plane]\nenabled = true\nendpoint = \"https://gw.example\"\n\n[paths]\nroot_dir = \".\"\nrun_dir = \"run\"\nstate_dir = \"state\"\nlog_dir = \"log\"\n",
+        )
+        .expect("write config");
+
+        let mut state = wist_contracts::agent_state::AgentRuntimeState::new(
+            "agent-real".to_string(),
+            "inst-real".to_string(),
+            "0.1.16".to_string(),
+            wist_contracts::agent_state::RuntimeMode::Normal,
+            "2026-09-29T00:00:00Z".to_string(),
+        );
+        state.bearer_token = Some("bearer-from-state".to_string());
+        state.credential_expires_at = Some(rfc3339_in(30 * 24 * 60 * 60));
+        agent_runtime::store(&agent_runtime::path_for(&state_dir), &state).expect("store state");
+
+        let config_path = config_runtime::resolve_config_path(&config_dir);
+
+        // 前提：凭据**不在** toml 里（只落 state）—— 这正是要注入的理由。
+        let mut raw_checks = Vec::new();
+        let plain = load_config(&config_path, &mut raw_checks).expect("plain load");
+        assert!(
+            plain.control_plane.bearer_token.is_none(),
+            "凭据不应写进 toml"
+        );
+        assert!(plain.agent.agent_id.is_none(), "agent_id 不应写进 toml");
+
+        // 注入后：配置拿到 state 的凭据与身份，控制面探测不再误判为「无下发」。
+        let mut checks = Vec::new();
+        let config = load_config_with_state_identity(&config_path, &mut checks).expect("load");
+        assert_eq!(
+            config.control_plane.bearer_token.as_deref(),
+            Some("bearer-from-state")
+        );
+        assert_eq!(config.agent.agent_id.as_deref(), Some("agent-real"));
+        assert!(
+            checks.iter().all(|c| c.status != Status::Fail),
+            "{checks:?}"
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -3,6 +3,25 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.17] - 2026-09-29
+
+### 修复
+
+- **`diagnose` 不再误报「未入网 / 旧网关」**：bearer 凭据**从不写进 `agentd.toml`、只落 state**，
+  daemon 启动时会把它注入内存配置；`diagnose` 以前只读 toml，于是控制面探测会「没凭据就不发请求」
+  并假报无下发。现在它做同一步注入 —— 你看到的是**真实结论**（401 就报 401，并带上网关的原因码）。
+- **`diagnose --offline` 不再丢掉本地能得出的结论**：生效上送输出 / spool 积压 / 本地工作视图照常报。
+- `paths.writable` 不再创建目录（回到最近已存在祖先探写）；IPv6 端点（`https://[::1]:3000`）
+  不再被误判为坏地址。
+
+### 变更
+
+- **凭据被网关明确拒绝时进入终态**：`unknown_credential`（库里没有这条凭据）/ `certificate_revoked`
+  （被拒名单）/ `credential_mismatch` 等，agentd 不再每 3 秒空转重试，而是打出一行
+  `event=AgentAuthTerminal code=… source=…` 并按 code 告诉运维**该做什么**；凭据**过期**等可自愈的情况不误停。
+- `diagnose` 在凭据一项打出 `credential_id`，一眼即可与网关库对照（判断「库里到底有没有这条」）。
+- 被拒详情（控制面探测 / 上送）里带上网关的稳定原因码。
+
 ## [0.1.16] - 2026-09-29
 
 ### 新增

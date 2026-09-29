@@ -363,13 +363,14 @@ fn local_renewal_report(
     })
 }
 
-/// 一次状态上报的结果：成功时的往返延迟 + **是否被吊销**（§5.6，终态）。
+/// 一次状态上报的结果：成功时的往返延迟 + **终态 code**（§5.4，`None` = 非终态）。
 ///
-/// 为什么要单独带 `revoked`：状态上报是 agentd 与网关最频繁的一次交互（每 3s，`STATUS_REPORT_INTERVAL`），
-/// 也是「被吊销」最快的发现点 —— 认出它才能让守护循环**停下**，而不是每 3s 刷一行失败日志。
+/// 为什么要单独带：状态上报是 agentd 与网关最频繁的一次交互（每 3s，`STATUS_REPORT_INTERVAL`），
+/// 也是「凭据被拒」最快的发现点 —— 认出终态才能让守护循环**停下**，而不是每 3s 刷一行失败日志。
 struct StatusReportOutcome {
     latency_ms: Option<u64>,
-    revoked: bool,
+    /// 需要运维介入时网关给的稳定 code（`unknown_credential` / `certificate_revoked` …）。
+    terminal: Option<&'static str>,
 }
 
 impl StatusReportOutcome {
@@ -377,14 +378,14 @@ impl StatusReportOutcome {
     fn failed() -> Self {
         Self {
             latency_ms: None,
-            revoked: false,
+            terminal: None,
         }
     }
 
-    fn revoked() -> Self {
+    fn terminal(code: &'static str) -> Self {
         Self {
             latency_ms: None,
-            revoked: true,
+            terminal: Some(code),
         }
     }
 }
@@ -468,17 +469,16 @@ async fn report_status_to_control_plane(
     {
         Ok(response) if response.status().is_success() => StatusReportOutcome {
             latency_ms: Some(started.elapsed().as_millis() as u64),
-            revoked: false,
+            terminal: None,
         },
         Ok(response) => {
             let status = response.status();
-            // 读正文才能把「被吊销（终态）」从其它 401 里认出来（§5.4 / §5.6）。
+            // 读正文才能把「需要停下的终态」从其它 401 里认出来（§5.4）。
             let body = response.text().await.unwrap_or_default();
-            if matches!(
-                crate::enrollment::classify_auth_rejection(status, &body),
-                crate::enrollment::AuthRejection::Revoked
-            ) {
-                return StatusReportOutcome::revoked();
+            if let crate::enrollment::AuthRejection::Terminal(code) =
+                crate::enrollment::classify_auth_rejection(status, &body)
+            {
+                return StatusReportOutcome::terminal(code);
             }
             eprintln!("wist-agentd status report failed: HTTP {status} from {endpoint}");
             StatusReportOutcome::failed()
@@ -490,13 +490,30 @@ async fn report_status_to_control_plane(
     }
 }
 
-/// 被吊销后把数据面上送压成待命（§5.6）：即使本轮还在按旧 grant 外发，也立刻停。
-fn force_standby(uplink: &mut AppliedUplink) {
-    if let Some(line) = uplink.observe(UplinkFetch::CredentialRejected(
-        "certificate_revoked".to_string(),
-    )) {
+/// 进终态后把数据面上送压成待命（§5.6）：即使本轮还在按旧 grant 外发，也立刻停。
+fn force_standby(uplink: &mut AppliedUplink, code: &str) {
+    if let Some(line) = uplink.observe(UplinkFetch::CredentialRejected(code.to_string())) {
         eprintln!("{line}");
     }
+}
+
+/// 终态时给运维看的一句话：按 code 说清**该做什么**，别让人猜。
+fn terminal_auth_message(code: &str, source: &str) -> String {
+    let detail = match code {
+        "certificate_revoked" => {
+            "gateway refused this agent as revoked (denylist); an operator must lift it, then restart \
+             — reinstalling will not help"
+        }
+        "unknown_credential" => {
+            "this gateway does not know this agent's credential (its store was replaced or reset); \
+             re-enroll: `wist-agentd enroll --force --token <token>`"
+        }
+        _ => {
+            "this agent's credential is not accepted and will not recover on its own; \
+             re-enroll with a one-time token"
+        }
+    };
+    format!("event=AgentAuthTerminal code={code} source={source} detail=\"{detail}\"")
 }
 
 /// 把事实摘要上送数据面（走 TCP uplink，与日志/指标同一条连接）。
@@ -814,15 +831,16 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     let config_dir = loop_ctx.config_dir;
     let mut runtime_config: AgentConfig = loop_ctx.config.clone();
     let mut last_renewal_check: Option<Instant> = None;
-    // 终态标志（§5.6）：一旦发现被网关吊销，就不再向控制面发任何请求。
-    let mut revoked = false;
+    // 终态标志（§5.4）：一旦认出网关的终态 code（被吊销 / 库里没有这条凭据 …），
+    // 就不再向控制面发任何请求。
+    let mut terminal = false;
     loop {
-        // 终态：被网关吊销。不再向控制面发任何请求（状态 / 工作 / 上送 / 续期），也不再每
-        // tick 刷失败日志。**本机采集也一起停** —— 此刻数据面 ingest 同样会拒（被吊销的
-        // agent 的记录不进库），采了也没人收。**进程留着不退出**：launchd/systemd 的
-        // KeepAlive 会把「退出」变成重启风暴。恢复只有一条路 —— 运维在网关解除拒绝名单，
-        // 然后重启 agentd。
-        if revoked {
+        // 终态：网关明确拒了这台 agent（`certificate_revoked` / `unknown_credential` …）。
+        // 不再向控制面发任何请求（状态 / 工作 / 上送 / 续期），也不再每 tick 刷失败日志。
+        // **本机采集也一起停** —— 此刻数据面 ingest 同样会拒（同一套鉴权），采了也没人收。
+        // **进程留着不退出**：launchd/systemd 的 KeepAlive 会把「退出」变成重启风暴。
+        // 恢复：按 code 运维处理（解除拒绝名单，或重新注册），然后重启 agentd。
+        if terminal {
             tokio::time::sleep(TICK_INTERVAL).await;
             continue;
         }
@@ -845,10 +863,10 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                     );
                 }
                 crate::enrollment::RenewalDecision::Revoked => {
-                    // 续期这条路径也认得出「被吊销」（`renew_now` 已打 `event=AgentRevoked`）。
+                    // 续期这条路径也认得出「终态」（`renew_now` 已打印 `event=AgentAuthTerminal`）。
                     // 这里只需进终态：下一轮起不再打扰控制面。
-                    revoked = true;
-                    force_standby(&mut uplink_runtime);
+                    terminal = true;
+                    force_standby(&mut uplink_runtime, "certificate_revoked");
                 }
             }
         }
@@ -932,12 +950,10 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                 &uplink_health,
             )
             .await;
-            if report.revoked {
-                eprintln!(
-                    "event=AgentRevoked source=status_report detail=\"gateway refused this agent as revoked (denylist); an operator must lift it, then restart — reinstalling will not help\""
-                );
-                revoked = true;
-                force_standby(&mut uplink_runtime);
+            if let Some(code) = report.terminal {
+                eprintln!("{}", terminal_auth_message(code, "status_report"));
+                terminal = true;
+                force_standby(&mut uplink_runtime, code);
             } else if let Some(latency) = report.latency_ms {
                 last_latency_ms = Some(latency);
             }
@@ -2896,7 +2912,7 @@ mod tests {
         assert!(outcome.latency_ms.is_none());
     }
 
-    /// 网关回 401 `certificate_revoked` → 上报结果带 `revoked`（守护循环据此进终态，不每 3s 刷日志）。
+    /// 网关回 401 `certificate_revoked` → 上报结果带终态 code（守护循环据此进终态，不每 3s 刷日志）。
     #[tokio::test]
     async fn report_status_flags_revocation_from_the_gateway() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -2927,10 +2943,46 @@ mod tests {
         )
         .await;
         server.await.expect("server task");
-        assert!(
-            outcome.revoked,
-            "a 401 certificate_revoked must flag revocation"
+        assert_eq!(
+            outcome.terminal,
+            Some("certificate_revoked"),
+            "a 401 certificate_revoked must be terminal"
         );
+        assert!(outcome.latency_ms.is_none());
+    }
+
+    /// 网关回 401 `unknown_credential`（库里没有这条凭据）→ 同样是**终态**（只能重新注册）。
+    #[tokio::test]
+    async fn report_status_flags_unknown_credential_as_terminal() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let _ = read_http_request(&mut socket).await;
+            let body = "agent identity rejected: unknown_credential";
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let mut config = test_config();
+        config.control_plane.endpoint = Some(endpoint);
+        let outcome = report_status_to_control_plane(
+            &config,
+            None,
+            None,
+            None,
+            None,
+            &AppliedWorkGrant::default(),
+            &AppliedUplink::default(),
+            &UplinkHealth::default(),
+        )
+        .await;
+        server.await.expect("server task");
+        assert_eq!(outcome.terminal, Some("unknown_credential"));
         assert!(outcome.latency_ms.is_none());
     }
 
