@@ -68,11 +68,9 @@ async fn fetch_uplink_grant_with_timeout(
     config: &AgentConfig,
     request_timeout: Duration,
 ) -> UplinkFetch {
-    // 未入网：缺端点 / 凭据 / 身份任一 —— 这是「无下发」，不是故障。
+    // 未入网：缺端点 / 身份任一 —— 这是「无下发」，不是故障。凭据走 mTLS（客户端证书），
+    // 这里不再有 bearer token 可缺。
     let Some(endpoint) = config.control_plane.endpoint.as_deref() else {
-        return UplinkFetch::NotDispatched;
-    };
-    let Some(bearer_token) = config.control_plane.bearer_token.as_deref() else {
         return UplinkFetch::NotDispatched;
     };
     let Some(agent_id) = config.agent.agent_id.as_deref() else {
@@ -100,7 +98,6 @@ async fn fetch_uplink_grant_with_timeout(
     match client
         .post(&url)
         .timeout(request_timeout)
-        .bearer_auth(bearer_token)
         .json(&request)
         .send()
         .await
@@ -260,7 +257,6 @@ mod tests {
                 enrollment_token: None,
                 credential_request: None,
                 credential_id: None,
-                bearer_token: Some("wic_test_token".to_string()),
                 credential_expires_at: None,
                 tls_mode: None,
                 trust_bundle: None,
@@ -323,11 +319,8 @@ mod tests {
             assert!(request.contains("\"kind\":\"poll_agent_uplink\""));
             assert!(request.contains("\"agent_id\":\"agent-x\""));
             assert!(request.contains("\"instance_id\":\"instance-x\""));
-            assert!(
-                request
-                    .to_lowercase()
-                    .contains("authorization: bearer wic_test_token")
-            );
+            // 凭据走客户端证书（mTLS）：请求里不再带 Authorization 头。
+            assert!(!request.to_lowercase().contains("authorization:"));
             let body = r#"{"enabled":true,"host":"c-001.gateway.example","port":9000,"granted_at":"2026-09-26T00:00:00Z"}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -405,7 +398,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("accept");
             let _ = read_http_request(&mut socket).await;
-            let body = "agent identity rejected: unknown_credential";
+            let body = "agent identity rejected: certificate_revoked";
             let response = format!(
                 "HTTP/1.1 401 Unauthorized\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 body.len(),
@@ -420,7 +413,7 @@ mod tests {
 
         match outcome {
             UplinkFetch::CredentialRejected(signature) => assert!(
-                signature.contains("unknown_credential"),
+                signature.contains("certificate_revoked"),
                 "signature should carry the gateway code: {signature}"
             ),
             other => panic!("expected CredentialRejected, got {other:?}"),
@@ -479,13 +472,12 @@ mod tests {
 
     #[tokio::test]
     async fn not_being_enrolled_is_no_dispatch() {
-        // 未入网（缺 endpoint / bearer / agent_id 任一）→ 不拉、且是「无下发」不是故障。
-        for strip in ["agent_id", "endpoint", "bearer"] {
+        // 未入网（缺 endpoint / agent_id 任一）→ 不拉、且是「无下发」不是故障。
+        for strip in ["agent_id", "endpoint"] {
             let mut config = test_config("http://127.0.0.1:1");
             match strip {
                 "agent_id" => config.agent.agent_id = None,
                 "endpoint" => config.control_plane.endpoint = None,
-                "bearer" => config.control_plane.bearer_token = None,
                 _ => unreachable!(),
             }
             assert_eq!(

@@ -21,10 +21,6 @@ use crate::state_store;
 const ENROLLMENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const ENROLLMENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const ENROLLMENT_MAX_ATTEMPTS: u32 = 3;
-/// 续期提前量：证书 37 天、保底 30 天 → 剩余 ≤ 30 天就该续（§4.2）。
-/// 与 [`state_store::client_identity::RENEWAL_LEAD_SECONDS`] 同一口径，**只此一处**。
-const RENEWAL_WINDOW: time::Duration =
-    time::Duration::seconds(state_store::client_identity::RENEWAL_LEAD_SECONDS);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnrollmentDecision {
@@ -38,19 +34,34 @@ pub use crate::error::{EnrollmentError, EnrollmentReason, EnrollmentResult};
 
 /// 网关 401 正文里代表「**重试也没用、必须运维介入**」的稳定 `code`（`unauthorized_code`）。
 ///
-/// 为什么不是「凡 401 即终态」：凭据**过期**（`credential_expired`）与「没带凭据」
-/// （`missing_credential` / `certificate_required`）是可能在配置 / mTLS 到位后自愈的，
-/// 不该让守护进程停死；下面这些才是**确实回不来**的。
+/// 为什么不是「凡 401 即终态」：「没带证书」（`certificate_required`）与「网关没开 mTLS」
+/// （`missing_credential`）都会在配置 / 证书到位后**自愈**，不该让守护进程停死；
+/// 下面这些才是**确实回不来**的。
+///
+/// （mTLS 收口后只剩这两个 —— 旧的 `unknown_credential` / `credential_mismatch` /
+/// `credential_inactive` 是 bearer 双轨的产物，网关已不再产生。）
 pub(crate) const TERMINAL_AUTH_CODES: &[&str] = &[
-    // 被拒名单（§5.6）：得由运维在网关解除，重装无效。
+    // 被拒名单（§5.6）：得由运维在网关解除，重装/重注册都无效。
     "certificate_revoked",
-    // 库里没有这条凭据（**库被换/重置过**）：只能重新注册（`enroll --force`）。
-    "unknown_credential",
-    // 凭据与这台 agent 对不上 / 已失效 / 证书身份不符：同样回不来。
-    "credential_mismatch",
-    "credential_inactive",
+    // 证书身份与请求体里的 agent 对不上：重试也回不来，只能重新注册。
     "certificate_mismatch",
 ];
+
+/// 每个终态 code 的**处置**（给运维看的一句话）。
+///
+/// 为何集中在一张表：守护进程的终态日志与 `diagnose` 的提示词以前各写一份，于是会漂 ——
+/// 2026-09-30 实撞过一次：网关回 `credential_mismatch`，而 `diagnose` 的提示词只列了
+/// `unknown_credential` 与 `certificate_revoked`，操作者只能猜。现在两边**同源**，
+/// 且 [`crate::doctor`] 的测试会卡住「[`TERMINAL_AUTH_CODES`] 里的每个 code 都得有处置」。
+pub(crate) fn terminal_auth_advice(code: &str) -> Option<&'static str> {
+    match code {
+        "certificate_revoked" => Some("在被拒名单里：得运维先在网关解除，重装/重注册都没用"),
+        "certificate_mismatch" => {
+            Some("证书身份与这台 agent 对不上：用一次性 token 重新注册（`enroll --force`）")
+        }
+        _ => None,
+    }
+}
 
 /// 从 401/403 正文里认出网关的稳定 `code`。
 pub(crate) fn auth_rejection_code(body: &str) -> Option<&'static str> {
@@ -232,7 +243,7 @@ async fn ensure_enrolled_with_optional_config_path(
             )
         })?
         .to_string();
-    let request = build_enrollment_request(config, state_dir, token);
+    let request = build_enrollment_request(config, state_dir, token)?;
     let returned = post_enrollment(config, &endpoint, &request).await?;
     apply_enrollment_result(config, state_dir, returned.result)?;
     if let Some(config_path) = config_path {
@@ -248,8 +259,9 @@ fn has_config_identity(config: &AgentConfig) -> bool {
 /// 把 `state/agent_runtime.json` 里的正式身份与凭据注入配置 —— **只读 state，不联网、不续期**。
 ///
 /// 给**升级器**这类独立进程用：daemon 启动时会走 [`ensure_enrolled_with_config_path`] 拿到凭据，
-/// 而凭据（`bearer_token`）**从不写进 `agentd.toml`**、只落在 state；升级器只 `load_from_path`
-/// 就读不到它，https 取包会发不出 `Authorization`（网关回 401）。所以升级器取包前补这一步。
+/// 而身份（`agent_id` / 客户端证书路径）**从不写进 `agentd.toml`**、只落在 state / `identity/`；
+/// 升级器只 `load_from_path` 就读不到它，取包会发不出安证（网关回 401）。
+/// 所以升级器取包前补这一步。
 ///
 /// 与 [`ensure_enrolled_with_config_path`] 的差别：即便配置里已有 `agent_id`（`has_config_identity`
 /// 为真，`ensure_enrolled` 会就此早返回）这里也照常从 state 注入，确保凭据一定被带上。
@@ -282,13 +294,8 @@ fn load_state_identity(
         .filter(|value| !value.trim().is_empty())
     {
         config.control_plane.credential_id = Some(credential_id);
-    }
-    if let Some(bearer_token) = runtime_state
-        .bearer_token
-        .filter(|value| !value.trim().is_empty())
-    {
-        config.control_plane.bearer_token = Some(bearer_token);
-        config.control_plane.auth_mode = Some("bearer".to_string());
+        // 凭据路径只剩客户端证书；标记一下便于诊断 / 展示。
+        config.control_plane.auth_mode = Some("certificate".to_string());
         config.control_plane.enrollment_token = None;
     }
     if let Some(expires_at) = runtime_state
@@ -304,41 +311,33 @@ fn build_enrollment_request(
     config: &AgentConfig,
     state_dir: &Path,
     token: String,
-) -> EnrollmentRequest {
-    EnrollmentRequest::new(
+) -> Result<EnrollmentRequest, EnrollmentError> {
+    // mTLS 是唯一凭据路径：注册**必须**带 CSR（网关据此签客户端证书，没有它就没有凭据）。
+    let certificate_signing_request = local_certificate_signing_request(state_dir)?;
+    Ok(EnrollmentRequest::new(
         token,
-        config
-            .control_plane
-            .credential_request
-            .clone()
-            .unwrap_or_else(|| "none".to_string()),
-        local_certificate_signing_request(state_dir),
+        "csr".to_string(),
+        certificate_signing_request,
         build_host_profile(config),
         "wist-agentd:discovery,telemetry,local-exec".to_string(),
         now_rfc3339(),
-    )
+    ))
 }
 
 /// 本地生成（或复用）客户端密钥，并用它生成 CSR：**只交公钥**，主体由网关填（§4.2）。
 ///
-/// 生成失败**不阻断注册**：拿不到 CSR 就退回纯 bearer 双轨（返回 `None`），
-/// 而不是让一台机器仅仅因为本地密钥写不出来就注册不上。
-fn local_certificate_signing_request(state_dir: &Path) -> Option<String> {
+/// 生成失败即**注册失败**：mTLS 是唯一凭据路径，没有 CSR 就没有任何可用凭据
+/// —— 继续注册等于发回一个拿不到证书、注定连不上的身份。
+fn local_certificate_signing_request(state_dir: &Path) -> Result<String, EnrollmentError> {
     let paths = state_store::client_identity::ClientIdentityPaths::under(state_dir);
-    let key_pair = match state_store::client_identity::load_or_generate_key_pair(&paths) {
-        Ok(key_pair) => key_pair,
-        Err(err) => {
-            eprintln!("wist-agentd cannot prepare a local client key for CSR: {err}");
-            return None;
-        }
-    };
-    match state_store::client_identity::build_certificate_signing_request(&key_pair) {
-        Ok(csr) => Some(csr),
-        Err(err) => {
-            eprintln!("wist-agentd cannot build a certificate signing request: {err}");
-            None
-        }
-    }
+    let key_pair = state_store::client_identity::load_or_generate_key_pair(&paths).source_err(
+        EnrollmentReason::Io,
+        "prepare a local client key for the certificate signing request",
+    )?;
+    state_store::client_identity::build_certificate_signing_request(&key_pair).source_err(
+        EnrollmentReason::Io,
+        "build the certificate signing request",
+    )
 }
 
 fn build_host_profile(config: &AgentConfig) -> HostProfile {
@@ -448,7 +447,7 @@ impl RenewalDecision {
             RenewalDecision::Renewed => "credential renewed".to_string(),
             RenewalDecision::Failed(detail) => detail.clone(),
             RenewalDecision::NeedsReinstall => {
-                "client certificate expired; re-enroll or reinstall with a token".to_string()
+                "no usable client certificate; re-enroll or reinstall with a token".to_string()
             }
             RenewalDecision::Revoked => {
                 "gateway refused this agent as revoked (denylist); an operator must lift the \
@@ -456,6 +455,11 @@ impl RenewalDecision {
                     .to_string()
             }
         }
+    }
+
+    /// 台账/日志共用的处置文案（避免守护进程日志与台账各写一份而漂移）。
+    pub(crate) fn ledger_detail_text(&self) -> String {
+        self.ledger_detail()
     }
 }
 
@@ -488,28 +492,19 @@ async fn renewal_decision(config: &mut AgentConfig, state_dir: &Path) -> Renewal
             CertificateValidity::Valid => return RenewalDecision::NotDue,
             CertificateValidity::RenewDue => {}
         },
-        // 还没有本地证书（只走 bearer 的双轨部署）：回落到凭据到期时间。
-        Ok(None) => return renew_by_credential_expiry(config, state_dir).await,
+        // 没有本地客户端证书：mTLS 是唯一凭据路径，此刻这台机器**没有任何可用身份**
+        // （续期也过不去）—— 不重试，记「需重装」（带一次性 token 重新注册）。
+        Ok(None) => {
+            eprintln!(
+                "wist-agentd has no client certificate: re-enroll or reinstall with a token \
+                 (mTLS is the only credential path; not retrying)"
+            );
+            return RenewalDecision::NeedsReinstall;
+        }
         Err(err) => {
             eprintln!("wist-agentd cannot read the local client certificate status: {err}");
             return RenewalDecision::Failed(err.to_string());
         }
-    }
-    renew_now(config, state_dir).await
-}
-
-/// 没有本地证书时（纯 bearer 双轨）的续期判定：按凭据到期时间与同一个提前量。
-async fn renew_by_credential_expiry(config: &mut AgentConfig, state_dir: &Path) -> RenewalDecision {
-    let Some(expires_at) = config.control_plane.credential_expires_at.as_deref() else {
-        return RenewalDecision::NotDue;
-    };
-    let Ok(expires_at) =
-        time::OffsetDateTime::parse(expires_at, &time::format_description::well_known::Rfc3339)
-    else {
-        return RenewalDecision::NotDue;
-    };
-    if time::OffsetDateTime::now_utc() + RENEWAL_WINDOW < expires_at {
-        return RenewalDecision::NotDue;
     }
     renew_now(config, state_dir).await
 }
@@ -565,26 +560,17 @@ async fn renew_credential(
             .to_err()
             .with_detail("control_plane.endpoint is required for enrollment"));
     };
-    let Some(bearer_token) = required_option(config.control_plane.bearer_token.as_deref()) else {
-        return Ok(RenewOutcome::Done);
-    };
     let Some(agent_id) = required_option(config.agent.agent_id.as_deref()) else {
         return Ok(RenewOutcome::Done);
     };
     let instance_id = required_option(config.agent.instance_name.as_deref())
         .unwrap_or_default()
         .to_string();
-    let certificate_signing_request = local_certificate_signing_request(state_dir);
+    let certificate_signing_request = local_certificate_signing_request(state_dir)?;
     let request = CredentialRenewal::new(
         agent_id.to_string(),
         instance_id,
-        // 有本地密钥就交 CSR 换新证书（gateway 没配 agent CA 时会忽略）；
-        // 没有就退回旧的 bearer 续期。
-        if certificate_signing_request.is_some() {
-            "csr".to_string()
-        } else {
-            "bearer".to_string()
-        },
+        "csr".to_string(),
         certificate_signing_request,
         now_rfc3339(),
     );
@@ -593,10 +579,8 @@ async fn renew_credential(
         "{}/api/v1/agent/credentials:renew",
         endpoint.trim_end_matches('/')
     );
-    let response = send_with_retry(&client, |client| {
-        client.post(&url).bearer_auth(bearer_token).json(&request)
-    })
-    .await?;
+    // 凭据由客户端证书（mTLS 握手）验明，不再发 Authorization 头。
+    let response = send_with_retry(&client, |client| client.post(&url).json(&request)).await?;
     // 不再用 `error_for_status()`：要先读正文，才能把「被吊销（终态）」从普通失败里认出来（§5.4）。
     let status = response.status();
     if !status.is_success() {
@@ -618,6 +602,8 @@ async fn renew_credential(
     let credential = renewed.credential_bundle;
 
     apply_credential_to_config(config, &credential)?;
+    // 新证书必须落盘：续期后控制面请求都拿它走 mTLS，不落盘就用不上新证书。
+    store_issued_client_certificate(state_dir, &credential)?;
     let runtime_path = state_store::agent_runtime::path_for(state_dir);
     let mut runtime_state = state_store::agent_runtime::load_or_default_async(&runtime_path)
         .await
@@ -824,58 +810,33 @@ fn store_issued_client_certificate(
     state_dir: &Path,
     credential: &wist_contracts::enrollment::CredentialBundle,
 ) -> Result<(), EnrollmentError> {
-    let Some(certificate_pem) = credential
-        .certificate
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    else {
-        return Ok(());
-    };
+    if credential.certificate.trim().is_empty() {
+        return Err(EnrollmentReason::InvalidAcceptedResult
+            .to_err()
+            .with_detail("accepted credential bundle is missing the client certificate"));
+    }
     let paths = state_store::client_identity::ClientIdentityPaths::under(state_dir);
-    state_store::client_identity::store_client_certificate(&paths, certificate_pem)
+    state_store::client_identity::store_client_certificate(&paths, &credential.certificate)
         .source_err(EnrollmentReason::Io, "store client certificate")
 }
 
 /// Apply an issued credential bundle to the in-memory agent config. Both the
-/// enrollment and renewal paths share this so the auth_scheme handling stays
-/// consistent.
+/// enrollment and renewal paths share this so the credential handling stays consistent.
+///
+/// mTLS 是唯一凭据路径：这里的凭据**只**是一张客户端证书（已由调用方落盘），
+/// 所以这里不再涉及任何 bearer token。
 fn apply_credential_to_config(
     config: &mut AgentConfig,
     credential: &wist_contracts::enrollment::CredentialBundle,
 ) -> Result<(), EnrollmentError> {
-    config.control_plane.credential_id = Some(credential.credential_id.clone());
-    match credential.auth_scheme.as_deref() {
-        // 双轨期两种都发：`certificate` 为主（mTLS），bearer 仍然收下当回落。
-        Some("certificate") => {
-            config.control_plane.auth_mode = Some("certificate".to_string());
-            if let Some(token) = required_option(credential.bearer_token.as_deref()) {
-                config.control_plane.bearer_token = Some(token.to_string());
-            }
-            config.control_plane.enrollment_token = None;
-        }
-        Some("bearer") | None => {
-            let token = credential
-                .bearer_token
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            let Some(token) = token else {
-                return Err(EnrollmentReason::InvalidAcceptedResult
-                    .to_err()
-                    .with_detail(
-                        "accepted enrollment response is missing credential bearer_token",
-                    ));
-            };
-            config.control_plane.bearer_token = Some(token.to_string());
-            config.control_plane.auth_mode = Some("bearer".to_string());
-            config.control_plane.enrollment_token = None;
-        }
-        Some(scheme) => {
-            return Err(EnrollmentReason::UnsupportedCredentialScheme
-                .to_err()
-                .with_detail(format!("unsupported credential auth_scheme: {scheme}")));
-        }
+    if credential.certificate.trim().is_empty() {
+        return Err(EnrollmentReason::InvalidAcceptedResult
+            .to_err()
+            .with_detail("accepted credential bundle is missing the client certificate"));
     }
+    config.control_plane.credential_id = Some(credential.credential_id.clone());
+    config.control_plane.auth_mode = Some("certificate".to_string());
+    config.control_plane.enrollment_token = None;
     if let Some(expires_at) = credential.not_after.as_ref() {
         config.control_plane.credential_expires_at = Some(expires_at.clone());
     }
@@ -887,20 +848,7 @@ fn apply_credential_to_runtime_state(
     credential: wist_contracts::enrollment::CredentialBundle,
 ) {
     runtime_state.credential_id = Some(credential.credential_id);
-    match credential.auth_scheme.as_deref() {
-        // `certificate` 与 bearer 一样把凭据存起来：bearer 是回落，证书另有 identity/ 文件。
-        Some("certificate") => {
-            runtime_state.bearer_token = credential.bearer_token;
-            runtime_state.credential_expires_at = credential.not_after;
-        }
-        Some("bearer") | None => {
-            runtime_state.bearer_token = credential.bearer_token;
-            runtime_state.credential_expires_at = credential.not_after;
-        }
-        Some(_) => {
-            // Unsupported scheme: apply_credential_to_config rejected this earlier.
-        }
-    }
+    runtime_state.credential_expires_at = credential.not_after;
 }
 
 pub(crate) fn is_registered_agent_id(value: &str) -> bool {
@@ -1051,7 +999,6 @@ mod tests {
                 enrollment_token: Some("token-a".to_string()),
                 credential_request: None,
                 credential_id: None,
-                bearer_token: None,
                 credential_expires_at: None,
                 tls_mode: None,
                 trust_bundle: None,
@@ -1087,17 +1034,17 @@ mod tests {
         let config = config();
         let state_dir = temp_dir("build-request");
 
-        let request = build_enrollment_request(&config, &state_dir, "token-a".to_string());
+        let request = build_enrollment_request(&config, &state_dir, "token-a".to_string())
+            .expect("build request");
 
         assert_eq!(request.token, "token-a");
         assert_eq!(request.host_profile.node_id, "host-a");
-        assert_eq!(request.credential_request, "none");
+        assert_eq!(request.credential_request, "csr");
         // CSR 随注册一起上去：本地生成密钥、只交公钥（主体留给网关填）。
         assert!(
             request
                 .certificate_signing_request
-                .as_deref()
-                .is_some_and(|csr| csr.contains("BEGIN CERTIFICATE REQUEST")),
+                .contains("BEGIN CERTIFICATE REQUEST"),
             "enrollment must carry a locally built CSR"
         );
         let _ = fs::remove_dir_all(state_dir);
@@ -1176,7 +1123,8 @@ mod tests {
         let mut config = config();
         config.control_plane.endpoint = Some("http://127.0.0.1:1".to_string());
         let request =
-            build_enrollment_request(&config, &temp_dir("post-enrollment"), "token-a".to_string());
+            build_enrollment_request(&config, &temp_dir("post-enrollment"), "token-a".to_string())
+                .expect("build request");
 
         let err = post_enrollment(&config, "http://127.0.0.1:1", &request)
             .await
@@ -1186,7 +1134,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn renew_credential_rotates_bearer_and_updates_state() {
+    async fn renew_credential_issues_a_new_certificate_and_updates_state() {
         let state_dir = temp_dir("renew-credential");
         let runtime_path = crate::state_store::agent_runtime::path_for(&state_dir);
         let mut runtime = wist_contracts::agent_state::AgentRuntimeState::new(
@@ -1197,7 +1145,6 @@ mod tests {
             "2026-07-01T00:00:00Z".to_string(),
         );
         runtime.credential_id = Some("cred-old".to_string());
-        runtime.bearer_token = Some("wic_old_token".to_string());
         runtime.credential_expires_at = Some("2026-08-01T00:00:00Z".to_string());
         crate::state_store::agent_runtime::store(&runtime_path, &runtime).expect("store state");
 
@@ -1219,12 +1166,13 @@ mod tests {
             }
             let request = String::from_utf8_lossy(&request_bytes);
             assert!(request.contains("credentials:renew"));
+            // 凭据走客户端证书（mTLS），续期请求不再带 Authorization 头。
             assert!(
-                request
-                    .to_lowercase()
-                    .contains("authorization: bearer wic_old_token")
+                !request.to_lowercase().contains("authorization:"),
+                "{request}"
             );
-            let body = r#"{"credential_bundle":{"credential_id":"cred-new","agent_id":"agent-x","instance_id":"instance-x","auth_scheme":"bearer","bearer_token":"wic_new_token","certificate":null,"private_key_ref":null,"ca_bundle":null,"issued_at":"2026-08-01T00:00:00Z","not_before":"2026-08-01T00:00:00Z","not_after":"2026-09-01T00:00:00Z"}}"#;
+            assert!(request.contains("\"certificate_signing_request\""));
+            let body = r#"{"credential_bundle":{"credential_id":"cred-new","agent_id":"agent-x","instance_id":"instance-x","certificate":"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n","private_key_ref":null,"ca_bundle":null,"issued_at":"2026-08-01T00:00:00Z","not_before":"2026-08-01T00:00:00Z","not_after":"2026-09-01T00:00:00Z"}}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 body.len(),
@@ -1238,7 +1186,6 @@ mod tests {
         let mut config = config();
         config.agent.agent_id = Some("agent-x".to_string());
         config.control_plane.endpoint = Some(endpoint);
-        config.control_plane.bearer_token = Some("wic_old_token".to_string());
         config.control_plane.credential_id = Some("cred-old".to_string());
         config.control_plane.credential_expires_at = Some("2026-08-01T00:00:00Z".to_string());
 
@@ -1248,17 +1195,22 @@ mod tests {
         server.await.expect("server task");
 
         assert_eq!(
-            config.control_plane.bearer_token.as_deref(),
-            Some("wic_new_token")
-        );
-        assert_eq!(
             config.control_plane.credential_id.as_deref(),
             Some("cred-new")
         );
+        assert_eq!(
+            config.control_plane.auth_mode.as_deref(),
+            Some("certificate")
+        );
         let runtime = crate::state_store::agent_runtime::load_or_default(&runtime_path)
             .expect("load runtime");
-        assert_eq!(runtime.bearer_token.as_deref(), Some("wic_new_token"));
         assert_eq!(runtime.credential_id.as_deref(), Some("cred-new"));
+        // 新证书已落盘：后续控制面请求都拿它走 mTLS。
+        let paths = crate::state_store::client_identity::ClientIdentityPaths::under(&state_dir);
+        assert!(
+            paths.cert_file.exists(),
+            "renewed client certificate stored"
+        );
     }
 
     #[tokio::test]
@@ -1298,7 +1250,6 @@ mod tests {
             "2026-07-27T00:00:00Z".to_string(),
         );
         runtime.credential_id = Some("cred-state".to_string());
-        runtime.bearer_token = Some("bearer-state".to_string());
         runtime.credential_expires_at = Some("2026-08-27T00:00:00Z".to_string());
         crate::state_store::agent_runtime::store(&runtime_path, &runtime).expect("store state");
         let mut config = config();
@@ -1313,10 +1264,9 @@ mod tests {
             Some("cred-state")
         );
         assert_eq!(
-            config.control_plane.bearer_token.as_deref(),
-            Some("bearer-state")
+            config.control_plane.auth_mode.as_deref(),
+            Some("certificate")
         );
-        assert_eq!(config.control_plane.auth_mode.as_deref(), Some("bearer"));
         assert_eq!(
             config.control_plane.credential_expires_at.as_deref(),
             Some("2026-08-27T00:00:00Z")
@@ -1325,9 +1275,9 @@ mod tests {
     }
 
     /// 升级器场景：配置里**已经有** `agent_id`（`has_config_identity` 为真，`ensure_enrolled` 会
-    /// 就此早返回、不碰凭据），`restore_runtime_identity` 仍必须从 state 注入 `bearer_token`。
+    /// 就此早返回、不碰凭据），`restore_runtime_identity` 仍必须从 state 注入身份。
     #[test]
-    fn restore_runtime_identity_injects_credential_despite_config_agent_id() {
+    fn restore_runtime_identity_injects_identity_despite_config_agent_id() {
         let state_dir = temp_dir("restore-credential");
         let runtime_path = crate::state_store::agent_runtime::path_for(&state_dir);
         let mut runtime = wist_contracts::agent_state::AgentRuntimeState::new(
@@ -1337,22 +1287,25 @@ mod tests {
             wist_contracts::agent_state::RuntimeMode::Normal,
             "2026-07-27T00:00:00Z".to_string(),
         );
-        runtime.bearer_token = Some("bearer-state".to_string());
+        runtime.credential_id = Some("cred-state".to_string());
         crate::state_store::agent_runtime::store(&runtime_path, &runtime).expect("store state");
 
         let mut config = config();
         // 配置已带 agent_id：这正是「升级器只 load 到配置文件」会落到的形态。
         config.agent.agent_id = Some("agent-config".to_string());
-        config.control_plane.bearer_token = None;
+        config.control_plane.credential_id = None;
 
         let restored = restore_runtime_identity(&mut config, &state_dir).expect("restore");
 
         assert!(restored);
         assert_eq!(
-            config.control_plane.bearer_token.as_deref(),
-            Some("bearer-state")
+            config.control_plane.credential_id.as_deref(),
+            Some("cred-state")
         );
-        assert_eq!(config.control_plane.auth_mode.as_deref(), Some("bearer"));
+        assert_eq!(
+            config.control_plane.auth_mode.as_deref(),
+            Some("certificate")
+        );
     }
 
     #[tokio::test]
@@ -1552,7 +1505,6 @@ state_dir = "state"
         config.paths.state_dir = state_dir.display().to_string();
         // 指向一个必然连不上的端点：若它真去续期就会是 `Failed`，而不是 `NeedsReinstall`。
         config.control_plane.endpoint = Some("http://127.0.0.1:1".to_string());
-        config.control_plane.bearer_token = Some("wic-token".to_string());
 
         let paths = crate::state_store::client_identity::ClientIdentityPaths::under(&state_dir);
         let (expired_pem, expired_key_pem) = self_signed_identity_pem(-1);
@@ -1571,16 +1523,17 @@ state_dir = "state"
         let _ = fs::remove_dir_all(state_dir);
     }
 
-    /// 没有本地证书（纯 bearer 双轨）：回落到凭据到期时间。
+    /// 没有本地证书：**不重试**，记 `needs_reinstall`（mTLS 是唯一凭据路径 —— 没证书就没有身份）。
     #[tokio::test]
-    async fn renewal_falls_back_to_credential_expiry_without_a_certificate() {
-        let state_dir = temp_dir("renewal-bearer-only");
+    async fn renewal_without_a_certificate_requires_reinstall() {
+        let state_dir = temp_dir("renewal-no-cert");
         let mut config = config();
         config.paths.state_dir = state_dir.display().to_string();
+        // 即便配了「凭据到期时间」，也不能拿它当退回路径：那正是旧的 bearer 双轨假设。
         config.control_plane.credential_expires_at = Some("2099-01-01T00:00:00Z".to_string());
 
         let decision = super::renew_credential_if_due(&mut config, &state_dir).await;
-        assert_eq!(decision, super::RenewalDecision::NotDue);
+        assert_eq!(decision, super::RenewalDecision::NeedsReinstall);
         let _ = fs::remove_dir_all(state_dir);
     }
 
@@ -1598,21 +1551,14 @@ state_dir = "state"
             AuthRejection::Terminal("certificate_revoked")
         );
         assert_eq!(
-            classify_auth_rejection(
-                StatusCode::UNAUTHORIZED,
-                "agent identity rejected: unknown_credential"
-            ),
-            AuthRejection::Terminal("unknown_credential")
-        );
-        assert_eq!(
             classify_auth_rejection(StatusCode::FORBIDDEN, "certificate_mismatch"),
             AuthRejection::Terminal("certificate_mismatch")
         );
-        // 凭据过期 / 没带凭据：可能在配置 / mTLS 到位后自愈 —— 不停。
+        // 没带证书 / 网关没开 mTLS：会在配置 / 证书到位后自愈 —— 不停。
         assert_eq!(
             classify_auth_rejection(
                 StatusCode::UNAUTHORIZED,
-                "agent identity rejected: credential_expired"
+                "agent identity rejected: certificate_required"
             ),
             AuthRejection::NotRevoked
         );
@@ -1662,9 +1608,13 @@ state_dir = "state"
         config.paths.state_dir = state_dir.display().to_string();
         config.agent.agent_id = Some("agent-x".to_string());
         config.control_plane.endpoint = Some(endpoint);
-        config.control_plane.bearer_token = Some("wic_token".to_string());
-        // 已过期的到期时间 → 判定为「该续期」。
-        config.control_plane.credential_expires_at = Some("2026-08-01T00:00:00Z".to_string());
+        // 种一张落在续签窗内的客户端证书（≤ 30 天）→ 判定为「该续期」——mTLS 是唯一凭据路径。
+        let paths = crate::state_store::client_identity::ClientIdentityPaths::under(&state_dir);
+        let (cert_pem, key_pem) = self_signed_identity_pem(10);
+        fs::create_dir_all(paths.key_file.parent().expect("parent")).expect("key dir");
+        fs::write(&paths.key_file, &key_pem).expect("write key");
+        crate::state_store::client_identity::store_client_certificate(&paths, &cert_pem)
+            .expect("store certificate");
 
         let decision = super::renew_credential_if_due(&mut config, &state_dir).await;
         server.await.expect("server task");
@@ -1822,8 +1772,6 @@ state_dir = "state"
                     "credential_id": "cred-cert",
                     "agent_id": "agent-cert",
                     "instance_id": "inst-cert",
-                    "auth_scheme": "certificate",
-                    "bearer_token": "wic-token",
                     "certificate": certificate_pem,
                     "private_key_ref": null,
                     "ca_bundle": null,
@@ -1867,7 +1815,7 @@ state_dir = "state"
         server.await.expect("server task");
         assert_eq!(decision, EnrollmentDecision::Enrolled);
 
-        // 证书落到 `identity/`（不是 state 里的 bearer 凭据）。
+        // 证书落到 `identity/`（不是 state 里的凭据）。
         let paths = crate::state_store::client_identity::ClientIdentityPaths::under(
             &config_root.join("state"),
         );
@@ -1875,11 +1823,11 @@ state_dir = "state"
             fs::read_to_string(&paths.cert_file).expect("read stored certificate"),
             certificate_pem
         );
-        // `certificate` 方案被接受，bearer 作为回落也留下了；到期时间用证书的。
+        // `certificate` 方案：state 里只留 credential_id 与证书到期时间。
         let state_path = crate::state_store::agent_runtime::path_for(&config_root.join("state"));
         let state: wist_contracts::agent_state::AgentRuntimeState =
             wist_shared::fs::read_json(&state_path).expect("read runtime state");
-        assert_eq!(state.bearer_token.as_deref(), Some("wic-token"));
+        assert_eq!(state.credential_id.as_deref(), Some("cred-cert"));
         assert_eq!(
             state.credential_expires_at.as_deref(),
             Some(not_after.as_str())
@@ -2033,9 +1981,8 @@ credential_request = "bearer"
                 credential_id: "cred-issued".to_string(),
                 agent_id: "agent-issued".to_string(),
                 instance_id: "instance-issued".to_string(),
-                auth_scheme: Some("bearer".to_string()),
-                bearer_token: Some("bearer-issued".to_string()),
-                certificate: None,
+                certificate: "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+                    .to_string(),
                 private_key_ref: None,
                 ca_bundle: None,
                 issued_at: "2026-07-27T00:00:00Z".to_string(),
@@ -2059,21 +2006,22 @@ credential_request = "bearer"
             Some("cred-issued")
         );
         assert_eq!(
-            config.control_plane.bearer_token.as_deref(),
-            Some("bearer-issued")
+            config.control_plane.auth_mode.as_deref(),
+            Some("certificate")
         );
-        assert_eq!(config.control_plane.auth_mode.as_deref(), Some("bearer"));
         assert_eq!(
             config.control_plane.credential_expires_at.as_deref(),
             Some("2026-08-27T00:00:00Z")
         );
         assert!(config.control_plane.enrollment_token.is_none());
+        // 客户端证书落到 `identity/`（后续控制面请求都拿它走 mTLS）。
+        let paths = crate::state_store::client_identity::ClientIdentityPaths::under(&state_dir);
+        assert!(paths.cert_file.exists(), "issued client certificate stored");
         let runtime = crate::state_store::agent_runtime::load_or_default(
             &crate::state_store::agent_runtime::path_for(&state_dir),
         )
         .expect("load runtime");
         assert_eq!(runtime.credential_id.as_deref(), Some("cred-issued"));
-        assert_eq!(runtime.bearer_token.as_deref(), Some("bearer-issued"));
         assert_eq!(
             runtime.credential_expires_at.as_deref(),
             Some("2026-08-27T00:00:00Z")
@@ -2092,7 +2040,6 @@ credential_request = "bearer"
             "2026-07-27T00:00:00Z".to_string(),
         );
         runtime.credential_id = Some("cred-state".to_string());
-        runtime.bearer_token = Some("bearer-state".to_string());
         runtime.credential_expires_at = Some("2026-08-27T00:00:00Z".to_string());
         crate::state_store::agent_runtime::store(&runtime_path, &runtime).expect("store state");
 
@@ -2156,8 +2103,8 @@ auth_mode = "enrollment_token"
     }
 
     #[test]
-    fn accepted_result_rejects_unsupported_credential_scheme() {
-        let state_dir = temp_dir("unsupported-scheme");
+    fn accepted_result_without_a_certificate_is_rejected() {
+        let state_dir = temp_dir("no-certificate");
         let mut config = config();
         let result = EnrollmentOutcome {
             status: EnrollmentStatus::Accepted,
@@ -2169,9 +2116,8 @@ auth_mode = "enrollment_token"
                 credential_id: "cred-x".to_string(),
                 agent_id: "agent-x".to_string(),
                 instance_id: "instance-x".to_string(),
-                auth_scheme: Some("mtls".to_string()),
-                bearer_token: Some("token-should-not-persist".to_string()),
-                certificate: None,
+                // 空证书：mTLS 是唯一凭据路径，没有证书的「已接受」是不合法的。
+                certificate: "".to_string(),
                 private_key_ref: None,
                 ca_bundle: None,
                 issued_at: "2026-07-27T00:00:00Z".to_string(),
@@ -2185,13 +2131,7 @@ auth_mode = "enrollment_token"
         let err =
             super::apply_enrollment_result(&mut config, &state_dir, result).expect_err("reject");
 
-        assert_eq!(err.reason(), &EnrollmentReason::UnsupportedCredentialScheme);
-        assert!(config.control_plane.bearer_token.is_none());
+        assert_eq!(err.reason(), &EnrollmentReason::InvalidAcceptedResult);
         assert!(config.control_plane.auth_mode.is_none());
-        let runtime = crate::state_store::agent_runtime::load_or_default(
-            &crate::state_store::agent_runtime::path_for(&state_dir),
-        )
-        .expect("load runtime");
-        assert!(runtime.bearer_token.is_none());
     }
 }

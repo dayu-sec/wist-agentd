@@ -192,12 +192,12 @@ async fn execute(args: Args) -> Result<(), String> {
     }
 }
 
-/// 加载升级器要用的配置：`agentd.toml` **加上**从 state 注入的正式身份 / 凭据。
+/// 加载升级器要用的配置：`agentd.toml` **加上**从 state 注入的正式身份。
 ///
 /// 配置由 agentd 负责生成 / 维护，升级器只读：没有配置说明这台机器还没装好 agentd。
-/// 但**凭据只落在 state（`agent_runtime.json`）、从不写进配置文件**，只 `load_from_path` 会
-/// 拿不到 `control_plane.bearer_token` —— 于是 https 取包发不出 `Authorization`，网关回 401。
-/// 这里补上 daemon 启动时同一步（`restore_runtime_identity`），与 agentd 取同样的凭据。
+/// 取包靠 `enrollment_http_client` 挂上的**客户端证书**（mTLS），不再是 bearer token；
+/// 证书路径来自配置里的 `state_dir`，而 agent_id 等身份只落在 state。
+/// 这里补上 daemon 启动时同一步（`restore_runtime_identity`），与 agentd 用同一份身份。
 fn load_upgrader_config(config_dir: &Path) -> Result<AgentConfig, String> {
     let config_path = config_runtime::resolve_config_path(config_dir);
     if !config_path.is_file() {
@@ -362,17 +362,17 @@ mod tests {
         assert!(bad_scope.contains("system or user"), "{bad_scope}");
     }
 
-    /// 升级器必须带上 agent 凭据：凭据只落在 state（`agent_runtime.json`），`agentd.toml` 里没有
-    /// —— 只 `load_from_path` 会让 https 取包发不出 `Authorization`，网关回 401（现场故障）。
+    /// 升级器必须带上 agent 身份：身份只落在 state（`agent_runtime.json`），`agentd.toml` 里没有
+    /// —— 取包靠客户端证书（mTLS），身份注入后控制面才认得这台机器。
     #[test]
-    fn load_upgrader_config_restores_the_state_credential() {
+    fn load_upgrader_config_restores_the_state_identity() {
         let dir = unique_dir("upgrader-cred");
         std::fs::create_dir_all(&dir).expect("create config dir");
         let config_path = config_runtime::resolve_config_path(&dir);
         std::fs::write(&config_path, config_runtime::default_config_template())
             .expect("write default config");
 
-        // 先解一次拿到真实的 state 目录（默认随配置目录而定），再把凭据落进去。
+        // 先解一次拿到真实的 state 目录（默认随配置目录而定），再把身份落进去。
         let base = config_runtime::load_from_path(&config_path).expect("base config");
         let state_dir = PathBuf::from(&base.paths.state_dir);
         std::fs::create_dir_all(&state_dir).expect("create state dir");
@@ -384,16 +384,16 @@ mod tests {
             "2026-01-01T00:00:00Z".to_string(),
         );
         runtime.credential_id = Some("cred-1".to_string());
-        runtime.bearer_token = Some("wic_secret".to_string());
         agent_runtime::store(&agent_runtime::path_for(&state_dir), &runtime)
             .expect("store runtime state");
 
         let config = load_upgrader_config(&dir).expect("load upgrader config");
         assert_eq!(
-            config.control_plane.bearer_token.as_deref(),
-            Some("wic_secret"),
-            "升级器必须从 state 注入 bearer_token，否则 https 取包 401"
+            config.control_plane.credential_id.as_deref(),
+            Some("cred-1"),
+            "升级器必须从 state 注入身份，否则取包/控制面认不出这台机器"
         );
+        assert_eq!(config.agent.agent_id.as_deref(), Some("agent-cred"));
 
         let _ = std::fs::remove_dir_all(dir);
     }

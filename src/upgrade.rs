@@ -384,12 +384,9 @@ async fn fetch_package(config: &AgentConfig, source: &str) -> Result<Vec<u8>, Up
     }
     let client = enrollment_http_client(config)
         .map_err(|err| fail("package_unavailable", format!("build http client: {err}")))?;
-    let mut request = client.get(source).timeout(DOWNLOAD_TIMEOUT);
-    // 网关的分发端点要 agent 凭据：带上 `Authorization: Bearer <token>`。
-    // 没配 token（`None`）就不加这个头 —— 不改错、也不报错，与服务端匿名分发保持兼容。
-    if let Some(token) = config.control_plane.bearer_token.as_deref() {
-        request = request.bearer_auth(token);
-    }
+    // 网关的分发端点要 agent 身份：靠 `enrollment_http_client` 里挂上的客户端证书（mTLS）
+    // 认证，不再有 bearer token。
+    let request = client.get(source).timeout(DOWNLOAD_TIMEOUT);
     let response = request
         .send()
         .await
@@ -2049,8 +2046,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_package_sends_the_agent_bearer_token() {
-        let dir = temp_dir("fetch-bearer");
+    async fn fetch_package_sends_no_authorization_header() {
+        let dir = temp_dir("fetch-cert");
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let source = format!("http://{}/package", listener.local_addr().expect("addr"));
         let server = tokio::spawn(async move {
@@ -2068,108 +2065,7 @@ mod tests {
                 }
             }
             let request = String::from_utf8_lossy(&request_bytes);
-            assert!(
-                request
-                    .to_lowercase()
-                    .contains("authorization: bearer wic_package_token"),
-                "{request}"
-            );
-            socket
-                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\nconnection: close\r\n\r\nPKG")
-                .await
-                .expect("write response");
-        });
-
-        let mut config = config_with_state(&dir);
-        config.control_plane.bearer_token = Some("wic_package_token".to_string());
-        let bytes = fetch_package(&config, &source).await.expect("fetch");
-        server.await.expect("server task");
-
-        assert_eq!(bytes, b"PKG");
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    /// 取包与**其它控制面 HTTP 调用同口径**：同一份 `config`、明文 `http://` 下都**无条件**带
-    /// `Authorization: Bearer <token>`，不看 URL scheme。
-    ///
-    /// 拿一个代表性的控制面调用 `fetch_work_grant`（`control::work`，work:poll）与取包对拍：
-    /// 两个请求打到同一个明文端点，都必须出现同一个头。其余控制面调用
-    /// （`report_status_to_control_plane` / `fetch_uplink_grant` / `fetch_discovery_policies` /
-    /// `report_work_result`）各自有同形状的单测钉住同样的行为 —— 这条把「跨调用口径」本身钉住。
-    #[tokio::test]
-    async fn fetch_package_matches_the_control_plane_bearer_convention_on_plaintext_http() {
-        let dir = temp_dir("fetch-convention");
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
-        let server = tokio::spawn(async move {
-            let mut seen = Vec::new();
-            for _ in 0..2 {
-                let (mut socket, _) = listener.accept().await.expect("accept");
-                let mut request_bytes = Vec::new();
-                loop {
-                    let mut chunk = [0u8; 1024];
-                    let read = socket.read(&mut chunk).await.expect("read");
-                    if read == 0 {
-                        break;
-                    }
-                    request_bytes.extend_from_slice(&chunk[..read]);
-                    if request_bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                seen.push(String::from_utf8_lossy(&request_bytes).to_lowercase());
-                socket
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\nconnection: close\r\n\r\nPKG",
-                    )
-                    .await
-                    .expect("write response");
-            }
-            seen
-        });
-
-        let mut config = config_with_state(&dir);
-        config.agent.agent_id = Some("agent-x".to_string());
-        config.agent.instance_name = Some("instance-x".to_string());
-        config.control_plane.endpoint = Some(endpoint.clone());
-        config.control_plane.bearer_token = Some("wic_shared_token".to_string());
-
-        // 取包（GET）与控制面的一个代表（POST work:poll）：同一份 config、同一个明文端点。
-        let _ = fetch_package(&config, &format!("{endpoint}/package")).await;
-        let _ = crate::control::work::fetch_work_grant(&config, 0).await;
-
-        let seen = server.await.expect("server task");
-        assert_eq!(seen.len(), 2, "两个调用都该打到这个端点");
-        for request in &seen {
-            assert!(
-                request.contains("authorization: bearer wic_shared_token"),
-                "明文 http 下每个控制面调用都必须带同一份凭据: {request}"
-            );
-        }
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn fetch_package_omits_authorization_without_a_token() {
-        let dir = temp_dir("fetch-no-bearer");
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let source = format!("http://{}/package", listener.local_addr().expect("addr"));
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept");
-            let mut request_bytes = Vec::new();
-            loop {
-                let mut chunk = [0u8; 1024];
-                let read = socket.read(&mut chunk).await.expect("read");
-                if read == 0 {
-                    break;
-                }
-                request_bytes.extend_from_slice(&chunk[..read]);
-                if request_bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let request = String::from_utf8_lossy(&request_bytes);
-            // 没配 token 就不该出现这个头（`None` 不是错误，只是不带凭据）。
+            // 凭据走客户端证书（mTLS）：取包请求不再带 Authorization 头。
             assert!(
                 !request.to_lowercase().contains("authorization:"),
                 "{request}"
@@ -2229,84 +2125,13 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// 令牌里的 URL-safe 特殊字符必须**原样**进 header（不能被转义 / 截断 / 丢字符）。
+    /// 本地路径分支不发 HTTP：直接读文件，与任何凭据无关。
     #[tokio::test]
-    async fn fetch_package_preserves_a_token_with_special_characters() {
-        let dir = temp_dir("fetch-bearer-special");
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let source = format!("http://{}/package", listener.local_addr().expect("addr"));
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept");
-            let mut request_bytes = Vec::new();
-            loop {
-                let mut chunk = [0u8; 1024];
-                let read = socket.read(&mut chunk).await.expect("read");
-                if read == 0 {
-                    break;
-                }
-                request_bytes.extend_from_slice(&chunk[..read]);
-                if request_bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let request = String::from_utf8_lossy(&request_bytes).to_lowercase();
-            assert!(
-                request.contains("authorization: bearer wic/tok+en=_.~-"),
-                "{request}"
-            );
-            socket
-                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\nconnection: close\r\n\r\nPKG")
-                .await
-                .expect("write response");
-        });
-
-        let mut config = config_with_state(&dir);
-        config.control_plane.bearer_token = Some("wic/tok+en=_.~-".to_string());
-        let bytes = fetch_package(&config, &source).await.expect("fetch");
-        server.await.expect("server task");
-        assert_eq!(bytes, b"PKG");
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    /// 头里塞不进换行的令牌：不能被拼进请求（请求走私），也不能 panic —— 干净地失败。
-    ///
-    /// 服务端只接受一次连接并立即回 200：若 header 真的被拼出去，请求会成功，这条就会挂号；
-    /// header 被客户端拒掉时根本不会建连，服务端 accept 超时后自然结束（不会挂住测试）。
-    #[tokio::test]
-    async fn fetch_package_fails_cleanly_on_a_token_that_cannot_be_a_header() {
-        let dir = temp_dir("fetch-bad-token");
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let source = format!("http://{}/package", listener.local_addr().expect("addr"));
-        let server = tokio::spawn(async move {
-            let accepted =
-                tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
-            if let Ok(Ok((mut socket, _))) = accepted {
-                let _ = socket
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\nconnection: close\r\n\r\nPKG",
-                    )
-                    .await;
-            }
-        });
-
-        let mut config = config_with_state(&dir);
-        config.control_plane.bearer_token = Some("wic_token\r\nx-evil: 1".to_string());
-        let err = fetch_package(&config, &source)
-            .await
-            .expect_err("must fail");
-        assert_eq!(err.reason, "package_unavailable", "{err}");
-        server.await.expect("server task");
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    /// 本地路径分支不发 HTTP：即便配了 token 也直接读文件，不受凭据影响。
-    #[tokio::test]
-    async fn fetch_package_reads_a_local_path_without_using_the_token() {
+    async fn fetch_package_reads_a_local_path() {
         let dir = temp_dir("fetch-local");
         let package = dir.join("package.tar.gz");
         fs::write(&package, b"LOCAL").expect("write package");
-        let mut config = config_with_state(&dir);
-        config.control_plane.bearer_token = Some("wic_unused_token".to_string());
+        let config = config_with_state(&dir);
         let bytes = fetch_package(&config, &package.display().to_string())
             .await
             .expect("local read");

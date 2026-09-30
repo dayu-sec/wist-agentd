@@ -825,7 +825,6 @@ fn sync_runtime_identity_prefers_config_identity_when_present() {
             enrollment_token: None,
             credential_request: None,
             credential_id: None,
-            bearer_token: None,
             credential_expires_at: None,
             tls_mode: None,
             trust_bundle: None,
@@ -872,7 +871,6 @@ fn sync_runtime_identity_rejects_config_agent_id_conflicting_with_enrolled_ident
             enrollment_token: None,
             credential_request: None,
             credential_id: None,
-            bearer_token: None,
             credential_expires_at: None,
             tls_mode: None,
             trust_bundle: None,
@@ -914,7 +912,6 @@ fn refresh_runtime_version_reports_the_running_binary_and_keeps_credentials() {
             "2026-09-21T00:00:00Z".to_string(),
         );
         state.credential_id = Some("cred-1".to_string());
-        state.bearer_token = Some("bearer-secret".to_string());
 
         refresh_runtime_version(&mut state);
 
@@ -923,7 +920,6 @@ fn refresh_runtime_version_reports_the_running_binary_and_keeps_credentials() {
         assert_eq!(state.agent_id, "agent-a");
         assert_eq!(state.instance_id, "instance-a");
         assert_eq!(state.credential_id.as_deref(), Some("cred-1"));
-        assert_eq!(state.bearer_token.as_deref(), Some("bearer-secret"));
     }
 }
 
@@ -956,7 +952,6 @@ fn initialize_runtime_state_refreshes_the_running_version() {
             enrollment_token: None,
             credential_request: None,
             credential_id: None,
-            bearer_token: None,
             credential_expires_at: None,
             tls_mode: None,
             trust_bundle: None,

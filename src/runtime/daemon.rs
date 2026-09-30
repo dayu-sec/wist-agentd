@@ -23,6 +23,7 @@ use crate::enrollment::enrollment_http_client;
 
 use crate::error::RuntimeResult;
 
+use crate::control::enrollment::terminal_auth_advice;
 use crate::control::uplink::{AppliedUplink, UplinkFetch, fetch_uplink_grant};
 use crate::control::work::{AppliedWorkGrant, ack_work, fetch_work_grant, report_work_result};
 use crate::discovery::DiscoveryProbe;
@@ -421,9 +422,6 @@ async fn report_status_to_control_plane(
     let Some(endpoint) = config.control_plane.endpoint.as_deref() else {
         return StatusReportOutcome::failed();
     };
-    let Some(bearer_token) = config.control_plane.bearer_token.as_deref() else {
-        return StatusReportOutcome::failed();
-    };
     let Some(agent_id) = config.agent.agent_id.as_deref() else {
         return StatusReportOutcome::failed();
     };
@@ -460,13 +458,7 @@ async fn report_status_to_control_plane(
     };
     let url = format!("{}/api/v1/agent/status", endpoint.trim_end_matches('/'));
     let started = Instant::now();
-    match client
-        .post(&url)
-        .bearer_auth(bearer_token)
-        .json(&report)
-        .send()
-        .await
-    {
+    match client.post(&url).json(&report).send().await {
         Ok(response) if response.status().is_success() => StatusReportOutcome {
             latency_ms: Some(started.elapsed().as_millis() as u64),
             terminal: None,
@@ -498,21 +490,14 @@ fn force_standby(uplink: &mut AppliedUplink, code: &str) {
 }
 
 /// 终态时给运维看的一句话：按 code 说清**该做什么**，别让人猜。
+///
+/// 处置文案取自 `control::enrollment` 的同一张表（与 `diagnose` 的提示词同源）——
+/// 两边各写一份就是会漂。
 fn terminal_auth_message(code: &str, source: &str) -> String {
-    let detail = match code {
-        "certificate_revoked" => {
-            "gateway refused this agent as revoked (denylist); an operator must lift it, then restart \
-             — reinstalling will not help"
-        }
-        "unknown_credential" => {
-            "this gateway does not know this agent's credential (its store was replaced or reset); \
-             re-enroll: `wist-agentd enroll --force --token <token>`"
-        }
-        _ => {
-            "this agent's credential is not accepted and will not recover on its own; \
-             re-enroll with a one-time token"
-        }
-    };
+    let detail = terminal_auth_advice(code).unwrap_or(
+        "this agent's credential is not accepted and will not recover on its own; \
+                    re-enroll with a one-time token",
+    );
     format!("event=AgentAuthTerminal code={code} source={source} detail=\"{detail}\"")
 }
 
@@ -654,7 +639,7 @@ fn within_fact_report_min_interval(last_attempt_at_ms: i64, now_ms: i64) -> bool
 /// 拉取平台发布的发现方向**策略表**（尽力而为，失败只进日志）。
 ///
 /// 返回 `None` = 这次没拿到表，且**全部**情况都归结为同一种处理：
-///   - 没配端点 / 没配 bearer / 没配 agent_id（未入网，同 `report_fact_summary` 的早退）；
+///   - 没配端点 / 没配 agent_id（未入网，同 `report_fact_summary` 的早退）；
 ///   - 网关回 503（契约里的「网关未配表」语义，不是错误）；
 ///   - 传输失败或响应体坏 JSON。
 ///
@@ -669,7 +654,6 @@ async fn fetch_discovery_policies(config: &AgentConfig) -> Option<DiscoveryAspec
     // 返回 `Option` 后这三行可以写成 `?`：语义与之前的 `let ... else { return None }` 一致，
     // 且不用为每一步重复一遍早退。
     let endpoint = config.control_plane.endpoint.as_deref()?;
-    let bearer_token = config.control_plane.bearer_token.as_deref()?;
     let agent_id = config.agent.agent_id.as_deref()?;
 
     let instance_id = config.agent.instance_name.as_deref().unwrap_or_default();
@@ -696,7 +680,6 @@ async fn fetch_discovery_policies(config: &AgentConfig) -> Option<DiscoveryAspec
         .post(&url)
         // 这条路径在主循环里，必须自己封顶，不能吃掉 tick。
         .timeout(DISCOVERY_POLICY_FETCH_TIMEOUT)
-        .bearer_auth(bearer_token)
         .json(&request)
         .send()
         .await
@@ -848,8 +831,9 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
         if last_renewal_check.is_none_or(|at| at.elapsed() >= RENEWAL_CHECK_INTERVAL) {
             last_renewal_check = Some(Instant::now());
             let state_dir = std::path::PathBuf::from(&runtime_config.paths.state_dir);
-            match crate::enrollment::renew_credential_if_due(&mut runtime_config, &state_dir).await
-            {
+            let decision =
+                crate::enrollment::renew_credential_if_due(&mut runtime_config, &state_dir).await;
+            match &decision {
                 crate::enrollment::RenewalDecision::NotDue => {}
                 crate::enrollment::RenewalDecision::Renewed => {
                     eprintln!("event=CredentialRenewed detail=\"credential rotated\"");
@@ -858,8 +842,10 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                     eprintln!("event=CredentialRenewalFailed detail=\"{detail}\"");
                 }
                 crate::enrollment::RenewalDecision::NeedsReinstall => {
+                    // 与台账**同源**的文案（`ledger_detail_text`），不再各写一份。
                     eprintln!(
-                        "event=CredentialNeedsReinstall detail=\"client certificate expired; re-enroll or reinstall with a token\""
+                        "event=CredentialNeedsReinstall detail=\"{}\"",
+                        decision.ledger_detail_text()
                     );
                 }
                 crate::enrollment::RenewalDecision::Revoked => {
@@ -1865,7 +1851,6 @@ mod tests {
                 enrollment_token: None,
                 credential_request: None,
                 credential_id: None,
-                bearer_token: Some("wic_test_token".to_string()),
                 credential_expires_at: None,
                 tls_mode: None,
                 trust_bundle: None,
@@ -1896,7 +1881,7 @@ mod tests {
         config.paths.state_dir = state_dir.display().to_string();
         let paths = crate::state_store::client_identity::ClientIdentityPaths::under(&state_dir);
 
-        // 没有证书（纯 bearer 或尚未签发）→ `None`，不是空 state。
+        // 没有证书（尚未签发）→ `None`，不是空 state。
         assert!(
             super::local_certificate_status(&config).is_none(),
             "no certificate must report None"
@@ -2065,11 +2050,8 @@ mod tests {
             let (mut socket, _) = listener.accept().await.expect("accept");
             let request = read_http_request(&mut socket).await;
             assert!(request.contains("/api/v1/agent/status"));
-            assert!(
-                request
-                    .to_lowercase()
-                    .contains("authorization: bearer wic_test_token")
-            );
+            // 凭据走客户端证书（mTLS）：请求里不再带 Authorization 头。
+            assert!(!request.to_lowercase().contains("authorization:"));
             assert!(request.contains("\"agent_id\":\"agent-x\""));
             assert!(request.contains("\"memory_bytes\":"));
             assert!(request.contains("\"cpu_percent\":"));
@@ -2685,11 +2667,8 @@ mod tests {
             let (mut socket, _) = listener.accept().await.expect("accept");
             let request = read_http_request(&mut socket).await;
             assert!(request.contains("/api/v1/agent/discovery-policies:poll"));
-            assert!(
-                request
-                    .to_lowercase()
-                    .contains("authorization: bearer wic_test_token")
-            );
+            // 凭据走客户端证书（mTLS）：请求里不再带 Authorization 头。
+            assert!(!request.to_lowercase().contains("authorization:"));
             assert!(request.contains("\"kind\":\"poll_discovery_policies\""));
             assert!(request.contains("\"api_version\":\"v1\""));
             assert!(request.contains("\"agent_id\":\"agent-x\""));
@@ -2897,7 +2876,8 @@ mod tests {
     #[tokio::test]
     async fn report_status_skips_when_not_enrolled() {
         let mut config = test_config();
-        config.control_plane.bearer_token = None;
+        // 未入网：没有正式身份（未注册）→ 不上报。
+        config.agent.agent_id = None;
         let outcome = report_status_to_control_plane(
             &config,
             None,
@@ -2953,13 +2933,13 @@ mod tests {
 
     /// 网关回 401 `unknown_credential`（库里没有这条凭据）→ 同样是**终态**（只能重新注册）。
     #[tokio::test]
-    async fn report_status_flags_unknown_credential_as_terminal() {
+    async fn report_status_flags_certificate_mismatch_as_terminal() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("accept");
             let _ = read_http_request(&mut socket).await;
-            let body = "agent identity rejected: unknown_credential";
+            let body = "agent identity rejected: certificate_mismatch";
             let response = format!(
                 "HTTP/1.1 401 Unauthorized\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 body.len(),
@@ -2982,7 +2962,7 @@ mod tests {
         )
         .await;
         server.await.expect("server task");
-        assert_eq!(outcome.terminal, Some("unknown_credential"));
+        assert_eq!(outcome.terminal, Some("certificate_mismatch"));
         assert!(outcome.latency_ms.is_none());
     }
 

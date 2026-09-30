@@ -659,7 +659,6 @@ pub(crate) async fn fetch_work_grant(
     last_seen_sequence: i64,
 ) -> Option<WorkGrant> {
     let endpoint = config.control_plane.endpoint.as_deref()?;
-    let bearer_token = config.control_plane.bearer_token.as_deref()?;
     let agent_id = config.agent.agent_id.as_deref()?;
     let instance_id = config.agent.instance_name.as_deref().unwrap_or_default();
 
@@ -684,7 +683,6 @@ pub(crate) async fn fetch_work_grant(
     match client
         .post(&url)
         .timeout(WORK_REQUEST_TIMEOUT)
-        .bearer_auth(bearer_token)
         .json(&request)
         .send()
         .await
@@ -723,9 +721,6 @@ pub(crate) async fn ack_work(config: &AgentConfig, work_id: &str, plan_version: 
     let Some(endpoint) = config.control_plane.endpoint.as_deref() else {
         return false;
     };
-    let Some(bearer_token) = config.control_plane.bearer_token.as_deref() else {
-        return false;
-    };
     let Some(agent_id) = config.agent.agent_id.as_deref() else {
         return false;
     };
@@ -754,7 +749,6 @@ pub(crate) async fn ack_work(config: &AgentConfig, work_id: &str, plan_version: 
     match client
         .post(&url)
         .timeout(WORK_REQUEST_TIMEOUT)
-        .bearer_auth(bearer_token)
         .json(&request)
         .send()
         .await
@@ -800,9 +794,6 @@ pub(crate) async fn report_work_result(
     let Some(endpoint) = config.control_plane.endpoint.as_deref() else {
         return false;
     };
-    let Some(bearer_token) = config.control_plane.bearer_token.as_deref() else {
-        return false;
-    };
     let Some(agent_id) = config.agent.agent_id.as_deref() else {
         return false;
     };
@@ -835,7 +826,6 @@ pub(crate) async fn report_work_result(
     match client
         .post(&url)
         .timeout(WORK_REQUEST_TIMEOUT)
-        .bearer_auth(bearer_token)
         .json(&request)
         .send()
         .await
@@ -1775,7 +1765,6 @@ mod tests {
                 enrollment_token: None,
                 credential_request: None,
                 credential_id: None,
-                bearer_token: Some("wic_test_token".to_string()),
                 credential_expires_at: None,
                 tls_mode: None,
                 trust_bundle: None,
@@ -1855,11 +1844,8 @@ mod tests {
         let request = server.join().expect("join server");
 
         assert!(request.contains("/api/v1/agent/work:poll"));
-        assert!(
-            request
-                .to_lowercase()
-                .contains("authorization: bearer wic_test_token")
-        );
+        // 凭据走客户端证书（mTLS）：请求里不再带 Authorization 头。
+        assert!(!request.to_lowercase().contains("authorization:"));
         assert!(request.contains("\"kind\":\"poll_work\""));
         assert!(request.contains("\"api_version\":\"v1\""));
         assert!(request.contains("\"agent_id\":\"agent-x\""));
@@ -1892,11 +1878,8 @@ mod tests {
         assert!(request.contains("/api/v1/agent/work:ack"));
         assert!(request.contains("\"kind\":\"ack_work\""));
         // 与其它控制面调用同口径：明文 http 也无条件带 agent 凭据。
-        assert!(
-            request
-                .to_lowercase()
-                .contains("authorization: bearer wic_test_token")
-        );
+        // 凭据走客户端证书（mTLS）：请求里不再带 Authorization 头。
+        assert!(!request.to_lowercase().contains("authorization:"));
         assert!(request.contains("\"work_id\":\"w1\""));
         assert!(request.contains("\"plan_version\":2"));
 
@@ -1922,11 +1905,8 @@ mod tests {
         assert!(request.contains("/api/v1/agent/work:result"));
         assert!(request.contains("\"kind\":\"report_work_result\""));
         // 与其它控制面调用同口径：明文 http 也无条件带 agent 凭据。
-        assert!(
-            request
-                .to_lowercase()
-                .contains("authorization: bearer wic_test_token")
-        );
+        // 凭据走客户端证书（mTLS）：请求里不再带 Authorization 头。
+        assert!(!request.to_lowercase().contains("authorization:"));
         assert!(request.contains("\"work_id\":\"w1\""));
         assert!(request.contains("\"status\":\"failed\""));
         assert!(request.contains("已回滚到 0.1.3"));

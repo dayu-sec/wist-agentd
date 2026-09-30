@@ -95,7 +95,7 @@ fn write_control_plane_config(config_dir: &Path, endpoint: &str) {
     std::fs::write(&config_path, text).expect("append control_plane section");
 }
 
-/// 种一份**已注册**的本机身份（含 bearer 凭据）：有了它，启动路径就不会去「带 token 注册」，
+/// 种一份**已注册**的本机身份（含 credential_id）：有了它，启动路径就不会去「带 token 注册」，
 /// 而是走「既有身份」分支（`load_state_identity` → 启动续期检查）。
 fn seed_registered_identity(state_dir: &Path) {
     std::fs::create_dir_all(state_dir).expect("state dir");
@@ -106,8 +106,8 @@ fn seed_registered_identity(state_dir: &Path) {
         RuntimeMode::Normal,
         now_rfc3339(),
     );
-    // 凭据只落 state（`agentd.toml` 里从不写）—— 续期请求要带它就靠这里注入。
-    state.bearer_token = Some("wic_e2e_token".to_string());
+    // 身份只落 state（`agentd.toml` 里从不写）；凭据是客户端证书（`identity/`）。
+    state.credential_id = Some("cred-e2e".to_string());
     let path = state_dir.join(AGENT_RUNTIME_FILE);
     write_json_atomic(&path, &state).expect("seed runtime identity");
 }

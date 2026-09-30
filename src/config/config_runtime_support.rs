@@ -147,7 +147,6 @@ pub(super) fn expand_env_contract(mut config: AgentConfig) -> Result<AgentConfig
     config.control_plane.credential_request =
         expand_optional(config.control_plane.credential_request)?;
     config.control_plane.credential_id = expand_optional(config.control_plane.credential_id)?;
-    config.control_plane.bearer_token = expand_optional(config.control_plane.bearer_token)?;
     config.control_plane.credential_expires_at =
         expand_optional(config.control_plane.credential_expires_at)?;
     config.control_plane.tls_mode = expand_optional(config.control_plane.tls_mode)?;

@@ -113,7 +113,6 @@ endpoint = "https://control.local"
 enrollment_token = "${HOME}/enroll-token"
 credential_request = "csr:${HOME}"
 credential_id = "cred-${HOME}"
-bearer_token = "bearer-${HOME}"
 credential_expires_at = "${HOME}/credential-expires-at"
 
 [paths]
@@ -174,10 +173,6 @@ multiline_mode = "indented"
     assert_eq!(
         config.control_plane.credential_id.as_deref(),
         Some(format!("cred-{home}").as_str())
-    );
-    assert_eq!(
-        config.control_plane.bearer_token.as_deref(),
-        Some(format!("bearer-{home}").as_str())
     );
     assert_eq!(
         config.control_plane.credential_expires_at.as_deref(),

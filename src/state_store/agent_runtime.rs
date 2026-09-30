@@ -133,7 +133,7 @@ mod tests {
             RuntimeMode::Normal,
             "2026-07-29T00:00:00Z".to_string(),
         );
-        state.bearer_token = Some("bearer-secret".to_string());
+        state.credential_id = Some("cred-secret".to_string());
 
         store(&path, &state).expect("store runtime state");
 
@@ -167,7 +167,7 @@ mod tests {
             RuntimeMode::Normal,
             "2026-07-29T00:00:00Z".to_string(),
         );
-        state.bearer_token = Some("bearer-secret".to_string());
+        state.credential_id = Some("cred-secret".to_string());
 
         store_async(&path, &state).await.expect("store");
         let loaded = load_or_default_async(&path).await.expect("load");

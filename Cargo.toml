@@ -1,6 +1,6 @@
 [package]
 name = "wist-agentd"
-version = "0.1.17" #@gxl:set(version)
+version = "0.1.18" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -24,13 +24,9 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 toml = "1.1"
 tokio = { version = "1.48", features = ["full"] }
 wist-contracts = { version = "0.1" }
-#wist-contracts = { version = "0.1.1", path = "../wist-contracts" }
 wist-metrics = { version = "0.1" }
-#wist-metrics = { version = "0.1.1", path = "../wist-metrics" }
 wist-shared = { version = "0.1" }
-#wist-shared = { version = "0.1.1", path = "../wist-shared" }
 wist-validate = { version = "0.1" }
-#wist-validate = { version = "0.1.1", path = "../wist-validate" }
 
 [lib]
 path = "src/lib.rs"

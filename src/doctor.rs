@@ -28,6 +28,7 @@ use wist_contracts::agent_config::AgentConfig;
 use wist_contracts::agent_uplink::AgentUplinkGrant;
 
 use crate::config_runtime;
+use crate::control::enrollment::{TERMINAL_AUTH_CODES, terminal_auth_advice};
 use crate::control::uplink::{UplinkFetch, fetch_uplink_grant};
 use crate::enrollment::is_registered_agent_id;
 use crate::error::AgentdResult;
@@ -39,9 +40,6 @@ use crate::state_store::{agent_runtime, client_identity, work};
 ///
 /// 与上送/工作拉取同量级：诊断要快出结论，不该让一次黑洞连接把整条命令拖到分钟级。
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// 凭据/证书剩余不足这个时长就告警（与证书 30 天续签窗口同一口径的来源）。
-const EXPIRY_WARN_WINDOW: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// spool 积压到这个体量就告警：说明出口在失败或长期跟不上。
 const SPOOL_WARN_BYTES: u64 = 8 * 1024 * 1024;
@@ -196,7 +194,12 @@ impl Report {
             let title = paint(BOLD, &check.title);
             let _ = writeln!(out, "{tag} {title}\n       {}", check.detail);
             if let Some(hint) = &check.hint {
-                let _ = writeln!(out, "       {}", paint(CYAN, &format!("→ {hint}")));
+                // 提示词可能是多行的（例如「按 code 分条给处置」）—— 每行都缩进对齐，
+                // 否则第二行会顶到行首、看起来像另一条检查。只有第一行带箭头。
+                for (index, line) in hint.lines().enumerate() {
+                    let marker = if index == 0 { "→ " } else { "  " };
+                    let _ = writeln!(out, "       {}", paint(CYAN, &format!("{marker}{line}")));
+                }
             }
         }
         let verdict = paint(&format!("1;{}", self.overall().color()), &self.verdict());
@@ -577,83 +580,29 @@ async fn identity_checks(config: &AgentConfig) -> Vec<Check> {
         ),
     }
 
-    checks.push(credential_check(config, &runtime_state));
+    checks.push(credential_check(config));
     checks.push(certificate_check(&state_dir));
     checks
 }
 
-/// bearer 凭据：有没有、过没过期。
+/// 已注册身份：网关下发的 `credential_id` 在不在（查库排障的关键线索）。
 ///
-/// 只有 mTLS 证书而无 bearer 也算可用（双轨），所以那种情况是 WARN 而不是 FAIL。
-fn credential_check(
-    config: &AgentConfig,
-    runtime_state: &wist_contracts::agent_state::AgentRuntimeState,
-) -> Check {
-    let expires = config
-        .control_plane
-        .credential_expires_at
-        .as_deref()
-        .or(runtime_state.credential_expires_at.as_deref());
-    let has_token = config
-        .control_plane
-        .bearer_token
-        .as_deref()
-        .is_some_and(|token| !token.trim().is_empty())
-        || runtime_state
-            .bearer_token
-            .as_deref()
-            .is_some_and(|token| !token.trim().is_empty());
-    // 凭据 id（注册时网关下发的那个）：**网关库里查不到它 = 库里没有这条凭据**（换过库/被清），
-    // 这正是 `401 unknown_credential` 的判据 —— 打出来，省得再去查库。
-    let credential_id = config
+/// 凭据路径只剩客户端证书，所以这里**不再**判 bearer；证书的有效期由 [`certificate_check`] 负责。
+fn credential_check(config: &AgentConfig) -> Check {
+    match config
         .control_plane
         .credential_id
         .as_deref()
         .map(str::trim)
-        .filter(|id| !id.is_empty());
-    let with_cred = |detail: String| match credential_id {
-        Some(id) => format!("{detail}；credential_id={id}"),
-        None => detail,
-    };
-
-    match (has_token, expires.and_then(parse_time)) {
-        (true, Some(expires_at)) => {
-            let remaining = expires_at - time::OffsetDateTime::now_utc();
-            if remaining <= time::Duration::ZERO {
-                Check::fail(
-                    "identity.credential",
-                    "控制面凭据已过期",
-                    with_cred(format!("到期时间 {}", expires.unwrap_or_default())),
-                )
-                .hint("重新注册（带一次性 token 重装），或确认网关没有把凭据吊销")
-            } else if remaining < time::Duration::seconds(EXPIRY_WARN_WINDOW.as_secs() as i64) {
-                Check::warn(
-                    "identity.credential",
-                    "控制面凭据即将过期",
-                    with_cred(format!("剩余约 {} 小时", remaining.whole_hours())),
-                )
-                .hint("重启 agentd 会触发续期；到期未续需要重装")
-            } else {
-                Check::ok(
-                    "identity.credential",
-                    "控制面凭据有效",
-                    with_cred(format!("剩余约 {} 天", remaining.whole_days())),
-                )
-            }
-        }
-        (true, None) => Check::ok(
+        .filter(|id| !id.is_empty())
+    {
+        Some(id) => Check::ok("identity.credential", "已注册身份", format!("credential_id={id}")),
+        None => Check::warn(
             "identity.credential",
-            "控制面凭据存在（没有到期时间）",
-            with_cred("旧版网关不写入过期时间".to_string()),
-        ),
-        (false, _) => Check::warn(
-            "identity.credential",
-            "本机没有 bearer 凭据",
-            with_cred("若客户端证书有效则仍可上报（mTLS 双轨）；两者都没有就会 401".to_string()),
+            "本机没有已注册身份",
+            "未注册，或 state 被清过".to_string(),
         )
-        .hint(
-            "重新注册拿一份凭据：`wist-agentd service install --system --enrollment-token <token>`",
-        ),
+        .hint("用一次性 token 重新注册：`wist-agentd service install --system --enrollment-token <token>`"),
     }
 }
 
@@ -681,14 +630,15 @@ fn certificate_check(state_dir: &Path) -> Check {
     match client_identity::client_certificate_status(&paths) {
         Ok(None) => {
             let detail = match &renewal {
-                Some(renewal) => format!("按 bearer 凭据认证；{renewal}"),
-                None => "按 bearer 凭据认证".to_string(),
+                Some(renewal) => format!("没有客户端证书；{renewal}"),
+                None => "网关未配 agent CA，或本机从未拿到过证书".to_string(),
             };
-            Check::ok(
+            Check::warn(
                 "identity.certificate",
-                "没有客户端证书（未启用 mTLS）",
+                "没有客户端证书（mTLS 不可用）",
                 detail,
             )
+            .hint("用一次性 token 重新注册，拿一张客户端证书")
         }
         Ok(Some(status)) => {
             let detail = format!("到期 {}", status.not_after);
@@ -992,11 +942,7 @@ fn classify_control_plane_probe(fetch: UplinkFetch) -> (Check, Option<AgentUplin
                 "控制面拒绝了本机凭据（401/403）",
                 detail,
             )
-            .hint(
-                "按正文里的 code 处理：`unknown_credential` = 网关库里没有这条凭据（库被换/重置过）→ \
-                 用一次性 token 重新注册（`enroll --force`）；`certificate_revoked` = 在被拒名单，需先在网关解除；\
-                 两者都对不上时看 `identity.credential` 打出的 `credential_id`",
-            ),
+            .hint(credential_rejected_hint()),
             None,
         ),
         UplinkFetch::Failed(detail) => (
@@ -1005,6 +951,27 @@ fn classify_control_plane_probe(fetch: UplinkFetch) -> (Check, Option<AgentUplin
             None,
         ),
     }
+}
+
+/// 「这个 code 该做什么」的全表提示。
+///
+/// 按 [`TERMINAL_AUTH_CODES`] 生成 —— 网关以后再加一个终态 code，它会**自动**出现在这里，
+/// 不用再记得改提示词（2026-09-30 就是因为漏了 `credential_mismatch` 让操作者只能猜）。
+fn credential_rejected_hint() -> String {
+    let mut text = String::from("按正文里的 code 处理（这些 code 都是**终态**，重试不会自愈）：");
+    for code in TERMINAL_AUTH_CODES {
+        match terminal_auth_advice(code) {
+            Some(advice) => text.push_str(&format!("\n  · `{code}`：{advice}")),
+            // 新 code 还没写处置：宁可缺口看得见，也不让它静默漏掉。
+            None => text.push_str(&format!("\n  · `{code}`：（尚无处置建议，看网关正文）")),
+        }
+    }
+    text.push_str(
+        "\n另：`certificate_required`（未带证书）、`missing_credential`（网关未开 mTLS）、\
+         信任锚不对**不属于**终态 —— 凭据/配置到位后会自愈；\
+         实在对不上时看 `identity.credential` 打出的 `credential_id`",
+    );
+    text
 }
 
 /// 上送（本地部分）：生效输出（复用守护进程那套合并规则）、spool 积压、本地工作视图。
@@ -1311,10 +1278,6 @@ fn reported_version(bin: &Path) -> Option<String> {
     stdout.split_whitespace().last().map(str::to_string)
 }
 
-fn parse_time(value: &str) -> Option<time::OffsetDateTime> {
-    time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()
-}
-
 /// 把可能多行的错误压成一行（诊断输出里一行一条最好读）。
 fn one_line(value: &str) -> String {
     value
@@ -1337,6 +1300,25 @@ mod tests {
             detail: String::new(),
             hint: None,
         }
+    }
+
+    /// 防漂：`TERMINAL_AUTH_CODES` 里每个 code 都得有处置与提示 —— 网关再加一个终态 code，
+    /// 这里会直接失败，逼着人把它写进同一张表（而不是让操作者拿到一句没头猪的 401）。
+    #[test]
+    fn every_terminal_auth_code_is_explained_in_the_hint() {
+        let hint = credential_rejected_hint();
+        for code in TERMINAL_AUTH_CODES {
+            assert!(
+                terminal_auth_advice(code).is_some(),
+                "{code} 是终态 code，但没写处置建议"
+            );
+            assert!(
+                hint.contains(code),
+                "提示词里没列出终态 code {code}：\n{hint}"
+            );
+        }
+        // 非终态的 code 不该被当成终态去吓人。
+        assert!(hint.contains("certificate_required"), "{hint}");
     }
 
     #[test]
@@ -1524,7 +1506,8 @@ mod tests {
         .expect("store renewal ledger");
 
         let check = certificate_check(&state);
-        assert_eq!(check.status, Status::Ok);
+        // 没有客户端证书：无法用 mTLS 认证 → WARN（不再是「按 bearer 凭据认证」）。
+        assert_eq!(check.status, Status::Warn);
         assert!(
             !check.detail.contains('\n'),
             "detail must stay single-line: {}",
@@ -1535,11 +1518,7 @@ mod tests {
             "no dangling separator: {}",
             check.detail
         );
-        assert!(
-            check.detail.contains("按 bearer 凭据认证"),
-            "{}",
-            check.detail
-        );
+        assert!(check.detail.contains("没有客户端证书"), "{}", check.detail);
         assert!(
             check.detail.contains("最近一次续签：failed"),
             "{}",
@@ -1551,16 +1530,6 @@ mod tests {
     fn template_config() -> AgentConfig {
         toml::from_str(&crate::config_runtime::default_config_template())
             .expect("default config template parses")
-    }
-
-    fn runtime_state() -> wist_contracts::agent_state::AgentRuntimeState {
-        wist_contracts::agent_state::AgentRuntimeState::new(
-            "agent-test".to_string(),
-            "inst-test".to_string(),
-            "0.1.15".to_string(),
-            wist_contracts::agent_state::RuntimeMode::Normal,
-            "2026-09-29T00:00:00Z".to_string(),
-        )
     }
 
     /// 距现在 `seconds` 秒的 RFC3339 时刻（负数为过去）。
@@ -1662,75 +1631,21 @@ mod tests {
     }
 
     #[test]
-    fn credential_check_covers_expiry_states() {
-        let state = runtime_state();
-        let day = 24 * 60 * 60;
-        let with = |token: Option<&str>, expires: Option<String>| {
-            let mut config = template_config();
-            config.control_plane.bearer_token = token.map(str::to_string);
-            config.control_plane.credential_expires_at = expires;
-            config
-        };
-
-        // 已过期 → FAIL。
-        assert_eq!(
-            credential_check(&with(Some("tok"), Some(rfc3339_in(-day))), &state).status,
-            Status::Fail
-        );
-        // 续期窗内（< 7 天）→ WARN。
-        assert_eq!(
-            credential_check(&with(Some("tok"), Some(rfc3339_in(3 * day))), &state).status,
-            Status::Warn
-        );
-        // 还早 → OK。
-        assert_eq!(
-            credential_check(&with(Some("tok"), Some(rfc3339_in(20 * day))), &state).status,
-            Status::Ok
-        );
-        // 有凭据但没到期时间 → OK。
-        assert_eq!(
-            credential_check(&with(Some("tok"), None), &state).status,
-            Status::Ok
-        );
-        // 本机没有凭据（state 里也没有）→ WARN。
-        assert_eq!(
-            credential_check(&with(None, None), &state).status,
-            Status::Warn
-        );
-    }
-
-    #[test]
-    fn credential_check_prints_the_credential_id() {
-        // 打出凭据 id：与网关库对照就能一眼判断「库里有没有这条」。
-        let state = runtime_state();
+    fn credential_check_reports_registered_identity() {
+        // 有 credential_id → OK，并把它打出来（与网关库对照就能一眼判断「库里有没有这条」）。
         let mut config = template_config();
-        config.control_plane.bearer_token = Some("tok".to_string());
         config.control_plane.credential_id = Some("cred_abc123".to_string());
-        config.control_plane.credential_expires_at = Some(rfc3339_in(20 * 24 * 60 * 60));
 
-        let check = credential_check(&config, &state);
+        let check = credential_check(&config);
         assert_eq!(check.status, Status::Ok);
         assert!(
             check.detail.contains("credential_id=cred_abc123"),
             "{check:?}"
         );
-    }
 
-    #[test]
-    fn credential_check_reports_the_expiry_even_when_everything_else_is_quiet() {
-        // 到期时间只在 config 里（state 里没有）时，失败消息不能打空。
-        let state = runtime_state();
-        let stamp = rfc3339_in(-24 * 60 * 60);
-        let mut config = template_config();
-        config.control_plane.bearer_token = Some("tok".to_string());
-        config.control_plane.credential_expires_at = Some(stamp.clone());
-
-        let check = credential_check(&config, &state);
-        assert_eq!(check.status, Status::Fail);
-        assert!(
-            check.detail.contains(&stamp),
-            "detail should show the real expiry: {check:?}"
-        );
+        // 没有 credential_id（未注册 / state 被清）→ WARN。
+        let empty = credential_check(&template_config());
+        assert_eq!(empty.status, Status::Warn);
     }
 
     #[test]
@@ -1829,27 +1744,27 @@ mod tests {
             wist_contracts::agent_state::RuntimeMode::Normal,
             "2026-09-29T00:00:00Z".to_string(),
         );
-        state.bearer_token = Some("bearer-from-state".to_string());
+        state.credential_id = Some("cred-from-state".to_string());
         state.credential_expires_at = Some(rfc3339_in(30 * 24 * 60 * 60));
         agent_runtime::store(&agent_runtime::path_for(&state_dir), &state).expect("store state");
 
         let config_path = config_runtime::resolve_config_path(&config_dir);
 
-        // 前提：凭据**不在** toml 里（只落 state）—— 这正是要注入的理由。
+        // 前提：身份/凭据**不在** toml 里（只落 state）—— 这正是要注入的理由。
         let mut raw_checks = Vec::new();
         let plain = load_config(&config_path, &mut raw_checks).expect("plain load");
         assert!(
-            plain.control_plane.bearer_token.is_none(),
+            plain.control_plane.credential_id.is_none(),
             "凭据不应写进 toml"
         );
         assert!(plain.agent.agent_id.is_none(), "agent_id 不应写进 toml");
 
-        // 注入后：配置拿到 state 的凭据与身份，控制面探测不再误判为「无下发」。
+        // 注入后：配置拿到 state 的身份与凭据，控制面探测不再误判为「无下发」。
         let mut checks = Vec::new();
         let config = load_config_with_state_identity(&config_path, &mut checks).expect("load");
         assert_eq!(
-            config.control_plane.bearer_token.as_deref(),
-            Some("bearer-from-state")
+            config.control_plane.credential_id.as_deref(),
+            Some("cred-from-state")
         );
         assert_eq!(config.agent.agent_id.as_deref(), Some("agent-real"));
         assert!(
