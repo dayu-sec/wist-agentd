@@ -146,6 +146,7 @@
     actions/<execution_id>/
   state/
     agent_runtime.json
+    auth_terminal.json
     execution_queue.json
     fact_report.json
     work.json
@@ -161,8 +162,8 @@
   log/
 ```
 
-约定：**单例状态扁平放在 `state/` 根下**（`agent_runtime.json` / `execution_queue.json` /
-`fact_report.json` / `work.json`），**「一个实体多实例」才用目录**
+约定：**单例状态扁平放在 `state/` 根下**（`agent_runtime.json` / `auth_terminal.json` /
+`execution_queue.json` / `fact_report.json` / `work.json`），**「一个实体多实例」才用目录**
 （`running/<execution_id>.json`、`logs/file_inputs/<input_id>/`）。
 
 ### 4.1 `agent_runtime.json`
@@ -267,6 +268,18 @@
   **本机执行状态** —— 两个轴分开记，不要混；
 - 写失败/读不动都**只记一行日志**：一份工作视图不该有让采集停下的权力。
 
+### 4.7 `auth_terminal.json`
+
+保存**凭据终态台账**：因为哪个 code、从哪条路径进来的、什么时候、低频重试了几次。
+
+为什么必须落盘（它是「内存标志」升格成文件的那次改动）：终态期间 agentd 停掉常规上报，
+而标志原先只在内存里 —— 于是①网关侧恢复了它也不知道（不自愈），②`diagnose` 看不到它
+（外部不可见：工具自己的探测会成功，人却以为一切正常）。落盘后这两点才成立：重启读回、
+`diagnose` 报 FAIL、低频重试成功即删除。
+
+约定：**它的存在本身就表示「在终态」** —— 恢复时删掉，读不动时降级为「没有终态」并清掉该文件。
+详见 `docs/design/agent-uplink-enablement.md` §4.2。
+
 ---
 
 ## 5. 哪些状态必须落盘
@@ -276,6 +289,7 @@
 ### 5.1 必须落盘
 
 - `agent_runtime.json`
+- `auth_terminal.json`
 - `execution_queue.json`
 - `work.json`
 - `running/<execution_id>.json`
@@ -305,14 +319,15 @@
 `wist-agentd` 启动时至少执行以下恢复步骤：
 
 1. 读取 `execution_queue.json`
-2. 扫描 `state/running/*.json`
-3. 扫描 `state/reporting/*.json`
-4. 扫描 `run/actions/*`
-5. 对每个 running execution 检查：
+2. 读回 `auth_terminal.json`：在终态里就**按终态起步**（只跑低频重试），而不是当成没进过
+3. 扫描 `state/running/*.json`
+4. 扫描 `state/reporting/*.json`
+5. 扫描 `run/actions/*`
+6. 对每个 running execution 检查：
    - 对应 pid 是否仍存活
    - workdir 是否存在
    - `result.json` 是否已存在
-6. 形成恢复结论：
+7. 形成恢复结论：
    - 若结果已存在，转入 reporting
    - 若进程不存在且无结果，标记为 `failed`
    - 若进程仍存在，重新纳入 running 监控

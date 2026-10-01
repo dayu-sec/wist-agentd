@@ -293,6 +293,7 @@ echo <token> | sudo wist-agentd enroll --token-stdin
 | --- | --- | --- |
 | `WARP_INSIGHT_EXEC_BIN` | 覆盖 `wist-exec` 路径 | 同目录 sibling → `PATH` |
 | `WIST_AGENTD_LOG_HEARTBEAT_SECS` | 稳态快照心跳间隔（秒）；`0` = 逐轮打印（仅联调） | `300` |
+| `WIST_AGENTD_TERMINAL_RETRY_SECS` | 凭据终态下重试状态上报的间隔（秒）；**仅供联调验证自愈** | `300` |
 | `WIST_AGENTD_RUN_ONCE` | `1` = 只跑一轮调度就退出（自检用） | 未设置 |
 
 ## 5. 运行方式
@@ -590,6 +591,8 @@ wist-agentd diagnose --offline     # 不碰网络，只查本机配置/身份/�
 | 想确认跑的是哪份配置/版本 | 启动行 `wist-agentd <version> starting: config=... mode=...`；`wist-agentd service status` 看 `config=` |
 | `diagnose` 报 `network.tcp` FAIL（TCP 连不上 `host:443`） | endpoint 不写端口时按 **443** 连，网关可能发布在别的端口（如 3000）。`config.control_plane` 那项会打出**推导出的 `host:port`**；改 endpoint 为 `https://<域名>:<端口>`（或让网关监听 443） |
 | `diagnose` 报 `network.control_plane` FAIL 且提到 TLS/证书 | 网关是自签/私有 CA，但本机没配信任锚。把网关 CA 写进 `[control_plane] trust_bundle`（安装脚本会自动填；**公有 CA 的网关不需要**，没配 trust_bundle 不算问题） |
+| `diagnose` 报 `identity.terminal` FAIL | 守护进程停在**凭据终态**（被网关明确拒了），已停发控制面请求 —— 这就是「机器哑了好几天没人知道」的形态。按 hint 里的 code 处置（被拒名单 → 先在网关解除；证书身份对不上 → 用一次性 token 重注册）。**一般不需要重装**：守护进程每 5 分钟会自己重试一次，网关一恢复接受即自动清除终态 |
+| `diagnose` 报 `uplink.effective` WARN，标题是「待命」 | 网关按「有生效工作 **或** 上送开关打开」且「有上送目标」现算授权，任一条不成立都是待命。到管理面查两处：①「Gateway 信息 → 数据面上送地址与开关」—— 目标在不在、开关开没开；②「采集工作」页 —— 这台有没有派工。补上任一条后下一个上报周期（≤30s）自动开始上送。注意 detail 里那个 `addr` 是**本机配置**的，待命期不生效 |
 
 ## 10. 相关文档
 

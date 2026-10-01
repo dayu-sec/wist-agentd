@@ -34,7 +34,7 @@ use crate::enrollment::is_registered_agent_id;
 use crate::error::AgentdResult;
 use crate::runtime::daemon::telemetry_support::effective_output;
 use crate::service::{self, ServiceLayout, ServicePlatform, ServiceScope, ServiceSpec};
-use crate::state_store::{agent_runtime, client_identity, work};
+use crate::state_store::{agent_runtime, auth_terminal, client_identity, work};
 
 /// 单次网络探测的超时（TCP 连接 / 数据面目标）。
 ///
@@ -582,7 +582,49 @@ async fn identity_checks(config: &AgentConfig) -> Vec<Check> {
 
     checks.push(credential_check(config));
     checks.push(certificate_check(&state_dir));
+    checks.push(auth_terminal_check(&state_dir).await);
     checks
+}
+
+/// 凭据**终态**：守护进程是否停在「网关明确拒了、不再发任何控制面请求」的状态。
+///
+/// 为什么必须要这一条（`docs/design/agent-uplink-enablement.md` §4.2）：终态原先只在守护进程
+/// 内存里，`diagnose` 是新进程看不到它，于是出现过一个很坑的组合 ——
+///   `[OK] 控制面可达且凭据被接受`（那是**本工具自己**发的一次探测）＋ 页面上只是「离线」，
+///   而守护进程已经静默四个小时，一次状态上报都没发。
+/// 现在终态落台账，这里把它**读出来**并说清该做什么。
+///
+/// 读它**只看不改**：清终态是守护进程自愈的事（或运维按处置重装），一个只读工具不该改变状态。
+async fn auth_terminal_check(state_dir: &Path) -> Check {
+    let path = auth_terminal::path_for(state_dir);
+    match auth_terminal::load_async(&path).await {
+        Ok(None) => Check::ok(
+            "identity.terminal",
+            "没有凭据终态",
+            "台账不存在（没进过终态）；不声称守护进程此刻一定在跑 —— 那看 `service.` 那几项",
+        ),
+        Ok(Some(state)) => Check::fail(
+            "identity.terminal",
+            "凭据终态：守护进程已停发常规控制面请求",
+            format!(
+                "code={} source={} since={} 重试={}",
+                state.code, state.source, state.detected_at, state.attempts
+            ),
+        )
+        .hint(format!(
+            "处置：{}。\
+             注意：`diagnose` 自己的控制面探测**仍会通过**（那是本工具发的请求），不代表守护进程在跑。\
+             守护进程会自己重试（进入终态后立刻试一次，之后每 {}s 一次），网关一恢复接受即自动清除终态，**不需要重装**。",
+            terminal_auth_advice(&state.code).unwrap_or("看网关正文里的 code（尚无处置建议）"),
+            crate::runtime::daemon::terminal_retry_interval().as_secs(),
+        )),
+        Err(err) => Check::warn(
+            "identity.terminal",
+            "凭据终态台账读不出来",
+            format!("{}：{err}", path.display()),
+        )
+        .hint("读不动会被守护进程当成「没有终态」继续常规上报；想清干净可删掉该文件"),
+    }
 }
 
 /// 已注册身份：网关下发的 `credential_id` 在不在（查库排障的关键线索）。
@@ -1000,20 +1042,32 @@ async fn uplink_local_checks(
             .hint("去掉 --offline 可确认控制面是否已授权上送"),
         ),
         None => checks.push(
-            Check::warn("uplink.effective", "没有控制面授权，按本机配置走", detail)
-                .hint("未入网或旧网关；派活后控制面会下发目标并自动打开上送"),
+            Check::warn("uplink.effective", "没有控制面授权，按本机配置走", detail).hint(
+                "未入网或旧网关（没有 `uplink:poll`）——本机配置**不能**自己把上送打开；\
+                 入网后由控制面按「派工 或 开关」下发授权",
+            ),
         ),
         Some(grant) if !grant.enabled => {
-            let why = if grant.target().is_some() {
-                "控制面给过目标但没启用（多半是还没有生效工作）→ 到管理面派一份常驻工作"
-            } else {
-                "控制面没给目标（网关侧没有可用的数据面上送地址）→ 在网关侧确认上送地址"
-            };
-            checks.push(Check::warn(
-                "uplink.effective",
-                "待命：控制面没启用上送",
-                format!("{detail}；{why}"),
-            ));
+            // 待命**只有一个形状**：`AgentUplinkGrant::standby` 恒不带目标，而 `target()` 在
+            // `!enabled` 时也一律返回 `None`。所以这里**不能**靠「有没有 target」去猜原因 ——
+            // 网关现算的是「（有生效工作 或 上送开关打开）且 有上送目标」，任一条不成立
+            // 都下发同一个待命。旧文案只认 target，于是永远指向「网关侧没有上送地址」，
+            // 哪怕地址配得好好的（`docs/design/agent-uplink-enablement.md` §4.3）。
+            checks.push(
+                Check::warn(
+                    "uplink.effective",
+                    "待命：控制面没启用上送",
+                    format!(
+                        "{detail}；网关的判据是「有生效工作 **或** 上送开关打开」且「有上送目标」，\
+                         任一条不成立都是待命；上面那个 addr 是本机配置的，待命期**不生效**"
+                    ),
+                )
+                .hint(
+                    "到管理面查两处：①「Gateway 信息 → 数据面上送地址与开关」—— 目标在不在、\
+                     开关开没开；② 这台的采集工作 —— 在「采集工作」页派一份常驻工作。\
+                     补上任一条后下一个上报周期（≤30s）自动开始上送，不需要改配置或重装",
+                ),
+            );
         }
         Some(_) => checks.push(Check::ok(
             "uplink.effective",
@@ -1527,6 +1581,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(state);
     }
 
+    /// 没台账 = 没进过终态 = OK。这一条得是**常态**：几乎所有机器都该看到它，
+    /// 不然「终态」这个信号会淹在噪声里。
+    #[tokio::test]
+    async fn auth_terminal_check_reports_absence_as_ok() {
+        let state =
+            std::env::temp_dir().join(format!("doctor-terminal-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+
+        let check = auth_terminal_check(&state).await;
+        assert_eq!(check.id, "identity.terminal");
+        assert_eq!(check.status, Status::Ok);
+    }
+
+    /// 有台账 → FAIL，并且要说清三件事：哪个 code、什么时候进的、该怎么办。
+    /// 这条检查存在的全部理由就是那个坑：终态期间 `diagnose` 的探测仍然会通过。
+    #[tokio::test]
+    async fn auth_terminal_check_reports_the_terminal_state_with_advice() {
+        let state =
+            std::env::temp_dir().join(format!("doctor-terminal-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&state).expect("create state dir");
+        auth_terminal::store_async(
+            &auth_terminal::path_for(&state),
+            &auth_terminal::AuthTerminal {
+                code: "certificate_revoked".to_string(),
+                source: auth_terminal::SOURCE_RENEWAL.to_string(),
+                detected_at: "2026-09-30T13:02:23Z".to_string(),
+                attempts: 2,
+            },
+        )
+        .await
+        .expect("store ledger");
+
+        let check = auth_terminal_check(&state).await;
+        assert_eq!(check.status, Status::Fail);
+        assert!(
+            check.detail.contains("certificate_revoked"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("2026-09-30T13:02:23Z"),
+            "{}",
+            check.detail
+        );
+        assert!(check.detail.contains("重试=2"), "{}", check.detail);
+        let hint = check.hint.expect("a terminal state must say what to do");
+        assert!(
+            hint.contains(terminal_auth_advice("certificate_revoked").expect("advice")),
+            "{hint}"
+        );
+        // 自愈是重点：不得让运维走去重装。
+        assert!(hint.contains("不需要重装"), "{hint}");
+        // 也不能让人把工具自己的探测当成守护进程在跑。
+        assert!(hint.contains("本工具发的请求"), "{hint}");
+    }
+
+    /// 台账读不出来（写坏了）→ WARN，而不是 FAIL：守护进程会把读不动当成「没有终态」
+    /// 继续常规上报，所以这不是「已停发」的断言，只是本机有份读不了的残留。
+    #[tokio::test]
+    async fn auth_terminal_check_warns_on_an_unreadable_ledger() {
+        let state =
+            std::env::temp_dir().join(format!("doctor-terminal-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&state).expect("create state dir");
+        std::fs::write(auth_terminal::path_for(&state), "not json").expect("write bad ledger");
+
+        let check = auth_terminal_check(&state).await;
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check.hint.is_some(),
+            "a warn must still tell the operator what to do"
+        );
+    }
+
     fn template_config() -> AgentConfig {
         toml::from_str(&crate::config_runtime::default_config_template())
             .expect("default config template parses")
@@ -1671,6 +1798,46 @@ mod tests {
         assert!(probe_writable(&file).is_err());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 待命的提示**不得指错方向**（`docs/design/agent-uplink-enablement.md` §4.3）。
+    ///
+    /// 旧文案拿「grant 里有没有 target」去猜原因，而待命只有一个形状 ——
+    /// `AgentUplinkGrant::standby` 恒不带目标，`target()` 在 `!enabled` 时也一律返回 `None`。
+    /// 于是它**永远**指向「网关侧没有可用的数据面上送地址」，哪怕地址配得好好的；
+    /// 现场就吃过这个亏（写这条测试时的那个实例：地址在库里躺着，人却被指去查地址）。
+    #[tokio::test]
+    async fn a_standby_uplink_names_both_possible_causes_instead_of_guessing() {
+        let config = template_config();
+        let grant = AgentUplinkGrant::standby("2026-10-01T00:00:00Z".to_string());
+
+        let checks = uplink_local_checks(&config, Some(&grant), false).await;
+        let standby = checks
+            .iter()
+            .find(|check| check.id == "uplink.effective")
+            .expect("uplink.effective must be reported");
+        assert_eq!(standby.status, Status::Warn);
+        assert!(standby.title.contains("待命"), "{standby:?}");
+
+        let hint = standby
+            .hint
+            .as_deref()
+            .expect("a standby must say what to do");
+        // 两种原因都要说到（网关的判据是「有生效工作 或 开关」且「有目标」）。
+        assert!(standby.detail.contains("开关"), "{}", standby.detail);
+        assert!(standby.detail.contains("上送目标"), "{}", standby.detail);
+        // 两种可能对应的两个地方都要指到。
+        assert!(hint.contains("Gateway 信息"), "{hint}");
+        assert!(hint.contains("采集工作"), "{hint}");
+        // 而且要说清「本机配的那个 addr 在待命期不生效」——否则 detail 里打出的 addr
+        // 会被读成「目标明明有，为什么不上送」。
+        assert!(standby.detail.contains("不生效"), "{}", standby.detail);
+        // 回归护栏：不得再出现单因断言式的旧文案。
+        assert!(
+            !standby.detail.contains("网关侧没有可用的数据面上送地址"),
+            "{}",
+            standby.detail
+        );
     }
 
     #[tokio::test]

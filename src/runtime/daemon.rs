@@ -44,7 +44,8 @@ use crate::self_observability::{
     RuntimeHealthSnapshot, emit,
 };
 use crate::state_store::{
-    agent_runtime, execution_queue, fact_report, log_seq_state, planner_candidates, work,
+    agent_runtime, auth_terminal, execution_queue, fact_report, log_seq_state, planner_candidates,
+    work,
 };
 use crate::telemetry::metrics::target_view;
 
@@ -72,6 +73,38 @@ const TICK_INTERVAL: Duration = Duration::from_secs(3);
 
 /// 凭据续期的检查周期：没必要每 3s 都查，1 小时足够，而续期窗是 30 天。
 const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// 终态（§5.4）下的**低频重试**间隔。
+///
+/// 终态原先只按「网关明确拒了」判定、判完就不再问，于是网关侧后来恢复了它也不知道
+/// （`docs/design/agent-uplink-enablement.md` §4.2）。这里每隔这么久发**一次**状态上报 ——
+/// 就是当初判终态的那条请求 —— 成功即自愈。
+///
+/// 为什么不是 3s：终态的初衷之一就是「不每 tick 刷失败日志」。取与事实摘要同一尺度
+/// （分钟级），既让恢复最多滞后一个尺度，又不把日志刷满。
+const TERMINAL_RETRY_INTERVAL: Duration = Duration::from_secs(300);
+
+/// 终态重试间隔的环境覆盖（秒）。
+///
+/// 为什么留一个口子：真实值是 5 分钟，而「网关恢复后 agentd **自动**清除终态并回到常规上报」
+/// 只有跨进程、真计时的 e2e 能验（`tests/agent_certificate_revoked_e2e.rs`）；不能为了可测性
+/// 把生产值调小。与日志心跳的环境覆盖同一模式（`steady_log::HEARTBEAT_ENV`）。
+pub const TERMINAL_RETRY_ENV: &str = "WIST_AGENTD_TERMINAL_RETRY_SECS";
+
+/// 生效的终态重试间隔：未设置 / 非法值 → 默认 `TERMINAL_RETRY_INTERVAL`。
+pub(crate) fn terminal_retry_interval() -> Duration {
+    match std::env::var(TERMINAL_RETRY_ENV)
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        None | Some("") => TERMINAL_RETRY_INTERVAL,
+        Some(text) => text
+            .parse::<u64>()
+            .map(Duration::from_secs)
+            .unwrap_or(TERMINAL_RETRY_INTERVAL),
+    }
+}
 
 /// 事实上送的最小间隔。
 ///
@@ -418,6 +451,10 @@ async fn report_status_to_control_plane(
     work: &AppliedWorkGrant,
     uplink: &AppliedUplink,
     uplink_health: &UplinkHealth,
+    // 终态下的低频重试传 `true`：那次调用只为问一句「还认我吗」，失败**不打印**
+    // （§4.2 的「失败静默」）——否则一台被拒的机器在网关宕机期间会每 5 分钟刷一行，
+    // 而终态的初衷之一就是「不刷日志」。
+    quiet: bool,
 ) -> StatusReportOutcome {
     let Some(endpoint) = config.control_plane.endpoint.as_deref() else {
         return StatusReportOutcome::failed();
@@ -452,7 +489,9 @@ async fn report_status_to_control_plane(
     let client = match enrollment_http_client(config) {
         Ok(client) => client,
         Err(err) => {
-            eprintln!("wist-agentd status report: failed to build client: {err}");
+            if !quiet {
+                eprintln!("wist-agentd status report: failed to build client: {err}");
+            }
             return StatusReportOutcome::failed();
         }
     };
@@ -472,11 +511,15 @@ async fn report_status_to_control_plane(
             {
                 return StatusReportOutcome::terminal(code);
             }
-            eprintln!("wist-agentd status report failed: HTTP {status} from {endpoint}");
+            if !quiet {
+                eprintln!("wist-agentd status report failed: HTTP {status} from {endpoint}");
+            }
             StatusReportOutcome::failed()
         }
         Err(err) => {
-            eprintln!("wist-agentd status report failed: {err}");
+            if !quiet {
+                eprintln!("wist-agentd status report failed: {err}");
+            }
             StatusReportOutcome::failed()
         }
     }
@@ -499,6 +542,143 @@ fn terminal_auth_message(code: &str, source: &str) -> String {
                     re-enroll with a one-time token",
     );
     format!("event=AgentAuthTerminal code={code} source={source} detail=\"{detail}\"")
+}
+
+/// 进终态：**先把台账落盘**，再交给调用方（内存标志）。
+///
+/// 落盘放在内存之前，是为了不让「写盘失败」变成「继续外发」——正好相反：
+/// 写不动台账时**照样进终态**（安全方向不变），只多打一行告知台账没落成。
+/// 反之若因为写不动就不进终态，一台凭据已被拒的机器会继续每 3s 打扰网关。
+async fn enter_terminal(path: &Path, code: &str, source: &str) -> auth_terminal::AuthTerminal {
+    let state = auth_terminal::AuthTerminal {
+        code: code.to_string(),
+        source: source.to_string(),
+        detected_at: now_rfc3339(),
+        attempts: 0,
+    };
+    if let Err(err) = auth_terminal::store_async(path, &state).await {
+        eprintln!(
+            "wist-agentd auth terminal state: failed to record {}: {err}（仍按终态执行）",
+            path.display()
+        );
+    }
+    state
+}
+
+/// 终态下的低频重试（§4.2）：唯一允许的控制面请求是**状态上报** —— 它就是当初判终态的那条
+/// 请求（`report_status_to_control_plane`），语义一致，不存在「探测说通、进程做不通」。
+///
+/// 返回 `true` = 网关已经重新接受这台 agent（调用方据此清终态）。
+/// **仍被拒、网络不通、服务端 5xx 都不外报**（`quiet = true`）：终态是正常态，不是每次重试
+/// 都要留一行。只有「进入终态」与「恢复」各一行。
+///
+/// 仍被拒时，若网关**换了个终态 code**（例：先 `certificate_revoked`，取消后又
+/// `certificate_mismatch`），就把台账改过来 —— 否则 `diagnose` 会一直照着旧 code 给处理，
+/// 而那两个 code 的处置完全不同（一个要去网关解除名单，一个要重注册）。
+async fn retry_terminal_probe(
+    config: &AgentConfig,
+    state: &mut auth_terminal::AuthTerminal,
+    work: &AppliedWorkGrant,
+    uplink: &AppliedUplink,
+    uplink_health: &UplinkHealth,
+    discovery_policy_version: Option<i64>,
+) -> bool {
+    state.attempts = state.attempts.saturating_add(1);
+    let report = report_status_to_control_plane(
+        config,
+        // CPU / 延迟 / 工作状态变化都是**可观测性**：重试只为问一句「还认我吗」，
+        // 这些字段给 `None` 即可（网关都接受 null，与「还没采到」同一形状）。
+        None,
+        None,
+        None,
+        discovery_policy_version,
+        work,
+        uplink,
+        uplink_health,
+        // 终态的「失败静默」：这条路径上所有非成功结果都不打日志。
+        true,
+    )
+    .await;
+    // 只有**成功**才算恢复。`report.terminal` = 仍被拒；两者都 `None` = 网络/服务端问题
+    // —— 都不足以说明网关重新接受了这台 agent（例如 401 `certificate_required` 就不是恢复）。
+    if let Some(code) = report.terminal
+        && code != state.code
+    {
+        eprintln!(
+            "event=AuthTerminalReasonChanged from={} to={} action=\"台账已更新；处理方式按新 code\"",
+            state.code, code
+        );
+        state.code = code.to_string();
+        // `since` 跟着走：它说的是「**这个** code 从什么时候起」。
+        state.detected_at = now_rfc3339();
+        state.source = auth_terminal::SOURCE_STATUS_REPORT.to_string();
+    }
+    report.latency_ms.is_some()
+}
+
+/// 读回终态台账（启动时一次）。
+///
+/// 三种结果都不应该把机器卡死：
+///   * 有台账 → 按终态起步（把上一份的 code / since / attempts 带出来）；
+///   * 没有 → 正常起步；
+///   * **读不动** → 按「没有终态」继续，**并把那份坏文件清掉**（宁可多发几次请求，也不要凭空
+///     造出一个不可自愈的静默）。清掉这一步不是顺手：留着它只会让 `diagnose` 每次 WARN，
+///     而守护进程永远走不到「清台账」那条路（它只在恢复时清，而此刻它认为没有终态）。
+async fn load_terminal_ledger(path: &Path, retry: Duration) -> Option<auth_terminal::AuthTerminal> {
+    match auth_terminal::load_async(path).await {
+        Ok(Some(state)) => {
+            eprintln!(
+                "event=AuthTerminalRestored code={} source={} since={} attempts={} note=\"仍在终态；每 {}s 重试一次状态上报，网关恢复接受即自动清除\"",
+                state.code,
+                state.source,
+                state.detected_at,
+                state.attempts,
+                retry.as_secs()
+            );
+            Some(state)
+        }
+        Ok(None) => None,
+        Err(err) => {
+            eprintln!(
+                "wist-agentd auth terminal state: ignoring unreadable {}: {err}（已清除，按无终态继续）",
+                path.display()
+            );
+            let _ = auth_terminal::clear_async(path).await;
+            None
+        }
+    }
+}
+
+/// 恢复那一轮没清掉台账时的补偿：下轮再试，直到清掉。
+///
+/// 为什么不能「算了」：那台机器已经恢复、在正常上报，`diagnose` 却会一直报
+/// `[FAIL] 凭据终态：已停发常规控制面请求` —— 一个会撒谎的信号比没有信号更糟。
+async fn clear_terminal_ledger_if_pending(path: &Path, pending: &mut bool) {
+    if !*pending {
+        return;
+    }
+    // 失败不重复刷（恢复那轮已报过一次），下轮继续试。
+    if auth_terminal::clear_async(path).await.is_ok() {
+        *pending = false;
+    }
+}
+
+/// 进终态（**若还没进**）。
+///
+/// 幂等是必要的：同一轮里续期与状态上报都可能认出终态（续期那条不复位就落到后面的常规 tick），
+/// 没这一道就会出现两次落盘 + 两行 `AgentAuthTerminal`，而且台账的 `source` 变成「后写者赢」
+/// —— 那是个没有意义的偶然事实，`diagnose` 却要拿它说清「从哪条路径进来的」。
+async fn enter_terminal_if_absent(
+    terminal: &mut Option<auth_terminal::AuthTerminal>,
+    path: &Path,
+    code: &str,
+    source: &str,
+) -> bool {
+    if terminal.is_some() {
+        return false;
+    }
+    *terminal = Some(enter_terminal(path, code, source).await);
+    true
 }
 
 /// 把事实摘要上送数据面（走 TCP uplink，与日志/指标同一条连接）。
@@ -814,18 +994,80 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     let config_dir = loop_ctx.config_dir;
     let mut runtime_config: AgentConfig = loop_ctx.config.clone();
     let mut last_renewal_check: Option<Instant> = None;
-    // 终态标志（§5.4）：一旦认出网关的终态 code（被吊销 / 库里没有这条凭据 …），
-    // 就不再向控制面发任何请求。
-    let mut terminal = false;
+    // 终态（§5.4）：一旦认出网关的终态 code（被吊销 / 证书身份对不上），就不再向控制面
+    // 发任何请求。
+    //
+    // 为什么是 `Option<台账>` 而不是一个 bool：终态要**跨重启保留**且**外部可见**，
+    // 台账（`state/auth_terminal.json`）就是那份事实（§4.2）。进程重启后先读回它 ——
+    // 不读回就会「重启即遗忘」，而「重启一下也许就好了」正是我们想去掉的运维动作。
+    let auth_terminal_path = auth_terminal::path_for(Path::new(&loop_ctx.config.paths.state_dir));
+    // 生效值读一次就够（环境覆盖不指望运行中变化）。
+    let terminal_retry = terminal_retry_interval();
+    let mut terminal = load_terminal_ledger(&auth_terminal_path, terminal_retry).await;
+    let mut last_terminal_retry: Option<Instant> = None;
+    // 恢复那一轮没清掉台账时置位，下一轮再试（见 `clear_terminal_ledger_if_pending`）。
+    let mut terminal_clear_pending = false;
     loop {
-        // 终态：网关明确拒了这台 agent（`certificate_revoked` / `unknown_credential` …）。
-        // 不再向控制面发任何请求（状态 / 工作 / 上送 / 续期），也不再每 tick 刷失败日志。
+        clear_terminal_ledger_if_pending(&auth_terminal_path, &mut terminal_clear_pending).await;
+        // 终态：网关明确拒了这台 agent（`certificate_revoked` / `certificate_mismatch`）。
+        // 常规上报全部停（状态 / 工作 / 上送 / 续期），也不再每 tick 刷失败日志。
         // **本机采集也一起停** —— 此刻数据面 ingest 同样会拒（同一套鉴权），采了也没人收。
         // **进程留着不退出**：launchd/systemd 的 KeepAlive 会把「退出」变成重启风暴。
-        // 恢复：按 code 运维处理（解除拒绝名单，或重新注册），然后重启 agentd。
-        if terminal {
-            tokio::time::sleep(TICK_INTERVAL).await;
-            continue;
+        //
+        // **唯一例外**是低频重试：`terminal_retry_interval()` 间隔发一次状态上报，成功即恢复
+        // （§4.2）。不重试的代价就是「网关侧改好了，这台却静默到下次人工重启」。
+        // 注意**首次重试是进入终态后的下一个 tick 就发生**（`last_terminal_retry` 初值为 `None`）
+        // —— 这是有意的：重启后读回台账的那台机器应当**一个 tick 内**就知道自己是否已恢复，
+        // 而不是白等 5 分钟。之后的节奏才是 `terminal_retry_interval()`。
+        if let Some(state) = terminal.as_mut() {
+            if last_terminal_retry.is_none_or(|at| at.elapsed() >= terminal_retry) {
+                last_terminal_retry = Some(Instant::now());
+                let recovered = retry_terminal_probe(
+                    &runtime_config,
+                    state,
+                    &work_runtime,
+                    &uplink_runtime,
+                    &uplink_health,
+                    discovery_runtime.policy_version(),
+                )
+                .await;
+                // 失败静默；但 `attempts`（以及可能的 code）变了要对着盘说一声，
+                // 否则「重试过多少次、还是不是因为同一个原因」只能看内存。
+                if let Err(err) = auth_terminal::store_async(&auth_terminal_path, state).await {
+                    eprintln!(
+                        "wist-agentd auth terminal state: failed to update {}: {err}",
+                        auth_terminal_path.display()
+                    );
+                }
+                if recovered {
+                    // **先清后报**：关掉这一行就意味着台账已经不在了（或下方明说了没清掉）。
+                    // 反过来的话，读到「已恢复」的人可能会先看到一个仍然存在的终态台账。
+                    let cleared = match auth_terminal::clear_async(&auth_terminal_path).await {
+                        Ok(()) => true,
+                        Err(err) => {
+                            eprintln!(
+                                "wist-agentd auth terminal state: failed to clear {}: {err}（下轮再试）",
+                                auth_terminal_path.display()
+                            );
+                            false
+                        }
+                    };
+                    eprintln!(
+                        "event=AuthTerminalCleared code={} source={} since={} attempts={} cleared={} detail=\"控制面重新接受本机凭据，已恢复常规上报\"",
+                        state.code, state.source, state.detected_at, state.attempts, cleared
+                    );
+                    terminal = None;
+                    terminal_clear_pending = !cleared;
+                    last_terminal_retry = None;
+                    // 不 `continue`：本轮直接落下去跑常规 tick（凭据刚被接受，正好抖上去）。
+                } else {
+                    tokio::time::sleep(TICK_INTERVAL).await;
+                    continue;
+                }
+            } else {
+                tokio::time::sleep(TICK_INTERVAL).await;
+                continue;
+            }
         }
         // 续期检查**放在建本轮 loop_ctx 之前**：要可变借用 `runtime_config`。
         if last_renewal_check.is_none_or(|at| at.elapsed() >= RENEWAL_CHECK_INTERVAL) {
@@ -850,8 +1092,15 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                 }
                 crate::enrollment::RenewalDecision::Revoked => {
                     // 续期这条路径也认得出「终态」（`renew_now` 已打印 `event=AgentAuthTerminal`）。
-                    // 这里只需进终态：下一轮起不再打扰控制面。
-                    terminal = true;
+                    // 这里只需进终态：下一轮起不再打扰控制面（只看低频重试）。
+                    // 幂等：同一轮后面还可能由状态上报再认一次（见 `enter_terminal_if_absent`）。
+                    enter_terminal_if_absent(
+                        &mut terminal,
+                        &auth_terminal_path,
+                        "certificate_revoked",
+                        auth_terminal::SOURCE_RENEWAL,
+                    )
+                    .await;
                     force_standby(&mut uplink_runtime, "certificate_revoked");
                 }
             }
@@ -934,11 +1183,22 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                 // 到这里那次可变借用早已结束，所以这里用 `&` 不会冲突。
                 &uplink_runtime,
                 &uplink_health,
+                // 常规上报：失败要看得见（只有终态下的低频重试才静默）。
+                false,
             )
             .await;
             if let Some(code) = report.terminal {
-                eprintln!("{}", terminal_auth_message(code, "status_report"));
-                terminal = true;
+                // 一行日志、一次落盘，**首个认出终态者为准**（续期那条已经进过的话这里不再重复）。
+                if terminal.is_none() {
+                    eprintln!("{}", terminal_auth_message(code, "status_report"));
+                }
+                enter_terminal_if_absent(
+                    &mut terminal,
+                    &auth_terminal_path,
+                    code,
+                    auth_terminal::SOURCE_STATUS_REPORT,
+                )
+                .await;
                 force_standby(&mut uplink_runtime, code);
             } else if let Some(latency) = report.latency_ms {
                 last_latency_ms = Some(latency);
@@ -2084,6 +2344,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             &UplinkHealth::default(),
+            false,
         )
         .await;
         server.await.expect("server task");
@@ -2119,6 +2380,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             &UplinkHealth::default(),
+            false,
         )
         .await;
         server.await.expect("server task");
@@ -2231,6 +2493,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &uplink,
             &UplinkHealth::default(),
+            false,
         )
         .await;
         server.await.expect("server task");
@@ -2779,6 +3042,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             &UplinkHealth::default(),
+            false,
         )
         .await;
         server.await.expect("server task");
@@ -2867,6 +3131,7 @@ mod tests {
             &grant,
             &AppliedUplink::default(),
             &UplinkHealth::default(),
+            false,
         )
         .await;
         server.await.expect("server task");
@@ -2887,6 +3152,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             &UplinkHealth::default(),
+            false,
         )
         .await;
         assert!(outcome.latency_ms.is_none());
@@ -2920,6 +3186,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             &UplinkHealth::default(),
+            false,
         )
         .await;
         server.await.expect("server task");
@@ -2959,6 +3226,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             &UplinkHealth::default(),
+            false,
         )
         .await;
         server.await.expect("server task");
@@ -3290,5 +3558,355 @@ mod tests {
         let err = upgrade_request_for(bin, &upgrade_work(r#"{"package_url":"https://gw/x"}"#))
             .expect_err("missing sha must not build a request");
         assert!(err.contains("spec_invalid"), "{err}");
+    }
+
+    /// 进终态必须**落台账**（§4.2）：不然重启即遗忘，而「重启一下试试」正是要去掉的运维动作。
+    #[tokio::test]
+    async fn entering_terminal_writes_the_ledger_with_code_and_source() {
+        let path = auth_terminal::path_for(&local_state_dir("enter-terminal"));
+        let state =
+            enter_terminal(&path, "certificate_mismatch", auth_terminal::SOURCE_RENEWAL).await;
+
+        assert_eq!(state.code, "certificate_mismatch");
+        assert_eq!(state.source, auth_terminal::SOURCE_RENEWAL);
+        assert_eq!(state.attempts, 0);
+        // 写盘失败只多打一行（见 `enter_terminal`），所以这里能读回来是**函数契约**的一部分。
+        assert_eq!(
+            auth_terminal::load_async(&path).await.expect("load"),
+            Some(state)
+        );
+    }
+
+    /// 终态下重试**成功** = 网关重新接受 → 调用方清除（返回 `true`），且请求确实发到了
+    /// 状态上报端点（不是别的探针）。
+    #[tokio::test]
+    async fn a_successful_terminal_retry_reports_recovery() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let request = read_http_request(&mut socket).await;
+            // 重试走的就是常规状态上报：同一个端点、同一套凭据口径。
+            assert!(request.contains("/api/v1/agent/status"), "{request}");
+            let response =
+                "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let mut config = test_config();
+        config.control_plane.endpoint = Some(endpoint);
+        let mut state = auth_terminal::AuthTerminal {
+            code: "certificate_mismatch".to_string(),
+            source: auth_terminal::SOURCE_STATUS_REPORT.to_string(),
+            detected_at: "2026-09-30T13:02:23Z".to_string(),
+            attempts: 0,
+        };
+        let recovered = retry_terminal_probe(
+            &config,
+            &mut state,
+            &AppliedWorkGrant::default(),
+            &AppliedUplink::default(),
+            &UplinkHealth::default(),
+            None,
+        )
+        .await;
+        server.await.expect("server task");
+
+        assert!(recovered, "a 202 must clear the terminal state");
+        assert_eq!(state.attempts, 1, "每次尝试都要计数");
+    }
+
+    /// 仍被终态拒绝（401 `certificate_mismatch`）→ **不算恢复**，且不打印（静默是终态的设计）。
+    #[tokio::test]
+    async fn a_still_rejected_terminal_retry_keeps_the_terminal_state() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let _ = read_http_request(&mut socket).await;
+            let body = "agent identity rejected: certificate_mismatch";
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let mut config = test_config();
+        config.control_plane.endpoint = Some(endpoint);
+        let mut state = auth_terminal::AuthTerminal {
+            code: "certificate_mismatch".to_string(),
+            source: auth_terminal::SOURCE_STATUS_REPORT.to_string(),
+            detected_at: "2026-09-30T13:02:23Z".to_string(),
+            attempts: 4,
+        };
+        let recovered = retry_terminal_probe(
+            &config,
+            &mut state,
+            &AppliedWorkGrant::default(),
+            &AppliedUplink::default(),
+            &UplinkHealth::default(),
+            None,
+        )
+        .await;
+        server.await.expect("server task");
+
+        assert!(
+            !recovered,
+            "still rejected must not clear the terminal state"
+        );
+        assert_eq!(state.attempts, 5);
+    }
+
+    /// 网络不通（连不上）同样是「不是恢复」：只有网关**成功应答**才算。
+    #[tokio::test]
+    async fn a_transport_failure_during_a_terminal_retry_is_not_a_recovery() {
+        // 1399 的低端口段：先占一个端口再放掉，保证这个端口没人听。
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener);
+
+        let mut config = test_config();
+        config.control_plane.endpoint = Some(format!("http://{addr}"));
+        let mut state = auth_terminal::AuthTerminal {
+            code: "certificate_revoked".to_string(),
+            source: auth_terminal::SOURCE_RENEWAL.to_string(),
+            detected_at: "2026-09-30T13:02:23Z".to_string(),
+            attempts: 0,
+        };
+        let recovered = retry_terminal_probe(
+            &config,
+            &mut state,
+            &AppliedWorkGrant::default(),
+            &AppliedUplink::default(),
+            &UplinkHealth::default(),
+            None,
+        )
+        .await;
+
+        assert!(
+            !recovered,
+            "a transport failure must not clear the terminal state"
+        );
+    }
+
+    /// 台账**读不动**时：按无终态继续，**并把坏文件清掉**。
+    ///
+    /// 不清掉的话，那份文件会一直躺在那儿 —— 每次 `diagnose` 报一条 WARN，每次重启多一行
+    /// 日志，而守护进程永远走不到「清台账」那条路（它只在恢复时清，而此刻它认为没进过终态）。
+    #[tokio::test]
+    async fn an_unreadable_terminal_ledger_is_cleared_not_kept() {
+        let dir = local_state_dir("terminal-unreadable");
+        let path = auth_terminal::path_for(&dir);
+        std::fs::write(&path, "not json").expect("write bad ledger");
+
+        let restored = load_terminal_ledger(&path, TERMINAL_RETRY_INTERVAL).await;
+
+        assert!(restored.is_none(), "读不动就不能当成终态（否则机器被卡死）");
+        assert!(
+            !path.exists(),
+            "坏台账要被清掉，否则 diagnose 每次都 WARN 而没人会去处理"
+        );
+    }
+
+    /// 台账好着的时候要**真读回**（启动即认账），而不是被当没进过。
+    #[tokio::test]
+    async fn a_readable_terminal_ledger_is_restored_verbatim() {
+        let dir = local_state_dir("terminal-restore");
+        let path = auth_terminal::path_for(&dir);
+        let stored = auth_terminal::AuthTerminal {
+            code: "certificate_revoked".to_string(),
+            source: auth_terminal::SOURCE_RENEWAL.to_string(),
+            detected_at: "2026-09-30T13:02:23Z".to_string(),
+            attempts: 4,
+        };
+        auth_terminal::store_async(&path, &stored)
+            .await
+            .expect("seed");
+
+        assert_eq!(
+            load_terminal_ledger(&path, TERMINAL_RETRY_INTERVAL).await,
+            Some(stored)
+        );
+        assert!(path.exists(), "读得动就不该被当成坏文件清掉");
+    }
+
+    /// 恢复那轮没清掉的台账：**下轮接着清，直到清掉为止**。
+    ///
+    /// 这条路径的失败模式很阴：机器已经恢复、在正常上报，而 `diagnose` 会一直报
+    /// `[FAIL] 凭据终态：已停发常规控制面请求` —— 一个会撒谎的信号比没有信号更糟。
+    #[tokio::test]
+    async fn a_pending_terminal_clear_keeps_retrying_until_it_succeeds() {
+        let dir = local_state_dir("terminal-clear-pending");
+        let path = auth_terminal::path_for(&dir);
+
+        // 没置位时是空操作（不闯任何文件）。
+        let mut pending = false;
+        clear_terminal_ledger_if_pending(&path, &mut pending).await;
+        assert!(!pending);
+
+        // 置位且清得掉 → 文件没了、标志复位。
+        auth_terminal::store_async(&path, &sample_terminal())
+            .await
+            .expect("seed");
+        let mut pending = true;
+        clear_terminal_ledger_if_pending(&path, &mut pending).await;
+        assert!(!pending, "清掉之后不应该再惦记");
+        assert!(!path.exists());
+
+        // 置位但**清不掉**（拿一个目录扮文件：`remove_file` 必然失败）→ 标志留着，下轮再试。
+        let blocked = dir.join("blocked.json");
+        std::fs::create_dir_all(&blocked).expect("make a directory in the file's place");
+        let mut pending = true;
+        clear_terminal_ledger_if_pending(&blocked, &mut pending).await;
+        assert!(
+            pending,
+            "清不掉就要留着标志，否则台账会一直对 diagnose 撒谎"
+        );
+
+        // 障碍消失后（对应现实里的权限/挂载恢复）下一轮就清掉了。
+        std::fs::remove_dir_all(&blocked).expect("clear the obstacle");
+        auth_terminal::store_async(&blocked, &sample_terminal())
+            .await
+            .expect("seed again");
+        clear_terminal_ledger_if_pending(&blocked, &mut pending).await;
+        assert!(!pending);
+        assert!(!blocked.exists());
+    }
+
+    fn sample_terminal() -> auth_terminal::AuthTerminal {
+        auth_terminal::AuthTerminal {
+            code: "certificate_revoked".to_string(),
+            source: auth_terminal::SOURCE_RENEWAL.to_string(),
+            detected_at: "2026-09-30T13:02:23Z".to_string(),
+            attempts: 1,
+        }
+    }
+
+    /// 进终态是**幂等**的：同一轮里续期与状态上报都可能认出终态，两次落盘会让台账的
+    /// `source` 变成「后写者赢」——那是个没意义的偶然事实，而 `diagnose` 要拿它说清来路。
+    #[tokio::test]
+    async fn entering_terminal_is_idempotent_within_a_tick() {
+        let path = auth_terminal::path_for(&local_state_dir("terminal-idempotent"));
+        let mut terminal: Option<auth_terminal::AuthTerminal> = None;
+
+        assert!(
+            enter_terminal_if_absent(
+                &mut terminal,
+                &path,
+                "certificate_revoked",
+                auth_terminal::SOURCE_RENEWAL,
+            )
+            .await,
+            "第一次必须真的进"
+        );
+        // 同一轮里状态上报又认了一次（哪怕 code 不同）：**首个认出的为准**。
+        assert!(
+            !enter_terminal_if_absent(
+                &mut terminal,
+                &path,
+                "certificate_mismatch",
+                auth_terminal::SOURCE_STATUS_REPORT,
+            )
+            .await,
+            "已经在终态里就不该再进一次"
+        );
+
+        let state = terminal.expect("terminal must be set");
+        assert_eq!(state.code, "certificate_revoked");
+        assert_eq!(state.source, auth_terminal::SOURCE_RENEWAL);
+        // 盘上那份也不能被后一次覆盖（doctor 读的就是它）。
+        assert_eq!(
+            auth_terminal::load_async(&path)
+                .await
+                .expect("load")
+                .expect("ledger"),
+            state
+        );
+    }
+
+    /// 网关把拒绝理由**换了**（先被吊销，后又变成证书身份对不上）：台账要跟着改。
+    ///
+    /// 两个 code 的处置完全不同（一个要去网关解除名单，一个要重注册），沿用旧 code 就是
+    /// 让 `diagnose` 给出一个错的行动建议。
+    #[tokio::test]
+    async fn a_terminal_retry_records_a_changed_rejection_code() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let _ = read_http_request(&mut socket).await;
+            let body = "agent identity rejected: certificate_mismatch";
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let mut config = test_config();
+        config.control_plane.endpoint = Some(endpoint);
+        let mut state = auth_terminal::AuthTerminal {
+            code: "certificate_revoked".to_string(),
+            source: auth_terminal::SOURCE_RENEWAL.to_string(),
+            detected_at: "2026-09-30T13:02:23Z".to_string(),
+            attempts: 0,
+        };
+        let recovered = retry_terminal_probe(
+            &config,
+            &mut state,
+            &AppliedWorkGrant::default(),
+            &AppliedUplink::default(),
+            &UplinkHealth::default(),
+            None,
+        )
+        .await;
+        server.await.expect("server task");
+
+        assert!(!recovered, "仍被拒就不是恢复");
+        assert_eq!(state.code, "certificate_mismatch", "换了 code 就要记下来");
+        assert_eq!(state.source, auth_terminal::SOURCE_STATUS_REPORT);
+        assert_eq!(state.attempts, 1);
+    }
+
+    /// 重试计数不能绕回负数（`saturating_add` 的护栏：台账是可手编的文件）。
+    #[tokio::test]
+    async fn terminal_attempts_saturate_instead_of_wrapping() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let _ = read_http_request(&mut socket).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write");
+        });
+
+        let mut config = test_config();
+        config.control_plane.endpoint = Some(endpoint);
+        let mut state = auth_terminal::AuthTerminal {
+            code: "certificate_revoked".to_string(),
+            source: auth_terminal::SOURCE_RENEWAL.to_string(),
+            detected_at: "t".to_string(),
+            attempts: i64::MAX,
+        };
+        let recovered = retry_terminal_probe(
+            &config,
+            &mut state,
+            &AppliedWorkGrant::default(),
+            &AppliedUplink::default(),
+            &UplinkHealth::default(),
+            None,
+        )
+        .await;
+        server.await.expect("server task");
+
+        assert!(!recovered);
+        assert_eq!(state.attempts, i64::MAX, "不能绕回负数");
     }
 }
