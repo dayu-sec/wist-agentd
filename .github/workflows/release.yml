@@ -42,10 +42,23 @@ jobs:
         run: |
           set -euo pipefail
           ARTIFACT="wist-agentd-${{ github.ref_name }}-${{ matrix.target }}"
-          mkdir -p artifacts
-          cp -av "target/${{ matrix.target }}/release/wist-agentd" artifacts/
-          cp -av "target/${{ matrix.target }}/release/wist-exec" artifacts/
-          tar -czf "${ARTIFACT}.tar.gz" artifacts
+          BIN_DIR="target/${{ matrix.target }}/release"
+          # 三件必须一起发：wist-upgrader 正是去换 agentd 自己的那个进程，缺一件就没有「同版本」前提。
+          # 网关下发的安装脚本会**当场拒收**漏件制品（agent package is missing wist-upgrader），
+          # 所以这里打前查可执行、打后查包内，与 dev/package-agentd.sh 同一口径。
+          # 包内一层同名目录（与 dev 打包一致；安装脚本用 find 找件，不依赖目录名）。
+          BINS="wist-agentd wist-exec wist-upgrader"
+          mkdir -p "${ARTIFACT}"
+          for bin in ${BINS}; do
+            test -x "${BIN_DIR}/${bin}" || { echo "拒绍打出漏件制品：${BIN_DIR}/${bin} 缺失或不可执行" >&2; exit 1; }
+            cp -av "${BIN_DIR}/${bin}" "${ARTIFACT}/"
+          done
+          tar -czf "${ARTIFACT}.tar.gz" "${ARTIFACT}"
+          for bin in ${BINS}; do
+            tar tzf "${ARTIFACT}.tar.gz" | grep -q "/${bin}$" || { echo "拒绍发布：${ARTIFACT}.tar.gz 里没有 ${bin}" >&2; exit 1; }
+          done
+          tar tzf "${ARTIFACT}.tar.gz"
+          ls -lh "${ARTIFACT}.tar.gz"
 
       - uses: actions/upload-artifact@v7
         with:
