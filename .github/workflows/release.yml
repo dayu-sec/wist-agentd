@@ -50,14 +50,22 @@ jobs:
           BINS="wist-agentd wist-exec wist-upgrader"
           mkdir -p "${ARTIFACT}"
           for bin in ${BINS}; do
-            test -x "${BIN_DIR}/${bin}" || { echo "拒绍打出漏件制品：${BIN_DIR}/${bin} 缺失或不可执行" >&2; exit 1; }
+            test -x "${BIN_DIR}/${bin}" || { echo "拒绝打出漏件制品：${BIN_DIR}/${bin} 缺失或不可执行" >&2; exit 1; }
             cp -av "${BIN_DIR}/${bin}" "${ARTIFACT}/"
           done
           tar -czf "${ARTIFACT}.tar.gz" "${ARTIFACT}"
+          # 验包内三件：**不要**用 `tar tzf | grep -q` —— grep -q 命中即退出会关掉管道，
+          # GNU tar 会报 `stdout: write error`，配上 pipefail 就变成“包里没有”的误判
+          # （Linux runner 上真踩了；macOS 的 BSD tar 不报，所以本地跑不出来）。
+          # 先整份取回再 case 匹配，与 dev/package-agentd.sh 的 verify_contents 同口径。
+          LISTED="$(tar tzf "${ARTIFACT}.tar.gz")"
           for bin in ${BINS}; do
-            tar tzf "${ARTIFACT}.tar.gz" | grep -q "/${bin}$" || { echo "拒绍发布：${ARTIFACT}.tar.gz 里没有 ${bin}" >&2; exit 1; }
+            case "${LISTED}" in
+              *"/${bin}"*) echo "包内 ${bin} ✓" ;;
+              *) echo "拒绝发布：${ARTIFACT}.tar.gz 里没有 ${bin}" >&2; exit 1 ;;
+            esac
           done
-          tar tzf "${ARTIFACT}.tar.gz"
+          printf '%s\n' "${LISTED}"   # 把包内清单打进 CI 日志（复用上面已取回的那份，不再跑一遍 tar）
           ls -lh "${ARTIFACT}.tar.gz"
 
       - uses: actions/upload-artifact@v7
