@@ -340,7 +340,7 @@ fn local_certificate_signing_request(state_dir: &Path) -> Result<String, Enrollm
     )
 }
 
-fn build_host_profile(config: &AgentConfig) -> HostProfile {
+pub(crate) fn build_host_profile(config: &AgentConfig) -> HostProfile {
     let hostname = hostname_from_sources(
         std::env::var("HOSTNAME").ok().as_deref(),
         std::env::var("COMPUTERNAME").ok().as_deref(),
@@ -363,7 +363,9 @@ fn build_host_profile(config: &AgentConfig) -> HostProfile {
         machine_id,
         cloud_instance_id: std::env::var("WARP_INSIGHT_CLOUD_INSTANCE_ID").ok(),
         k8s_node_uid: std::env::var("WARP_INSIGHT_K8S_NODE_UID").ok(),
-        ip_addresses: Vec::new(),
+        // 机器名 / node_id / machine_id / 网卡地址一起构成「这是哪台机器」的展示依据。
+        // 注册与**状态上报**共用这一份（注册时凭证书首触重建会把它留空，靠后续上报补齐）。
+        ip_addresses: crate::discovery::network::local_ip_addresses(),
     }
 }
 

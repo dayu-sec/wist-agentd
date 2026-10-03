@@ -485,6 +485,9 @@ async fn report_status_to_control_plane(
         local_work,
         uplink_state,
         certificate_status,
+        // 机器画像：注册表里「这是哪台机器」的展示依据（机器名 / node_id / 网卡地址）。
+        // 凭证书首触重建登记时机器画像是空的，靠每次状态上报带上、由网关回填。
+        machine_profile: Some(crate::enrollment::build_host_profile(config)),
     };
     let client = match enrollment_http_client(config) {
         Ok(client) => client,
@@ -2355,6 +2358,16 @@ mod tests {
             assert!(request.contains("\"work_state_changes\":null"));
             // 本机实际生效的策略版本随状态上报一起上去（`null` = 还没拉到策略表）。
             assert!(request.contains("\"discovery_policy_version\":7"));
+            // 机器画像随上报带上：注册表里「这是哪台机器」靠它补齐（凭证书重建登记时是空的）。
+            assert!(
+                request.contains("\"machine_profile\":{"),
+                "machine_profile must be reported: {request}"
+            );
+            assert!(
+                request.contains("\"hostname\":"),
+                "hostname must be reported"
+            );
+            assert!(request.contains("\"node_id\":"), "node_id must be reported");
             let response =
                 "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
             socket.write_all(response.as_bytes()).await.expect("write");

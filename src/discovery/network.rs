@@ -231,6 +231,29 @@ fn discover_network_inventory() -> io::Result<Vec<ObservedNetworkInterface>> {
     unix_interfaces_from_getifaddrs(&BTreeMap::new())
 }
 
+/// 本机网卡地址列表（形如 `en0 192.168.1.5/24`），供机器画像 / 状态上报在管理面展示。
+///
+/// 与发现探针共用同一份枚举（`discover_network_inventory`，已跳过回环），格式也与事实摘要的
+/// `network_addresses` 一致（`iface cidr`）；采不到就返回空表 —— 这是展示信息，不该影响上报本身。
+#[cfg(unix)]
+pub(crate) fn local_ip_addresses() -> Vec<String> {
+    let Ok(interfaces) = discover_network_inventory() else {
+        return Vec::new();
+    };
+    let mut addresses = Vec::new();
+    for iface in interfaces {
+        for address in iface.addresses {
+            addresses.push(format!("{} {}", iface.name, address.cidr()));
+        }
+    }
+    addresses
+}
+
+#[cfg(not(unix))]
+pub(crate) fn local_ip_addresses() -> Vec<String> {
+    Vec::new()
+}
+
 #[cfg(unix)]
 fn unix_interfaces_from_getifaddrs(
     gateways: &BTreeMap<String, String>,
