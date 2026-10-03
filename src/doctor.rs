@@ -3,7 +3,7 @@
 //! 为什么要有它：agentd 的故障大多出在**进程外** —— 配置里的 endpoint 端口与网关实际监听的不一致、
 //! 信任锚被换过、凭据被拒或过期、网关换了库/锚、服务根本没起来……这些在日志里各是一行，
 //! 读起来要自己拼因果（而且要 root 才能读日志）。`diagnose` 按
-//! 「配置 → 身份 → 安装/服务 → 控制面连通 → 数据面（上送）→ 本地工作」
+//! 「配置 → 身份 → 安装/服务 → 控制面连通 → 数据面（上送）→ 本地工作/升级」
 //! 自己探一遍，每项给 `OK` / `WARN` / `FAIL` 与**下一步怎么做**，最后给一个总判定：
 //! **退出码非零 = 有 FAIL**，脚本与 AI 可以直接用。
 //!
@@ -22,7 +22,7 @@ use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Write as _};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use wist_contracts::agent_config::AgentConfig;
 use wist_contracts::agent_uplink::AgentUplinkGrant;
@@ -35,6 +35,7 @@ use crate::error::AgentdResult;
 use crate::runtime::daemon::telemetry_support::effective_output;
 use crate::service::{self, ServiceLayout, ServicePlatform, ServiceScope, ServiceSpec};
 use crate::state_store::{agent_runtime, auth_terminal, client_identity, work};
+use crate::upgrade::{UPGRADE_RECORD_FILE, UPGRADER_DEAD_AFTER, UpgradeRecord, heartbeat_is_fresh};
 
 /// 单次网络探测的超时（TCP 连接 / 数据面目标）。
 ///
@@ -304,6 +305,10 @@ async fn diagnose(config_root: &Path, offline: bool) -> Report {
         checks.extend(uplink_local_checks(&config, grant.as_ref(), false).await);
         checks.extend(uplink_target_check(&config, grant.as_ref()).await);
     }
+
+    // 升级器是**分离进程**：它死没死不在本进程的记忆里。agentd 判死后只把结论报给控制面，
+    // 本机日志里只剩一行 —— 所以本地也报一项（离线也报：它只读本地文件）。
+    checks.push(local_upgrade_check(&config));
 
     Report { checks }
 }
@@ -1218,6 +1223,111 @@ async fn local_work_check(config: &AgentConfig) -> Check {
     }
 }
 
+/// 升级（`state/upgrade.json` + `state/upgrade.heartbeat`）。
+///
+/// 为什么 diagnose 必须报这一项：升级器是**分离进程**，它死没死不在 agentd 的记忆里。agentd 判死后
+/// 只把结论报给控制面、并解开互斥锁，**不重写升级记录**（那份记录是升级器写的）—— 于是会出现
+/// 「控制面上次升级显示 failed（判定已死），而本机 diagnose 全绿」这种对不上的局面（2026-10-03 实撞）。
+/// 这里用与守护进程**同一套**判据（[`heartbeat_is_fresh`] / [`UPGRADER_DEAD_AFTER`]）把记录读出来报。
+///
+/// 与守护进程的一处刻意不同：agentd 判死前还要确认「工作视图里有这件活」（它只对自己认领的工作
+/// 负责）；诊断**不套**这道门槛 —— 一份停在 `running`、写入者已消失的记录，不管在不在视图里，
+/// 都是这台机器上卡住的一件升级，正该报出来。
+fn local_upgrade_check(config: &AgentConfig) -> Check {
+    let state_dir = Path::new(&config.paths.state_dir);
+    let path = state_dir.join(UPGRADE_RECORD_FILE);
+    let record: UpgradeRecord = match wist_shared::fs::read_json(&path) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Check::ok(
+                "upgrade.local",
+                "还没有升级记录（没升过级）",
+                path.display().to_string(),
+            );
+        }
+        Err(err) => {
+            return Check::warn(
+                "upgrade.local",
+                "升级记录读不出来",
+                format!("{}：{err}", path.display()),
+            );
+        }
+        Ok(record) => record,
+    };
+
+    // 目标版本要等解包读到包内自报版本才确定；早于那一步的记录里它是空的。
+    let target = if record.to_version.trim().is_empty() {
+        "未定"
+    } else {
+        record.to_version.as_str()
+    };
+    let where_at = format!(
+        "{} -> {target}（步骤 {}）",
+        record.from_version, record.step
+    );
+    match record.status.as_str() {
+        "succeeded" => Check::ok(
+            "upgrade.local",
+            "最近一次升级成功",
+            format!("{where_at}；updated_at={}", record.updated_at),
+        ),
+        // 记录停在 `running` 就是升级器**还没写终态**；它还在不在，只能看心跳（与 agentd 同一判据）。
+        "running" => {
+            if heartbeat_is_fresh(state_dir, SystemTime::now()) {
+                Check::ok(
+                    "upgrade.local",
+                    "有升级正在进行（升级器心跳正常）",
+                    where_at,
+                )
+            } else {
+                Check::fail(
+                    "upgrade.local",
+                    "升级器已失联（判定已死）",
+                    format!(
+                        "升级器 {}s 没有心跳（步骤 {}）；机器可能停在中间态",
+                        UPGRADER_DEAD_AFTER.as_secs(),
+                        record.step
+                    ),
+                )
+                .hint(
+                    "看升级器日志与那个瞬态 unit：`journalctl -u wist-agentd`、日志目录下的 \
+                     `wist-upgrader.log`、`systemctl status wist-upgrader-<work_id>`；\
+                     确认当前版本后到管理面重派升级",
+                )
+            }
+        }
+        "rolled_back" => Check::warn(
+            "upgrade.local",
+            "最近一次升级已回滚（机器已回到原版本）",
+            join_detail(where_at, &record.detail),
+        )
+        .hint("升级没成、但机器是干净的；看升级器日志定因后再重派"),
+        "failed" => Check::fail(
+            "upgrade.local",
+            "最近一次升级失败",
+            join_detail(where_at, &record.detail),
+        )
+        .hint("看升级器日志：`journalctl -u wist-agentd` 与日志目录下的 `wist-upgrader.log`"),
+        other => Check::warn(
+            "upgrade.local",
+            "升级记录状态未知",
+            format!("status={other}；{where_at}"),
+        ),
+    }
+}
+
+/// 正文后接一段可选说明（`；` 分隔）。
+///
+/// 说明先经 [`one_line`] 压成一行 —— 正文是单行排版（见 [`Report::render_text`]），原始换行会把版式
+/// 冲乱；说明为空就不接，免得留一个孤零零的 `；`。
+fn join_detail(base: String, detail: &str) -> String {
+    let detail = one_line(detail);
+    if detail.is_empty() {
+        base
+    } else {
+        format!("{base}；{detail}")
+    }
+}
+
 /// endpoint 拆成（主机，端口，端口是否显式写了）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EndpointTarget {
@@ -1921,6 +2031,8 @@ mod tests {
         assert!(ids.contains(&"uplink.effective"), "{ids:?}");
         assert!(ids.contains(&"uplink.spool"), "{ids:?}");
         assert!(ids.contains(&"work.local"), "{ids:?}");
+        // 升级记录也是纯本地文件：--offline 同样要报（否则又会「控制面报警、本机全绿」）。
+        assert!(ids.contains(&"upgrade.local"), "{ids:?}");
         // 网络项一个都不该出现（除了那条“已跳过”的说明）。
         assert!(ids.contains(&"network.skipped"), "{ids:?}");
         assert!(
@@ -1949,6 +2061,222 @@ mod tests {
             report.checks[0]
         );
         assert_eq!(report.exit_code(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn upgrade_config_in(state_dir: &Path) -> AgentConfig {
+        let mut config = template_config();
+        config.paths.state_dir = state_dir.display().to_string();
+        config
+    }
+
+    fn upgrade_record(status: &str, step: &str, detail: &str) -> UpgradeRecord {
+        UpgradeRecord {
+            work_id: "work-1".to_string(),
+            from_version: "0.1.21".to_string(),
+            to_version: "0.1.22".to_string(),
+            step: step.to_string(),
+            status: status.to_string(),
+            detail: detail.to_string(),
+            agentd_bin: "/usr/local/bin/wist-agentd".to_string(),
+            updated_at: "2026-10-03T04:20:00Z".to_string(),
+        }
+    }
+
+    fn write_upgrade_record(state_dir: &Path, record: &UpgradeRecord) {
+        wist_shared::fs::write_json_atomic(&state_dir.join(UPGRADE_RECORD_FILE), record)
+            .expect("write upgrade record");
+    }
+
+    fn upgrade_state_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "doctor-upgrade-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create state dir");
+        dir
+    }
+
+    #[test]
+    fn local_upgrade_check_says_ok_when_nothing_was_ever_upgraded() {
+        let dir = upgrade_state_dir("none");
+        let check = local_upgrade_check(&upgrade_config_in(&dir));
+        assert_eq!(check.status, Status::Ok, "{check:?}");
+        assert!(check.title.contains("还没有升级记录"), "{check:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 记录停在 `running` 而心跳已旧 = 升级器没了。这正是控制面收到「判定已死」时的本机事实 ——
+    /// diagnose 必须把同一句话报出来，否则又回到「控制面报警、本机全绿」的对不上。
+    #[test]
+    fn local_upgrade_check_surfaces_a_lost_upgrader_as_a_failure() {
+        let dir = upgrade_state_dir("dead");
+        write_upgrade_record(&dir, &upgrade_record("running", "restart", ""));
+        // 没有心跳文件 = 不新鲜（[`heartbeat_is_fresh`] 的既有语义）。
+        let check = local_upgrade_check(&upgrade_config_in(&dir));
+        assert_eq!(check.status, Status::Fail, "{check:?}");
+        assert!(check.title.contains("失联"), "{check:?}");
+        assert!(check.detail.contains("没有心跳"), "{}", check.detail);
+        assert!(check.detail.contains("restart"), "{}", check.detail);
+        assert!(check.hint.is_some(), "must say what to do next");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 心跳文件存在但时间戳已越过死亡阈值 —— 走的是真实的「老化」路径，不是「文件不存在」。
+    #[test]
+    fn local_upgrade_check_treats_a_stale_heartbeat_as_dead() {
+        let dir = upgrade_state_dir("stale");
+        write_upgrade_record(&dir, &upgrade_record("running", "wait_ready", ""));
+        crate::upgrade::touch_heartbeat(&dir).expect("touch heartbeat");
+        let hb = dir.join(crate::upgrade::UPGRADE_HEARTBEAT_FILE);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&hb)
+            .expect("open heartbeat");
+        let old = SystemTime::now() - Duration::from_secs(UPGRADER_DEAD_AFTER.as_secs() + 5);
+        file.set_modified(old).expect("backdate heartbeat");
+
+        let check = local_upgrade_check(&upgrade_config_in(&dir));
+        assert_eq!(check.status, Status::Fail, "{check:?}");
+        assert!(check.detail.contains("没有心跳"), "{}", check.detail);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn local_upgrade_check_calls_a_live_upgrade_ok() {
+        let dir = upgrade_state_dir("live");
+        write_upgrade_record(&dir, &upgrade_record("running", "install", ""));
+        crate::upgrade::touch_heartbeat(&dir).expect("touch heartbeat");
+        let check = local_upgrade_check(&upgrade_config_in(&dir));
+        assert_eq!(check.status, Status::Ok, "{check:?}");
+        assert!(check.title.contains("正在进行"), "{check:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn local_upgrade_check_reports_terminal_outcomes() {
+        let dir = upgrade_state_dir("terminal");
+
+        write_upgrade_record(&dir, &upgrade_record("succeeded", "wait_ready", ""));
+        let ok = local_upgrade_check(&upgrade_config_in(&dir));
+        assert_eq!(ok.status, Status::Ok, "{ok:?}");
+        assert!(ok.title.contains("成功"), "{ok:?}");
+
+        write_upgrade_record(
+            &dir,
+            &upgrade_record("failed", "fetch", "unreachable package"),
+        );
+        let failed = local_upgrade_check(&upgrade_config_in(&dir));
+        assert_eq!(failed.status, Status::Fail, "{failed:?}");
+        assert!(
+            failed.detail.contains("unreachable package"),
+            "{}",
+            failed.detail
+        );
+
+        write_upgrade_record(
+            &dir,
+            &upgrade_record("rolled_back", "wait_ready", "not_ready"),
+        );
+        let rolled = local_upgrade_check(&upgrade_config_in(&dir));
+        assert_eq!(rolled.status, Status::Warn, "{rolled:?}");
+        assert!(rolled.title.contains("回滚"), "{rolled:?}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn local_upgrade_check_warns_on_an_unreadable_record() {
+        let dir = upgrade_state_dir("corrupt");
+        std::fs::write(dir.join(UPGRADE_RECORD_FILE), b"{ not json").expect("write garbage");
+        let check = local_upgrade_check(&upgrade_config_in(&dir));
+        assert_eq!(check.status, Status::Warn, "{check:?}");
+        assert!(check.title.contains("读不出来"), "{check:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn local_upgrade_check_warns_on_an_unknown_status() {
+        let dir = upgrade_state_dir("unknown");
+        write_upgrade_record(&dir, &upgrade_record("bogus", "install", ""));
+        let check = local_upgrade_check(&upgrade_config_in(&dir));
+        assert_eq!(check.status, Status::Warn, "{check:?}");
+        assert!(check.detail.contains("status=bogus"), "{}", check.detail);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 早于 `verify_artifact` 的步骤里目标版本还没定 —— 显示成 `未定`，不要打出一个空箭头。
+    #[test]
+    fn local_upgrade_check_shows_an_undecided_target_before_it_is_known() {
+        let dir = upgrade_state_dir("undecided");
+        let mut record = upgrade_record("running", "fetch", "");
+        record.to_version = String::new();
+        write_upgrade_record(&dir, &record);
+        crate::upgrade::touch_heartbeat(&dir).expect("touch heartbeat");
+        let check = local_upgrade_check(&upgrade_config_in(&dir));
+        assert_eq!(check.status, Status::Ok, "{check:?}");
+        assert!(check.detail.contains("-> 未定"), "{}", check.detail);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 失败原因是多行错误链时，正文里要压成一行（正文是单行排版，换行会把版式冲乱）。
+    #[test]
+    fn local_upgrade_check_flattens_a_multiline_failure_detail() {
+        let dir = upgrade_state_dir("multiline");
+        write_upgrade_record(
+            &dir,
+            &upgrade_record("failed", "stage", "outer\n  inner\n\nlast"),
+        );
+        let check = local_upgrade_check(&upgrade_config_in(&dir));
+        assert_eq!(check.status, Status::Fail, "{check:?}");
+        assert!(!check.detail.contains('\n'), "{:?}", check.detail);
+        assert!(
+            check.detail.contains("outer | inner | last"),
+            "{}",
+            check.detail
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 端到端：一份「升级器已失联」的记录要能穿过整个 `diagnose` 报成 FAIL（而不只是函数单测）。
+    #[tokio::test]
+    async fn diagnose_surfaces_a_dead_upgrader_as_a_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "doctor-upgrade-e2e-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let config_dir = root.join("wist-agentd");
+        let state_dir = root.join("state");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        std::fs::write(
+            config_dir.join("agentd.toml"),
+            format!(
+                "schema_version = \"v1\"\n\n[control_plane]\nenabled = false\n\n[paths]\nroot_dir = \"{d}\"\nrun_dir = \"{d}/run\"\nstate_dir = \"{s}\"\nlog_dir = \"{d}/log\"\n",
+                d = root.display(),
+                s = state_dir.display()
+            ),
+        )
+        .expect("write config");
+        write_upgrade_record(&state_dir, &upgrade_record("running", "restart", ""));
+
+        let report = diagnose(&config_dir, true).await;
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "upgrade.local")
+            .expect("upgrade.local must be reported");
+        assert_eq!(check.status, Status::Fail, "{check:?}");
+        assert!(check.detail.contains("没有心跳"), "{}", check.detail);
         let _ = std::fs::remove_dir_all(root);
     }
 

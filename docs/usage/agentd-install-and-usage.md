@@ -503,6 +503,10 @@ wist-agentd version                                  # 核对版本
 - **别用 `systemctl enable --now` 代替 restart**：它在已 active 的 unit 上是 no-op，会让旧进程继续跑旧二进制；
 - 执行中的 `ActionPlan` 会在停止时被一并收走（systemd `KillMode=control-group`），未完成的执行由下次启动的
   crash recovery 转成 reporting，不会丢结果上报；
+- 升级器**不在**被收走之列：Linux 上它以独立瞬态 unit 拉起（见架构 §11.2），能在 `systemctl restart` 的
+  窗口里活到新版起来并上报；
+- 升级出问题先看本机：`wist-agentd diagnose` 的 `upgrade.local` 项读 `state/upgrade.json` + 心跳，
+  给出最近一次升级的成败/进度，以及「升级器已失联（判定已死）」这种控制面会看到的结论；
 - 回滚：把旧二进制换回并按上表重启。state 是 schema 化 JSON，升级/回退不丢 checkpoint；但不要回退到读不懂新
   schema 的更早版本（损坏的状态会被隔离，不会再执行）。
 

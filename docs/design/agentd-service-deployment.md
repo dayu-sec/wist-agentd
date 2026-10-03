@@ -150,7 +150,7 @@ supervisor。后者让“谁在管、怎么重启、日志去哪”都有唯一�
 | 前台运行 | `Type=simple` | `ProgramArguments` 直指二进制 | 见第 3 节 |
 | 退出即拉起 | `Restart=always` + `RestartSec=5` | `KeepAlive` + `ThrottleInterval=10` | 常驻进程不应退出；限流避免失败重启风暴 |
 | 重启风暴兜底 | `StartLimitIntervalSec=60` + `StartLimitBurst=10` | `ThrottleInterval` | 单实例锁冲突会快速失败 |
-| 停止语义 | `KillSignal=SIGTERM` + `TimeoutStopSec=30` + `KillMode=control-group` | `ExitTimeOut=30` | 停止时连 `wist-exec` 子进程一起收走；未完成执行交由 crash recovery |
+| 停止语义 | `KillSignal=SIGTERM` + `TimeoutStopSec=30` + `KillMode=control-group` | `ExitTimeOut=30` | 停止时连 `wist-exec` 子进程一起收走；未完成执行交由 crash recovery。升级器不受此回收：它另立瞬态 unit（见架构 §11.2）|
 | 环境变量 | `EnvironmentFile=-<config>/agentd.env`（可缺失） | 仅显式 `PATH` | 放长期环境变量；注册 token 走命令行，不落盘 |
 | 日志 | `StandardOutput/Error=journal` | `StandardOut/ErrorPath` 落 `/var/log/wist-agentd/` | journald 自带回收；launchd 需 newsyslog |
 | 权限 | `NoNewPrivileges=true`、`LimitNOFILE=65536` | 运行在 root（LaunchDaemon） | 只禁提权、不降权：agent 仍要以 root 读受限日志路径 |

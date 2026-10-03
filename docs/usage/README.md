@@ -102,6 +102,8 @@ journalctl -u wist-agentd -f
 - 只停不 disable：macOS 的 plist 还在 → 下次图形登录重新加载；Linux 的 unit 仍 enabled → **重启机器**会再起。
 - 停止是优雅的：`ExitTimeOut=30` / `TimeoutStopSec=30`（先 SIGTERM，30s 后 SIGKILL）。Linux
   `KillMode=control-group` 会连 `wist-exec` 一起收走，未完成的执行由下次启动的 crash recovery 重排。
+- 唯一的例外是升级器：Linux 上它被拉成独立的瞬态 unit（`systemd-run`），不会被这次回收冲掉 —— 
+  否则「换件成功、刚重启」那一步会被连坐杀死，升级会被误判成失败。
 - `uninstall` 不删配置、state、日志（保留 agent 身份，便于复装）。
 - 谁拉起来的：macOS `launchctl blame gui/$(id -u)/com.dayu-sec.wist-agentd`；
   Linux `systemctl show wist-agentd -p NRestarts`。

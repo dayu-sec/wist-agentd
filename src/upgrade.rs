@@ -9,6 +9,9 @@
 //! - 单独二进制：它必须能在 **agentd 被换掉的那个窗口里活着** —— 等新版起来、失败回滚。
 //!   agentd 对 `wist-exec` 的每个子进程有完整生命周期控制（超时杀 / cancel / kill），
 //!   所以**不能**把它塞进 `wist-exec`；它也不该进 agentd 自己的调度，而是以分离进程运行。
+//!   Linux 上还要再进一步：由 agentd 把它包成一个**独立的 systemd 瞬态 unit** 拉起
+//!   （见 [`spawn_upgrader`]）—— 否则 agentd 的 `KillMode=control-group` 会在
+//!   `systemctl restart` 时按 cgroup 把它一起收走。
 //!
 //! ## 与 `install.sh` 的关系：同一份制品、同一套动作
 //!
@@ -1005,8 +1008,11 @@ pub fn build_launch(program: &Path, config_dir: &Path, request: &UpgradeRequest)
 
 /// 把升级器作为**分离进程**起起来（不等待、不随 agentd 退出而死），返回其 pid。
 ///
-/// 为什么要自成会话：agentd 马上就会被这个进程换掉并重启。留在同一个会话里，
-/// 服务管理器回收整个会话时会把它一起收走 —— 而它正是「在 agentd 死掉的窗口里必须活着」的那个。
+/// 为什么要自成会话：agentd 马上就会被这个进程换掉并重启，它必须在那个窗口里活着。
+/// `setsid()` 能逃开**按会话/进程组**回收的服务管理器（launchd），但**逃不开 systemd 的
+/// cgroup** —— `wist-agentd.service` 是 `KillMode=control-group`，`systemctl restart` 按 cgroup
+/// 把整组进程一起收走。所以 Linux 上真正的入口是 [`spawn_upgrader`]（先包成独立瞬态 unit），
+/// 本函数只作为它的退化路径（无 `systemd-run`）与 launchd 路径。
 pub fn launch_detached(launch: &UpgradeLaunch, log_path: &Path) -> std::io::Result<u32> {
     if let Some(parent) = log_path.parent()
         && !parent.as_os_str().is_empty()
@@ -1042,6 +1048,133 @@ pub fn launch_detached(launch: &UpgradeLaunch, log_path: &Path) -> std::io::Resu
     // 不 `wait`：它的生命周期比本次调用长得多（要活到新版 agentd 起来）。
     // 它退出时会短暂成为僵尸，旧 agentd 一死就由服务管理器收尸 —— 对一件稀有动作可接受。
     Ok(child.id())
+}
+
+/// systemd 瞬态 unit 名前缀：一眼能看出这是「一次升级」的进程。
+const UPGRADER_UNIT_PREFIX: &str = "wist-upgrader-";
+
+/// 瞬态 unit 名：unit 名只允许 `[A-Za-z0-9:_.-]`，`work_id` 里其余字符一律换成 `_`。
+///
+/// 用 `work_id`（而非随机名）是为了运维能直接 `systemctl status wist-upgrader-<id>` 找到它。
+pub fn upgrader_unit_name(work_id: &str) -> String {
+    let mut name = String::from(UPGRADER_UNIT_PREFIX);
+    for ch in work_id.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, ':' | '_' | '.' | '-') {
+            name.push(ch);
+        } else {
+            name.push('_');
+        }
+    }
+    name
+}
+
+/// 把升级器包进一个**独立的 systemd 瞬态 unit**（纯构造，便于单测）。
+///
+/// 为什么必须独立成 unit：`wist-agentd.service` 用 `KillMode=control-group`，`systemctl restart`
+/// 是按 **cgroup** 回收进程的；升级器是 agentd 的子进程，`setsid()` 只换会话、换不掉 cgroup，
+/// 于是会被这次 restart 一起杀掉（记录停在 `restart`，心跳断 60s 后即被判死）。
+/// 拉成瞬态 unit 后它自带一个新 cgroup，restart 收不到它，`wait_ready` 才有机会跑完并上报成功。
+pub fn build_systemd_run_launch(
+    inner: &UpgradeLaunch,
+    scope_is_system: bool,
+    unit_name: &str,
+    log_path: &Path,
+    env_file: &Path,
+) -> UpgradeLaunch {
+    let mut args = Vec::new();
+    if !scope_is_system {
+        args.push("--user".to_string());
+    }
+    args.push(format!("--unit={unit_name}"));
+    // 退出即清（成功失败都清）：留着同名 unit 会让下一次同 work_id 的升级起不来。
+    args.push("--collect".to_string());
+    // `exec`：让 systemd-run 等到 `execve` 成功才算起 unit 成功。默认的 `simple` 在 execve
+    // **之前**就报成功 —— 那样一个起不来的升级器会被当成“已派发”，白白占住互斥锁。
+    args.push("--service-type=exec".to_string());
+    // 日志仍去 agentd 那份文件（与不包 unit 时一致，运维不用换地方找）。
+    let log = systemd_property_path_escape(&log_path.display().to_string());
+    args.push(format!("--property=StandardOutput=append:{log}"));
+    args.push(format!("--property=StandardError=append:{log}"));
+    // 瞬态 unit 跑在 systemd 给的干净环境里，**不继承** agentd 的进程环境；长期环境变量
+    // （代理等）得显式指向 agentd 用的同一份 EnvironmentFile。
+    let env = systemd_property_path_escape(&env_file.display().to_string());
+    args.push(format!("--property=EnvironmentFile=-{env}"));
+    args.push(format!("--property=SyslogIdentifier={unit_name}"));
+    // `--` 把 systemd-run 的选项与要跑的命令分开，命令原样跟在后面。
+    args.push("--".to_string());
+    args.push(systemd_exec_escape(&inner.program.display().to_string()));
+    args.extend(inner.args.iter().map(|arg| systemd_exec_escape(arg)));
+    UpgradeLaunch {
+        program: PathBuf::from("systemd-run"),
+        args,
+    }
+}
+
+/// 命令（会被当成 `ExecStart`）里不该被服务管理器展开的字符要转义：
+/// `$`→`$$`（环境变量展开）、`%`→`%%`（specifier 展开）。
+///
+/// 不转义的话，URL 里的百分号编码（如 `%2F`）会被当成 specifier 吞掉，`$` 会被当变量展开 ——
+/// 而走 [`launch_detached`] 时这些参数是逐字传的，两条路径的语义必须一致。
+fn systemd_exec_escape(arg: &str) -> String {
+    arg.replace('$', "$$").replace('%', "%%")
+}
+
+/// unit 属性里的路径只做 specifier 转义（`%`→`%%`）。
+///
+/// 属性值不做 `$` 展开，所以**不能**顺手把 `$` 也转了（那会把一个 `$` 写成两个）——
+/// 只转 `%`。这也跟 unit 文件里对 `EnvironmentFile=` / `StandardOutput=` 路径的处理一致。
+fn systemd_property_path_escape(value: &str) -> String {
+    value.replace('%', "%%")
+}
+
+/// 拉起升级器，并保证它能**活过**紧接着的 `systemctl restart wist-agentd`。
+///
+/// Linux/systemd 上包成独立瞬态 unit（见 [`build_systemd_run_launch`]）；没有 `systemd-run`
+///（容器 / 非 systemd 发行版）或其他平台（launchd 按进程组回收，`setsid` 已足够）沿用
+/// [`launch_detached`]。返回一个用于日志的句柄：瞬态 unit 名，或分离进程的 pid。
+pub fn spawn_upgrader(
+    launch: &UpgradeLaunch,
+    log_path: &Path,
+    work_id: &str,
+    scope_is_system: bool,
+    env_file: &Path,
+) -> Result<String, String> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(parent) = log_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|err| format!("create log dir: {err}"))?;
+        }
+        let unit = upgrader_unit_name(work_id);
+        let wrapped = build_systemd_run_launch(launch, scope_is_system, &unit, log_path, env_file);
+        match std::process::Command::new(&wrapped.program)
+            .args(&wrapped.args)
+            .output()
+        {
+            // 起 unit 成功即返回：`systemd-run` 只是个 D-Bus 客户端，立刻退出；升级器在那个
+            // 瞬态 unit 里继续跑（不等它：它的生命周期比本次调用长得多）。
+            Ok(output) if output.status.success() => return Ok(unit),
+            // `systemd-run` 在，但没起起来（权限 / 总线不可达 / 重名）：如实报错，绝不确认这活。
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let detail = if stderr.trim().is_empty() {
+                    format!("exit status {}", output.status)
+                } else {
+                    stderr.trim().to_string()
+                };
+                return Err(format!("systemd-run {unit}: {detail}"));
+            }
+            // 没有 systemd-run：不是 systemd 环境，退回到分离进程。
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(format!("run systemd-run: {err}")),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (work_id, scope_is_system, env_file);
+    launch_detached(launch, log_path)
+        .map(|pid| pid.to_string())
+        .map_err(|err| format!("launch {}: {err}", launch.program.display()))
 }
 
 /// 执行一次升级，并把进度/结果落盘。
@@ -1619,6 +1752,185 @@ mod tests {
         }
         assert!(marker.is_file(), "detached child should have run");
         assert!(dir.join("log").join("out.log").is_file(), "log file");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// systemd 上必须把升级器包成**独立瞬态 unit**：否则 `systemctl restart wist-agentd`
+    /// （`KillMode=control-group`，按 cgroup 回收）会把它和旧 agentd 一起收走 ——
+    /// 记录停在 `restart`、心跳断 60s，于是每次成功升级都被判死。
+    #[test]
+    fn systemd_run_launch_wraps_the_upgrader_in_its_own_unit() {
+        let inner = UpgradeLaunch {
+            program: PathBuf::from("/usr/local/bin/wist-upgrader"),
+            args: vec![
+                "apply".to_string(),
+                "--work-id".to_string(),
+                "work-1".to_string(),
+            ],
+        };
+        let log = Path::new("/var/log/wist-agentd/wist-upgrader.log");
+        let env_file = Path::new("/etc/wist-agentd/agentd.env");
+
+        let system = build_systemd_run_launch(&inner, true, "wist-upgrader-work-1", log, env_file);
+        assert_eq!(system.program, PathBuf::from("systemd-run"));
+        assert!(
+            !system.args.iter().any(|arg| arg == "--user"),
+            "system 作用域不带 --user：{:?}",
+            system.args
+        );
+        assert!(
+            system
+                .args
+                .iter()
+                .any(|arg| arg == "--unit=wist-upgrader-work-1")
+        );
+        // `--collect`：退出即清，免得同名 unit 残留挡住下一次同 work_id 的升级。
+        assert!(system.args.iter().any(|arg| arg == "--collect"));
+        // `exec`：起 unit 成功要到 execve 成功为止，否则起不来的升级器会被误当成已派发。
+        assert!(system.args.iter().any(|arg| arg == "--service-type=exec"));
+        assert!(
+            system
+                .args
+                .iter()
+                .any(|arg| arg == "--property=EnvironmentFile=-/etc/wist-agentd/agentd.env"),
+            "瞬态 unit 不继承 agentd 进程环境，要显式指出 EnvironmentFile：{:?}",
+            system.args
+        );
+        assert!(system.args.iter().any(|arg| {
+            arg == "--property=StandardOutput=append:/var/log/wist-agentd/wist-upgrader.log"
+        }));
+        assert!(
+            system
+                .args
+                .iter()
+                .any(|arg| arg == "--property=SyslogIdentifier=wist-upgrader-work-1")
+        );
+        // `--` 把 systemd-run 的选项与命令分开：它只能出现一次，且之前全是以 `-` 开头的选项。
+        assert_eq!(system.args.iter().filter(|arg| *arg == "--").count(), 1);
+        let sep = system
+            .args
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("separator before the command");
+        assert!(
+            system.args[..sep].iter().all(|arg| arg.starts_with('-')),
+            "选项必须在 `--` 之前：{:?}",
+            system.args
+        );
+        assert_eq!(system.args[sep + 1], "/usr/local/bin/wist-upgrader");
+        assert_eq!(&system.args[sep + 2..], &inner.args[..]);
+
+        // user 作用域要带 `--user`（走用户的 systemd 实例）。
+        let user = build_systemd_run_launch(&inner, false, "wist-upgrader-work-1", log, env_file);
+        assert!(user.args.iter().any(|arg| arg == "--user"));
+    }
+
+    /// 命令（会被当成 `ExecStart`）里带 `$` / `%` 必须转义：systemd-run 会把它们当变量 / specifier
+    /// 展开。`%` 不是可选项 —— URL 里的百分号编码（`%2F`）不加转义就会被吞掉。
+    #[test]
+    fn systemd_run_launch_escapes_dollar_and_percent_in_the_command() {
+        let inner = UpgradeLaunch {
+            program: PathBuf::from("/usr/local/bin/wist-upgrader"),
+            args: vec![
+                "https://gw/pkg%2Fa?token=$FILE".to_string(),
+                "plain".to_string(),
+            ],
+        };
+        let wrapped = build_systemd_run_launch(
+            &inner,
+            true,
+            "wist-upgrader-w",
+            Path::new("/var/log/x.log"),
+            Path::new("/etc/wist-agentd/agentd.env"),
+        );
+        let sep = wrapped.args.iter().position(|a| a == "--").expect("--");
+        // `$`→`$$`、`%`→`%%`；不含这两个字符的参数原样不动。
+        assert_eq!(&wrapped.args[sep + 2], "https://gw/pkg%%2Fa?token=$$FILE");
+        assert_eq!(&wrapped.args[sep + 3], "plain");
+    }
+
+    /// 属性里的路径只转 `%`（不转 `$`）：属性值不做 `$` 展开，多转会把一个 `$` 写成两个。
+    #[test]
+    fn systemd_run_launch_escapes_percent_in_property_paths() {
+        let inner = UpgradeLaunch {
+            program: PathBuf::from("/usr/local/bin/wist-upgrader"),
+            args: Vec::new(),
+        };
+        let wrapped = build_systemd_run_launch(
+            &inner,
+            true,
+            "wist-upgrader-w",
+            Path::new("/var/log/%d/up.log"),
+            Path::new("/etc/%n/agentd.env"),
+        );
+        assert!(
+            wrapped
+                .args
+                .iter()
+                .any(|arg| { arg == "--property=StandardOutput=append:/var/log/%%d/up.log" })
+        );
+        assert!(
+            wrapped
+                .args
+                .iter()
+                .any(|arg| arg == "--property=EnvironmentFile=-/etc/%%n/agentd.env")
+        );
+    }
+
+    #[test]
+    fn upgrader_unit_name_sanitizes_the_work_id() {
+        assert_eq!(upgrader_unit_name("work-1"), "wist-upgrader-work-1");
+        // unit 名只允许 [A-Za-z0-9:_.-]，其余一律替换，避免 systemd 拒收。
+        assert_eq!(upgrader_unit_name("a/b c@d"), "wist-upgrader-a_b_c_d");
+        // 空 work_id 也得是个合法 unit 名（前面有固定前缀）。
+        assert_eq!(upgrader_unit_name(""), "wist-upgrader-");
+        // 非 ASCII 一律替换（systemd unit 名只接受 ASCII 白名单）。
+        assert_eq!(upgrader_unit_name("工单-1"), "wist-upgrader-__-1");
+        // 白名单内的字符原样保留。
+        assert_eq!(upgrader_unit_name("a:b_c.d-e"), "wist-upgrader-a:b_c.d-e");
+    }
+
+    /// 非 Linux（以及无 `systemd-run` 的 Linux）走原来的分离进程：句柄是 pid，且脚本真跑起来了。
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn spawn_upgrader_falls_back_to_a_detached_process() {
+        let dir = temp_dir("spawn-fallback");
+        let marker = dir.join("marker");
+        let script = dir.join("fake-upgrader");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\necho started > {}\n", marker.display()),
+        )
+        .expect("write script");
+        set_executable(&script).expect("chmod");
+
+        let launch = UpgradeLaunch {
+            program: script,
+            args: Vec::new(),
+        };
+        let log_path = dir.join("log").join("out.log");
+        let handle = spawn_upgrader(
+            &launch,
+            &log_path,
+            "work-fallback",
+            true,
+            Path::new("/etc/wist-agentd/agentd.env"),
+        )
+        .expect("spawn");
+        // 分离进程路径返回 pid（纯数字），而不是瞬态 unit 名。
+        assert!(
+            handle.parse::<u32>().is_ok(),
+            "expected a pid, got {handle}"
+        );
+
+        for _ in 0..50 {
+            if marker.is_file() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(marker.is_file(), "detached child should have run");
+        assert!(log_path.is_file(), "log file");
         let _ = fs::remove_dir_all(dir);
     }
 

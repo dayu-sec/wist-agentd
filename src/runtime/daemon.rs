@@ -1582,9 +1582,12 @@ async fn refresh_work_grant(
             continue;
         }
         match dispatch_upgrade(loop_ctx, work) {
-            Ok(pid) => {
+            Ok(handle) => {
                 runtime.mark_one_shot_execution(&work.work_id, "dispatched");
-                eprintln!("event=UpgradeDispatched work_id={} pid={pid}", work.work_id);
+                eprintln!(
+                    "event=UpgradeDispatched work_id={} handle={handle}",
+                    work.work_id
+                );
                 // 确认只对“真派出去的活”发：起不了进程就不确认，网关页面上「一直没确认」
                 // 正是这种情况该有的样子（与常驻工作“参数读不懂就不确认”同一取舍）。
                 if ack_work(config, &work.work_id, 0).await {
@@ -1666,7 +1669,7 @@ fn upgrade_request_for(
     })
 }
 
-/// 把一件升级交给升级器执行（分离进程），返回其 pid。
+/// 把一件升级交给升级器执行（分离进程），返回其句柄（systemd 瞬态 unit 名，或 pid）。
 ///
 /// 参数全部从工作参数里取，**不做任何默认**：取哪个包必须写在 `spec` 里 ——
 /// 让「升级」这件事只有一个证据来源（网关派下来的那份），而不是 agent 自己的猜测。
@@ -1674,7 +1677,7 @@ fn upgrade_request_for(
 fn dispatch_upgrade(
     loop_ctx: &DaemonLoop<'_>,
     entry: &wist_contracts::work::OneShotWork,
-) -> Result<u32, String> {
+) -> Result<String, String> {
     let agentd_bin =
         std::env::current_exe().map_err(|err| format!("resolve current exe: {err}"))?;
     let request = upgrade_request_for(agentd_bin, entry)?;
@@ -1691,8 +1694,19 @@ fn dispatch_upgrade(
         launch.program.display(),
         log_path.display()
     );
-    crate::upgrade::launch_detached(&launch, &log_path)
-        .map_err(|err| format!("launch {}: {err}", launch.program.display()))
+    // 作用域：与升级器自己挑重启手段（`systemctl [--user] restart`）是同一个判据
+    // —— 配置目录在 `/etc` 下 = system。它决定瞬态 unit 走系统实例还是 `--user`。
+    let scope_is_system =
+        crate::config_runtime::system_data_root_for(loop_ctx.config_dir).is_some();
+    // 瞬态 unit 不继承 agentd 的进程环境，把同一份长期环境变量文件交给它。
+    let env_file = loop_ctx.config_dir.join(crate::service::ENV_FILE_NAME);
+    crate::upgrade::spawn_upgrader(
+        &launch,
+        &log_path,
+        &entry.work_id,
+        scope_is_system,
+        &env_file,
+    )
 }
 
 /// 从升级器落盘的记录里同步进度/结果，返回「本机视图是否因此变了」。

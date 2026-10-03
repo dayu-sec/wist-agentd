@@ -433,6 +433,25 @@ agentd 对 `wist-exec` 一类动作有超时杀/取消/回收，升级若挂在�
 agentd 发现进度停在 `running` 而心跳超过 60s 没动，就判定这个进程已经没了（被 kill / 崩溃 / 卡死），
 把结果报成 `failed`（说明里写清“判定已死，机器可能停在中间态”），并解开互斥锁，让新的升级能派下去。
 
+### 11.2 Linux：还要跳出 agentd 的 cgroup
+
+`setsid()` 只能让升级器脱离**会话/进程组** —— 这足够骗过 launchd（按进程组回收），但骗不过 systemd：
+`wist-agentd.service` 是 `KillMode=control-group`，`systemctl restart` 按 **cgroup** 收走整组进程，
+而 cgroup 归属是继承来的、`setsid` 改不了。于是升级器会在「换件成功、刚发出 restart」那一步被连坐
+杀掉：记录停在 `restart`、心跳断 60s，新版 agentd 启动后把它判死并报成 `failed` —— 一次**成功**的
+升级反而被记成失败（机器其实已经换好并跑起来了）。
+
+Linux 上 agentd 用 `systemd-run` 把升级器拉成一个**独立的瞬态 unit**（`wist-upgrader-<work_id>`，
+`--collect` 退出即清，日志仍旧去 `log_dir/wist-upgrader.log`）：它自带新 cgroup，`systemctl restart
+wist-agentd` 收不到它，`wait_ready` 才能跑完并上报成功。没有 `systemd-run`（容器 / 非 systemd 环境）
+时退回分离进程；launchd 路径不变。
+
+另外，`wist-agentd diagnose` 也把这一状态报出来（`upgrade.local`）：读 `state/upgrade.json` +
+`state/upgrade.heartbeat`，用与守护进程**同一套**判据（`heartbeat_is_fresh` / `UPGRADER_DEAD_AFTER`）
+折算成 OK/WARN/FAIL —— 记录停在 `running` 而心跳过期就是 FAIL（“升级器已失联（判定已死）”）。
+不报的话会“对不上”：agentd 判死只报给控制面、**不重写升级记录**（那份记录是升级器写的），
+本机 diagnose 便会全绿（2026-10-03 实撞）。
+
 ---
 
 ## 12. 启动顺序
