@@ -288,6 +288,7 @@ async fn diagnose(config_root: &Path, offline: bool) -> Report {
     checks.extend(path_checks(&config));
     checks.extend(identity_checks(&config).await);
     checks.extend(service_checks(config_root, &config));
+    checks.extend(exporter_tool_checks(&config));
 
     if offline {
         checks.push(Check::warn(
@@ -876,6 +877,29 @@ fn binary_checks() -> Vec<Check> {
         )),
     }
     checks
+}
+
+/// 导出器工具：缺的**记在本地状态**里（由守护进程跑前预检写入），这里如实报出来。
+///
+/// 为什么读状态而不是自己 `stat`：需求是「缺件被记录」，而记录点就在采集路径上
+/// （`process_exporters` 跑前预检）；diagnose 只做**呈现**，不另造一份判据。
+fn exporter_tool_checks(config: &AgentConfig) -> Vec<Check> {
+    let state_dir = PathBuf::from(&config.paths.state_dir);
+    let missing = crate::telemetry::exporters::load_state(&state_dir).missing;
+    if missing.is_empty() {
+        return Vec::new();
+    }
+    let detail = missing
+        .iter()
+        .map(|(id, path)| format!("{id}（{path}）"))
+        .collect::<Vec<_>>()
+        .join("、");
+    vec![
+        Check::warn("exporter.tools", "导出器工具缺失", detail).hint(
+            "对应采集面今天采不到；装上工具后守护进程会自动恢复\
+             （如 apt-get install smartmontools / auditd）",
+        ),
+    ]
 }
 
 /// 控制面连通：DNS → TCP → 应用层（TLS + 鉴权）。
@@ -1664,6 +1688,42 @@ mod tests {
         (time::OffsetDateTime::now_utc() + time::Duration::seconds(seconds))
             .format(&time::format_description::well_known::Rfc3339)
             .expect("format timestamp")
+    }
+
+    #[test]
+    fn missing_exporter_tools_are_reported_from_recorded_state() {
+        // 优先预检记录在 `state/exporters.json` 的 `missing`；diagnose 只做呈现。
+        let dir = std::env::temp_dir().join(format!("wist-doctor-exp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mut recorded = crate::telemetry::exporters::ExporterState::default();
+        recorded
+            .missing
+            .insert("smartctl".to_string(), "/usr/sbin/smartctl".to_string());
+        crate::telemetry::exporters::save_state(&dir, &recorded);
+
+        let mut config = template_config();
+        config.paths.state_dir = dir.display().to_string();
+        let checks = exporter_tool_checks(&config);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, Status::Warn);
+        assert!(
+            checks[0].detail.contains("smartctl"),
+            "{}",
+            checks[0].detail
+        );
+        assert!(checks[0].hint.is_some(), "要告诉运维怎么处置");
+
+        // 没记录 → 不报（不造噪声）。
+        let empty =
+            std::env::temp_dir().join(format!("wist-doctor-exp-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&empty);
+        std::fs::create_dir_all(&empty).expect("mkdir");
+        config.paths.state_dir = empty.display().to_string();
+        assert!(exporter_tool_checks(&config).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty);
     }
 
     #[test]

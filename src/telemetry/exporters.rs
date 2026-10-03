@@ -203,39 +203,56 @@ pub async fn run_argv(argv: &[String], timeout_secs: u64) -> io::Result<String> 
     }
 }
 
-/// 导出器上次运行时刻的本地状态（跨 restart 保留，避免重启就重跑快照）。
+/// agentd 对导出器的本地状态（跨 restart 保留）：上次跑的时刻 + **缺的工具**。
+///
+/// 「缺的工具」记在这里（`id -> 二进制路径`），供 `diagnose` 展示 —— 缺件不是靠 `spawn` 报错
+/// 得知的，而是**跑前预检**得出的，并在恢复时自动清掉。
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct Schedule {
+pub struct ExporterState {
     #[serde(default)]
-    last_run_ms: BTreeMap<String, i64>,
+    pub last_run_ms: BTreeMap<String, i64>,
+    #[serde(default)]
+    pub missing: BTreeMap<String, String>,
 }
 
-fn schedule_path(state_dir: &Path) -> PathBuf {
+fn state_path(state_dir: &Path) -> PathBuf {
     state_dir.join("exporters.json")
 }
 
-/// 读调度状态；文件不存在 / 坏了都当「从没跑过」（最多重跑一次快照，不致命）。
-pub fn load_schedule(state_dir: &Path) -> BTreeMap<String, i64> {
-    std::fs::read(schedule_path(state_dir))
+/// 读状态；文件不存在 / 坏了都当空（最多重跑一次快照，不致命）。
+pub fn load_state(state_dir: &Path) -> ExporterState {
+    std::fs::read(state_path(state_dir))
         .ok()
-        .and_then(|bytes| serde_json::from_slice::<Schedule>(&bytes).ok())
-        .map(|schedule| schedule.last_run_ms)
+        .and_then(|bytes| serde_json::from_slice::<ExporterState>(&bytes).ok())
         .unwrap_or_default()
 }
 
-/// 写调度状态（原子替换，避免半份文件）。
-pub fn save_schedule(state_dir: &Path, last_run_ms: &BTreeMap<String, i64>) {
-    let snapshot = Schedule {
-        last_run_ms: last_run_ms.clone(),
-    };
-    let Ok(bytes) = serde_json::to_vec_pretty(&snapshot) else {
+/// 写状态（原子替换，避免半份文件）。
+pub fn save_state(state_dir: &Path, state: &ExporterState) {
+    let Ok(bytes) = serde_json::to_vec_pretty(state) else {
         return;
     };
-    let path = schedule_path(state_dir);
+    let path = state_path(state_dir);
     let tmp = path.with_extension("json.tmp");
     if std::fs::write(&tmp, bytes).is_ok() {
         let _ = std::fs::rename(&tmp, &path);
     }
+}
+
+/// 工具在不在：**跑前就判**（不是 `spawn` 报错），且要**可执行**而不只是存在。
+///
+/// 为什么要预检：缺件是**部署缺口**（如忘装 `smartmontools`），拿「进程启动失败」去表达
+/// 既难归因又不能区别「没装」与「跑了但退出非 0」。预检只碰文件系统，不进子进程。
+pub fn tool_present(tool: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(tool)
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// argv 里的二进制路径（argv[0]）。
+pub fn tool_path(argv: &[String]) -> Option<&str> {
+    argv.first().map(String::as_str)
 }
 
 /// 当前时刻（毫秒），供调度用。
@@ -341,15 +358,33 @@ mod tests {
     }
 
     #[test]
-    fn schedule_round_trips_and_survives_a_missing_file() {
+    fn state_round_trips_missing_file_and_records_missing_tools() {
         let dir = std::env::temp_dir().join(format!("wist-exporters-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
-        // 文件不存在 → 空表（而不是报错）。
-        assert!(load_schedule(&dir).is_empty());
-        let mut map = BTreeMap::new();
-        map.insert("work-1".to_string(), 12345i64);
-        save_schedule(&dir, &map);
-        assert_eq!(load_schedule(&dir), map);
+        // 文件不存在 → 空状态（而不是报错）。
+        let empty = load_state(&dir);
+        assert!(empty.last_run_ms.is_empty() && empty.missing.is_empty());
+
+        let mut state = ExporterState::default();
+        state.last_run_ms.insert("work-1".to_string(), 12345i64);
+        state
+            .missing
+            .insert("smartctl".to_string(), "/usr/sbin/smartctl".to_string());
+        save_state(&dir, &state);
+        let loaded = load_state(&dir);
+        assert_eq!(loaded.last_run_ms, state.last_run_ms);
+        assert_eq!(loaded.missing, state.missing);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tool_presence_preflight_distinguishes_missing_from_present() {
+        // 跑前预检：存在的可执行文件为真，不存在的为假。
+        assert!(tool_present("/bin/sh"));
+        assert!(!tool_present("/usr/sbin/wist-does-not-exist"));
+        assert_eq!(
+            tool_path(&["/usr/sbin/smartctl".to_string(), "--scan-open".to_string()]),
+            Some("/usr/sbin/smartctl")
+        );
     }
 }

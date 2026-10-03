@@ -284,22 +284,29 @@ pub(super) async fn process_exporters(
     next_seq: &mut u64,
 ) {
     let runs = work.exporter_runs();
+    let mut state = exporters::load_state(state_dir);
+    let mut changed = false;
+    // 剪掉不在本次授权里的缺件记录（面撤了，记录不该留着误导）。
+    let before = state.missing.len();
+    state
+        .missing
+        .retain(|id, _| runs.iter().any(|run| run.exporter_id == *id));
+    if state.missing.len() != before {
+        changed = true;
+    }
     if runs.is_empty() {
+        if changed {
+            exporters::save_state(state_dir, &state);
+        }
         return;
     }
-    let mut schedule = exporters::load_schedule(state_dir);
+
     let now = exporters::now_ms();
-    let mut changed = false;
+    let mut ran_any = false;
     for run in runs {
         let Some(def) = exporters::def(&run.exporter_id) else {
             continue;
         };
-        if !exporters::is_due(def.period_secs, schedule.get(&run.input_id).copied(), now) {
-            continue;
-        }
-        // 先记「已尝试」：失败也推进下次时间（否则一个坏导出器每 tick 重试）。
-        schedule.insert(run.input_id.clone(), now);
-        changed = true;
         let argv = match exporters::argv_for(&run.exporter_id, run.arg.as_deref()) {
             Ok(argv) => argv,
             Err(err) => {
@@ -307,6 +314,41 @@ pub(super) async fn process_exporters(
                 continue;
             }
         };
+        // **跑前预检**：工具不在就别 spawn —— 缺件是部署缺口（如忘装 smartmontools），
+        // 不是「运行错误」。如实记进状态（`diagnose` 会展示），工具装上即自动恢复。
+        let tool = exporters::tool_path(&argv).unwrap_or_default().to_string();
+        if !exporters::tool_present(&tool) {
+            let newly = state.missing.get(&run.exporter_id) != Some(&tool);
+            state.missing.insert(run.exporter_id.clone(), tool.clone());
+            if newly {
+                changed = true;
+                eprintln!(
+                    "wist-agentd exporter {} tool missing: {tool} \
+                     （对应面今天采不到；装上后自动恢复）",
+                    run.exporter_id
+                );
+            }
+            // 不推进周期：工具一装上，下一个 tick 就能跑。
+            continue;
+        }
+        if state.missing.remove(&run.exporter_id).is_some() {
+            changed = true;
+            eprintln!(
+                "wist-agentd exporter {} tool available again: {tool}",
+                run.exporter_id
+            );
+        }
+        if !exporters::is_due(
+            def.period_secs,
+            state.last_run_ms.get(&run.input_id).copied(),
+            now,
+        ) {
+            continue;
+        }
+        // 先记「已尝试」：失败也推进下次时间（否则一个坏导出器每 tick 重试）。
+        state.last_run_ms.insert(run.input_id.clone(), now);
+        changed = true;
+        ran_any = true;
         match exporters::run_argv(&argv, def.timeout_secs).await {
             Ok(output) => {
                 let records = exporters::records_from_output(
@@ -337,10 +379,10 @@ pub(super) async fn process_exporters(
         }
     }
     if changed {
-        exporters::save_schedule(state_dir, &schedule);
-        if let Err(err) = log_seq_state::store_async(global_seq_path, *next_seq).await {
-            eprintln!("wist-agentd exporter seq persist failed: {err}");
-        }
+        exporters::save_state(state_dir, &state);
+    }
+    if ran_any && let Err(err) = log_seq_state::store_async(global_seq_path, *next_seq).await {
+        eprintln!("wist-agentd exporter seq persist failed: {err}");
     }
 }
 
