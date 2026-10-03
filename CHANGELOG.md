@@ -3,6 +3,25 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.21] - 2026-10-03
+
+### 新增
+
+- **定时导出器（`Exporter` 来源）落地**：采集内容目录里那些「不是 tail 一个文件」的来源
+  （journald、`last`、`smartctl`、`nft` / `iptables-save`、`dmesg`、`auditd`）现在能采了。agentd 按
+  **授权**把它们折算成**周期任务**：到点跑一条**固定命令**（无 shell、无参数拼接、有超时），
+  输出按行变成记录上送，`source_path` 记为 `exporter:<target>`。
+- 导出器上次运行时刻落本地 `state/exporters.json`（跨重启保留，重启不重跑快照）。
+- 失败（二进制缺失 / 退出非 0 / 超时）如实打到自观测，不静默。
+
+### 说明
+
+- 「能不能采」的判据与网关是**同一个**（`wist-contracts::work::is_executable_source`）：只有
+  **已知导出器 ID** 才算可采，未知 ID 仍如实报 `unsupported`。
+- 首版导出器：`journalctl-unit` / `journalctl-shutdown` / `last-reboot` / `nft-ruleset` /
+  `iptables-save` / `smartctl` / `dmesg`（`panic` / `nvidia-xid`）/ `auditd-execve`。
+  命令路径与开关按通用发行版写，**建议在目标机核对**；`smartctl` 首版只枚举磁盘。
+
 ## [0.1.20] - 2026-10-02
 
 ### 修复

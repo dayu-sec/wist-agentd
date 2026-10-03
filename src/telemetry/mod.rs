@@ -1,6 +1,7 @@
 //! Telemetry runtime building blocks.
 
 pub mod buffer;
+pub mod exporters;
 pub mod logs;
 pub mod metrics;
 pub mod spool;

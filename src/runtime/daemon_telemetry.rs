@@ -1,10 +1,12 @@
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use wist_contracts::agent_config::{AgentConfig, LogFileInputSection, LogsOutputSection};
 use wist_shared::time::now_rfc3339;
 
 use crate::control::work::AppliedWorkGrant;
+use crate::state_store::log_seq_state;
+use crate::telemetry::exporters;
 use crate::telemetry::logs::InputOrigin;
 use crate::telemetry::logs::files::{FileInputProcessor, ProcessOutcome};
 use crate::telemetry::warp_parse::{
@@ -264,6 +266,82 @@ pub(super) async fn process_telemetry_inputs(
     }
 
     tick
+}
+
+/// 跑一轮**到点**的导出器（`Exporter` 来源），把输出当记录上送。
+///
+/// 与 [`process_telemetry_inputs`] 平行，但导出器不是「读一个文件」而是「**周期跑一条固定命令**」：
+///   * 周期是导出器属性（`crate::telemetry::exporters`），到点才跑；上次运行时刻落本地状态；
+///   * 跑**无论成败都推进下次时间**（失败不每 tick 重试，避免刷屏）；
+///   * 失败/写失败都如实打到自观测（`agentd.err`），不静默。
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn process_exporters(
+    work: &AppliedWorkGrant,
+    state_dir: &Path,
+    agent_id: &str,
+    global_seq_path: &Path,
+    sink: &mut TelemetryRecordSink,
+    next_seq: &mut u64,
+) {
+    let runs = work.exporter_runs();
+    if runs.is_empty() {
+        return;
+    }
+    let mut schedule = exporters::load_schedule(state_dir);
+    let now = exporters::now_ms();
+    let mut changed = false;
+    for run in runs {
+        let Some(def) = exporters::def(&run.exporter_id) else {
+            continue;
+        };
+        if !exporters::is_due(def.period_secs, schedule.get(&run.input_id).copied(), now) {
+            continue;
+        }
+        // 先记「已尝试」：失败也推进下次时间（否则一个坏导出器每 tick 重试）。
+        schedule.insert(run.input_id.clone(), now);
+        changed = true;
+        let argv = match exporters::argv_for(&run.exporter_id, run.arg.as_deref()) {
+            Ok(argv) => argv,
+            Err(err) => {
+                eprintln!("wist-agentd exporter {} failed: {err}", run.exporter_id);
+                continue;
+            }
+        };
+        match exporters::run_argv(&argv, def.timeout_secs).await {
+            Ok(output) => {
+                let records = exporters::records_from_output(
+                    agent_id,
+                    &run.input_id,
+                    &run.target,
+                    &run.family,
+                    &run.unit_id,
+                    &output,
+                    next_seq,
+                );
+                if !records.is_empty()
+                    && let Err(err) = sink.write_records(&records).await
+                {
+                    eprintln!(
+                        "wist-agentd exporter {} uplink failed: {err}",
+                        run.exporter_id
+                    );
+                }
+                eprintln!(
+                    "event=ExporterRun exporter={} unit={} records={}",
+                    run.exporter_id,
+                    run.unit_id,
+                    records.len()
+                );
+            }
+            Err(err) => eprintln!("wist-agentd exporter {} failed: {err}", run.exporter_id),
+        }
+    }
+    if changed {
+        exporters::save_schedule(state_dir, &schedule);
+        if let Err(err) = log_seq_state::store_async(global_seq_path, *next_seq).await {
+            eprintln!("wist-agentd exporter seq persist failed: {err}");
+        }
+    }
 }
 
 async fn process_telemetry_input<S: RecordSink>(

@@ -908,7 +908,8 @@ use runtime_state_support::{
 };
 use telemetry_support::{
     TelemetryFailureKind, TelemetryTick, TelemetryWorkState, UplinkHealth, WorkState,
-    build_telemetry_sink, effective_output, invalid_output_tick, process_telemetry_inputs,
+    build_telemetry_sink, effective_output, invalid_output_tick, process_exporters,
+    process_telemetry_inputs,
 };
 
 fn to_agent_work_state_changes(changes: &[TelemetryWorkState]) -> Vec<AgentWorkStateChange> {
@@ -1320,7 +1321,19 @@ async fn run_once_with_failure_cache(
                     )
                     .await;
                 }
-                process_telemetry_inputs(loop_ctx.config, work, &mut sink, &mut next_seq).await
+                let telemetry_tick =
+                    process_telemetry_inputs(loop_ctx.config, work, &mut sink, &mut next_seq).await;
+                // 导出器（`Exporter` 来源）与文件输入平行：到点的跑一条固定命令，输出当记录上送。
+                process_exporters(
+                    work,
+                    state_dir,
+                    agent_id,
+                    &global_seq_path,
+                    &mut sink,
+                    &mut next_seq,
+                )
+                .await;
+                telemetry_tick
             }
         }
         Err(err) => {

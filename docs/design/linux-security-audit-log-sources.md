@@ -193,8 +193,9 @@ Linux 侧目前**只有本文档**：`data-plane/models/wpl/linux/` 为空，无
 | WPL 规则 | `models/mac-drafts/<面>/parse.wpl` 的 Linux 对应物 | 0 条 |
 | OML 富化 | `models/oml/linux_*.oml` | 0 条 |
 
-模板侧对应结论：`linux-compute` / `linux-data` 的 `unit_refs` 现在**全部落在 `status = draft`**
-（`rule_ref` 为空），因此两个模板都只能是 `draft`，不能授权投产。
+模板侧对应结论：`linux-compute` / `linux-data` 的 `unit_refs` 里**专有面**目前仍是 `status = draft`
+（`rule_ref` 为空），只有公共基线的 `linux-host-metrics` 先开了采集就绪（指标周期采，不依赖解析规则），
+因此这两个模板现在只派得出 `HostMetrics`；各专有面要投产仍缺上面三件套。
 
 ## 10. 待核对记录（未做）
 

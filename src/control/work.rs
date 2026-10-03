@@ -9,8 +9,8 @@
 //!      一个不做任务工作的 Agent 不该有"顺手的默认采集"。
 //!   2. **暂停 ≠ 撤回**：`paused` 的工作仍被持有（记得版本、保留确认），但折算不出任务；
 //!      恢复沿用同一版本，不重新审定。
-//!   3. **折算不了就说**：`Exporter` / `UnifiedLogPredicate` 这类来源 agentd 现在接不了，
-//!      目标不是显式路径的（通配 / `~`）同样接不了 —— 两者都如实记进 `unsupported`，
+//!   3. **折算不了就说**：`UnifiedLogPredicate` 这类来源 agentd 现在接不了，`Exporter` 里
+//!      **未知 ID**、以及目标不是显式路径的（通配 / `~`）同样接不了 —— 都如实记进 `unsupported`，
 //!      绝不当成"没这回事"，也不造一条永远报错的采集任务。
 //!
 //! 关于确认（ack）：只对**真正应用了**的工作回报版本。工作参数解析不了就**不回报** ——
@@ -21,9 +21,9 @@ use std::time::Duration;
 
 use wist_contracts::agent_config::{AgentConfig, LogFileInputSection};
 use wist_contracts::work::{
-    ACK_WORK_KIND, AckWork, EXECUTABLE_SOURCE_KINDS, OneShotWork, POLL_WORK_KIND, PollWork,
-    REPORT_WORK_RESULT_KIND, ReportWorkResult, StandingWork, WorkAccepted, WorkGrant,
-    WorkResultAccepted, WorkSpec, WorkSpecSource,
+    ACK_WORK_KIND, AckWork, OneShotWork, POLL_WORK_KIND, PollWork, REPORT_WORK_RESULT_KIND,
+    ReportWorkResult, StandingWork, WorkAccepted, WorkGrant, WorkResultAccepted, WorkSpec,
+    WorkSpecSource, is_known_exporter, parse_exporter_target,
 };
 use wist_shared::time::now_rfc3339;
 
@@ -51,6 +51,24 @@ pub struct WorkLogInput {
     pub family: String,
     pub unit_id: String,
     pub input: LogFileInputSection,
+}
+
+/// 从工作折算出来的一次导出器运行（`Exporter` 来源）。
+///
+/// 与 [`WorkLogInput`] 平行：日志来源变成「盯一个文件」，导出器来源变成「周期跑一条固定命令」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkExporterRun {
+    pub work_id: String,
+    pub family: String,
+    pub unit_id: String,
+    /// 归一后的导出器 ID（`dmesg:panic` 的 `dmesg`）。
+    pub exporter_id: String,
+    /// 归一后的 `arg`（`dmesg:panic` 的 `panic`）。
+    pub arg: Option<String>,
+    /// 原始 `target`（记录与审计用）。
+    pub target: String,
+    /// 任务 id：导出器记录与调度的键（前缀与文件任务区分开）。
+    pub input_id: String,
 }
 
 /// 折算不了的单元（来源类型 agentd 现在接不了）。
@@ -534,6 +552,57 @@ impl AppliedWorkGrant {
         inputs
     }
 
+    /// 折算出的导出器运行（只来自**正在干活**的单元）。
+    ///
+    /// 与 [`Self::log_inputs`] 平行：`Exporter` 来源不是 tail 一个文件，而是**周期跑一条固定命令**
+    /// （实现见 `crate::telemetry::exporters`）。只折算**已知 ID**；未知 ID 走 `unsupported_units()`。
+    pub fn exporter_runs(&self) -> Vec<WorkExporterRun> {
+        let mut runs = Vec::new();
+        for (work_id, work) in &self.works {
+            if !work.is_working() {
+                continue;
+            }
+            let Some(spec) = work.spec.as_ref() else {
+                continue;
+            };
+            for unit in &spec.units {
+                if unit.capability != "collect_logs" {
+                    continue;
+                }
+                let exporters: Vec<&WorkSpecSource> = unit
+                    .sources
+                    .iter()
+                    .filter(|source| source.kind == "Exporter" && is_known_exporter(&source.target))
+                    .collect();
+                for (index, source) in exporters.iter().enumerate() {
+                    let Some((id, arg)) = parse_exporter_target(&source.target) else {
+                        continue;
+                    };
+                    let suffix = if exporters.len() > 1 {
+                        format!("-{}", index + 1)
+                    } else {
+                        String::new()
+                    };
+                    runs.push(WorkExporterRun {
+                        work_id: work_id.clone(),
+                        family: work.family.clone(),
+                        unit_id: unit.unit_id.clone(),
+                        exporter_id: id.to_string(),
+                        arg: arg.map(|value| value.to_string()),
+                        target: source.target.clone(),
+                        input_id: format!(
+                            "work-{}-{}-exporter{}",
+                            safe_token(&work.family),
+                            safe_token(&unit.unit_id),
+                            suffix
+                        ),
+                    });
+                }
+            }
+        }
+        runs
+    }
+
     /// 指标上送的周期；`None` = 现在不该上送（没有授权的指标工作）。
     ///
     /// 取所有在干活的指标工作里**最密**的那个周期：要得最急的需求是上送频率的下界。
@@ -592,16 +661,18 @@ impl AppliedWorkGrant {
     pub fn summary(&self) -> String {
         let working = self.works.values().filter(|work| work.is_working()).count();
         let log_inputs = self.log_inputs().len();
+        let exporters = self.exporter_runs().len();
         let metrics = match self.metrics_interval() {
             Some(interval) => format!("on({}s)", interval.as_secs()),
             None => "off".to_string(),
         };
         let unsupported = self.unsupported_units().len();
         format!(
-            "held={} working={} log_inputs={} metrics={} unsupported_units={} one_shot_pending={}",
+            "held={} working={} log_inputs={} exporters={} metrics={} unsupported_units={} one_shot_pending={}",
             self.works.len(),
             working,
             log_inputs,
+            exporters,
             metrics,
             unsupported,
             self.unexecutable_one_shot.len()
@@ -619,17 +690,23 @@ impl AppliedWorkGrant {
 /// 两种情况给运维的下一步完全不同：前者等实现，后者把目标改成显式绝对路径就行。
 /// 合成笼统一句就会把人引向错误的下一步。
 fn unsupported_reason(source: &WorkSpecSource) -> String {
-    if !EXECUTABLE_SOURCE_KINDS.contains(&source.kind.as_str()) {
-        format!(
-            "source kind {} is not collectable on this agent",
-            source.kind
-        )
-    } else {
-        format!(
+    match source.kind.as_str() {
+        // 认识 kind，目标形态不对：把目标改成显式绝对路径就行。
+        "FileGlob" => format!(
             "source target {:?} is not an explicit absolute path \
              (glob/~ expansion is not implemented on this agent)",
             source.target
-        )
+        ),
+        // 认识 kind，ID 不认识：旧网关发了新 ID，或写错了。
+        "Exporter" => format!(
+            "Exporter target {:?} is not a known exporter id (see \
+             wist_contracts::work::EXPORTER_IDS)",
+            source.target
+        ),
+        _ => format!(
+            "source kind {} is not collectable on this agent",
+            source.kind
+        ),
     }
 }
 
@@ -964,6 +1041,77 @@ mod tests {
         assert_eq!(inputs[0].family, "CrashPanic");
         // 指标面无授权 → 不上送。
         assert_eq!(applied.metrics_interval(), None);
+    }
+
+    #[test]
+    fn a_granted_exporter_source_becomes_a_scheduled_run() {
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![standing(
+                "work-1",
+                "NetworkFirewall",
+                1,
+                "active",
+                &spec(&[(
+                    "linux-network-firewall",
+                    "collect_logs",
+                    "Exporter:nft-ruleset",
+                )]),
+            )],
+        ));
+        let runs = applied.exporter_runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].exporter_id, "nft-ruleset");
+        assert_eq!(runs[0].arg, None);
+        assert_eq!(runs[0].family, "NetworkFirewall");
+        assert_eq!(runs[0].unit_id, "linux-network-firewall");
+        // 导出器不是文件输入：不产生 log_inputs，也不算“接不了”。
+        assert!(applied.log_inputs().is_empty());
+        assert!(applied.unsupported_units().is_empty());
+    }
+
+    #[test]
+    fn an_exporter_argument_is_kept_out_of_the_id() {
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![standing(
+                "work-1",
+                "CrashPanic",
+                1,
+                "active",
+                &spec(&[("linux-crash-panic", "collect_logs", "Exporter:dmesg:panic")]),
+            )],
+        ));
+        let runs = applied.exporter_runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].exporter_id, "dmesg");
+        assert_eq!(runs[0].arg.as_deref(), Some("panic"));
+    }
+
+    #[test]
+    fn an_unknown_exporter_id_is_reported_not_scheduled() {
+        // 还没实现的 ID（macOS 的 `praudit`）：不排期，但如实报出来。
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![standing(
+                "work-1",
+                "PrivilegeExecution",
+                1,
+                "active",
+                &spec(&[(
+                    "mac-privilege-exec",
+                    "collect_logs",
+                    "Exporter:praudit(/var/audit)",
+                )]),
+            )],
+        ));
+        assert!(applied.exporter_runs().is_empty());
+        let unsupported = applied.unsupported_units();
+        assert_eq!(unsupported.len(), 1);
+        assert!(unsupported[0].detail.contains("Exporter"));
     }
 
     #[test]

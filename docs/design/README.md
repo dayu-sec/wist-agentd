@@ -23,6 +23,7 @@ wist-agentd（edge daemon）实现时最重要的设计文档。
 ## 日志 / telemetry 采集（配合 `src/telemetry/logs/files/`）
 
 - [log-file-input-spec.md](./log-file-input-spec.md) — 文件日志输入规格（checkpoint/tail/rotate）
+- [log-source-exporters.md](./log-source-exporters.md) — 定时导出器（`Exporter` 采集来源）设计（journald/smartctl/nft/dmesg…）
 - [log-file-state-schema.md](./log-file-state-schema.md) — 文件日志 checkpoint 状态 schema
 - [macos-agent-uplink-to-warp-parse.md](./macos-agent-uplink-to-warp-parse.md) — macOS P0 采集端到端方案
 - [macos-security-audit-log-sources.md](./macos-security-audit-log-sources.md) — macOS 安全/审计日志源清单
