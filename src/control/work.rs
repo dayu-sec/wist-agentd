@@ -19,11 +19,13 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use wist_api::work::{
+    ACK_WORK_KIND, AckWork, POLL_WORK_KIND, PollWork, REPORT_WORK_RESULT_KIND, ReportWorkResult,
+    WorkAccepted, WorkGrant, WorkResultAccepted,
+};
 use wist_contracts::agent_config::{AgentConfig, LogFileInputSection};
 use wist_contracts::work::{
-    ACK_WORK_KIND, AckWork, OneShotWork, POLL_WORK_KIND, PollWork, REPORT_WORK_RESULT_KIND,
-    ReportWorkResult, StandingWork, WorkAccepted, WorkGrant, WorkResultAccepted, WorkSpec,
-    WorkSpecSource, is_known_exporter, parse_exporter_target,
+    OneShotWork, StandingWork, WorkSpec, WorkSpecSource, is_known_exporter, parse_exporter_target,
 };
 use wist_shared::time::now_rfc3339;
 

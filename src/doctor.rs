@@ -24,8 +24,8 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use wist_api::agent_uplink::AgentUplinkGrant;
 use wist_contracts::agent_config::AgentConfig;
-use wist_contracts::agent_uplink::AgentUplinkGrant;
 
 use crate::config_runtime;
 use crate::control::enrollment::{TERMINAL_AUTH_CODES, terminal_auth_advice};

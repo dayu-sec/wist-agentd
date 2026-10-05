@@ -3,6 +3,14 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.30-alpha] - 2026-10-05
+
+### 变更
+
+- **`work` / `agent_uplink` 的 seam 报文改用 `wist-api`**（`wist-api::work` / `wist-api::agent_uplink`）；
+  **领域 / 状态类仍在 `wist-contracts`**。**线上 JSON 不变**。
+- 依赖：`wist-api` 0.4、`wist-validate` 0.2.1。
+
 ## [0.1.29-alpha] - 2026-10-05
 
 ### 变更

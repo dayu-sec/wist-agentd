@@ -2127,7 +2127,7 @@ mod tests {
 
     use crate::control::uplink::UplinkFetch;
     use crate::telemetry::warp_parse::{FileRecordSink, TcpFraming, TcpRecordSink};
-    use wist_contracts::agent_uplink::AgentUplinkGrant;
+    use wist_api::agent_uplink::AgentUplinkGrant;
 
     fn test_config() -> AgentConfig {
         AgentConfig::new(

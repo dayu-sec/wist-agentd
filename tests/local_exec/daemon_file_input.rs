@@ -9,12 +9,13 @@ use wist_agentd::bootstrap;
 use wist_agentd::control::work::AppliedWorkGrant;
 use wist_agentd::daemon;
 use wist_agentd::self_observability::DiscoveryReadiness;
+use wist_api::work::WorkGrant;
 use wist_contracts::agent_config::{DiscoverySection, LogFileInputSection};
 use wist_contracts::discovery::{
     CollectionCandidate, DiscoveredResource, DiscoveredTarget, DiscoveryCacheMeta,
 };
 use wist_contracts::telemetry_record::TelemetryRecord;
-use wist_contracts::work::{StandingWork, WorkGrant, WorkSpec, WorkSpecSource, WorkSpecUnit};
+use wist_contracts::work::{StandingWork, WorkSpec, WorkSpecSource, WorkSpecUnit};
 use wist_shared::fs::read_json;
 
 use super::common::{
