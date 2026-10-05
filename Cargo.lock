@@ -2023,9 +2023,9 @@ dependencies = [
 
 [[package]]
 name = "wist-shared"
-version = "0.1.1"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb248ae9e6c57651296666df8bf3205384fe06f1aab7f6b5fd78f4598ed1e821"
+checksum = "53f16332420536ecac1f937346e6bc511bcdbbb25b21dd615c300fa0b5aabb8c"
 dependencies = [
  "chrono",
  "serde",
