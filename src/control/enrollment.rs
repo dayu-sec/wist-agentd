@@ -952,6 +952,7 @@ mod tests {
     use tokio::net::TcpListener;
     use wist_api::enrollment::{
         AgentIdentity, AgentIdentityStatus, CredentialBundle, EnrollmentOutcome, EnrollmentStatus,
+        SUBMIT_ENROLLMENT_REQUEST_KIND,
     };
     use wist_contracts::agent_config::{
         AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, PathsSection,
@@ -1040,6 +1041,9 @@ mod tests {
             .expect("build request");
 
         assert_eq!(request.token, "token-a");
+        // 注册报文必须带上**本版本号**与稳定 kind（seam 的两把“钥匙”）。
+        assert_eq!(request.api_version, "v1");
+        assert_eq!(request.kind, SUBMIT_ENROLLMENT_REQUEST_KIND);
         assert_eq!(request.host_profile.node_id, "host-a");
         assert_eq!(request.credential_request, "csr");
         // CSR 随注册一起上去：本地生成密钥、只交公钥（主体留给网关填）。
