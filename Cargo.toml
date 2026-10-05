@@ -1,6 +1,6 @@
 [package]
 name = "wist-agentd"
-version = "0.1.30" #@gxl:set(version)
+version = "0.1.31" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -25,8 +25,8 @@ toml = "1.1"
 tokio = { version = "1.48", features = ["full"] }
 wist-contracts = { version = "0.3" }
 # 跨进程 seam 报文（enrollment / agent_status / gateway / work / agent_uplink）。CI/发布走 registry；本地联调可改用下面注释的 path 行。
-wist-api = { version = "0.4" }
-#wist-api = { version = "0.4", path = "../wist-api" }
+wist-api = { version = "0.5" }
+#wist-api = { version = "0.5", path = "../wist-api" }
 wist-metrics = { version = "0.1" }
 wist-shared = { version = "0.1" }
 wist-validate = { version = "0.2" }
