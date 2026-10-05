@@ -3,6 +3,13 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.25-alpha] - 2026-10-05
+
+### 变更
+
+- **排障文档路径更新**：网关开发态 home 从 `~/.wist-gateway` 迁到 `<栈根>/dev/configs/gateway`
+  （对称发布态 `configs/gateway`）；FAQ 里的 admin token / TLS 证书路径同步更新。
+
 ## [0.1.24] - 2026-10-03
 
 ### 新增
