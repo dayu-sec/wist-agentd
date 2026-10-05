@@ -7,12 +7,12 @@ use std::time::Duration;
 
 use orion_error::{conversion::ToStructError, prelude::*};
 
-use wist_contracts::agent_config::AgentConfig;
-use wist_contracts::agent_state::{AgentRuntimeState, RuntimeMode};
-use wist_contracts::enrollment::{
+use wist_api::enrollment::{
     CredentialRenewal, CredentialRenewed, EnrollmentEnvelope, EnrollmentOutcome, EnrollmentRequest,
     EnrollmentStatus, HostProfile,
 };
+use wist_contracts::agent_config::AgentConfig;
+use wist_contracts::agent_state::{AgentRuntimeState, RuntimeMode};
 use wist_shared::fs::write_bytes_private_atomic;
 use wist_shared::time::now_rfc3339;
 
@@ -810,7 +810,7 @@ fn apply_enrollment_result(
 /// 注意别 `trim`：证书 PEM 要原样落盘（去掉尾换行会让拼接/平台工具都变脆）。
 fn store_issued_client_certificate(
     state_dir: &Path,
-    credential: &wist_contracts::enrollment::CredentialBundle,
+    credential: &wist_api::enrollment::CredentialBundle,
 ) -> Result<(), EnrollmentError> {
     if credential.certificate.trim().is_empty() {
         return Err(EnrollmentReason::InvalidAcceptedResult
@@ -829,7 +829,7 @@ fn store_issued_client_certificate(
 /// 所以这里不再涉及任何 bearer token。
 fn apply_credential_to_config(
     config: &mut AgentConfig,
-    credential: &wist_contracts::enrollment::CredentialBundle,
+    credential: &wist_api::enrollment::CredentialBundle,
 ) -> Result<(), EnrollmentError> {
     if credential.certificate.trim().is_empty() {
         return Err(EnrollmentReason::InvalidAcceptedResult
@@ -847,7 +847,7 @@ fn apply_credential_to_config(
 
 fn apply_credential_to_runtime_state(
     runtime_state: &mut AgentRuntimeState,
-    credential: wist_contracts::enrollment::CredentialBundle,
+    credential: wist_api::enrollment::CredentialBundle,
 ) {
     runtime_state.credential_id = Some(credential.credential_id);
     runtime_state.credential_expires_at = credential.not_after;
@@ -950,11 +950,11 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use wist_api::enrollment::{
+        AgentIdentity, AgentIdentityStatus, CredentialBundle, EnrollmentOutcome, EnrollmentStatus,
+    };
     use wist_contracts::agent_config::{
         AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, PathsSection,
-    };
-    use wist_contracts::enrollment::{
-        AgentIdentity, AgentIdentityStatus, CredentialBundle, EnrollmentOutcome, EnrollmentStatus,
     };
 
     use super::{

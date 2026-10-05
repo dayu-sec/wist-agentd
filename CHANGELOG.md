@@ -3,6 +3,16 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.27-alpha] - 2026-10-05
+
+### 变更
+
+- **对齐 `wist-contracts` 0.3**：agent 注册/续期（`agent/enroll`、`agent/credentials:renew`）的报文
+  改由独立 seam crate **`wist-api` 0.1** 提供（`wist_contracts::enrollment` 里的报文已移出）；
+  **线上 JSON 不变**，纯依赖归位。契约里被多条 seam 复用的领域类型（`HostProfile` /
+  `CredentialBundle` 等）仍在 `wist-contracts`。
+- 依赖链一并跟进：`wist-validate` 0.1.5、`wist-metrics` 0.1.6（均已切 `wist-contracts` 0.3）。
+
 ## [0.1.26-alpha] - 2026-10-05
 
 ### 变更

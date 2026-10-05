@@ -2202,7 +2202,7 @@ checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 
 [[package]]
 name = "wist-agentd"
-version = "0.1.25"
+version = "0.1.27"
 dependencies = [
  "jumo-derive",
  "libc",
@@ -2216,6 +2216,7 @@ dependencies = [
  "time",
  "tokio",
  "toml",
+ "wist-api",
  "wist-contracts",
  "wist-metrics",
  "wist-shared",
@@ -2224,10 +2225,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "wist-contracts"
-version = "0.2.0"
+name = "wist-api"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5d20ee1c04370833ea8c655f4f338ec305fc659c523e4b9738a9e12e90522b3"
+checksum = "08b0f3d00142e31169d4908c350f2912b14bfdebeba1b09d09d790f42653555a"
+dependencies = [
+ "serde",
+ "wist-contracts",
+]
+
+[[package]]
+name = "wist-contracts"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fe49f939331e96a65161ca1a16a016d4d8e2f96ea8265c184b5ee07f2cbcfd8"
 dependencies = [
  "jumo-derive",
  "serde",
@@ -2237,9 +2248,9 @@ dependencies = [
 
 [[package]]
 name = "wist-metrics"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e661c6021d1f5c03b068ec5fca377739c046e4b5af1e0c336114e68fdd86f88b"
+checksum = "429303586d7fc148ece70a68e5e9dc0026eacc23bbe789fc4e45a481e226693a"
 dependencies = [
  "jumo-derive",
  "serde",
@@ -2260,9 +2271,9 @@ dependencies = [
 
 [[package]]
 name = "wist-validate"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dddff5e7e4df10a07d09f8740ce38947d6edbc3d62f0ce8fd9af653f40f9a8bf"
+checksum = "1e5e756b28cd6e8e6b9c7a98301244cc86ac938ea4bff534138b4f620081dec4"
 dependencies = [
  "time",
  "wist-contracts",
