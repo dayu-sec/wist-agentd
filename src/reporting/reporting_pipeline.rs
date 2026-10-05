@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::RuntimeResult;
 use crate::fs_async::write_json_atomic_async;
+use wist_api::gateway::ReportActionResult;
 use wist_contracts::action_result::ActionResult;
-use wist_contracts::gateway::ReportActionResult;
 use wist_shared::fs::write_json_atomic;
 use wist_shared::paths::REPORT_ENVELOPE_SUFFIX;
 

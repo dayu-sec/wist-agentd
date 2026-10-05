@@ -3,6 +3,15 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.29-alpha] - 2026-10-05
+
+### 变更
+
+- **agent 面其余 seam 报文改用 `wist-api::gateway`**：`ReportActionResult` / `ReportAgentFactSummary` /
+  `PollDiscoveryPolicies` / `DiscoveryPoliciesReturned` 等由 `wist-api` 提供
+  （`wist_contracts::gateway` 已整体移出）。**线上 JSON 不变**。
+- 依赖跟进：`wist-validate` 0.2（其校验输入类型也随迁）、`wist-api` 0.3。
+
 ## [0.1.28-alpha] - 2026-10-05
 
 ### 变更

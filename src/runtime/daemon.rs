@@ -7,13 +7,13 @@ use std::time::{Duration, Instant};
 
 use crate::telemetry::warp_parse::TelemetryRecordSink;
 use wist_api::agent_status::{AgentStatusReport, AgentWorkState, AgentWorkStateChange};
-use wist_contracts::agent_config::AgentConfig;
-use wist_contracts::agent_uplink::AgentUplinkState;
-use wist_contracts::discovery_policy::DiscoveryAspectPolicySet;
-use wist_contracts::gateway::{
+use wist_api::gateway::{
     DiscoveryPoliciesReturned, POLL_DISCOVERY_POLICIES_KIND, PollDiscoveryPolicies,
     ReportAgentFactSummary,
 };
+use wist_contracts::agent_config::AgentConfig;
+use wist_contracts::agent_uplink::AgentUplinkState;
+use wist_contracts::discovery_policy::DiscoveryAspectPolicySet;
 use wist_contracts::local_work::{
     AgentLocalOneShotWork, AgentLocalStandingWork, AgentLocalTask, AgentLocalWork,
 };
