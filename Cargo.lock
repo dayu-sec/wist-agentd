@@ -2035,13 +2035,11 @@ dependencies = [
 
 [[package]]
 name = "wist-validate"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f409426d36933d49410c28f067782b13169430adac0b4e2706c86ceb8cfe5391"
+checksum = "b76c69c357c8b8d7f3d6638033b8cae68343161fe57b2247179eff6943929645"
 dependencies = [
- "serde_json",
  "time",
- "toml",
  "wist-contracts",
 ]
 
