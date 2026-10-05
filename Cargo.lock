@@ -2225,9 +2225,9 @@ dependencies = [
 
 [[package]]
 name = "wist-contracts"
-version = "0.1.14"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5df586062be54cfbb91ef50914bb16636129a0b111507718e23e98b7c78d392b"
+checksum = "b5d20ee1c04370833ea8c655f4f338ec305fc659c523e4b9738a9e12e90522b3"
 dependencies = [
  "jumo-derive",
  "serde",
@@ -2237,9 +2237,9 @@ dependencies = [
 
 [[package]]
 name = "wist-metrics"
-version = "0.1.3"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31c7a0fe4a9362f71164a98bd4dae15b76f701916eac11b686855154c8879a8a"
+checksum = "e661c6021d1f5c03b068ec5fca377739c046e4b5af1e0c336114e68fdd86f88b"
 dependencies = [
  "jumo-derive",
  "serde",
@@ -2260,13 +2260,11 @@ dependencies = [
 
 [[package]]
 name = "wist-validate"
-version = "0.1.2"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f409426d36933d49410c28f067782b13169430adac0b4e2706c86ceb8cfe5391"
+checksum = "dddff5e7e4df10a07d09f8740ce38947d6edbc3d62f0ce8fd9af653f40f9a8bf"
 dependencies = [
- "serde_json",
  "time",
- "toml",
  "wist-contracts",
 ]
 

@@ -3,6 +3,15 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.26-alpha] - 2026-10-05
+
+### 变更
+
+- **对齐 `wist-contracts` 0.2**：由 0.1 升至 0.2，与 `wist-gateway` / `wist-center` 统一边缘契约版本；
+  一并跟进依赖链（`wist-validate` 0.1.4 / `wist-metrics` 0.1.5 也已切到 `wist-contracts` 0.2）。
+  agentd 用到的契约类型（`enrollment` / `work` / `gateway` / `action_*` / `discovery` 等）在 0.2.0 中未变
+  —— 0.2.0 的破坏点集中在网关↔中心注册/凭据（`gateway_control`），agentd 不消费。
+
 ## [0.1.25-alpha] - 2026-10-05
 
 ### 变更
