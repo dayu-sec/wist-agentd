@@ -138,7 +138,7 @@ wist-agentd service status --user | grep running=
 | ④ 本地在跑？ | `service status` 的 `running=` | `false` → §2.2 |
 
 ```bash
-# admin token 在网关配置 ~/.wist-gateway/wist-gateway.toml 的 admin_api_token
+# admin token 在网关**开发态** home `dev/configs/gateway/wist-gateway.toml`（栈根下；或直接 `./dev/svc.sh token`）的 admin_api_token
 curl -sk -H "Authorization: Bearer <token>" https://<网关>/api/v1/admin/agents \
   | python3 -c "import sys,json; [print(a['agent_id'],a['status'],a['last_seen_at'],a['credential_status']) for a in json.load(sys.stdin)['agents']]"
 ```
@@ -166,7 +166,7 @@ curl -fsSLk --pinnedpubkey "sha256//<网关证书指纹>" \
 
 ```bash
 cargo test --offline --lib -- --ignored rustls_accepts_gateway_certificate --nocapture
-# 默认 ~/.wist-gateway/state/admin-tls.crt.pem；可用 WIST_GATEWAY_TLS_CERT / WIST_GATEWAY_TLS_SERVER_NAME 覆盖
+# 默认 <栈根>/dev/configs/gateway/state/admin-tls.crt.pem；可用 WIST_GATEWAY_TLS_CERT / WIST_GATEWAY_TLS_SERVER_NAME 覆盖
 ```
 
 `rustls ACCEPTS` 才算过；`REJECTS … CaUsedAsEndEntity` = 证书带 `CA:TRUE` 却当叶证书用，须重新生成
