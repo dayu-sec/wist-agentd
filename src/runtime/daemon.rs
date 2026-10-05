@@ -6,12 +6,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::telemetry::warp_parse::TelemetryRecordSink;
+use wist_api::agent_status::{AgentStatusReport, AgentWorkState, AgentWorkStateChange};
 use wist_contracts::agent_config::AgentConfig;
 use wist_contracts::agent_uplink::AgentUplinkState;
 use wist_contracts::discovery_policy::DiscoveryAspectPolicySet;
 use wist_contracts::gateway::{
-    AgentStatusReport, AgentWorkState, AgentWorkStateChange, DiscoveryPoliciesReturned,
-    POLL_DISCOVERY_POLICIES_KIND, PollDiscoveryPolicies, ReportAgentFactSummary,
+    DiscoveryPoliciesReturned, POLL_DISCOVERY_POLICIES_KIND, PollDiscoveryPolicies,
+    ReportAgentFactSummary,
 };
 use wist_contracts::local_work::{
     AgentLocalOneShotWork, AgentLocalStandingWork, AgentLocalTask, AgentLocalWork,
@@ -359,14 +360,14 @@ fn build_uplink_state(
 /// 读不出来就 `None` —— 不影响上报本身。
 fn local_certificate_status(
     config: &AgentConfig,
-) -> Option<wist_contracts::gateway::AgentCertificateStatus> {
+) -> Option<wist_api::agent_status::AgentCertificateStatus> {
     use crate::state_store::client_identity::{CertificateValidity, ClientIdentityPaths};
 
     let paths = ClientIdentityPaths::under(Path::new(&config.paths.state_dir));
     let status = crate::state_store::client_identity::client_certificate_status(&paths)
         .ok()
         .flatten()?;
-    Some(wist_contracts::gateway::AgentCertificateStatus {
+    Some(wist_api::agent_status::AgentCertificateStatus {
         not_after: status.not_after,
         remaining_seconds: status.remaining_seconds,
         state: match status.validity {
@@ -385,11 +386,11 @@ fn local_certificate_status(
 /// 读不出来就 `None`（不影响上报本身）。
 fn local_renewal_report(
     paths: &crate::state_store::client_identity::ClientIdentityPaths,
-) -> Option<wist_contracts::gateway::AgentCredentialRenewal> {
+) -> Option<wist_api::agent_status::AgentCredentialRenewal> {
     let ledger = crate::state_store::client_identity::read_renewal_ledger(paths)
         .ok()
         .flatten()?;
-    Some(wist_contracts::gateway::AgentCredentialRenewal {
+    Some(wist_api::agent_status::AgentCredentialRenewal {
         outcome: ledger.outcome,
         checked_at: ledger.checked_at,
         detail: ledger.detail,
@@ -3067,9 +3068,9 @@ mod tests {
 
         let mut config = test_config();
         config.control_plane.endpoint = Some(endpoint);
-        let changes = Some(vec![wist_contracts::gateway::AgentWorkStateChange {
+        let changes = Some(vec![wist_api::agent_status::AgentWorkStateChange {
             input_id: "app".to_string(),
-            state: wist_contracts::gateway::AgentWorkState::Paused,
+            state: wist_api::agent_status::AgentWorkState::Paused,
             reason: "spool over limit".to_string(),
             at: "now".to_string(),
         }]);
