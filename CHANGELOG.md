@@ -3,6 +3,20 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.34-alpha] - 2026-10-06
+
+### 变更
+
+- **依赖换到底座 crate `wist-artifact`**：升级取包 / 摘要校验 / 版本比较原先经 `wist-release` 拿 ——
+  那是**发布域** crate（包身份解析 + 发布计划），被管端不该依赖控制面的域 crate：它只需要
+  「拿下来 / 核摘要 / 判方向」。换到底座之后，agentd 的依赖树里**不再有 `wist-release`，也不再
+  有 `flate2` / `tar`**（那两个只在身份解析那层用），发布域升版也不会再牵着 agent 走。
+  **行为不变**（错误码 `package_unavailable` / `package_too_large` / `digest_invalid` /
+  `digest_mismatch` 与「只前进、降级需显式声明」的规则逐条保持原样）。
+- **`reqwest` 0.13.1 → 0.13.5，并去掉 `webpki-roots`**：它不是 reqwest 0.13 的 feature（只是可选依赖
+  的隐式 feature，reqwest 源码也不引用），0.13.5 已把它去掉 —— 留着会把本仓**钉死在 0.13.1**，任何
+  forward 更新都解析失败。0.13 里 TLS 根由 `rustls`（系统根）决定。
+
 ## [0.1.33-alpha] - 2026-10-06
 
 ### 变更

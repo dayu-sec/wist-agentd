@@ -28,10 +28,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use wist_artifact::digest::{parse_digest, sha256_hex_bytes};
+use wist_artifact::source::{ArtifactError, read_local_source, read_source_with_client};
+use wist_artifact::version::{parse_version, version_is_newer};
 use wist_contracts::agent_config::AgentConfig;
-use wist_release::package::{
-    parse_digest, read_source_with_client, sha256_hex_bytes, version_is_newer,
-};
 use wist_shared::fs::{read_json, write_json_atomic};
 use wist_shared::time::now_rfc3339;
 
@@ -256,15 +256,15 @@ pub fn parse_spec(text: &str) -> Result<UpgradeSpec, UpgradeError> {
 ///
 /// 认不出来就返回 `None`：升级方向宁可拒绝，也不要拿字符串比较去猜大小。
 ///
-/// 实现在共享 crate `wist-release`（与「该不该升 / 是不是降级」同一口径）；中心、网关、
+/// 实现在**底座** crate `wist-artifact`（与「该不该升 / 是不是降级」同一口径）；中心、网关、
 /// gwlinkd 将来都用它。旧的本地实现已删。
 fn version_parts(value: &str) -> Option<Vec<u64>> {
-    wist_release::package::parse_version(value)
+    parse_version(value)
 }
 
 /// 摘要字段：允许 `sha256:` 前缀（管理面/模型里就是那个写法），但必须是 64 位裸 hex。
 ///
-/// 口径（前缀 / 大小写 / 长度）在共享 crate `wist-release`（与网关缓存、中心发布同一份）；
+/// 口径（前缀 / 大小写 / 长度）在**底座** crate `wist-artifact`（与网关缓存、中心发布同一份）；
 /// 这里只把它翻成 agentd 自己的错误码。
 fn digest_hex(value: &str) -> Result<String, UpgradeError> {
     parse_digest(value).map_err(|_| {
@@ -367,7 +367,7 @@ fn verify_digest(bytes: &[u8], expected: &str) -> Result<(), UpgradeError> {
 
 /// 取包：`https://…` 走网关（带信任锚与 mTLS 客户端证书），`/abs/path` 直接读本机（联调与离线演练）。
 ///
-/// 读字节这套**机制**（甄别路径 / URL、读完前拦大小超限）在共享 crate `wist-release`，
+/// 读字节这套**机制**（甄别路径 / URL、读完前拦大小超限）在**底座** crate `wist-artifact`，
 /// 与网关缓存、中心发布同一份；这里只保留 agentd 的**策略与错误码**：
 /// 超时 300s、上限 512 MiB、`package_too_large` / `package_unavailable`。
 ///
@@ -376,8 +376,7 @@ fn verify_digest(bytes: &[u8], expected: &str) -> Result<(), UpgradeError> {
 async fn fetch_package(config: &AgentConfig, source: &str) -> Result<Vec<u8>, UpgradeError> {
     let source = source.trim();
     if source.starts_with('/') {
-        return wist_release::package::read_local_source(source, MAX_PACKAGE_BYTES)
-            .map_err(map_fetch_error);
+        return read_local_source(source, MAX_PACKAGE_BYTES).map_err(map_fetch_error);
     }
     // 网关的分发端点要 agent 身份：靠 `enrollment_http_client` 里挂上的客户端证书（mTLS）
     // 认证，不再有 bearer token。client 交给共享 crate，就是为了不把这层身份丢掉。
@@ -390,9 +389,9 @@ async fn fetch_package(config: &AgentConfig, source: &str) -> Result<Vec<u8>, Up
 
 /// 把共享 crate 的取包错误翻成 agentd 自己的码：`package_too_large` 单独一类（可操作：
 /// 「你指的包太大」），其余「拿不到」统一归 `package_unavailable`。
-fn map_fetch_error(err: wist_release::package::PackageError) -> UpgradeError {
+fn map_fetch_error(err: ArtifactError) -> UpgradeError {
     match err {
-        wist_release::package::PackageError::TooLarge(detail) => fail("package_too_large", detail),
+        ArtifactError::TooLarge(detail) => fail("package_too_large", detail),
         other => fail("package_unavailable", other.to_string()),
     }
 }
