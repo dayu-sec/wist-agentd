@@ -3,6 +3,20 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.33-alpha] - 2026-10-06
+
+### 变更
+
+- **升级取包与摘要校验收进共享 crate `wist-release` 0.2**：本仓原先自带一份「读来源（本机路径 / 
+  mTLS 请求）+ 大小上限 + sha256 + `sha256:` 前缀口径 + 版本比较」，与网关缓存、中心发布那两份是同口径的
+  **第三、四份**实现。现在统一走 `wist-release`，**行为不变**（错误码
+  `package_unavailable` / `package_too_large` / `digest_invalid` / `digest_mismatch`
+  与「只前进、降级需显式声明」的拒绝规则逐条保持原样）。
+  - 本机路径分支**刻意不构造 HTTP client**：联调 / 离线演练常在还没有已签发身份的机器上跑；
+    一旦那里要求 client，「能读本地文件」就会变成读不了。
+  - 生产代码不再直依赖 `sha2`（摘要改由 `wist-release` 算，与中心 / 网关同一个实现）；
+    `sha2` 只留在 dev-dependencies —— e2e 需要一个**独立于被测实现**算出来的摘要夹具。
+
 ## [0.1.32-alpha] - 2026-10-06
 
 ### 变更

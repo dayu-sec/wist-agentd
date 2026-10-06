@@ -28,8 +28,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use wist_contracts::agent_config::AgentConfig;
+use wist_release::package::{
+    parse_digest, read_source_with_client, sha256_hex_bytes, version_is_newer,
+};
 use wist_shared::fs::{read_json, write_json_atomic};
 use wist_shared::time::now_rfc3339;
 
@@ -253,35 +255,24 @@ pub fn parse_spec(text: &str) -> Result<UpgradeSpec, UpgradeError> {
 /// 版本号拆成可比的分段（`0.1.4` → `[0,1,4]`）。带 `-pre` 后缀时只看前面的数字段。
 ///
 /// 认不出来就返回 `None`：升级方向宁可拒绝，也不要拿字符串比较去猜大小。
+///
+/// 实现在共享 crate `wist-release`（与「该不该升 / 是不是降级」同一口径）；中心、网关、
+/// gwlinkd 将来都用它。旧的本地实现已删。
 fn version_parts(value: &str) -> Option<Vec<u64>> {
-    let core = value.trim().split(['-', '+']).next()?;
-    if core.is_empty() {
-        return None;
-    }
-    let mut parts = Vec::new();
-    for segment in core.split('.') {
-        parts.push(segment.parse::<u64>().ok()?);
-    }
-    Some(parts)
-}
-
-fn version_is_newer(target: &str, current: &str) -> Option<bool> {
-    let target = version_parts(target)?;
-    let current = version_parts(current)?;
-    Some(target > current)
+    wist_release::package::parse_version(value)
 }
 
 /// 摘要字段：允许 `sha256:` 前缀（管理面/模型里就是那个写法），但必须是 64 位裸 hex。
+///
+/// 口径（前缀 / 大小写 / 长度）在共享 crate `wist-release`（与网关缓存、中心发布同一份）；
+/// 这里只把它翻成 agentd 自己的错误码。
 fn digest_hex(value: &str) -> Result<String, UpgradeError> {
-    let hex = value.trim().strip_prefix("sha256:").unwrap_or(value.trim());
-    let ok = hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit());
-    if !ok {
-        return Err(fail(
+    parse_digest(value).map_err(|_| {
+        fail(
             "digest_invalid",
             format!("package_sha256 must be 64 hex chars, got {value:?}"),
-        ));
-    }
-    Ok(hex.to_ascii_lowercase())
+        )
+    })
 }
 
 fn validate_request(request: &UpgradeRequest) -> Result<(), UpgradeError> {
@@ -361,14 +352,10 @@ fn resolve_target_version(
     Ok(target)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let hash = Sha256::digest(bytes);
-    hash.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 fn verify_digest(bytes: &[u8], expected: &str) -> Result<(), UpgradeError> {
     let expected = digest_hex(expected)?;
-    let actual = sha256_hex(bytes);
+    // 摘要算法在共享 crate（`ring`）——与网关缓存那份、中心发布那份同一个实现。
+    let actual = sha256_hex_bytes(bytes);
     if actual != expected {
         return Err(fail(
             "digest_mismatch",
@@ -378,54 +365,36 @@ fn verify_digest(bytes: &[u8], expected: &str) -> Result<(), UpgradeError> {
     Ok(())
 }
 
-/// 取包：`https://…` 走网关（带信任锚），`/abs/path` 直接读本机（联调与离线演练）。
+/// 取包：`https://…` 走网关（带信任锚与 mTLS 客户端证书），`/abs/path` 直接读本机（联调与离线演练）。
+///
+/// 读字节这套**机制**（甄别路径 / URL、读完前拦大小超限）在共享 crate `wist-release`，
+/// 与网关缓存、中心发布同一份；这里只保留 agentd 的**策略与错误码**：
+/// 超时 300s、上限 512 MiB、`package_too_large` / `package_unavailable`。
+///
+/// 本机路径分支**刻意不建 client**：联调 / 离线演练常在没有已签发身份、甚至没有 trust
+/// bundle 的机器上跑，那边一旦要求 client，就把「能读本地文件」变成了读不了。
 async fn fetch_package(config: &AgentConfig, source: &str) -> Result<Vec<u8>, UpgradeError> {
     let source = source.trim();
     if source.starts_with('/') {
-        return std::fs::read(source)
-            .map_err(|err| fail("package_unavailable", format!("read {source}: {err}")));
+        return wist_release::package::read_local_source(source, MAX_PACKAGE_BYTES)
+            .map_err(map_fetch_error);
     }
+    // 网关的分发端点要 agent 身份：靠 `enrollment_http_client` 里挂上的客户端证书（mTLS）
+    // 认证，不再有 bearer token。client 交给共享 crate，就是为了不把这层身份丢掉。
     let client = enrollment_http_client(config)
         .map_err(|err| fail("package_unavailable", format!("build http client: {err}")))?;
-    // 网关的分发端点要 agent 身份：靠 `enrollment_http_client` 里挂上的客户端证书（mTLS）
-    // 认证，不再有 bearer token。
-    let request = client.get(source).timeout(DOWNLOAD_TIMEOUT);
-    let response = request
-        .send()
+    read_source_with_client(&client, source, MAX_PACKAGE_BYTES, DOWNLOAD_TIMEOUT)
         .await
-        .map_err(|err| fail("package_unavailable", format!("GET {source}: {err}")))?;
-    if !response.status().is_success() {
-        return Err(fail(
-            "package_unavailable",
-            format!("GET {source}: HTTP {}", response.status()),
-        ));
+        .map_err(map_fetch_error)
+}
+
+/// 把共享 crate 的取包错误翻成 agentd 自己的码：`package_too_large` 单独一类（可操作：
+/// 「你指的包太大」），其余「拿不到」统一归 `package_unavailable`。
+fn map_fetch_error(err: wist_release::package::PackageError) -> UpgradeError {
+    match err {
+        wist_release::package::PackageError::TooLarge(detail) => fail("package_too_large", detail),
+        other => fail("package_unavailable", other.to_string()),
     }
-    // 大小上限拦两道：先看响应头（不必为一个已知超大的响应去读体），读完再按实际长度兜底
-    // （头可能缺席或是撒谎）。`response.bytes()` 是无界的，见 [`MAX_PACKAGE_BYTES`]。
-    if let Some(len) = response.content_length()
-        && len > MAX_PACKAGE_BYTES
-    {
-        return Err(fail(
-            "package_too_large",
-            format!("GET {source}: content-length {len} exceeds {MAX_PACKAGE_BYTES} bytes"),
-        ));
-    }
-    let bytes = response.bytes().await.map_err(|err| {
-        fail(
-            "package_unavailable",
-            format!("read body from {source}: {err}"),
-        )
-    })?;
-    if bytes.len() as u64 > MAX_PACKAGE_BYTES {
-        return Err(fail(
-            "package_too_large",
-            format!(
-                "GET {source}: body of {} bytes exceeds {MAX_PACKAGE_BYTES} bytes",
-                bytes.len()
-            ),
-        ));
-    }
-    Ok(bytes.to_vec())
 }
 
 /// 制品里被认出来的一个二进制。
@@ -1990,7 +1959,7 @@ mod tests {
     #[test]
     fn verify_digest_accepts_with_and_without_prefix() {
         let bytes = b"package-bytes";
-        let hex = sha256_hex(bytes);
+        let hex = sha256_hex_bytes(bytes);
         verify_digest(bytes, &hex).expect("bare hex");
         verify_digest(bytes, &format!("sha256:{hex}")).expect("prefixed hex");
         let err = verify_digest(bytes, &"1".repeat(64)).expect_err("mismatch");
@@ -2488,7 +2457,7 @@ mod tests {
         let config = config_with_state(&state_dir);
         let mut request = request(installed.clone());
         request.package_url = packaged.display().to_string();
-        request.package_sha256 = sha256_hex(&bytes);
+        request.package_sha256 = sha256_hex_bytes(&bytes);
 
         let record = apply(&config, &request, &UpgradeOptions::default()).await;
         assert_eq!(record.status, "succeeded", "{record:?}");
@@ -2516,7 +2485,7 @@ mod tests {
         let mut request = request(installed);
         request.target_version = None; // 没给 → 以包内 agentd 自报的版本为准
         request.package_url = packaged.display().to_string();
-        request.package_sha256 = sha256_hex(&bytes);
+        request.package_sha256 = sha256_hex_bytes(&bytes);
 
         let record = apply(&config, &request, &UpgradeOptions::default()).await;
         assert_eq!(record.status, "succeeded", "{record:?}");
@@ -2546,7 +2515,7 @@ mod tests {
         request.current_version = "0.1.5".to_string();
         request.target_version = None; // 版本由包内自报决定 → 更低的 0.1.3
         request.package_url = packaged.display().to_string();
-        request.package_sha256 = sha256_hex(&bytes);
+        request.package_sha256 = sha256_hex_bytes(&bytes);
 
         // 没声明降级：默认只前进，在“验制品”这步被 `not_newer` 拦住（不落件）。
         let record = apply(&config, &request, &UpgradeOptions::default()).await;
