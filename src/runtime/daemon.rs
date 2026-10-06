@@ -6,11 +6,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::telemetry::warp_parse::TelemetryRecordSink;
-use wist_api::agent_status::{AgentStatusReport, AgentWorkState, AgentWorkStateChange};
-use wist_api::gateway::{
+use wist_api::discovery_policies::{
     DiscoveryPoliciesReturned, POLL_DISCOVERY_POLICIES_KIND, PollDiscoveryPolicies,
-    ReportAgentFactSummary,
 };
+use wist_api::facts::ReportAgentFactSummary;
+use wist_api::status::{AgentStatusReport, AgentWorkState, AgentWorkStateChange};
 use wist_contracts::agent_config::AgentConfig;
 use wist_contracts::agent_uplink::AgentUplinkState;
 use wist_contracts::discovery_policy::DiscoveryAspectPolicySet;
@@ -360,14 +360,14 @@ fn build_uplink_state(
 /// 读不出来就 `None` —— 不影响上报本身。
 fn local_certificate_status(
     config: &AgentConfig,
-) -> Option<wist_api::agent_status::AgentCertificateStatus> {
+) -> Option<wist_api::status::AgentCertificateStatus> {
     use crate::state_store::client_identity::{CertificateValidity, ClientIdentityPaths};
 
     let paths = ClientIdentityPaths::under(Path::new(&config.paths.state_dir));
     let status = crate::state_store::client_identity::client_certificate_status(&paths)
         .ok()
         .flatten()?;
-    Some(wist_api::agent_status::AgentCertificateStatus {
+    Some(wist_api::status::AgentCertificateStatus {
         not_after: status.not_after,
         remaining_seconds: status.remaining_seconds,
         state: match status.validity {
@@ -386,11 +386,11 @@ fn local_certificate_status(
 /// 读不出来就 `None`（不影响上报本身）。
 fn local_renewal_report(
     paths: &crate::state_store::client_identity::ClientIdentityPaths,
-) -> Option<wist_api::agent_status::AgentCredentialRenewal> {
+) -> Option<wist_api::status::AgentCredentialRenewal> {
     let ledger = crate::state_store::client_identity::read_renewal_ledger(paths)
         .ok()
         .flatten()?;
-    Some(wist_api::agent_status::AgentCredentialRenewal {
+    Some(wist_api::status::AgentCredentialRenewal {
         outcome: ledger.outcome,
         checked_at: ledger.checked_at,
         detail: ledger.detail,
@@ -2127,7 +2127,7 @@ mod tests {
 
     use crate::control::uplink::UplinkFetch;
     use crate::telemetry::warp_parse::{FileRecordSink, TcpFraming, TcpRecordSink};
-    use wist_api::agent_uplink::AgentUplinkGrant;
+    use wist_api::uplink::AgentUplinkGrant;
 
     fn test_config() -> AgentConfig {
         AgentConfig::new(
@@ -3068,9 +3068,9 @@ mod tests {
 
         let mut config = test_config();
         config.control_plane.endpoint = Some(endpoint);
-        let changes = Some(vec![wist_api::agent_status::AgentWorkStateChange {
+        let changes = Some(vec![wist_api::status::AgentWorkStateChange {
             input_id: "app".to_string(),
-            state: wist_api::agent_status::AgentWorkState::Paused,
+            state: wist_api::status::AgentWorkState::Paused,
             reason: "spool over limit".to_string(),
             at: "now".to_string(),
         }]);

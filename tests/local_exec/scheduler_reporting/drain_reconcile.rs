@@ -48,7 +48,7 @@ fn scheduler_drains_queue_and_prepares_report() {
         read_json(&reporting_path).expect("read reporting state");
     let report_envelope_path =
         reporting_pipeline::envelope_path_for(&state_dir, &submitted.execution_id);
-    let report_envelope: wist_api::gateway::ReportActionResult =
+    let report_envelope: wist_api::action_result::ReportActionResult =
         read_json(&report_envelope_path).expect("read report envelope");
 
     assert!(queue_state.items.is_empty());
@@ -384,7 +384,7 @@ fn drain_rebuilds_corrupt_envelope_without_quarantining_execution() {
         execution_queue::load_or_default(&execution_queue::path_for(&state_dir)).expect("queue");
     let rebuilt_reporting_state: reporting::ReportingState =
         read_json(&reporting_path).expect("read reporting state");
-    let rebuilt_envelope: wist_api::gateway::ReportActionResult =
+    let rebuilt_envelope: wist_api::action_result::ReportActionResult =
         read_json(&envelope_path).expect("read rebuilt envelope");
     let quarantine_path = history::path_for(&state_dir, &submitted.execution_id);
 

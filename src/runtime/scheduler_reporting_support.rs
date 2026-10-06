@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::error::RuntimeResult;
 use crate::fs_async::{read_json_async, write_json_atomic_async};
-use wist_api::gateway::ReportActionResult;
+use wist_api::action_result::ReportActionResult;
 use wist_contracts::action_plan::ActionPlan;
 use wist_contracts::action_result::ActionResult;
 use wist_shared::paths::{WORKDIR_PLAN_FILE, WORKDIR_RESULT_FILE};

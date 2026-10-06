@@ -56,7 +56,7 @@ fn recovery_turns_incomplete_running_state_into_reporting() {
         reporting_pipeline::envelope_path_for(&state_dir, &submitted.execution_id);
     let reporting_state: reporting::ReportingState =
         read_json(&reporting_path).expect("read reporting state");
-    let report_envelope: wist_api::gateway::ReportActionResult =
+    let report_envelope: wist_api::action_result::ReportActionResult =
         read_json(&report_envelope_path).expect("read report envelope");
 
     assert!(!running_path.exists());
@@ -134,7 +134,7 @@ fn recovery_reuses_reporting_state_and_rebuilds_report_attempt() {
 
     let rebuilt_reporting_state: reporting::ReportingState =
         read_json(&reporting_path).expect("read rebuilt reporting state");
-    let rebuilt_envelope: wist_api::gateway::ReportActionResult =
+    let rebuilt_envelope: wist_api::action_result::ReportActionResult =
         read_json(&envelope_path).expect("read rebuilt envelope");
 
     assert!(!running_path.exists());

@@ -22,7 +22,7 @@
 
 use std::time::Duration;
 
-use wist_api::agent_uplink::{AgentUplinkGrant, POLL_AGENT_UPLINK_KIND, PollAgentUplink};
+use wist_api::uplink::{AgentUplinkGrant, POLL_AGENT_UPLINK_KIND, PollAgentUplink};
 use wist_contracts::agent_config::AgentConfig;
 use wist_shared::time::now_rfc3339;
 
@@ -242,7 +242,7 @@ mod tests {
     };
 
     use super::{AppliedUplink, UplinkFetch, fetch_uplink_grant, fetch_uplink_grant_with_timeout};
-    use wist_api::agent_uplink::AgentUplinkGrant;
+    use wist_api::uplink::AgentUplinkGrant;
 
     fn test_config(endpoint: &str) -> AgentConfig {
         AgentConfig::new(

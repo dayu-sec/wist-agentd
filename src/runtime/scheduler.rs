@@ -50,7 +50,7 @@ pub struct DrainRequest {
 pub struct DrainOutcome {
     pub execution_id: String,
     pub plan_digest: String,
-    pub report: wist_api::gateway::ReportActionResult,
+    pub report: wist_api::action_result::ReportActionResult,
 }
 
 pub fn submit_local_plan(request: &SchedulerRequest) -> RuntimeResult<SchedulerOutcome> {

@@ -3,6 +3,15 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.32-alpha] - 2026-10-06
+
+### 变更
+
+- 依赖跟随：`wist-api` `0.5` → **`0.6`**（seam 模块名统一：`gateway` 拆成
+  `action_plan` / `action_result` / `facts` / `discovery_policies`；`agent_status` / `agent_uplink`
+  改名为 `status` / `uplink`）、`wist-validate` `0.2.2` → **`0.3`**（后者也是跟随 `wist-api 0.6`）。
+  **线上 JSON 与行为不变**，本仓只改 `use` / 类型路径。
+
 ## [0.1.31-alpha] - 2026-10-06
 
 ### 变更

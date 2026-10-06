@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::error::RuntimeResult;
 use crate::fs_async::read_json_async;
-use wist_api::gateway::{ReportActionResult, ResultAttestation};
+use wist_api::action_result::{ReportActionResult, ResultAttestation};
 use wist_shared::fs::read_json;
 use wist_shared::integrity::{dev_placeholder_issuer, digest_json, sign_dev_placeholder};
 use wist_shared::time::now_rfc3339;
