@@ -72,14 +72,52 @@ impl DiscoveryProbe for HostDiscoveryProbe {
     }
 }
 
+/// 机器名的**唯一**来源优先级：`HOSTNAME` → `COMPUTERNAME` → `/etc/hostname` → 系统主机名
+/// （`gethostname`）。返回 `None` = 四个来源都拿不到 —— 占位名由调用方按语境定
+/// （`local-host` / `local-instance`）。
+///
+/// 三处都需要「这台机器叫什么」（发现探针、注册/状态上报的机器画像、实例名兜底），优先级只在这里
+/// 定义一次。前两个来源不可靠：macOS 没有 `/etc/hostname`、守护进程环境里也常常没有 `HOSTNAME`，
+/// 只靠它们会退化成占位名；系统主机名才是管理面想看的那个（macOS 上是 `MacBook-Pro-2.local`）。
+pub(crate) fn host_name_from_sources<'a>(
+    hostname_env: Option<&'a str>,
+    computername_env: Option<&'a str>,
+    hostname_file: Option<&'a str>,
+    os_hostname: Option<&'a str>,
+) -> Option<&'a str> {
+    [hostname_env, computername_env, hostname_file, os_hostname]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+}
+
+/// 从**本机**来源解析机器名（优先级见 [`host_name_from_sources`]）。
+pub(crate) fn resolve_host_name() -> Option<String> {
+    host_name_from_sources(
+        std::env::var("HOSTNAME").ok().as_deref(),
+        std::env::var("COMPUTERNAME").ok().as_deref(),
+        hostname_from_file().as_deref(),
+        os_hostname().as_deref(),
+    )
+    .map(str::to_string)
+}
+
+/// 当前机器名，四个来源都拿不到时回落占位名 `local-host`。
 pub(crate) fn default_host_name() -> String {
-    std::env::var("HOSTNAME")
-        .ok()
-        .or_else(|| std::env::var("COMPUTERNAME").ok())
-        .or_else(hostname_from_file)
+    resolve_host_name().unwrap_or_else(|| "local-host".to_string())
+}
+
+/// 本机操作系统主机名（`gethostname`）。
+///
+/// `HOSTNAME` / `COMPUTERNAME` / `/etc/hostname` 是「好来源」，但都不可靠：macOS 没有
+/// `/etc/hostname`，守护进程环境里也常常没有导出的 `HOSTNAME`。两者都拿不到时会退化成占位名
+/// `local-host` —— 而系统主机名正是管理面想看的那个（macOS 上是 `MacBook-Pro-2.local`）。
+/// 所以让它排在占位名之前。
+pub(crate) fn os_hostname() -> Option<String> {
+    sysinfo::System::host_name()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "local-host".to_string())
 }
 
 pub(crate) fn default_host_id() -> String {
@@ -113,41 +151,49 @@ fn machine_id_from_known_locations() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    fn default_host_name_from_sources(
-        hostname_env: Option<&str>,
-        computername_env: Option<&str>,
-        hostname_file: Option<&str>,
-    ) -> String {
-        hostname_env
-            .or(computername_env)
-            .or(hostname_file)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("local-host")
-            .to_string()
-    }
+    use super::{default_host_name, host_name_from_sources};
 
     #[test]
     fn host_name_prefers_hostname_env() {
         assert_eq!(
-            default_host_name_from_sources(Some("host-a"), Some("pc-a"), Some("file-a")),
-            "host-a"
+            host_name_from_sources(Some("host-a"), Some("pc-a"), Some("file-a"), Some("os-a")),
+            Some("host-a")
         );
     }
 
     #[test]
     fn host_name_falls_back_to_hostname_file() {
         assert_eq!(
-            default_host_name_from_sources(None, None, Some("file-a")),
-            "file-a"
+            host_name_from_sources(None, None, Some("file-a"), Some("os-a")),
+            Some("file-a")
         );
     }
 
     #[test]
-    fn host_name_defaults_when_sources_missing() {
+    fn host_name_falls_back_to_os_hostname_before_placeholder() {
+        // env / file 都拿不到（macOS 的常态）时，得用系统主机名，而不是占位名。
         assert_eq!(
-            default_host_name_from_sources(None, None, None),
-            "local-host"
+            host_name_from_sources(None, None, None, Some("MacBook-Pro-2.local")),
+            Some("MacBook-Pro-2.local")
         );
+    }
+
+    #[test]
+    fn host_name_is_none_when_all_sources_missing() {
+        assert_eq!(host_name_from_sources(None, None, None, None), None);
+    }
+
+    #[test]
+    fn host_name_skips_blank_sources() {
+        // 空串 / 纯空白不算来源，继续往后找。
+        assert_eq!(
+            host_name_from_sources(Some("  "), None, Some(""), Some("os-a")),
+            Some("os-a")
+        );
+    }
+
+    #[test]
+    fn default_host_name_is_never_empty() {
+        assert!(!default_host_name().is_empty());
     }
 }

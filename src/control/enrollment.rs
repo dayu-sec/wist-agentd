@@ -341,11 +341,9 @@ fn local_certificate_signing_request(state_dir: &Path) -> Result<String, Enrollm
 }
 
 pub(crate) fn build_host_profile(config: &AgentConfig) -> HostProfile {
-    let hostname = hostname_from_sources(
-        std::env::var("HOSTNAME").ok().as_deref(),
-        std::env::var("COMPUTERNAME").ok().as_deref(),
-        hostname_from_file().as_deref(),
-    );
+    // 机器名优先级只有一份实现：`discovery::host`（`HOSTNAME` → `COMPUTERNAME` → `/etc/hostname`
+    // → `gethostname`），三处调用点共用，避免各自遗漏系统主机名而退化成占位名。
+    let hostname = crate::discovery::host::default_host_name();
     let machine_id = machine_id_from_file().unwrap_or_else(|| "unknown".to_string());
     let node_id = first_non_empty([
         config.agent.instance_name.as_deref(),
@@ -874,29 +872,6 @@ fn first_non_empty<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> Opt
         .find(|value| !value.is_empty())
 }
 
-fn hostname_from_sources(
-    hostname_env: Option<&str>,
-    computername_env: Option<&str>,
-    hostname_file: Option<&str>,
-) -> String {
-    first_non_empty([hostname_env, computername_env, hostname_file])
-        .unwrap_or("local-host")
-        .to_string()
-}
-
-#[cfg(unix)]
-fn hostname_from_file() -> Option<String> {
-    fs::read_to_string("/etc/hostname")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-#[cfg(not(unix))]
-fn hostname_from_file() -> Option<String> {
-    None
-}
-
 #[cfg(unix)]
 fn machine_id_from_file() -> Option<String> {
     ["/etc/machine-id", "/var/lib/dbus/machine-id"]
@@ -959,10 +934,10 @@ mod tests {
     };
 
     use super::{
-        EnrollmentDecision, EnrollmentReason, build_enrollment_request, enroll_from_config,
-        enroll_with_token, enroll_with_token_forced, enrollment_http_client, ensure_enrolled,
-        ensure_enrolled_with_config_path, hostname_from_sources, is_registered_agent_id,
-        post_enrollment, renew_credential, restore_runtime_identity,
+        EnrollmentDecision, EnrollmentReason, build_enrollment_request, build_host_profile,
+        enroll_from_config, enroll_with_token, enroll_with_token_forced, enrollment_http_client,
+        ensure_enrolled, ensure_enrolled_with_config_path, is_registered_agent_id, post_enrollment,
+        renew_credential, restore_runtime_identity,
     };
 
     #[test]
@@ -1057,15 +1032,20 @@ mod tests {
     }
 
     #[test]
-    fn hostname_from_sources_prefers_env_values() {
-        assert_eq!(
-            hostname_from_sources(Some("host-env"), Some("pc-env"), Some("file-host")),
-            "host-env"
-        );
-        assert_eq!(
-            hostname_from_sources(None, None, Some("file-host")),
-            "file-host"
-        );
+    fn host_profile_addresses_exclude_noise() {
+        // 端到端不变量（与运行环境的网卡无关）：机器画像里的每条地址都是可展示的 ——
+        // 链路本地 / 回环 / 未指定 / 自分配都不会出现。真实过滤的确定性验证在
+        // `discovery::network::projects_only_meaningful_host_addresses`（用合成 inventory）。
+        let profile = build_host_profile(&config());
+        for entry in &profile.ip_addresses {
+            // 条目形如 `en0 192.168.3.178/24`：取地址段再判噪声。
+            let spec = entry.split_whitespace().nth(1).unwrap_or(entry.as_str());
+            let address = spec.split('/').next().unwrap_or(spec);
+            assert!(
+                !crate::discovery::network::is_meaningless_address(address),
+                "机器画像里不该出现噪声地址：{entry}"
+            );
+        }
     }
 
     #[test]

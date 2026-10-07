@@ -3,6 +3,20 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0-alpha] - 2026-10-07
+
+### 新增
+
+- **机器名兜底到系统主机名**：`HOSTNAME` / `COMPUTERNAME` / `/etc/hostname` 都拿不到时（macOS 的常态）
+  改用 `gethostname()` —— 此前会退化成占位名 `local-host`，导致管理面上**所有 macOS 机器同名**。
+
+### 变更
+
+- **机器画像与事实摘要只带有信息量的网卡地址**：在采集侧就滤掉 IPv6 链路本地（`fe80::/10`）、
+  回环与 IPv4 自分配（`169.254.0.0/16`）—— 多网卡主机不再把十几条噪声地址带上管理面 / 中心。
+- 机器名优先级（`HOSTNAME → COMPUTERNAME → /etc/hostname → gethostname`）收成**一份共享实现**
+  （发现探针 / 机器画像 / 实例名三处共用），不再各自复制、各自退化。
+
 ## [0.1.34-alpha] - 2026-10-06
 
 ### 变更

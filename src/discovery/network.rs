@@ -4,12 +4,9 @@ use std::collections::BTreeMap;
 #[cfg(target_os = "linux")]
 use std::fs;
 use std::io;
+use std::net::{Ipv4Addr, Ipv6Addr};
 #[cfg(unix)]
-use std::{
-    ffi::CStr,
-    net::{Ipv4Addr, Ipv6Addr},
-    ptr,
-};
+use std::{ffi::CStr, ptr};
 
 use wist_contracts::discovery::{DiscoveredResource, DiscoveredTarget, DiscoveryOrigin};
 use wist_shared::time::now_rfc3339;
@@ -233,20 +230,55 @@ fn discover_network_inventory() -> io::Result<Vec<ObservedNetworkInterface>> {
 
 /// 本机网卡地址列表（形如 `en0 192.168.1.5/24`），供机器画像 / 状态上报在管理面展示。
 ///
-/// 与发现探针共用同一份枚举（`discover_network_inventory`，已跳过回环），格式也与事实摘要的
+/// 与发现探针共用同一份枚举（`discover_network_inventory`，已跳过回环）。**只保留有信息量的地址**：
+/// 滤掉 IPv6 链路本地（`fe80::/10`，每张网卡都有一条）、回环与 IPv4 自分配（`169.254.0.0/16`）——
+/// 一台多网卡主机否则会带上十几条这种噪声，把管理面的「这是哪台机器」淹掉。格式与事实摘要的
 /// `network_addresses` 一致（`iface cidr`）；采不到就返回空表 —— 这是展示信息，不该影响上报本身。
 #[cfg(unix)]
 pub(crate) fn local_ip_addresses() -> Vec<String> {
     let Ok(interfaces) = discover_network_inventory() else {
         return Vec::new();
     };
+    project_host_addresses(interfaces)
+}
+
+/// 从网卡枚举投影出「这台机器是谁」的 `iface cidr` 列表：滤掉噪声，其余保持枚举顺序。
+///
+/// 拆成纯函数是为了能用合成 inventory 单测 —— 真实枚举（`discover_network_inventory`）依赖
+/// 运行环境的网卡，测不稳定。
+fn project_host_addresses(interfaces: Vec<ObservedNetworkInterface>) -> Vec<String> {
     let mut addresses = Vec::new();
     for iface in interfaces {
         for address in iface.addresses {
+            if is_meaningless_address(&address.ip) {
+                continue;
+            }
             addresses.push(format!("{} {}", iface.name, address.cidr()));
         }
     }
     addresses
+}
+
+/// 对「这台机器是谁」没有信息量的地址：IPv6 链路本地 / 回环 / 未指定，IPv4 回环 / 自分配（APIPA）/ 未指定。
+///
+/// 判断靠解析而不是字符串前缀：`fe80::/10` 覆盖 `fe80`–`febf`，只有按位判断才不漏。解析不了的
+/// 串（不该出现）不作为噪声，原样保留 —— 展示层宁愿多一条也不要错删。
+pub(crate) fn is_meaningless_address(ip: &str) -> bool {
+    if let Ok(v6) = ip.parse::<Ipv6Addr>() {
+        return v6.is_loopback() || v6.is_unspecified() || v6.is_unicast_link_local();
+    }
+    if let Ok(v4) = ip.parse::<Ipv4Addr>() {
+        return v4.is_loopback() || v4.is_unspecified() || v4.is_link_local();
+    }
+    false
+}
+
+/// 判断一条地址 **spec**（`192.168.1.5/24` 或裸 `10.0.0.2`）是否是展示噪声：
+/// 取 `/` 前的地址段再交给 [`is_meaningless_address`]。
+///
+/// 供不经过 `project_host_addresses` 的展示口径使用（发现快照里的 `net.if.cidr` / `net.if.addr`）。
+pub(crate) fn is_meaningless_address_spec(spec: &str) -> bool {
+    is_meaningless_address(spec.split('/').next().unwrap_or(spec))
 }
 
 #[cfg(not(unix))]
@@ -378,9 +410,136 @@ fn discover_network_inventory() -> io::Result<Vec<ObservedNetworkInterface>> {
 #[cfg(test)]
 mod tests {
     use super::ObservedIpAddress;
+    use super::ObservedNetworkInterface;
     #[cfg(target_os = "linux")]
     use super::parse_linux_proc_default_gateways;
-    use super::{encode_id_segment, ipv6_scope};
+    use super::{encode_id_segment, ipv6_scope, is_meaningless_address, project_host_addresses};
+
+    fn iface(name: &str, addresses: &[(&str, u8)]) -> ObservedNetworkInterface {
+        ObservedNetworkInterface {
+            name: name.to_string(),
+            mac: None,
+            state: Some("up".to_string()),
+            addresses: addresses
+                .iter()
+                .map(|(ip, prefix)| ObservedIpAddress {
+                    ip: (*ip).to_string(),
+                    prefix: *prefix,
+                    gateway_ip: None,
+                    scope: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// 端到端投影：用一条真实的 macOS 记录（18 条，其中 12 条是每张网卡一条的链路本地 IPv6）
+    /// 验证噪声被滤掉、有信息量的保留。
+    #[test]
+    fn projects_only_meaningful_host_addresses() {
+        let interfaces = vec![
+            iface("awdl0", &[("fe80::303b:c4ff:fe6b:406e", 64)]),
+            iface(
+                "bridge100",
+                &[
+                    ("192.168.139.3", 23),
+                    ("fe80::603e:5fff:fef3:3364", 64),
+                    ("fd07:b51a:cc66:0:a617:db5e:ab7:e9f1", 64),
+                ],
+            ),
+            iface(
+                "bridge101",
+                &[("192.168.117.0", 24), ("fe80::603e:5fff:fef3:3365", 64)],
+            ),
+            iface(
+                "bridge102",
+                &[("192.168.107.0", 24), ("fe80::603e:5fff:fef3:3366", 64)],
+            ),
+            iface(
+                "en0",
+                &[("fe80::1857:ec5:fe03:af06", 64), ("192.168.3.178", 24)],
+            ),
+            iface("llw0", &[("fe80::303b:c4ff:fe6b:406e", 64)]),
+            iface("utun0", &[("fe80::19c3:bef7:1b4f:f4f5", 64)]),
+            iface("utun1", &[("fe80::3de5:8507:afee:5945", 64)]),
+            iface(
+                "utun100",
+                &[
+                    ("100.121.111.48", 8),
+                    ("fe80::845:a9a4:a00a:8bcd", 64),
+                    ("fe80::", 64),
+                ],
+            ),
+            iface("utun2", &[("fe80::4aef:bbdd:5acd:f782", 64)]),
+            iface("utun3", &[("fe80::ce81:b1c:bd2c:69e", 64)]),
+        ];
+
+        let addresses = project_host_addresses(interfaces);
+
+        // 18 → 6：只留物理/虚拟网卡上的有信息量地址。
+        assert_eq!(addresses.len(), 6, "实际：{addresses:?}");
+        assert!(
+            !addresses.iter().any(|entry| entry.contains("fe80")),
+            "不得留链路本地：{addresses:?}"
+        );
+        // en0 的物理 IPv4、ULA 与 Tailscale CGNAT 都保留；顺序按枚举来。
+        assert_eq!(
+            addresses,
+            vec![
+                "bridge100 192.168.139.3/23",
+                "bridge100 fd07:b51a:cc66:0:a617:db5e:ab7:e9f1/64",
+                "bridge101 192.168.117.0/24",
+                "bridge102 192.168.107.0/24",
+                "en0 192.168.3.178/24",
+                "utun100 100.121.111.48/8",
+            ]
+        );
+    }
+
+    #[test]
+    fn classifies_meaningless_addresses() {
+        // 噪声：IPv6 链路本地（每张网卡一条）、回环、未指定、IPv4 自分配。
+        for noise in [
+            "fe80::1",
+            "fe80::303b:c4ff:fe6b:406e",
+            "febf::1",
+            "Fe80::1",
+            "::1",
+            "::",
+            "127.0.0.1",
+            "169.254.10.20",
+            "0.0.0.0",
+        ] {
+            assert!(is_meaningless_address(noise), "{noise} 应被判为噪声");
+        }
+        // 有信息量：私网 / 公网 / ULA（fd00::/8）/ Tailscale CGNAT（100.64.0.0/10）/
+        // site-local（fec0::/10，虽废弃但不是链路本地）/ IPv4-mapped。
+        for meaningful in [
+            "192.168.3.178",
+            "10.0.0.5",
+            "100.121.111.48",
+            "fd07:b51a:cc66:0:a617:db5e:ab7:e9f1",
+            "2001:db8::1",
+            "fec0::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(
+                !is_meaningless_address(meaningful),
+                "{meaningful} 不该被滤掉"
+            );
+        }
+        // 解析不了的串（含空串）保留，宁可多一条也不错删 —— 真实枚举不会产生这些。
+        assert!(!is_meaningless_address("not-an-ip"));
+        assert!(!is_meaningless_address(""));
+    }
+
+    #[test]
+    fn projects_nothing_when_every_address_is_noise() {
+        let interfaces = vec![
+            iface("lo0", &[("127.0.0.1", 8), ("::1", 128)]),
+            iface("en0", &[("fe80::1", 64), ("169.254.1.2", 16)]),
+        ];
+        assert!(project_host_addresses(interfaces).is_empty());
+    }
 
     #[test]
     fn address_formats_cidr() {

@@ -60,6 +60,7 @@ pub struct FactSummaryDraft {
     /// 主机名（`host.name`）。
     pub host_name: String,
     /// 网卡地址（每块网卡一条，形如 `en0 192.168.1.5/24`）。
+    /// 已滤掉链路本地（`fe80::/10`）/ 回环 / IPv4 自分配 —— 展示口径与机器画像一致。
     pub network_addresses: Vec<String>,
 }
 
@@ -127,6 +128,11 @@ pub fn build_summary(snapshot: &DiscoverySnapshot) -> FactSummaryDraft {
                 else {
                     continue;
                 };
+                // 展示口径：滤掉链路本地 / 回环 / 自分配（与机器画像同一判据）。网卡探针会把每张
+                // 网卡的 `fe80::` 都列进快照，不滤的话「这台机器在哪」会被十几条噪声淹掉。
+                if crate::discovery::network::is_meaningless_address_spec(address) {
+                    continue;
+                }
                 // 带上网卡名，否则多块网卡时一堆地址分不清谁是谁。
                 addresses.insert(match attribute(resource, ADDR_IFACE) {
                     Some(iface) => format!("{iface} {address}"),
@@ -327,6 +333,11 @@ mod tests {
             ),
             // 没有 cidr 时退回裸地址，且没有网卡名也能用。
             resource(IP_ADDRESS_KIND, &[(ADDR_IP, "10.8.0.2")]),
+            // 链路本地噪声：展示口径里滤掉（每张网卡一条，会把「在哪」淹掉）。
+            resource(
+                IP_ADDRESS_KIND,
+                &[(ADDR_IFACE, "en0"), (ADDR_CIDR, "fe80::1/64")],
+            ),
         ]));
 
         assert_eq!(summary.host_id, "mid-1");
@@ -335,6 +346,31 @@ mod tests {
             summary.network_addresses,
             vec!["10.8.0.2", "en0 192.168.1.5/24"]
         );
+    }
+
+    #[test]
+    fn drops_link_local_loopback_and_self_assigned_network_addresses() {
+        // 展示口径与机器画像一致：噪声地址不进 fact summary（否则中心那边也是十几条 fe80）。
+        let summary = build_summary(&snapshot(vec![
+            resource(
+                IP_ADDRESS_KIND,
+                &[(ADDR_IFACE, "en0"), (ADDR_CIDR, "192.168.3.178/24")],
+            ),
+            resource(
+                IP_ADDRESS_KIND,
+                &[
+                    (ADDR_IFACE, "en0"),
+                    (ADDR_CIDR, "fe80::1857:ec5:fe03:af06/64"),
+                ],
+            ),
+            resource(
+                IP_ADDRESS_KIND,
+                &[(ADDR_IFACE, "lo0"), (ADDR_CIDR, "127.0.0.1/8")],
+            ),
+            resource(IP_ADDRESS_KIND, &[(ADDR_IP, "169.254.10.20")]),
+        ]));
+
+        assert_eq!(summary.network_addresses, vec!["en0 192.168.3.178/24"]);
     }
 
     #[test]
