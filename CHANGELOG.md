@@ -3,6 +3,17 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.1-alpha] - 2026-10-08
+
+### 变更
+
+- **Linux 制品改为静态 musl**：发布矩阵从 `x86_64-unknown-linux-gnu` / `aarch64-unknown-linux-gnu`
+  收敛为 `x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl`（macOS 仍 `aarch64-apple-darwin`），
+  构建时装 `musl-tools` 并把 C 依赖（`ring` 等）的 `CC`/链接器指向 `musl-gcc`，产出**静态链接**二进制
+  （`file` → `statically linked`，`ldd` → `not a dynamic executable`），glibc 与 musl（Alpine）主机上都能跑。
+  制品名相应变为 `<repo>-<version>-<triple>.tar.gz` 的 musl 形态，满足控制中心「三平台、不出现 glibc」的平台集。
+  **包内三件套**（`wist-agentd` / `wist-exec` / `wist-upgrader`）与安装脚本口径不变；仅发布产物形态变更。
+
 ## [0.2.0-alpha] - 2026-10-07
 
 ### 新增
