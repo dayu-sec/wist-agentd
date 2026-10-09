@@ -1,6 +1,6 @@
 [package]
 name = "wist-agentd"
-version = "0.2.2" #@gxl:set(version)
+version = "0.2.3" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -8,7 +8,7 @@ license = "Apache-2.0"
 libc = "0.2"
 sysinfo = { version = "0.39", default-features = false, features = ["system", "disk"] }
 jumo-derive = "0.1"
-orion-error = { version = "0.8", features = ["derive", "serde_json"] }
+orion-error = { version = "0.9", features = ["derive", "serde_json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # 升级时校验制品摘要、判版本方向、取包 —— 全在**底座** crate `wist-artifact`（不在发布域）：

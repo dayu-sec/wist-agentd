@@ -3,6 +3,13 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.3-alpha] - 2026-10-09
+
+### 变更
+
+- **对齐 `orion-error` 0.9**：依赖由 `0.8` 升到 `0.9`（`OperationContext` 变纯数据、Drop 日志交给
+  `AutoLogGuard`）。本仓只用 `to_err` / `source_err` / builder，无行为变更。
+
 ## [0.2.2-alpha] - 2026-10-09
 
 ### 变更

@@ -908,9 +908,9 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "orion-error"
-version = "0.8.3"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d40fe94cd4fe0d82201572062e9ca46968ff8fb19c6786d772e9deb8ba0b806"
+checksum = "575552089359a03595b39776384dac800d02938e8821eadf2b57ccef28477044"
 dependencies = [
  "log",
  "orion-error-derive",
@@ -922,9 +922,9 @@ dependencies = [
 
 [[package]]
 name = "orion-error-derive"
-version = "0.8.3"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2419a84868c55bfe730bedaabf250fa9b6de3c9d2e254d9154b1c3212fdc354"
+checksum = "e9864158ef9ac77e9540459781704e6706080bc3f795e7be2fbb8947b6d5e3dc"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2192,7 +2192,7 @@ checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 
 [[package]]
 name = "wist-agentd"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "jumo-derive",
  "libc",
