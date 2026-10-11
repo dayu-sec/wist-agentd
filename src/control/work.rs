@@ -19,11 +19,11 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use crate::config::agent_config::{AgentConfig, LogFileInputSection};
 use wist_api::work::{
     ACK_WORK_KIND, AckWork, POLL_WORK_KIND, PollWork, REPORT_WORK_RESULT_KIND, ReportWorkResult,
     WorkAccepted, WorkGrant, WorkResultAccepted,
 };
-use crate::config::agent_config::{AgentConfig, LogFileInputSection};
 use wist_contracts::work::{
     OneShotWork, StandingWork, WorkSpec, WorkSpecSource, is_known_exporter, parse_exporter_target,
 };

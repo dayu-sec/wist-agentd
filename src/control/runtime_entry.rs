@@ -685,9 +685,7 @@ async fn run_daemon(root: PathBuf, config_dir: Option<&Path>) -> AgentdResult<()
     let upgrader_bin = match crate::upgrade::resolve_upgrader_bin() {
         Ok(path) => path,
         Err(detail) => {
-            log::warn!(
-                "{detail}; one-shot work `upgrade` will be rejected until it is installed"
-            );
+            log::warn!("{detail}; one-shot work `upgrade` will be rejected until it is installed");
             PathBuf::new()
         }
     };

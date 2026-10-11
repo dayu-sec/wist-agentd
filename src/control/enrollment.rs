@@ -7,11 +7,11 @@ use std::time::Duration;
 
 use orion_error::{conversion::ToStructError, prelude::*};
 
+use crate::config::agent_config::AgentConfig;
 use wist_api::enrollment::{
     CredentialRenewal, CredentialRenewed, EnrollmentEnvelope, EnrollmentOutcome, EnrollmentRequest,
     EnrollmentStatus, HostProfile,
 };
-use crate::config::agent_config::AgentConfig;
 use wist_contracts::agent_state::{AgentRuntimeState, RuntimeMode};
 use wist_shared::fs::write_bytes_private_atomic;
 use wist_shared::time::now_rfc3339;
@@ -923,14 +923,14 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crate::config::agent_config::{
+        AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, PathsSection,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use wist_api::enrollment::{
         AgentIdentity, AgentIdentityStatus, CredentialBundle, EnrollmentOutcome, EnrollmentStatus,
         SUBMIT_ENROLLMENT_REQUEST_KIND,
-    };
-    use crate::config::agent_config::{
-        AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, PathsSection,
     };
 
     use super::{

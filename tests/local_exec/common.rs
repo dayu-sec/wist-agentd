@@ -8,14 +8,14 @@ use serde::Deserialize;
 use time::Duration as TimeDuration;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use wist_contracts::action_plan::{
-    ActionPlan, ActionPlanConstraints, ActionPlanMeta, ActionPlanProgram, ActionPlanStep,
-    ActionPlanTarget, ApprovalMode, RiskLevel,
-};
 use wist_agentd::config::agent_config::{
     AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, LogFileInputSection,
     LogsFileOutputSection, LogsOutputSection, LogsSection, LogsTcpOutputSection, PathsSection,
     TelemetrySection,
+};
+use wist_contracts::action_plan::{
+    ActionPlan, ActionPlanConstraints, ActionPlanMeta, ActionPlanProgram, ActionPlanStep,
+    ActionPlanTarget, ApprovalMode, RiskLevel,
 };
 
 #[derive(Debug, Deserialize)]

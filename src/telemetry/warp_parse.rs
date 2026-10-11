@@ -4,11 +4,11 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::config::agent_config::LogsOutputSection;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout};
-use crate::config::agent_config::LogsOutputSection;
 use wist_contracts::telemetry_record::{DataFrame, TelemetryRecord};
 use wist_shared::fs::ensure_parent;
 

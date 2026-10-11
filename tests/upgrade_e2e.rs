@@ -17,11 +17,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
+use wist_agentd::config::agent_config::{
+    AgentConfig, AgentSection, ControlPlaneSection, PathsSection,
+};
 use wist_agentd::upgrade::{
     AGENTD_BIN_NAME, EXEC_BIN_NAME, RestartPlan, UPGRADE_HEARTBEAT_FILE, UPGRADE_RECORD_FILE,
     UPGRADER_BIN_NAME, UpgradeOptions, UpgradeRecord, UpgradeRequest, apply,
 };
-use wist_agentd::config::agent_config::{AgentConfig, AgentSection, ControlPlaneSection, PathsSection};
 use wist_contracts::agent_state::{AgentRuntimeState, RuntimeMode};
 use wist_shared::fs::{read_json, write_json_atomic};
 use wist_shared::time::now_rfc3339;

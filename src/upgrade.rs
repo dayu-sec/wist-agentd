@@ -27,11 +27,11 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::config::agent_config::AgentConfig;
 use serde::{Deserialize, Serialize};
 use wist_artifact::digest::{parse_digest, sha256_hex_bytes};
 use wist_artifact::source::{ArtifactError, read_local_source, read_source_with_client};
 use wist_artifact::version::{parse_version, version_is_newer};
-use crate::config::agent_config::AgentConfig;
 use wist_shared::fs::{read_json, write_json_atomic};
 use wist_shared::time::now_rfc3339;
 
@@ -1291,11 +1291,11 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
     use crate::config::agent_config::{
         AgentConfig, AgentSection, ControlPlaneSection, PathsSection,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     use wist_contracts::agent_state::{AgentRuntimeState, RuntimeMode};
 
     use super::*;

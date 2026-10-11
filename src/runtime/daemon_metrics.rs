@@ -209,7 +209,10 @@ pub(super) fn emit_metrics_failures(failures: &[MetricsFailure]) {
 pub(super) fn emit_metrics_failure(failure: &MetricsFailure) {
     log::error!(
         "event=MetricsRuntimeFailed kind={:?} phase={} path={} error={}",
-        failure.kind, failure.phase, failure.path, failure.detail
+        failure.kind,
+        failure.phase,
+        failure.path,
+        failure.detail
     );
 }
 

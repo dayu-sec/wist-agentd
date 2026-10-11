@@ -1,8 +1,8 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use wist_api::uplink::AgentUplinkGrant;
 use crate::config::agent_config::{AgentConfig, LogFileInputSection, LogsOutputSection};
+use wist_api::uplink::AgentUplinkGrant;
 
 use crate::telemetry::logs::InputOrigin;
 use crate::telemetry::logs::files::file_reader::ReadLimits;
@@ -246,13 +246,13 @@ mod tests {
         InputOrigin, TelemetryFailureKind, Withheld, build_file_input_config, effective_output,
         startup_position_for, unsupported_target, uplink_failure, withheld_failure,
     };
-    use crate::telemetry::logs::files::file_watcher::StartupPosition;
-    use std::path::PathBuf;
-    use wist_api::uplink::AgentUplinkGrant;
     use crate::config::agent_config::{
         AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, LogFileInputSection,
         PathsSection,
     };
+    use crate::telemetry::logs::files::file_watcher::StartupPosition;
+    use std::path::PathBuf;
+    use wist_api::uplink::AgentUplinkGrant;
 
     fn config_with_agent(agent_id: Option<&str>) -> AgentConfig {
         AgentConfig::new(

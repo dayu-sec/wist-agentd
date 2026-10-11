@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use wist_agentd::bootstrap;
+use wist_agentd::config::agent_config::{DiscoverySection, LogFileInputSection};
 use wist_agentd::control::work::AppliedWorkGrant;
 use wist_agentd::daemon;
 use wist_agentd::self_observability::DiscoveryReadiness;
 use wist_api::work::WorkGrant;
-use wist_agentd::config::agent_config::{DiscoverySection, LogFileInputSection};
 use wist_contracts::discovery::{
     CollectionCandidate, DiscoveredResource, DiscoveredTarget, DiscoveryCacheMeta,
 };

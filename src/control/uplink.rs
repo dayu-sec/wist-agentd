@@ -22,8 +22,8 @@
 
 use std::time::Duration;
 
-use wist_api::uplink::{AgentUplinkGrant, POLL_AGENT_UPLINK_KIND, PollAgentUplink};
 use crate::config::agent_config::AgentConfig;
+use wist_api::uplink::{AgentUplinkGrant, POLL_AGENT_UPLINK_KIND, PollAgentUplink};
 use wist_shared::time::now_rfc3339;
 
 use crate::control::enrollment::enrollment_http_client;
@@ -235,11 +235,11 @@ fn describe(grant: &AgentUplinkGrant) -> String {
 mod tests {
     use std::time::Duration;
 
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
     use crate::config::agent_config::{
         AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, PathsSection,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
 
     use super::{AppliedUplink, UplinkFetch, fetch_uplink_grant, fetch_uplink_grant_with_timeout};
     use wist_api::uplink::AgentUplinkGrant;

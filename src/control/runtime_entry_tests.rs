@@ -3,6 +3,9 @@ use super::{
     refresh_runtime_version, resolve_config_dir_arg, resolve_exec_bin_from, run_from_args,
     sync_runtime_identity, usage_message,
 };
+use crate::config::agent_config::{
+    AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, PathsSection,
+};
 use crate::enrollment::EnrollmentDecision;
 use crate::state_store::agent_runtime;
 use std::fs;
@@ -10,9 +13,6 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use crate::config::agent_config::{
-    AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, PathsSection,
-};
 use wist_contracts::agent_state::{AgentRuntimeState, RuntimeMode};
 
 fn temp_dir(name: &str) -> PathBuf {

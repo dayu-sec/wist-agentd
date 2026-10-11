@@ -5,13 +5,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::config::agent_config::AgentConfig;
 use crate::telemetry::warp_parse::TelemetryRecordSink;
 use wist_api::discovery_policies::{
     DiscoveryPoliciesReturned, POLL_DISCOVERY_POLICIES_KIND, PollDiscoveryPolicies,
 };
 use wist_api::facts::ReportAgentFactSummary;
 use wist_api::status::{AgentStatusReport, AgentWorkState, AgentWorkStateChange};
-use crate::config::agent_config::AgentConfig;
 use wist_contracts::agent_uplink::AgentUplinkState;
 use wist_contracts::discovery_policy::DiscoveryAspectPolicySet;
 use wist_contracts::local_work::{
@@ -610,7 +610,8 @@ async fn retry_terminal_probe(
     {
         log::info!(
             "event=AuthTerminalReasonChanged from={} to={} action=\"台账已更新；处理方式按新 code\"",
-            state.code, code
+            state.code,
+            code
         );
         state.code = code.to_string();
         // `since` 跟着走：它说的是「**这个** code 从什么时候起」。
@@ -1059,7 +1060,11 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                     };
                     log::info!(
                         "event=AuthTerminalCleared code={} source={} since={} attempts={} cleared={} detail=\"控制面重新接受本机凭据，已恢复常规上报\"",
-                        state.code, state.source, state.detected_at, state.attempts, cleared
+                        state.code,
+                        state.source,
+                        state.detected_at,
+                        state.attempts,
+                        cleared
                     );
                     terminal = None;
                     terminal_clear_pending = !cleared;
@@ -1559,7 +1564,9 @@ async fn refresh_work_grant(
     for unit in &outcome.unsupported {
         log::warn!(
             "event=WorkUnitUnsupported work_id={} unit_id={} detail={}",
-            unit.work_id, unit.unit_id, unit.detail
+            unit.work_id,
+            unit.unit_id,
+            unit.detail
         );
     }
     for work_id in &outcome.stopped {
@@ -1748,13 +1755,17 @@ async fn reconcile_upgrade_record(
     }
     log::info!(
         "event=UpgradeProgress work_id={} step={} status={} detail=\"{}\"",
-        record.work_id, record.step, record.status, record.detail
+        record.work_id,
+        record.step,
+        record.status,
+        record.detail
     );
     let mapped = if dead {
         // 要报成 failed；说明里必须写清“是被判死的”，否则页面上只是一个无法解释的失败。
         log::warn!(
             "event=UpgradeDeclaredDead work_id={} step={}",
-            record.work_id, record.step
+            record.work_id,
+            record.step
         );
         Some((
             "failed",
@@ -1772,7 +1783,8 @@ async fn reconcile_upgrade_record(
         // 免得编一个网关会拒的取值，把“状态闭集不一致”变成一个无限重试。
         log::warn!(
             "event=UpgradeResultUnmappable work_id={} status={}",
-            record.work_id, record.status
+            record.work_id,
+            record.status
         );
         return false;
     };
@@ -2119,11 +2131,11 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
     use crate::config::agent_config::{
         AgentSection, ControlPlaneSection, ExecutionSection, PathsSection,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     use crate::control::uplink::UplinkFetch;
     use crate::telemetry::warp_parse::{FileRecordSink, TcpFraming, TcpRecordSink};

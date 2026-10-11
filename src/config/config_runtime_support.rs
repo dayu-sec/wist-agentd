@@ -1,8 +1,8 @@
 use std::env;
 use std::path::{Component, Path, PathBuf};
 
-use orion_error::conversion::ToStructError;
 use crate::config::agent_config::AgentConfig;
+use orion_error::conversion::ToStructError;
 
 use crate::config_runtime::{
     ConfigError, ConfigReason, SYSTEM_CONFIG_DIR, SYSTEM_DATA_ROOT, SYSTEM_LOG_DIR,

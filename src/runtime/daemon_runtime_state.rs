@@ -20,21 +20,28 @@ pub(super) fn emit_telemetry_failure(failure: &TelemetryFailure) {
     match failure.kind {
         TelemetryFailureKind::MissingInput => log::error!(
             "telemetry input missing input_id={} path={}",
-            failure.input_id, failure.path
+            failure.input_id,
+            failure.path
         ),
         TelemetryFailureKind::ProcessingFailed => log::error!(
             "telemetry input failed input_id={} path={} err={}",
-            failure.input_id, failure.path, failure.detail
+            failure.input_id,
+            failure.path,
+            failure.detail
         ),
         TelemetryFailureKind::InvalidOutput => log::error!(
             "telemetry output invalid input_id={} path={} err={}",
-            failure.input_id, failure.path, failure.detail
+            failure.input_id,
+            failure.path,
+            failure.detail
         ),
         TelemetryFailureKind::RecordWithheld => {
             let magnitude = failure.magnitude.as_deref().unwrap_or("n/a");
             log::error!(
                 "telemetry record withheld input_id={} path={} detail={} magnitude={magnitude}",
-                failure.input_id, failure.path, failure.detail
+                failure.input_id,
+                failure.path,
+                failure.detail
             );
         }
         // 出口写失败：`magnitude` 里带目标地址与底层原因（`TcpRecordSink` 已挂 `host:port`）——
@@ -43,7 +50,9 @@ pub(super) fn emit_telemetry_failure(failure: &TelemetryFailure) {
             let magnitude = failure.magnitude.as_deref().unwrap_or("n/a");
             log::error!(
                 "telemetry output write failed input_id={} path={} detail={} magnitude={magnitude}",
-                failure.input_id, failure.path, failure.detail
+                failure.input_id,
+                failure.path,
+                failure.detail
             );
         }
     }
@@ -59,11 +68,15 @@ pub(super) fn emit_work_state_notification(notification: &TelemetryWorkState) {
     match notification.state {
         WorkState::Paused => log::warn!(
             "telemetry work-state paused input_id={} reason={} at={}",
-            notification.input_id, notification.reason, notification.at
+            notification.input_id,
+            notification.reason,
+            notification.at
         ),
         WorkState::Resumed => log::info!(
             "telemetry work-state resumed input_id={} reason={} at={}",
-            notification.input_id, notification.reason, notification.at
+            notification.input_id,
+            notification.reason,
+            notification.at
         ),
     }
 }

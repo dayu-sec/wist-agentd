@@ -10,11 +10,11 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use wist_agentd::config::agent_config::AgentConfig;
 use wist_agentd::config_runtime;
 use wist_agentd::upgrade::{
     DEFAULT_READY_WAIT, RestartPlan, UpgradeOptions, UpgradeRequest, apply, default_restart_plan,
 };
-use wist_agentd::config::agent_config::AgentConfig;
 
 const USAGE: &str = "\
 Usage:
