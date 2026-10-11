@@ -255,7 +255,7 @@ where
         {
             Ok(state) => state,
             Err(err) => {
-                eprintln!(
+                log::warn!(
                     "event=LogCheckpointUnreadable input_id={} path={} err={err} action=\"按没有 checkpoint 处理，按 startup_position={} 重新定位\"",
                     self.config.input_id,
                     checkpoint_path.display(),

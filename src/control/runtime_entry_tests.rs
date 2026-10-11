@@ -10,7 +10,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use wist_contracts::agent_config::{
+use crate::config::agent_config::{
     AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, PathsSection,
 };
 use wist_contracts::agent_state::{AgentRuntimeState, RuntimeMode};

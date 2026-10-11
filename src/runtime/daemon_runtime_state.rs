@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::io;
 use std::path::Path;
 
-use wist_contracts::agent_config::AgentConfig;
+use crate::config::agent_config::AgentConfig;
 use wist_shared::paths::REPORT_ENVELOPE_SUFFIX;
 use wist_shared::time::now_rfc3339;
 
@@ -18,21 +18,21 @@ pub(super) fn emit_telemetry_failures(failures: &[TelemetryFailure]) {
 
 pub(super) fn emit_telemetry_failure(failure: &TelemetryFailure) {
     match failure.kind {
-        TelemetryFailureKind::MissingInput => eprintln!(
+        TelemetryFailureKind::MissingInput => log::error!(
             "telemetry input missing input_id={} path={}",
             failure.input_id, failure.path
         ),
-        TelemetryFailureKind::ProcessingFailed => eprintln!(
+        TelemetryFailureKind::ProcessingFailed => log::error!(
             "telemetry input failed input_id={} path={} err={}",
             failure.input_id, failure.path, failure.detail
         ),
-        TelemetryFailureKind::InvalidOutput => eprintln!(
+        TelemetryFailureKind::InvalidOutput => log::error!(
             "telemetry output invalid input_id={} path={} err={}",
             failure.input_id, failure.path, failure.detail
         ),
         TelemetryFailureKind::RecordWithheld => {
             let magnitude = failure.magnitude.as_deref().unwrap_or("n/a");
-            eprintln!(
+            log::error!(
                 "telemetry record withheld input_id={} path={} detail={} magnitude={magnitude}",
                 failure.input_id, failure.path, failure.detail
             );
@@ -41,7 +41,7 @@ pub(super) fn emit_telemetry_failure(failure: &TelemetryFailure) {
         // 运维看到这一行就该知道是哪个数据面目标连不上。
         TelemetryFailureKind::OutputWriteFailed => {
             let magnitude = failure.magnitude.as_deref().unwrap_or("n/a");
-            eprintln!(
+            log::error!(
                 "telemetry output write failed input_id={} path={} detail={} magnitude={magnitude}",
                 failure.input_id, failure.path, failure.detail
             );
@@ -57,11 +57,11 @@ pub(super) fn emit_work_state_notifications(notifications: &[TelemetryWorkState]
 
 pub(super) fn emit_work_state_notification(notification: &TelemetryWorkState) {
     match notification.state {
-        WorkState::Paused => eprintln!(
+        WorkState::Paused => log::warn!(
             "telemetry work-state paused input_id={} reason={} at={}",
             notification.input_id, notification.reason, notification.at
         ),
-        WorkState::Resumed => eprintln!(
+        WorkState::Resumed => log::info!(
             "telemetry work-state resumed input_id={} reason={} at={}",
             notification.input_id, notification.reason, notification.at
         ),

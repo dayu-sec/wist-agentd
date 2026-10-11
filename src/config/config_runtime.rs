@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 use orion_error::{conversion::ToStructError, prelude::*};
 
 use crate::fs_async::write_bytes_atomic_async;
-use wist_contracts::agent_config::{AgentConfig, LogFileInputsFile};
+use crate::config::agent_config::{AgentConfig, LogFileInputsFile};
+use crate::config::validate::validate_config;
 use wist_shared::fs::write_bytes_atomic;
 use wist_shared::paths::{AGENTD_CONFIG_FILE, LEGACY_AGENT_CONFIG_FILE};
-use wist_validate::config::validate_config;
 
 #[path = "config_runtime_support.rs"]
 mod support;

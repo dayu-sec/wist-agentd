@@ -11,7 +11,7 @@ use wist_api::enrollment::{
     CredentialRenewal, CredentialRenewed, EnrollmentEnvelope, EnrollmentOutcome, EnrollmentRequest,
     EnrollmentStatus, HostProfile,
 };
-use wist_contracts::agent_config::AgentConfig;
+use crate::config::agent_config::AgentConfig;
 use wist_contracts::agent_state::{AgentRuntimeState, RuntimeMode};
 use wist_shared::fs::write_bytes_private_atomic;
 use wist_shared::time::now_rfc3339;
@@ -929,7 +929,7 @@ mod tests {
         AgentIdentity, AgentIdentityStatus, CredentialBundle, EnrollmentOutcome, EnrollmentStatus,
         SUBMIT_ENROLLMENT_REQUEST_KIND,
     };
-    use wist_contracts::agent_config::{
+    use crate::config::agent_config::{
         AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, PathsSection,
     };
 

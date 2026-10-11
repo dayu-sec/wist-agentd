@@ -2,7 +2,7 @@ use std::env;
 use std::path::{Component, Path, PathBuf};
 
 use orion_error::conversion::ToStructError;
-use wist_contracts::agent_config::AgentConfig;
+use crate::config::agent_config::AgentConfig;
 
 use crate::config_runtime::{
     ConfigError, ConfigReason, SYSTEM_CONFIG_DIR, SYSTEM_DATA_ROOT, SYSTEM_LOG_DIR,
@@ -134,6 +134,18 @@ container_enabled = false
 # addr = "127.0.0.1"
 # port = 9000
 # framing = "line"
+#
+# 本进程**运行日志**（与上面 telemetry.logs 的“被采集日志”不同）：级别 / 格式 / 落点 / 轮转。
+# 缺省写 stderr（系统级部署交给 journald；容器里交给容器 runtime 收）。RUST_LOG 环境变量优先于 [log].level。
+# 写文件时进程内按 max_bytes / keep_files / max_seconds 轮转；自己轮转就别再挂 logrotate。
+# 容器里**不要**给 file，让容器 runtime 管日志落盘与轮转。
+# [log]
+# level = "info"          # 如 "wist_agentd=debug,wist_shared=warn"
+# format = "text"         # text | json
+# file = "/var/log/wist-agentd/agentd.log"
+# max_bytes = 67108864    # 64 MiB
+# keep_files = 4
+# max_seconds = 604800    # 7 天；0 = 不按时间清
 "#
     .to_string()
 }

@@ -110,7 +110,7 @@ pub async fn replay_records_async<S: RecordSink>(
             Ok(record) => batch.push(record),
             Err(err) => {
                 quarantine_line(path, &line).await?;
-                eprintln!(
+                log::warn!(
                     "telemetry spool: quarantined an unreadable record from {}: {err}",
                     path.display()
                 );

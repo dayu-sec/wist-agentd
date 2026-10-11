@@ -73,7 +73,7 @@ pub struct RuntimeHealthSnapshot {
 }
 
 pub fn register() {
-    eprintln!("self-observability registered");
+    log::info!("self-observability registered");
 }
 
 /// 稳态日志收敛用的稳定签名：只包含改变运维语义的字段，排除每 tick 都会变化的
@@ -139,7 +139,7 @@ pub fn emit(snapshot: &RuntimeHealthSnapshot) {
 }
 
 fn emit_full(snapshot: &RuntimeHealthSnapshot) {
-    eprintln!(
+    log::info!(
         "health state={:?} queue={} running={} reporting={} paused_inputs={} discovery_readiness={:?} discovery_cached_loaded={} discovery_used_cached={} discovery_resources={} discovery_targets={} discovery_failures={} discovery_last_success_at={} updated_at={}",
         snapshot.state,
         snapshot.queue_depth,
@@ -155,7 +155,7 @@ fn emit_full(snapshot: &RuntimeHealthSnapshot) {
         snapshot.discovery.last_success_at.as_deref().unwrap_or("-"),
         snapshot.updated_at
     );
-    eprintln!(
+    log::info!(
         "metrics_runtime target_view_loaded={} used_cached_snapshot={} total_targets={} host_targets={} process_targets={} container_targets={} attempted_targets={} succeeded_targets={} failed_targets={} failures={} last_error={} updated_at={}",
         snapshot.metrics.target_view_loaded,
         snapshot.metrics.used_cached_snapshot,
@@ -172,7 +172,7 @@ fn emit_full(snapshot: &RuntimeHealthSnapshot) {
     );
 
     for probe in &snapshot.discovery.probes {
-        eprintln!(
+        log::info!(
             "discovery_probe source={} probe={} phase={} status={} resources={} targets={} error={}",
             probe.source,
             probe.probe,

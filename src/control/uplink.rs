@@ -23,7 +23,7 @@
 use std::time::Duration;
 
 use wist_api::uplink::{AgentUplinkGrant, POLL_AGENT_UPLINK_KIND, PollAgentUplink};
-use wist_contracts::agent_config::AgentConfig;
+use crate::config::agent_config::AgentConfig;
 use wist_shared::time::now_rfc3339;
 
 use crate::control::enrollment::enrollment_http_client;
@@ -237,7 +237,7 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
-    use wist_contracts::agent_config::{
+    use crate::config::agent_config::{
         AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, PathsSection,
     };
 

@@ -637,6 +637,11 @@ async fn run_daemon(root: PathBuf, config_dir: Option<&Path>) -> AgentdResult<()
     let mut config = crate::config_runtime::load_or_init_async(&config_root)
         .await
         .conv_err()?;
+    // 运行日志按配置的 `[log]` 段落地：越早初始化，后续诊断（含下面这些启动行）越完整。
+    wist_log::init(
+        &config.log,
+        &wist_log::Identity::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+    );
     let root_dir = PathBuf::from(&config.paths.root_dir);
     let run_dir = PathBuf::from(&config.paths.run_dir);
     let state_dir = PathBuf::from(&config.paths.state_dir);
@@ -660,7 +665,7 @@ async fn run_daemon(root: PathBuf, config_dir: Option<&Path>) -> AgentdResult<()
         .await
         .source_err(AgentdReason::system_error(), "initialize runtime state")?;
     self_observability::register();
-    eprintln!(
+    log::info!(
         "wist-agentd {} starting: config={} mode={} run_dir={} state_dir={} log_dir={}",
         env!("CARGO_PKG_VERSION"),
         config_path.display(),
@@ -680,8 +685,8 @@ async fn run_daemon(root: PathBuf, config_dir: Option<&Path>) -> AgentdResult<()
     let upgrader_bin = match crate::upgrade::resolve_upgrader_bin() {
         Ok(path) => path,
         Err(detail) => {
-            eprintln!(
-                "warn: {detail}; one-shot work `upgrade` will be rejected until it is installed"
+            log::warn!(
+                "{detail}; one-shot work `upgrade` will be rejected until it is installed"
             );
             PathBuf::new()
         }
@@ -863,7 +868,7 @@ enum StateIdentity {
 /// state 文件读不出来时单独给一行提示：那份文件是守护进程启动的必需品
 /// （`initialize_runtime_state_async` 读它失败会让 daemon 直接起不来），
 /// 静默当成「没注册」会把一个真故障藏起来。
-fn reported_identity(config: &wist_contracts::agent_config::AgentConfig) -> ReportedIdentity {
+fn reported_identity(config: &crate::config::agent_config::AgentConfig) -> ReportedIdentity {
     let from_config = config
         .agent
         .agent_id
@@ -1178,7 +1183,7 @@ fn default_config_root() -> PathBuf {
 
 async fn initialize_runtime_state_async(
     state_dir: &Path,
-    config: &wist_contracts::agent_config::AgentConfig,
+    config: &crate::config::agent_config::AgentConfig,
 ) -> io::Result<()> {
     let runtime_path = state_store::agent_runtime::path_for(state_dir);
     let mut runtime_state =
@@ -1268,7 +1273,7 @@ fn validate_exec_bin(path: PathBuf, origin: &str) -> io::Result<PathBuf> {
 
 fn sync_runtime_identity(
     runtime_state: &mut wist_contracts::agent_state::AgentRuntimeState,
-    config: &wist_contracts::agent_config::AgentConfig,
+    config: &crate::config::agent_config::AgentConfig,
 ) -> io::Result<()> {
     if let Some(agent_id) = config
         .agent

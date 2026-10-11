@@ -11,7 +11,7 @@ use wist_api::discovery_policies::{
 };
 use wist_api::facts::ReportAgentFactSummary;
 use wist_api::status::{AgentStatusReport, AgentWorkState, AgentWorkStateChange};
-use wist_contracts::agent_config::AgentConfig;
+use crate::config::agent_config::AgentConfig;
 use wist_contracts::agent_uplink::AgentUplinkState;
 use wist_contracts::discovery_policy::DiscoveryAspectPolicySet;
 use wist_contracts::local_work::{
@@ -494,7 +494,7 @@ async fn report_status_to_control_plane(
         Ok(client) => client,
         Err(err) => {
             if !quiet {
-                eprintln!("wist-agentd status report: failed to build client: {err}");
+                log::error!("wist-agentd status report: failed to build client: {err}");
             }
             return StatusReportOutcome::failed();
         }
@@ -516,13 +516,13 @@ async fn report_status_to_control_plane(
                 return StatusReportOutcome::terminal(code);
             }
             if !quiet {
-                eprintln!("wist-agentd status report failed: HTTP {status} from {endpoint}");
+                log::warn!("wist-agentd status report failed: HTTP {status} from {endpoint}");
             }
             StatusReportOutcome::failed()
         }
         Err(err) => {
             if !quiet {
-                eprintln!("wist-agentd status report failed: {err}");
+                log::warn!("wist-agentd status report failed: {err}");
             }
             StatusReportOutcome::failed()
         }
@@ -532,7 +532,7 @@ async fn report_status_to_control_plane(
 /// 进终态后把数据面上送压成待命（§5.6）：即使本轮还在按旧 grant 外发，也立刻停。
 fn force_standby(uplink: &mut AppliedUplink, code: &str) {
     if let Some(line) = uplink.observe(UplinkFetch::CredentialRejected(code.to_string())) {
-        eprintln!("{line}");
+        log::warn!("{line}");
     }
 }
 
@@ -561,7 +561,7 @@ async fn enter_terminal(path: &Path, code: &str, source: &str) -> auth_terminal:
         attempts: 0,
     };
     if let Err(err) = auth_terminal::store_async(path, &state).await {
-        eprintln!(
+        log::error!(
             "wist-agentd auth terminal state: failed to record {}: {err}（仍按终态执行）",
             path.display()
         );
@@ -608,7 +608,7 @@ async fn retry_terminal_probe(
     if let Some(code) = report.terminal
         && code != state.code
     {
-        eprintln!(
+        log::info!(
             "event=AuthTerminalReasonChanged from={} to={} action=\"台账已更新；处理方式按新 code\"",
             state.code, code
         );
@@ -631,7 +631,7 @@ async fn retry_terminal_probe(
 async fn load_terminal_ledger(path: &Path, retry: Duration) -> Option<auth_terminal::AuthTerminal> {
     match auth_terminal::load_async(path).await {
         Ok(Some(state)) => {
-            eprintln!(
+            log::warn!(
                 "event=AuthTerminalRestored code={} source={} since={} attempts={} note=\"仍在终态；每 {}s 重试一次状态上报，网关恢复接受即自动清除\"",
                 state.code,
                 state.source,
@@ -643,7 +643,7 @@ async fn load_terminal_ledger(path: &Path, retry: Duration) -> Option<auth_termi
         }
         Ok(None) => None,
         Err(err) => {
-            eprintln!(
+            log::warn!(
                 "wist-agentd auth terminal state: ignoring unreadable {}: {err}（已清除，按无终态继续）",
                 path.display()
             );
@@ -718,7 +718,7 @@ async fn report_fact_summary(
     let previous = match fact_report::load_async(&state_path).await {
         Ok(state) => state,
         Err(err) => {
-            eprintln!(
+            log::warn!(
                 "wist-agentd fact summary report: ignoring unreadable state {}: {err}",
                 state_path.display()
             );
@@ -767,7 +767,7 @@ async fn report_fact_summary(
         last_attempt_at_ms: now_ms,
     };
     if let Err(err) = fact_report::store_async(&state_path, &attempt_state).await {
-        eprintln!("wist-agentd fact summary report: failed to record attempt: {err}");
+        log::error!("wist-agentd fact summary report: failed to record attempt: {err}");
     }
 
     // 正文是**契约对象原样**（`ReportAgentFactSummary`）：订阅端按 `wist-contracts` 解析，
@@ -797,7 +797,7 @@ async fn send_fact_summary(
     global_seq_path: &Path,
 ) {
     match report_fact_summary(sink, config, state_dir, summary, next_seq, global_seq_path).await {
-        Ok(true) => eprintln!(
+        Ok(true) => log::info!(
             "event=FactSummaryReported digest={} processes={} executables={} ports={}",
             summary.content_digest(),
             summary.process_count,
@@ -805,7 +805,7 @@ async fn send_fact_summary(
             summary.listen_ports.len()
         ),
         Ok(false) => {}
-        Err(err) => eprintln!("wist-agentd fact summary uplink failed: {err}"),
+        Err(err) => log::warn!("wist-agentd fact summary uplink failed: {err}"),
     }
 }
 
@@ -851,7 +851,7 @@ async fn fetch_discovery_policies(config: &AgentConfig) -> Option<DiscoveryAspec
     let client = match enrollment_http_client(config) {
         Ok(client) => client,
         Err(err) => {
-            eprintln!("wist-agentd discovery policy fetch: failed to build client: {err}");
+            log::error!("wist-agentd discovery policy fetch: failed to build client: {err}");
             return None;
         }
     };
@@ -876,7 +876,7 @@ async fn fetch_discovery_policies(config: &AgentConfig) -> Option<DiscoveryAspec
                     returned.policies,
                 )),
                 Err(err) => {
-                    eprintln!(
+                    log::warn!(
                         "wist-agentd discovery policy fetch failed: invalid response from {endpoint}: {err}"
                     );
                     None
@@ -884,7 +884,7 @@ async fn fetch_discovery_policies(config: &AgentConfig) -> Option<DiscoveryAspec
             }
         }
         Ok(response) => {
-            eprintln!(
+            log::warn!(
                 "wist-agentd discovery policy fetch failed: HTTP {} from {}",
                 response.status(),
                 endpoint
@@ -892,7 +892,7 @@ async fn fetch_discovery_policies(config: &AgentConfig) -> Option<DiscoveryAspec
             None
         }
         Err(err) => {
-            eprintln!("wist-agentd discovery policy fetch failed: {err}");
+            log::warn!("wist-agentd discovery policy fetch failed: {err}");
             None
         }
     }
@@ -955,7 +955,7 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     let mut work_runtime = match work::load_async(&work_record_path).await {
         Ok(Some(record)) => {
             let restored = AppliedWorkGrant::restore(&record);
-            eprintln!(
+            log::info!(
                 "event=WorkRestored path={} sequence={} recorded_at={} {} note=\"以网关为准；仅在拉不到快照时用这份\"",
                 work_record_path.display(),
                 restored.sequence(),
@@ -967,7 +967,7 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
         Ok(None) => AppliedWorkGrant::default(),
         Err(err) => {
             // 一份工作视图不该有让采集停下的权力：读不动就记一行、当没有。
-            eprintln!(
+            log::warn!(
                 "wist-agentd work view state: ignoring unreadable {}: {err}",
                 work_record_path.display()
             );
@@ -1039,7 +1039,7 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                 // 失败静默；但 `attempts`（以及可能的 code）变了要对着盘说一声，
                 // 否则「重试过多少次、还是不是因为同一个原因」只能看内存。
                 if let Err(err) = auth_terminal::store_async(&auth_terminal_path, state).await {
-                    eprintln!(
+                    log::error!(
                         "wist-agentd auth terminal state: failed to update {}: {err}",
                         auth_terminal_path.display()
                     );
@@ -1050,14 +1050,14 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                     let cleared = match auth_terminal::clear_async(&auth_terminal_path).await {
                         Ok(()) => true,
                         Err(err) => {
-                            eprintln!(
+                            log::error!(
                                 "wist-agentd auth terminal state: failed to clear {}: {err}（下轮再试）",
                                 auth_terminal_path.display()
                             );
                             false
                         }
                     };
-                    eprintln!(
+                    log::info!(
                         "event=AuthTerminalCleared code={} source={} since={} attempts={} cleared={} detail=\"控制面重新接受本机凭据，已恢复常规上报\"",
                         state.code, state.source, state.detected_at, state.attempts, cleared
                     );
@@ -1083,14 +1083,14 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
             match &decision {
                 crate::enrollment::RenewalDecision::NotDue => {}
                 crate::enrollment::RenewalDecision::Renewed => {
-                    eprintln!("event=CredentialRenewed detail=\"credential rotated\"");
+                    log::info!("event=CredentialRenewed detail=\"credential rotated\"");
                 }
                 crate::enrollment::RenewalDecision::Failed(detail) => {
-                    eprintln!("event=CredentialRenewalFailed detail=\"{detail}\"");
+                    log::warn!("event=CredentialRenewalFailed detail=\"{detail}\"");
                 }
                 crate::enrollment::RenewalDecision::NeedsReinstall => {
                     // 与台账**同源**的文案（`ledger_detail_text`），不再各写一份。
-                    eprintln!(
+                    log::warn!(
                         "event=CredentialNeedsReinstall detail=\"{}\"",
                         decision.ledger_detail_text()
                     );
@@ -1195,7 +1195,7 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
             if let Some(code) = report.terminal {
                 // 一行日志、一次落盘，**首个认出终态者为准**（续期那条已经进过的话这里不再重复）。
                 if terminal.is_none() {
-                    eprintln!("{}", terminal_auth_message(code, "status_report"));
+                    log::error!("{}", terminal_auth_message(code, "status_report"));
                 }
                 enter_terminal_if_absent(
                     &mut terminal,
@@ -1306,11 +1306,11 @@ async fn run_once_with_failure_cache(
                     {
                         // 成功也记一行：否则“指标到底发没发”只能靠间接迹象去猜，
                         // 而运维问的第一个问题往往是这个（尤其是刚授权完）。
-                        Ok(()) => eprintln!(
+                        Ok(()) => log::info!(
                             "event=MetricsUplinkSent agent_id={agent_id} targets={}",
                             snapshot.total_targets
                         ),
-                        Err(err) => eprintln!("wist-agentd metrics uplink failed: {err}"),
+                        Err(err) => log::warn!("wist-agentd metrics uplink failed: {err}"),
                     }
                 }
                 // 事实摘要在**指标之后**发：同样共用这条连接与全局 `seq`，只是帧标记不同。
@@ -1362,7 +1362,7 @@ async fn run_once_with_failure_cache(
             .iter()
             .any(|outcome| outcome.emitted_directly > 0 || outcome.replayed_spool > 0);
         if let Some(line) = health.note_tick(failed, sent_something) {
-            eprintln!("{line}");
+            log::info!("{line}");
         }
     }
     if let Some(previous) = previous_telemetry_failures {
@@ -1488,7 +1488,7 @@ async fn refresh_discovery_policy(config: &AgentConfig, runtime: &mut DiscoveryR
             } else {
                 format!(" adjustments=[{adjustments}]")
             };
-            eprintln!(
+            log::info!(
                 "event=DiscoveryPolicyApplied policy_version={policy_version} aspects={aspects}{adjustments}"
             );
         }
@@ -1516,7 +1516,7 @@ async fn refresh_uplink_grant(
     // 与工作授权同一取舍 —— 失败清空会把一次网络抖动放大成采集中断。
     // 「该不该打日志」交给 `observe`：预期内（未入网 / 404）静默，异常按签名去重。
     if let Some(line) = runtime.observe(fetch_uplink_grant(config).await) {
-        eprintln!("{line}");
+        log::warn!("{line}");
     }
 }
 
@@ -1546,7 +1546,7 @@ async fn refresh_work_grant(
     };
     let outcome = runtime.apply(&grant);
     if outcome.changed {
-        eprintln!(
+        log::info!(
             "event=WorkGrantApplied sequence={} {}",
             runtime.sequence(),
             runtime.summary()
@@ -1554,23 +1554,23 @@ async fn refresh_work_grant(
     }
     for (work_id, detail) in &outcome.broken {
         // 参数读不懂就不确认：网关那边“期望版本一直没被确认”正是这条坏参数真被看见的形态。
-        eprintln!("event=WorkSpecUnparsable work_id={work_id} detail={detail}");
+        log::warn!("event=WorkSpecUnparsable work_id={work_id} detail={detail}");
     }
     for unit in &outcome.unsupported {
-        eprintln!(
+        log::warn!(
             "event=WorkUnitUnsupported work_id={} unit_id={} detail={}",
             unit.work_id, unit.unit_id, unit.detail
         );
     }
     for work_id in &outcome.stopped {
-        eprintln!("event=WorkStopped work_id={work_id}");
+        log::info!("event=WorkStopped work_id={work_id}");
     }
     for work_id in &outcome.started {
-        eprintln!("event=WorkStarted work_id={work_id}");
+        log::info!("event=WorkStarted work_id={work_id}");
     }
     for work_id in &outcome.unexecutable_one_shot {
         // 收到了但不执行：说清楚，否则网关页面上只剩一个无法解释的“派了没确认”。
-        eprintln!(
+        log::warn!(
             "event=OneShotWorkNotExecuted work_id={work_id} detail=\"agentd 尚未实现这个动作的执行\""
         );
     }
@@ -1579,7 +1579,7 @@ async fn refresh_work_grant(
     for work in &outcome.one_shot_to_dispatch {
         if runtime.has_upgrade_in_flight() {
             // 互斥：升级会换掉 agentd 自己，同时跑两件只会两败俱伤。
-            eprintln!(
+            log::warn!(
                 "event=UpgradeBusy work_id={} detail=\"已有一件升级在进行，本轮不派\"",
                 work.work_id
             );
@@ -1588,7 +1588,7 @@ async fn refresh_work_grant(
         match dispatch_upgrade(loop_ctx, work) {
             Ok(handle) => {
                 runtime.mark_one_shot_execution(&work.work_id, "dispatched");
-                eprintln!(
+                log::info!(
                     "event=UpgradeDispatched work_id={} handle={handle}",
                     work.work_id
                 );
@@ -1597,7 +1597,7 @@ async fn refresh_work_grant(
                 if ack_work(config, &work.work_id, 0).await {
                     dispatched_anything = true;
                 } else {
-                    eprintln!(
+                    log::warn!(
                         "event=WorkAckFailed work_id={} plan_version=0",
                         work.work_id
                     );
@@ -1610,12 +1610,12 @@ async fn refresh_work_grant(
                 runtime.mark_one_shot_execution(&work.work_id, "rejected");
                 let detail = format!("agentd 未能启动升级器：{err}");
                 if !report_work_result(config, &work.work_id, "failed", &detail).await {
-                    eprintln!(
+                    log::warn!(
                         "event=WorkResultReportFailed work_id={} status=failed",
                         work.work_id
                     );
                 }
-                eprintln!(
+                log::error!(
                     "event=UpgradeDispatchFailed work_id={} detail={err}",
                     work.work_id
                 );
@@ -1631,7 +1631,7 @@ async fn refresh_work_grant(
             runtime.mark_acked(&work_id, plan_version);
             acked_anything = true;
         } else {
-            eprintln!("event=WorkAckFailed work_id={work_id} plan_version={plan_version}");
+            log::warn!("event=WorkAckFailed work_id={work_id} plan_version={plan_version}");
         }
     }
     // 有变化（含“确认了某个版本”）才落盘：这份视图是给人看的，不必每 30s 重写一遍。
@@ -1640,7 +1640,7 @@ async fn refresh_work_grant(
         && let Some(record) = runtime.device_view(&now_rfc3339())
         && let Err(err) = work::store_async(record_path, &record).await
     {
-        eprintln!(
+        log::error!(
             "wist-agentd work view state: failed to write {}: {err}",
             record_path.display()
         );
@@ -1691,7 +1691,7 @@ fn dispatch_upgrade(
         .unwrap_or_else(|| "(由包内自报)".to_string());
     let launch = crate::upgrade::build_launch(loop_ctx.upgrader_bin, loop_ctx.config_dir, &request);
     let log_path = Path::new(&loop_ctx.config.paths.log_dir).join("wist-upgrader.log");
-    eprintln!(
+    log::info!(
         "event=UpgradeLaunching work_id={} target={} program={} log={}",
         entry.work_id,
         target_label,
@@ -1746,13 +1746,13 @@ async fn reconcile_upgrade_record(
     if current == local_status {
         return false;
     }
-    eprintln!(
+    log::info!(
         "event=UpgradeProgress work_id={} step={} status={} detail=\"{}\"",
         record.work_id, record.step, record.status, record.detail
     );
     let mapped = if dead {
         // 要报成 failed；说明里必须写清“是被判死的”，否则页面上只是一个无法解释的失败。
-        eprintln!(
+        log::warn!(
             "event=UpgradeDeclaredDead work_id={} step={}",
             record.work_id, record.step
         );
@@ -1770,7 +1770,7 @@ async fn reconcile_upgrade_record(
     let Some((status, detail)) = mapped else {
         // 升级器写了本机视图认得、控制面却不认的状态：不动视图也不报，
         // 免得编一个网关会拒的取值，把“状态闭集不一致”变成一个无限重试。
-        eprintln!(
+        log::warn!(
             "event=UpgradeResultUnmappable work_id={} status={}",
             record.work_id, record.status
         );
@@ -1779,7 +1779,7 @@ async fn reconcile_upgrade_record(
     // 先报控制面、再推进本机视图：报不出去就**不推进**，下一 tick 读到同一份记录会重试。
     // 反过来（先推进）会让一次网络抖动把“升级做完了”永久留在机器上，而控制面永远停在“已接受”。
     if !report_work_result(config, &record.work_id, status, &detail).await {
-        eprintln!(
+        log::warn!(
             "event=WorkResultReportFailed work_id={} status={status}",
             record.work_id
         );
@@ -2035,7 +2035,7 @@ fn build_probe_health(
 }
 
 fn emit_discovery_refresh(result: &DiscoveryRefreshResult, probes: &[DiscoveryProbeHealth]) {
-    eprintln!(
+    log::info!(
         "event=DiscoveryRefreshed revision={} persisted_revision={} resources={} targets={} failures={} used_cached_snapshot={} last_success_at={}",
         result.refreshed_snapshot.revision,
         result.persisted_snapshot.revision,
@@ -2048,7 +2048,7 @@ fn emit_discovery_refresh(result: &DiscoveryRefreshResult, probes: &[DiscoveryPr
 
     for probe in probes {
         if probe.status == "failed" {
-            eprintln!(
+            log::error!(
                 "event=DiscoveryRefreshFailed source={} probe={} phase={} error={}",
                 probe.source,
                 probe.probe,
@@ -2121,7 +2121,7 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use wist_contracts::agent_config::{
+    use crate::config::agent_config::{
         AgentSection, ControlPlaneSection, ExecutionSection, PathsSection,
     };
 
@@ -3156,7 +3156,7 @@ mod tests {
         let mut config = test_config();
         config.control_plane.endpoint = Some(endpoint);
         config.telemetry.logs.file_inputs =
-            vec![wist_contracts::agent_config::LogFileInputSection {
+            vec![crate::config::agent_config::LogFileInputSection {
                 input_id: "manual-app".to_string(),
                 path: "/var/log/manual.log".to_string(),
                 startup_position: "tail".to_string(),

@@ -23,7 +23,7 @@ use wist_api::work::{
     ACK_WORK_KIND, AckWork, POLL_WORK_KIND, PollWork, REPORT_WORK_RESULT_KIND, ReportWorkResult,
     WorkAccepted, WorkGrant, WorkResultAccepted,
 };
-use wist_contracts::agent_config::{AgentConfig, LogFileInputSection};
+use crate::config::agent_config::{AgentConfig, LogFileInputSection};
 use wist_contracts::work::{
     OneShotWork, StandingWork, WorkSpec, WorkSpecSource, is_known_exporter, parse_exporter_target,
 };
@@ -754,7 +754,7 @@ pub(crate) async fn fetch_work_grant(
     let client = match enrollment_http_client(config) {
         Ok(client) => client,
         Err(err) => {
-            eprintln!("wist-agentd work grant fetch: failed to build client: {err}");
+            log::warn!("wist-agentd work grant fetch: failed to build client: {err}");
             return None;
         }
     };
@@ -770,7 +770,7 @@ pub(crate) async fn fetch_work_grant(
             match response.json::<WorkGrant>().await {
                 Ok(grant) => Some(grant),
                 Err(err) => {
-                    eprintln!(
+                    log::warn!(
                         "wist-agentd work grant fetch failed: invalid response from {endpoint}: {err}"
                     );
                     None
@@ -778,14 +778,14 @@ pub(crate) async fn fetch_work_grant(
             }
         }
         Ok(response) => {
-            eprintln!(
+            log::warn!(
                 "wist-agentd work grant fetch failed: HTTP {} from {endpoint}",
                 response.status()
             );
             None
         }
         Err(err) => {
-            eprintln!("wist-agentd work grant fetch failed: {err}");
+            log::warn!("wist-agentd work grant fetch failed: {err}");
             None
         }
     }
@@ -820,7 +820,7 @@ pub(crate) async fn ack_work(config: &AgentConfig, work_id: &str, plan_version: 
     let client = match enrollment_http_client(config) {
         Ok(client) => client,
         Err(err) => {
-            eprintln!("wist-agentd work ack: failed to build client: {err}");
+            log::warn!("wist-agentd work ack: failed to build client: {err}");
             return false;
         }
     };
@@ -836,20 +836,20 @@ pub(crate) async fn ack_work(config: &AgentConfig, work_id: &str, plan_version: 
             match response.json::<WorkAccepted>().await {
                 Ok(accepted) => accepted.status == "accepted",
                 Err(err) => {
-                    eprintln!("wist-agentd work ack failed: invalid response: {err}");
+                    log::warn!("wist-agentd work ack failed: invalid response: {err}");
                     false
                 }
             }
         }
         Ok(response) => {
-            eprintln!(
+            log::warn!(
                 "wist-agentd work ack failed: HTTP {} from {endpoint}",
                 response.status()
             );
             false
         }
         Err(err) => {
-            eprintln!("wist-agentd work ack failed: {err}");
+            log::warn!("wist-agentd work ack failed: {err}");
             false
         }
     }
@@ -894,7 +894,7 @@ pub(crate) async fn report_work_result(
     let client = match enrollment_http_client(config) {
         Ok(client) => client,
         Err(err) => {
-            eprintln!("wist-agentd work result: failed to build client: {err}");
+            log::warn!("wist-agentd work result: failed to build client: {err}");
             return false;
         }
     };
@@ -913,20 +913,20 @@ pub(crate) async fn report_work_result(
             match response.json::<WorkResultAccepted>().await {
                 Ok(_) => true,
                 Err(err) => {
-                    eprintln!("wist-agentd work result failed: invalid response: {err}");
+                    log::warn!("wist-agentd work result failed: invalid response: {err}");
                     false
                 }
             }
         }
         Ok(response) => {
-            eprintln!(
+            log::warn!(
                 "wist-agentd work result failed: HTTP {} from {endpoint}",
                 response.status()
             );
             false
         }
         Err(err) => {
-            eprintln!("wist-agentd work result failed: {err}");
+            log::warn!("wist-agentd work result failed: {err}");
             false
         }
     }
@@ -1898,7 +1898,7 @@ mod tests {
     use std::io::{Read, Write as _};
     use std::net::TcpListener;
 
-    use wist_contracts::agent_config::{
+    use crate::config::agent_config::{
         AgentSection, ControlPlaneSection, ExecutionSection, PathsSection,
     };
 

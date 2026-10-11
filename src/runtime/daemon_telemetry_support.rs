@@ -2,7 +2,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use wist_api::uplink::AgentUplinkGrant;
-use wist_contracts::agent_config::{AgentConfig, LogFileInputSection, LogsOutputSection};
+use crate::config::agent_config::{AgentConfig, LogFileInputSection, LogsOutputSection};
 
 use crate::telemetry::logs::InputOrigin;
 use crate::telemetry::logs::files::file_reader::ReadLimits;
@@ -249,7 +249,7 @@ mod tests {
     use crate::telemetry::logs::files::file_watcher::StartupPosition;
     use std::path::PathBuf;
     use wist_api::uplink::AgentUplinkGrant;
-    use wist_contracts::agent_config::{
+    use crate::config::agent_config::{
         AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, LogFileInputSection,
         PathsSection,
     };

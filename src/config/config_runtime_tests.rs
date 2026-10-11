@@ -89,6 +89,9 @@ fn default_config_template_contains_file_input_example() {
     assert!(template.contains("数据（run/state/spool + 采集输出 data/）落 /var/lib/wist-agentd"));
     assert!(template.contains("日志落 /var/log/wist-agentd"));
     assert!(template.contains("# kind = \"tcp\""));
+    // 本进程运行日志段（默认注释示例）。
+    assert!(template.contains("# [log]"));
+    assert!(template.contains("# format = \"text\""));
     assert!(!template.contains("max_running_actions = 1"));
     assert!(!template.contains("instance_name = \"local\""));
 }
@@ -323,7 +326,7 @@ fn apply_path_defaults_routes_collected_output_to_data_dir() {
     let text = "schema_version = \"v1\"\n";
     let raw: toml::Value = toml::from_str(text).expect("parse raw toml");
 
-    let mut system: wist_contracts::agent_config::AgentConfig =
+    let mut system: crate::config::agent_config::AgentConfig =
         toml::from_str(text).expect("parse config");
     apply_path_defaults(&mut system, Path::new("/etc/wist-agentd/agentd.toml"), &raw);
     assert_eq!(system.paths.log_dir, "/var/log/wist-agentd");
@@ -333,7 +336,7 @@ fn apply_path_defaults_routes_collected_output_to_data_dir() {
         "/var/lib/wist-agentd/data/wist-records.ndjson"
     );
 
-    let mut local: wist_contracts::agent_config::AgentConfig =
+    let mut local: crate::config::agent_config::AgentConfig =
         toml::from_str(text).expect("parse config");
     apply_path_defaults(&mut local, Path::new("/tmp/dev/agentd.toml"), &raw);
     assert_eq!(local.paths.log_dir, "log");
@@ -352,7 +355,7 @@ schema_version = "v1"
 root_dir = "/srv/wist"
 "#;
     let raw: toml::Value = toml::from_str(text).expect("parse raw toml");
-    let mut config: wist_contracts::agent_config::AgentConfig =
+    let mut config: crate::config::agent_config::AgentConfig =
         toml::from_str(text).expect("parse config");
 
     apply_path_defaults(&mut config, Path::new("/etc/wist-agentd/agentd.toml"), &raw);
@@ -382,7 +385,7 @@ schema_version = "v1"
 state_dir = "custom-state"
 "#;
     let raw: toml::Value = toml::from_str(text).expect("parse raw toml");
-    let mut config: wist_contracts::agent_config::AgentConfig =
+    let mut config: crate::config::agent_config::AgentConfig =
         toml::from_str(text).expect("parse config");
 
     apply_path_defaults(&mut config, Path::new("/etc/wist-agentd/agentd.toml"), &raw);

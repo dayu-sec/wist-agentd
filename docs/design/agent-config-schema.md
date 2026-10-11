@@ -31,6 +31,7 @@ AgentConfig {
   execution
   telemetry
   discovery
+  log
 }
 ```
 
@@ -293,7 +294,37 @@ DiscoverySection {
 
 ---
 
-## 9. 当前决定
+## 9. `log`
+
+本进程**运行日志**（级别 / 格式 / 落点 / 轮转）。与 `telemetry.logs`（**被采集的日志**）不同：
+后者是 agentd 采集上送的"原料"，这里描述的是 agentd **自己**往哪里、以什么格式、记到什么级别。
+
+```text
+LogSection {
+  level        # 可选，过滤器指令，如 "info" / "wist_agentd=debug,wist_shared=warn"
+  format       # "text"（缺省） | "json"
+  file         # 可选，写文件（追加、自动建父目录、写满轮转）；缺省写 stderr
+  max_bytes    # 可选，单文件上限（字节），缺省 64 MiB
+  keep_files   # 可选，保留分卷个数，缺省 4
+  max_seconds  # 可选，分卷保留时长（秒）；旧名 max_age_seconds 仍接受
+}
+```
+
+约定（与全库其它 wist 组件**同名同义**，见共享 crate `wist-log` 与 `wist-agentd`
+`docs/design/logging-output.md`）：
+
+- 优先级：`RUST_LOG` > `[log].level` > `info`。
+- 缺省写 **stderr**：系统级部署交给 journald；容器里交给容器 runtime 收（**不要**在容器里给 `file`）。
+- 给了 `file` 才写文件，并在**进程内**按 `max_bytes` / `keep_files` / `max_seconds` 轮转；
+  自己轮转就**别**再挂 logrotate。
+- `format = "json"` 时每行带 `level` 字段，便于采集端按级别筛。
+
+缺省值（整段不写）：`format = "text"`、写 stderr、级别 `info`。本段**直接内嵌**共享 crate 的
+单类型 `wist_log::LogSection`（同名同义、单一事实来源），在 daemon 启动早期交给 `wist_log::init`。
+
+---
+
+## 10. 当前决定
 
 当前阶段固定以下结论：
 

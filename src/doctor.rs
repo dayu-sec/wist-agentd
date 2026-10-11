@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use wist_api::uplink::AgentUplinkGrant;
-use wist_contracts::agent_config::AgentConfig;
+use crate::config::agent_config::AgentConfig;
 
 use crate::config_runtime;
 use crate::control::enrollment::{TERMINAL_AUTH_CODES, terminal_auth_advice};

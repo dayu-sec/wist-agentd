@@ -184,7 +184,7 @@ pub(super) fn emit_metrics_tick(tick: &MetricsTick) {
     ) {
         return;
     }
-    eprintln!(
+    log::info!(
         "event=MetricsRuntimeUpdated target_view_loaded={} used_cached_snapshot={} total_targets={} host_targets={} process_targets={} container_targets={} attempted_targets={} succeeded_targets={} failed_targets={} failures={} updated_at={}",
         health.target_view_loaded,
         health.used_cached_snapshot,
@@ -207,7 +207,7 @@ pub(super) fn emit_metrics_failures(failures: &[MetricsFailure]) {
 }
 
 pub(super) fn emit_metrics_failure(failure: &MetricsFailure) {
-    eprintln!(
+    log::error!(
         "event=MetricsRuntimeFailed kind={:?} phase={} path={} error={}",
         failure.kind, failure.phase, failure.path, failure.detail
     );

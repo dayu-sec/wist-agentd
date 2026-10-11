@@ -1,7 +1,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use wist_contracts::agent_config::{AgentConfig, LogFileInputSection, LogsOutputSection};
+use crate::config::agent_config::{AgentConfig, LogFileInputSection, LogsOutputSection};
 use wist_shared::time::now_rfc3339;
 
 use crate::control::work::AppliedWorkGrant;
@@ -187,7 +187,7 @@ pub(super) fn build_telemetry_sink(
     let Some(input_id) = required else {
         return build_record_sink(output, None);
     };
-    eprintln!(
+    log::info!(
         "event=UplinkFramingEscalated from=line to=len input_id={input_id} reason=\"该输入声明多行读法，折叠出的正文可能含换行（协议 §3：line 只用于单行）\""
     );
     build_record_sink(output, Some(TcpFraming::Len))
@@ -310,7 +310,7 @@ pub(super) async fn process_exporters(
         let argv = match exporters::argv_for(&run.exporter_id, run.arg.as_deref()) {
             Ok(argv) => argv,
             Err(err) => {
-                eprintln!("wist-agentd exporter {} failed: {err}", run.exporter_id);
+                log::error!("wist-agentd exporter {} failed: {err}", run.exporter_id);
                 continue;
             }
         };
@@ -322,7 +322,7 @@ pub(super) async fn process_exporters(
             state.missing.insert(run.exporter_id.clone(), tool.clone());
             if newly {
                 changed = true;
-                eprintln!(
+                log::warn!(
                     "wist-agentd exporter {} tool missing: {tool} \
                      （对应面今天采不到；装上后自动恢复）",
                     run.exporter_id
@@ -333,7 +333,7 @@ pub(super) async fn process_exporters(
         }
         if state.missing.remove(&run.exporter_id).is_some() {
             changed = true;
-            eprintln!(
+            log::info!(
                 "wist-agentd exporter {} tool available again: {tool}",
                 run.exporter_id
             );
@@ -363,26 +363,26 @@ pub(super) async fn process_exporters(
                 if !records.is_empty()
                     && let Err(err) = sink.write_records(&records).await
                 {
-                    eprintln!(
+                    log::error!(
                         "wist-agentd exporter {} uplink failed: {err}",
                         run.exporter_id
                     );
                 }
-                eprintln!(
+                log::info!(
                     "event=ExporterRun exporter={} unit={} records={}",
                     run.exporter_id,
                     run.unit_id,
                     records.len()
                 );
             }
-            Err(err) => eprintln!("wist-agentd exporter {} failed: {err}", run.exporter_id),
+            Err(err) => log::error!("wist-agentd exporter {} failed: {err}", run.exporter_id),
         }
     }
     if changed {
         exporters::save_state(state_dir, &state);
     }
     if ran_any && let Err(err) = log_seq_state::store_async(global_seq_path, *next_seq).await {
-        eprintln!("wist-agentd exporter seq persist failed: {err}");
+        log::error!("wist-agentd exporter seq persist failed: {err}");
     }
 }
 
@@ -494,7 +494,7 @@ mod tests {
         assert!(health.note_tick(true, true).is_none());
         assert!(health.note_tick(false, true).is_some());
     }
-    use wist_contracts::agent_config::{
+    use crate::config::agent_config::{
         LogFileInputSection, LogsOutputSection, LogsTcpOutputSection,
     };
 

@@ -3,6 +3,22 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.0-alpha] - 2026-10-11
+
+### 新增
+
+- **接入统一日志**（共享 crate `wist-log`）：daemon 启动早期按配置的 `[log]` 段初始化，级别 / 格式
+  （`text` | `json`）/ 落点（缺省 stderr；可选文件 + 进程内轮转）与全栈同名同义。
+  daemon 运行诊断从 `eprintln!` 改为 `log::{info,warn,error}!`（CLI 输出 `version` / `init-config` /
+  `wist-exec` / `wist-upgrader` 仍走 stdout）。
+
+### 变更（不兼容）
+
+- **`AgentConfig` 新增顶层 `[log]` 段**（直接内嵌 `wist_log::LogSection`，与 gateway / center 同口径）。
+- **依赖升到** `wist-contracts 0.8` / `wist-api 0.8` / `wist-metrics 0.3` / `wist-validate 0.5` /
+  `wist-log 0.1`。`AgentConfig` 与配置校验（`config::agent_config` / `config::validate`）现由本仓承载
+  —— `wist-contracts` 删了 `agent_config`、`wist-validate` 删了 `config`。
+
 ## [0.2.3-alpha] - 2026-10-09
 
 ### 变更

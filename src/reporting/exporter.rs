@@ -258,7 +258,7 @@ pub async fn export_disc_snap_async(
     let mut resources = match read_json_async::<serde_json::Value>(&paths.resources).await {
         Ok(v) => v,
         Err(err) => {
-            eprintln!("exporter: discovery cache skipped: {err}");
+            log::warn!("exporter: discovery cache skipped: {err}");
             return Ok(());
         }
     };
@@ -280,7 +280,7 @@ pub async fn export_disc_snap_async(
             )
             .await
             {
-                eprintln!("exporter: process_classified error: {err}");
+                log::error!("exporter: process_classified error: {err}");
             }
         } else if let Err(err) = export_probe_async(
             state_dir,
@@ -292,7 +292,7 @@ pub async fn export_disc_snap_async(
         )
         .await
         {
-            eprintln!("exporter: {probe} export error: {err}");
+            log::error!("exporter: {probe} export error: {err}");
         }
     }
     Ok(())
@@ -420,7 +420,7 @@ pub async fn export_metrics_async(state_dir: &Path, source: &ExporterSource) -> 
             write_jsonl_async(&out_path, &rows).await
         }
         Err(err) => {
-            eprintln!("exporter: metrics skipped (no runtime snapshot): {err}");
+            log::warn!("exporter: metrics skipped (no runtime snapshot): {err}");
             Ok(())
         }
     }
@@ -434,10 +434,10 @@ pub fn export_metrics(state_dir: &Path, source: &ExporterSource) -> RuntimeResul
 /// Export all probe discovery snapshots and metrics. Errors are logged, not propagated.
 pub async fn export_all_async(state_dir: &Path, source: &ExporterSource) {
     if let Err(err) = export_disc_snap_async(state_dir, source).await {
-        eprintln!("exporter: disc_snap error: {err}");
+        log::error!("exporter: disc_snap error: {err}");
     }
     if let Err(err) = export_metrics_async(state_dir, source).await {
-        eprintln!("exporter: metrics error: {err}");
+        log::error!("exporter: metrics error: {err}");
     }
 }
 

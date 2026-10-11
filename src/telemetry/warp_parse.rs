@@ -8,7 +8,7 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout};
-use wist_contracts::agent_config::LogsOutputSection;
+use crate::config::agent_config::LogsOutputSection;
 use wist_contracts::telemetry_record::{DataFrame, TelemetryRecord};
 use wist_shared::fs::ensure_parent;
 
