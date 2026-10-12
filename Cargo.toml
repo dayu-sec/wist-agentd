@@ -18,7 +18,7 @@ tokio = { version = "1.48", features = ["full"] }
 wist-contracts = { version = "0.1"  }
 wist-metrics = { version = "0.1"  }
 wist-shared = { version = "0.1"  }
-wist-validate = { version = "0.1" }
+wist-validate = { version = "0.3" }
 
 #wist-contracts = { version = "0.1.1", path = "../wist-contracts" }
 #wist-metrics = { version = "0.1.1", path = "../wist-metrics" }
