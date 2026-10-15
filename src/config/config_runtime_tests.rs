@@ -315,8 +315,8 @@ fn default_paths_separate_data_from_system_config_dir() {
     assert_eq!(system.state_dir, "state");
     assert_eq!(system.log_dir, "/var/log/wist-agentd");
 
-    // 非系统位置（开发机 / --user）保持“数据就在配置目录下”。
-    let local = default_paths_for(Path::new("/Users/me/.wist-agentd"));
+    // 非系统位置（开发机 / 自定义配置目录）保持“数据就在配置目录下”。
+    let local = default_paths_for(Path::new("/home/dev/wist-agentd-conf"));
     assert_eq!(local.root_dir, ".");
     assert_eq!(local.log_dir, "log");
 }
@@ -373,7 +373,9 @@ fn is_system_config_dir_only_matches_the_system_tree() {
     assert!(is_system_config_dir(Path::new("/etc/wist-agentd/sub")));
     assert!(!is_system_config_dir(Path::new("/etc/wist-agentd-dev")));
     assert!(!is_system_config_dir(Path::new("/tmp/etc/wist-agentd")));
-    assert!(!is_system_config_dir(Path::new("/Users/me/.wist-agentd")));
+    assert!(!is_system_config_dir(Path::new(
+        "/home/dev/wist-agentd-conf"
+    )));
 }
 
 #[test]

@@ -21,9 +21,8 @@
 # 若整个脚本以 root 跑，`cargo build` 会让 target/ 变成 root 属主，之后普通用户就构建不动了。
 #
 # 可覆盖 env：
-#   WIST_AGENTD_SCOPE=system|user  安装作用域（默认 system，与 install.sh 同名同义）
-#   WIST_AGENTD_BIN_DIR=<dir>      二进制目录（默认 /usr/local/bin | ~/bin）
-#   WIST_AGENTD_HOME=<dir>         配置目录（默认 /etc/wist-agentd | ~/.wist-agentd）
+#   WIST_AGENTD_BIN_DIR=<dir>      二进制目录（默认 /usr/local/bin）
+#   WIST_AGENTD_HOME=<dir>         配置目录（默认 /etc/wist-agentd）
 #   WIST_AGENTD_BIN_SRC=<dir>      产物目录（默认 <crate>/target/release）
 #   SKIP_BUILD=1                   跳过 cargo build
 #   WIST_AGENTD_INSTALL_DRY_RUN=1  等价于 --dry-run
@@ -44,7 +43,6 @@ EXEC_NAME="wist-exec"
 UPGRADER_NAME="wist-upgrader"
 LAUNCHD_LABEL="com.dayu-sec.wist-agentd"
 
-SCOPE="${WIST_AGENTD_SCOPE:-system}"
 BIN_SRC_DIR="${WIST_AGENTD_BIN_SRC:-${CRATE_ROOT}/target/release}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 DRY_RUN="${WIST_AGENTD_INSTALL_DRY_RUN:-0}"
@@ -112,30 +110,14 @@ case "$(uname -s)" in
   *) die "unsupported platform: $(uname -s) (macOS launchd / Linux systemd only)" ;;
 esac
 
-case "${SCOPE}" in
-  system)
-    SCOPE_ARG="--system"
-    BIN_DST_DIR="${WIST_AGENTD_BIN_DIR:-/usr/local/bin}"
-    CONFIG_DIR="${WIST_AGENTD_HOME:-/etc/wist-agentd}"
-    LOG_DIR="/var/log/wist-agentd"
-    SERVICE_TARGET="system/${LAUNCHD_LABEL}"
-    ;;
-  user)
-    SCOPE_ARG="--user"
-    BIN_DST_DIR="${WIST_AGENTD_BIN_DIR:-${HOME}/bin}"
-    CONFIG_DIR="${WIST_AGENTD_HOME:-${HOME}/.wist-agentd}"
-    LOG_DIR="${HOME}/Library/Logs/wist-agentd"
-    SERVICE_TARGET="gui/$(id -u)/${LAUNCHD_LABEL}"
-    ;;
-  *) die "WIST_AGENTD_SCOPE 只能是 system 或 user，收到 ${SCOPE}" ;;
-esac
+# agentd 只支持系统级托管：二进制落 /usr/local/bin、配置在 /etc/wist-agentd、日志在 /var/log。
+BIN_DST_DIR="${WIST_AGENTD_BIN_DIR:-/usr/local/bin}"
+CONFIG_DIR="${WIST_AGENTD_HOME:-/etc/wist-agentd}"
+LOG_DIR="/var/log/wist-agentd"
+SERVICE_TARGET="system/${LAUNCHD_LABEL}"
 
-# system 作用域要 root：脚本自己提权（而不是要求外层 sudo —— 那会把 cargo build 也变成 root）。
-if [ "${SCOPE}" = "system" ]; then
-  SUDO="sudo"
-else
-  SUDO=""
-fi
+# 系统级要 root：脚本自己提权（而不是要求外层 sudo —— 那会把 cargo build 也变成 root）。
+SUDO="sudo"
 
 DEST_BIN="${BIN_DST_DIR}/${SERVICE_NAME}"
 DEST_EXEC="${BIN_DST_DIR}/${EXEC_NAME}"
@@ -156,14 +138,10 @@ sha12() { shasum -a 256 "$1" 2>/dev/null | awk '{print substr($1, 1, 12)}'; }
 
 service_is_running() {
   if [ "${PLATFORM}" = "launchd" ]; then
-    # system 域可免 sudo 查询；user 域本来就是当前用户。
+    # system 域可免 sudo 查询。
     launchctl print "${SERVICE_TARGET}" 2>/dev/null | grep -q 'state = running'
   else
-    if [ "${SCOPE}" = "system" ]; then
-      systemctl is-active --quiet "${SERVICE_NAME}"
-    else
-      systemctl --user is-active --quiet "${SERVICE_NAME}"
-    fi
+    systemctl is-active --quiet "${SERVICE_NAME}"
   fi
 }
 
@@ -172,11 +150,7 @@ service_program_path() {
     launchctl print "${SERVICE_TARGET}" 2>/dev/null |
       awk -F'= ' '/^[[:space:]]*program = /{print $2; exit}'
   else
-    if [ "${SCOPE}" = "system" ]; then
-      systemctl show -p ExecStart --value "${SERVICE_NAME}" 2>/dev/null
-    else
-      systemctl --user show -p ExecStart --value "${SERVICE_NAME}" 2>/dev/null
-    fi
+    systemctl show -p ExecStart --value "${SERVICE_NAME}" 2>/dev/null
   fi
 }
 
@@ -184,17 +158,9 @@ service_program_path() {
 # 系统级的 /etc/wist-agentd 对普通用户不可读，拿它判断会得出假结论。
 service_definition_present() {
   if [ "${PLATFORM}" = "launchd" ]; then
-    if [ "${SCOPE}" = "system" ]; then
-      [ -f "/Library/LaunchDaemons/${LAUNCHD_LABEL}.plist" ]
-    else
-      [ -f "${HOME}/Library/LaunchAgents/${LAUNCHD_LABEL}.plist" ]
-    fi
+    [ -f "/Library/LaunchDaemons/${LAUNCHD_LABEL}.plist" ]
   else
-    if [ "${SCOPE}" = "system" ]; then
-      [ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]
-    else
-      [ -f "${HOME}/.config/systemd/user/${SERVICE_NAME}.service" ]
-    fi
+    [ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]
   fi
 }
 
@@ -207,11 +173,8 @@ preflight() {
     die "别用 root 跑本脚本：cargo build 会让 target/ 变成 root 属主。
   用普通用户运行，需要 root 的步骤脚本会自己 sudo。"
   fi
-  if [ "${SCOPE}" = "user" ] && [ "$(id -u)" = "0" ]; then
-    die "user 作用域必须以目标用户身份安装（launchd gui 域/systemd --user 都属于该会话用户），不能 sudo。"
-  fi
 
-  note "platform=${PLATFORM} scope=${SCOPE} uid=$(id -u) dry_run=${DRY_RUN} mode=${MODE}"
+  note "platform=${PLATFORM} uid=$(id -u) dry_run=${DRY_RUN} mode=${MODE}"
   note "产物目录 ${BIN_SRC_DIR}"
   note "目标目录 $(short "${BIN_DST_DIR}")　配置目录 $(short "${CONFIG_DIR}")"
   note "服务目标 ${SERVICE_TARGET}"
@@ -223,15 +186,14 @@ preflight() {
 
   # 系统级布局的前提：配置目录必须是 /etc/wist-agentd。落到别处 agentd 就不再当系统级
   # 看待（见 config_runtime 的 is_system_config_dir），数据/日志会退回配置目录下。
-  if [ "${SCOPE}" = "system" ] && [ "${CONFIG_DIR}" != "/etc/wist-agentd" ]; then
-    note "提醒：system 作用域但配置目录是 ${CONFIG_DIR}（非 /etc/wist-agentd）"
+  if [ "${CONFIG_DIR}" != "/etc/wist-agentd" ]; then
+    note "提醒：配置目录是 ${CONFIG_DIR}（非 /etc/wist-agentd）"
     note "      agentd 不把它当系统级，数据/日志不会落到 /var/lib|/var/log/wist-agentd"
   fi
 
   local current
   current="$(service_program_path || true)"
   if [ -n "${current}" ] && [ "${current}" != "${DEST_BIN}" ]; then
-    # 本机曾同时存在 user/system 两套安装时最容易踩：换的是 A，跑的是 B。
     note "注意：当前服务跑的是 ${current}"
     note "      本脚本会把它改成 ${DEST_BIN}（service install --force 重写定义）"
   fi
@@ -324,7 +286,7 @@ restart_service() {
   step "重写服务定义并重启（service install --force）"
   # 用刚装上去的那个二进制来渲染定义：它的 `--bin` 默认值就是「当前可执行文件」，
   # 所以必须显式传 --bin/--config-dir，别指望默认值猜对。
-  run ${SUDO} "${DEST_BIN}" service install "${SCOPE_ARG}" --force \
+  run ${SUDO} "${DEST_BIN}" service install --force \
     --bin "${DEST_BIN}" --config-dir "${CONFIG_DIR}"
 }
 
@@ -410,7 +372,7 @@ fi
 
 step "完成"
 note "日志：$(short "${LOG_DIR}")/agentd.err"
-note "状态：${DEST_BIN} service status ${SCOPE_ARG}"
+note "状态：${DEST_BIN} service status"
 if [ "${MODE}" = "install" ]; then
   note "确认新功能在生效：网关「采集日志」页每条记录应带采集面（family / unit）"
 fi

@@ -19,16 +19,15 @@ wist-agentd diagnose --offline     # 不碰网络，只查本机配置/身份/�
 先看**第一条 FAIL**，再读该项的 `→` 提示（断点已分层：DNS → TCP → TLS/HTTP/鉴权）；下面三条是更细的自检：
 
 ```bash
-wist-agentd service status --system               # 用户级：--user；只读
-tail -50 /var/log/wist-agentd/agentd.err          # macOS；用户级 ~/Library/Logs/wist-agentd/
-journalctl -u wist-agentd -n 50                   # Linux；用户级加 --user
+wist-agentd service status                        # 只读
+tail -50 /var/log/wist-agentd/agentd.err          # macOS
+journalctl -u wist-agentd -n 50                   # Linux
 launchctl print system/com.dayu-sec.wist-agentd   # macOS 平台侧
 systemctl status wist-agentd                      # Linux 平台侧
 ```
 
 | `service status` 字段 | 含义 |
 | --- | --- |
-| `scope` | system / user |
 | `definition_present` | 定义在不在；`false` = 没托管（前台/`start.sh` 跑的，或已 uninstall） |
 | `running` | 单实例锁是否被持有（= 真在跑），比 pidfile 可靠 |
 | `bin=` / `exec_bin=` | 都该 `(present)`；缺 `wist-exec` 会让执行类任务全失败 |
@@ -42,39 +41,29 @@ systemctl status wist-agentd                      # Linux 平台侧
 
 | 运行方式 | 自启 / 崩溃拉起 | 停止 |
 | --- | --- | --- |
-| 托管 `--system` | ✓ 开机起 | `systemctl stop` / `launchctl bootout system/…`（§1.2） |
-| 托管 `--user` | ✓ 登录起 | 同上；macOS 域换 `gui/$(id -u)`，systemd 加 `--user` |
+| 托管 | ✓ 开机起 | `systemctl stop` / `launchctl bootout system/…`（§1.2） |
 | `dev/start.sh` | ✗ | `dev/stop.sh`（日志 `~/.wist-agentd/log/agentd.out`） |
 | 前台 | ✗ | Ctrl-C |
 
 四者共用同一 state 目录，靠 `<state_dir>/.agentd.lock` 的 `flock` 互斥：**同时只能一个实例**，
 换方式前先停旧的（§2.2）。
 
-### 1.1 作用域：macOS `gui/501` / Linux `systemctl --user`
+### 1.1 只支持系统级托管
 
-macOS 用域名 `<类型>/<uid>`：`system`（LaunchDaemon，`/Library/LaunchDaemons/`，`--system`）、
-`gui/<uid>`（LaunchAgent，`~/Library/LaunchAgents/`，`--user`）、`user/<uid>`（无图形会话，SSH）。
+agentd 只装**系统级**：Linux 系统 unit（`/etc/systemd/system/wist-agentd.service`）、macOS LaunchDaemon
+（`/Library/LaunchDaemons/`，launchd 域 `system`），以 root 运行、开机即起。
 
-`501` 是 UID（`id -u`）：0–500 留给系统账号，人类账号从 501 起，换机器会变 → 用 `gui/$(id -u)`。
-`sudo` 下 uid=0，install.sh 因此走 `--system`（域是 `system`，没有 `gui/0`）。
+> 用户级（`systemctl --user` / launchd `gui/<uid>`）已移除，不再支持。
 
-Linux 无域名，就是 `/etc/systemd/system/wist-agentd.service`（系统级）与
-`~/.config/systemd/user/wist-agentd.service`（用户级）。两个坑：
-
-- `systemctl --user` 需该用户有 user manager：无人登录的机器 / 容器 / 纯 SSH 会话常常没有，报
-  `Failed to connect to bus`（`sudo -i` 里也踩）→ 用 `--system`。
-- 用户级随会话结束而停；要常驻：`sudo loginctl enable-linger <user>`
-  （查 `loginctl show-user <user> -p Linger`）。
+`sudo` 下 uid=0，install.sh 因此一律落到 `system` 域。
 
 ### 1.2 平台命令
 
 ```bash
-# macOS：用户级把 system/ 换成 gui/$(id -u)/
 launchctl print system/com.dayu-sec.wist-agentd        # 状态
 launchctl kickstart -k system/com.dayu-sec.wist-agentd # 重启（定义不动）
 launchctl bootout system/com.dayu-sec.wist-agentd      # 停止（下次登录/重启会回来）
 
-# Linux：用户级每行加 --user
 systemctl status wist-agentd
 systemctl restart wist-agentd
 systemctl stop wist-agentd
@@ -94,9 +83,9 @@ journalctl -u wist-agentd -f
 
 | 目标 | macOS | Linux |
 | --- | --- | --- |
-| 停一会儿 | `launchctl bootout gui/$(id -u)/…` | `systemctl stop wist-agentd` |
-| 停且不再自启 | 加 `launchctl disable gui/$(id -u)/…`（恢复 `enable`） | `systemctl disable --now wist-agentd`（恢复 `enable --now`） |
-| 彻底卸载 | `service uninstall --user` / `--system` | 同左 |
+| 停一会儿 | `launchctl bootout system/…` | `systemctl stop wist-agentd` |
+| 停且不再自启 | 加 `launchctl disable system/…`（恢复 `enable`） | `systemctl disable --now wist-agentd`（恢复 `enable --now`） |
+| 彻底卸载 | `service uninstall` | 同左 |
 | 只重启 | `launchctl kickstart -k …` | `systemctl restart wist-agentd` |
 
 - 只停不 disable：macOS 的 plist 还在 → 下次图形登录重新加载；Linux 的 unit 仍 enabled → **重启机器**会再起。
@@ -105,7 +94,7 @@ journalctl -u wist-agentd -f
 - 唯一的例外是升级器：Linux 上它被拉成独立的瞬态 unit（`systemd-run`），不会被这次回收冲掉 —— 
   否则「换件成功、刚重启」那一步会被连坐杀死，升级会被误判成失败。
 - `uninstall` 不删配置、state、日志（保留 agent 身份，便于复装）。
-- 谁拉起来的：macOS `launchctl blame gui/$(id -u)/com.dayu-sec.wist-agentd`；
+- 谁拉起来的：macOS `launchctl blame system/com.dayu-sec.wist-agentd`；
   Linux `systemctl show wist-agentd -p NRestarts`。
 
 ### 2.2 日志刷 another wist-agentd instance is already running
@@ -116,7 +105,7 @@ journalctl -u wist-agentd -f
 ```bash
 pgrep -fl wist-agentd          # 有几个、各读哪份配置
 dev/stop.sh                 # 停掉手工那份
-wist-agentd service status --user | grep running=
+wist-agentd service status | grep running=
 ```
 
 **Linux 专有**：`StartLimitIntervalSec=60` / `StartLimitBurst=10` → 60 秒内失败 10 次即标记 `failed` 并
@@ -213,7 +202,7 @@ mv -f /usr/local/bin/wist-agentd.new /usr/local/bin/wist-agentd
 （`dmesg | grep -i denied`、`ausearch -m avc`）。只支持可追加的单个文本文件，见
 [../design/log-file-input-spec.md](../design/log-file-input-spec.md)。
 
-**落点**（系统级都要 root；`--user` / 开发机安装则全在配置目录 `~/.wist-agentd/` 下）：
+**落点**（系统级都要 root；开发机 / 自定义配置目录安装则全在配置目录下）：
 
 ```
 /etc/wist-agentd/       配置与 tasks
@@ -225,7 +214,7 @@ mv -f /usr/local/bin/wist-agentd.new /usr/local/bin/wist-agentd
 
 ```bash
 wist-agentd version
-wist-agentd service status --system | grep -E 'config=|bin='
+wist-agentd service status | grep -E 'config=|bin='
 tail -1 /var/log/wist-agentd/agentd.err      # macOS 启动行；Linux：journalctl -u wist-agentd -n 1
 # 启动行形如 wist-agentd 0.1.3 starting: config=… mode=managed run_dir=… state_dir=… log_dir=…
 ```
@@ -256,7 +245,7 @@ for b in wist-agentd wist-exec wist-upgrader; do
   chmod 0755 /usr/local/bin/$b.new
   mv -f /usr/local/bin/$b.new /usr/local/bin/$b
 done
-wist-agentd service install --force --system --bin /usr/local/bin/wist-agentd --config-dir /etc/wist-agentd
+wist-agentd service install --force --bin /usr/local/bin/wist-agentd --config-dir /etc/wist-agentd
 wist-agentd version
 ```
 
@@ -287,7 +276,8 @@ dev/install-local.sh --rollback # 换回最近一次备份
   **换前备份**（回滚不再依赖“手边还留着旧包”）与**换后按 sha256 核对**。
 - 以**普通用户**运行（它自己为需要 root 的步骤提权）：整个脚本以 root 跑会让 `cargo build` 把 `target/` 变成 root 属主。
 - 它不下载、不写配置、不碰注册与凭据 —— 升级前后 enrollment 与 state 不变。
-- 默认 `WIST_AGENTD_SCOPE=system`；`user` 作用域同理（装 `~/bin` + `~/.wist-agentd`）。
+- 安装落点固定（系统级）：二进制 `/usr/local/bin`、配置 `/etc/wist-agentd`、日志 `/var/log/wist-agentd`、
+  数据 `/var/lib/wist-agentd`。
 
 ### 3.2 换网关地址 / 重新注册
 
@@ -303,17 +293,17 @@ dev/install-local.sh --rollback # 换回最近一次备份
 
 ```bash
 dev/stop.sh                       # 必须先停，见 §2.2
-wist-agentd service install --user --bin ~/bin/wist-agentd --config-dir ~/.wist-agentd
-wist-agentd service status --user | grep -E 'definition_present|running='
+sudo wist-agentd service install --bin /usr/local/bin/wist-agentd --config-dir /etc/wist-agentd
+wist-agentd service status | grep -E 'definition_present|running='
 ```
 
-服务自身日志：macOS `~/Library/Logs/wist-agentd/agentd.err`，Linux `journalctl --user -u wist-agentd`；
-业务输出仍在配置目录 `log/`、`data/`。Linux 用户级记得 `loginctl enable-linger`（§1.1）。
+服务自身日志：Linux `journalctl -u wist-agentd`，macOS `/var/log/wist-agentd/agentd.err`；
+采集输出在数据目录 `/var/lib/wist-agentd/data/wist-records.ndjson`。
 
 ### 3.4 卸载 / 重装
 
 ```bash
-wist-agentd service uninstall --system      # 停止 + 删定义（用户级 --user）
+wist-agentd service uninstall      # 停止 + 删定义
 # 按需清理（保留则重装后仍是同一 agent 身份）：
 #   /etc/wist-agentd/  /var/lib/wist-agentd/  /var/log/wist-agentd/（仅 macOS）
 ```
@@ -333,7 +323,7 @@ wist-agentd service uninstall --system      # 停止 + 删定义（用户级 --u
 
 ### 3.6 报障要带什么
 
-1. `wist-agentd service status`（`--system`/`--user`）全文；
+1. `wist-agentd service status` 全文；
 2. `launchctl print …` / `systemctl cat wist-agentd` + `systemctl status`；
 3. 服务日志尾部 200 行（`tail -200 …/agentd.err` 或 `journalctl -u wist-agentd -n 200`）；
 4. `wist-agentd version` 与启动行；网关侧同时段日志（`failed TLS handshake` / `CertificateUnknown`）。
@@ -353,5 +343,4 @@ wist-agentd service uninstall --system      # 停止 + 删定义（用户级 --u
 | 改完 plist/unit 直接重启 | 定义没重写：用 `service install --force` |
 | 把一次性 token 写进 `agentd.toml` | 注册后本会清掉，手工留着等于长期落盘 |
 | `/etc` 下装却不用 sudo | 配置/数据/日志三处都要 root |
-| Linux 无人登录机器用 `--user` | `systemctl --user` 连不上 bus；改 `--system`（§1.1） |
 | Linux 崩溃循环后只 `restart` | 已被 start-limit 拒掉：先 `systemctl reset-failed`（§2.2） |

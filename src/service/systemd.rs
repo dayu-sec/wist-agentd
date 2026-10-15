@@ -12,18 +12,14 @@
 use std::path::PathBuf;
 
 use crate::error::AgentdResult;
-use crate::service::{SERVICE_NAME, ServiceScope, ServiceSpec, home_dir};
+use crate::service::{SERVICE_NAME, ServiceSpec};
 
 const SYSTEM_UNIT_DIR: &str = "/etc/systemd/system";
-const USER_UNIT_DIR: &str = ".config/systemd/user";
 const UNIT_FILE_NAME: &str = "wist-agentd.service";
 
-/// unit 文件落盘路径。
-pub fn unit_path(scope: ServiceScope) -> AgentdResult<PathBuf> {
-    match scope {
-        ServiceScope::System => Ok(PathBuf::from(SYSTEM_UNIT_DIR).join(UNIT_FILE_NAME)),
-        ServiceScope::User => Ok(home_dir()?.join(USER_UNIT_DIR).join(UNIT_FILE_NAME)),
-    }
+/// unit 文件落盘路径（系统级）。
+pub fn unit_path() -> AgentdResult<PathBuf> {
+    Ok(PathBuf::from(SYSTEM_UNIT_DIR).join(UNIT_FILE_NAME))
 }
 
 /// 渲染 unit 文本。
@@ -31,10 +27,7 @@ pub fn unit_path(scope: ServiceScope) -> AgentdResult<PathBuf> {
 /// 所有写进 unit 的路径都经过 [`systemd_arg`] 处理：含空格/引号/`%`/`$` 的路径会被引号包裹并转义，
 /// 避免路径里的空白把一条指令拆成两条，或 `%`/`$` 被 systemd 当成 specifier / 变量展开。
 pub fn unit_text(spec: &ServiceSpec) -> String {
-    let wanted_by = match spec.scope {
-        ServiceScope::System => "multi-user.target",
-        ServiceScope::User => "default.target",
-    };
+    let wanted_by = "multi-user.target";
     let mut text = String::new();
     text.push_str("[Unit]\n");
     text.push_str("Description=wist agent daemon (edge controller)\n");
@@ -104,9 +97,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unit_path_uses_system_dir_for_system_scope() {
+    fn unit_path_uses_the_system_dir() {
         assert_eq!(
-            unit_path(ServiceScope::System).expect("unit path"),
+            unit_path().expect("unit path"),
             PathBuf::from("/etc/systemd/system/wist-agentd.service")
         );
     }

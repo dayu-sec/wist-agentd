@@ -3,6 +3,18 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.0-alpha] - 2026-10-15
+
+### 变更（不兼容）
+
+- **移除 `--user` 用户级作用域**：`wist-agentd` 只保留系统级托管（Linux systemd 系统 unit /
+  macOS `LaunchDaemons`）。`service` 子命令不再有任何作用域旗标（系统级为默认且唯一）；
+  升级器 `wist-upgrader` 的 `--scope system|user` 选项一并删除，systemd 重启不再带 `--user`，launchd 固定
+  用 `system/<label>` 域。`--config-dir` 与“非 `/etc/wist-agentd` 配置目录 → 数据/日志就地”的开发机行为保留。
+- **`dev/install-local.sh` 不再接受 `WIST_AGENTD_SCOPE`**：一律系统级安装，落点固定
+  `/usr/local/bin`（二进制）+ `/etc/wist-agentd`（配置）。
+- **升级注意**：旧的 `--user` 用户级安装需先重装为系统级 —— 否则升级重启会指向不存在的 system 服务。
+
 ## [0.3.2-alpha] - 2026-10-14
 
 ### 变更
@@ -315,8 +327,8 @@
 
 ### 新增
 
-- **后台服务托管**：`service print | install | uninstall | status` 为 `--system`（默认）与 `--user` 渲染并安装
-  systemd unit 或 launchd plist，随后加载并启动服务；`--no-activate` 只落盘定义并打印需要手动执行的加载命令。
+- **后台服务托管**：`service print | install | uninstall | status` 渲染并安装 systemd unit 或 launchd plist，
+  随后加载并启动服务；`--no-activate` 只落盘定义并打印需要手动执行的加载命令。
 - **命令行一次性注册**：`enroll --token <t>` / `enroll --token-stdin`，以及
   `service install --enrollment-token <t>`（先注册后装服务，token 被拒时不会留下半成品服务）。token 不写入配置、
   不落盘；重复注册是幂等空操作。
@@ -330,7 +342,7 @@
 ### 变更
 
 - 常驻/自启/拉起交给 OS 服务管理器；daemon 自身**只前台运行**（不自带 daemonize），单实例由 `flock` 保证。
-- 默认配置目录：`--system` 为 `/etc/wist-agentd`，`--user` 为 `~/.wist-agentd`。配置目录在 `/etc/wist-agentd`
+- 默认配置目录：`/etc/wist-agentd`。配置目录在 `/etc/wist-agentd`
   下时，数据落 `/var/lib/wist-agentd`、日志落 `/var/log/wist-agentd`；其它位置则配置/数据/日志全部就地，因此非 root
   开发不会碰到 `/etc`、`/var/lib`、`/var/log`。只填充**未声明**的 `[paths]` 键——显式声明优先。
 - `service install --force` 会**重建服务进程**：systemd 走 `daemon-reload` + `enable` + `restart`，launchd 走

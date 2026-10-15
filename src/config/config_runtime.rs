@@ -20,7 +20,7 @@ use support::{
     is_system_config_dir, resolve_paths,
 };
 
-/// 系统级部署的配置目录：普通运行、`init-config`、`service install --system` 的默认值。
+/// 系统级部署的配置目录：普通运行、`init-config`、`service install` 的默认值。
 pub const SYSTEM_CONFIG_DIR: &str = "/etc/wist-agentd";
 /// 系统级部署的数据根目录：配置在 [`SYSTEM_CONFIG_DIR`] 下时，`run/state/spool` 默认落在这里。
 pub const SYSTEM_DATA_ROOT: &str = "/var/lib/wist-agentd";

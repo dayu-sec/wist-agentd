@@ -14,7 +14,7 @@
 | 目标 | 落地手段 |
 | --- | --- |
 | 关掉终端、退出登录后仍运行 | 交给 OS 服务管理器（Linux systemd / macOS launchd）托管 |
-| 开机自启 | systemd `enable`；launchd `RunAtLoad` + `LaunchDaemons`/`LaunchAgents` |
+| 开机自启 | systemd `enable`；launchd `RunAtLoad` + `LaunchDaemons` |
 | 崩溃自动拉起 | systemd `Restart=always`；launchd `KeepAlive` |
 | 长期运行不撑爆磁盘 | 稳态日志收敛 + journald / newsyslog 轮转 |
 | 长期运行不出现重复实例 | state 目录 `flock` 单实例锁（进程退出即自动释放） |
@@ -61,9 +61,9 @@ flowchart TD
 | --- | --- | --- |
 | 发起方 | 工程师手工执行 | 控制面下发安装指令（含 endpoint + 一次性 token） |
 | 目录落点 | 全部就地（配置/数据/日志在同一个目录） | 配置 `/etc`、数据 `/var/lib`、日志 `/var/log`（第 5 节） |
-| 运行身份 | 当前用户（`--user` 或不装服务） | root（系统级 systemd / launchd） |
+| 运行身份 | 当前用户（不装服务，前台直跑） | root（系统级 systemd / launchd） |
 | 注册 | 可选；`enroll --token` 一次性传入 | `service install --enrollment-token`，token 不落盘 |
-| 日志采集 | `journalctl --user` / `~/Library/Logs/wist-agentd` | journald / `/var/log/wist-agentd` |
+| 日志采集 | 随进程（stderr 或 `[log].file`） | journald / `/var/log/wist-agentd` |
 
 共用机制：`service install`（渲染 + 落盘 + 激活）、命令行一次性注册、路径推导、flock 单实例。
 网关安装只是把这一串手工步骤搬进安装脚本，因此 agent 侧的能力已就位（见手册 §3.2）。
@@ -134,11 +134,11 @@ supervisor。后者让“谁在管、怎么重启、日志去哪”都有唯一�
 `/var/lib/wist-agentd`、日志落 `/var/log/wist-agentd`；其它位置 → 配置/数据/日志全部就地”。
 选择“路径推导”而不是“新增配置项或安装参数”的原因：
 
-- 没有任何新增开关，`service install --system` 与直接运行两种入口得到同一套布局；
+- 没有任何新增开关，`service install` 与直接运行两种入口得到同一套布局；
 - 显式声明优先，不会静默改写运维已经写定的路径（在 `/opt` 等非标准位置部署时运维可自行声明）；
 - 判断依据（配置文件在哪）与运维看到的完全一致，不需要额外解释“为什么数据在另一个目录”。
 
-开发机 / `--user` 走“就地一整套”，所以**非 root 开发不会碰到 `/etc`、`/var/lib`、`/var/log`**；
+开发机 / 自定义配置目录走“就地一整套”，所以**非 root 开发不会碰到 `/etc`、`/var/lib`、`/var/log`**；
 `init-config` 的输出与 `service status` 的 `root_dir/run_dir/state_dir/log_dir` 都会把真实落点直接展示出来。
 
 ## 6. 服务定义里固化了什么
@@ -154,7 +154,7 @@ supervisor。后者让“谁在管、怎么重启、日志去哪”都有唯一�
 | 环境变量 | `EnvironmentFile=-<config>/agentd.env`（可缺失） | 仅显式 `PATH` | 放长期环境变量；注册 token 走命令行，不落盘 |
 | 日志 | `StandardOutput/Error=journal` | `StandardOut/ErrorPath` 落 `/var/log/wist-agentd/` | journald 自带回收；launchd 需 newsyslog |
 | 权限 | `NoNewPrivileges=true`、`LimitNOFILE=65536` | 运行在 root（LaunchDaemon） | 只禁提权、不降权：agent 仍要以 root 读受限日志路径 |
-| 自启 | `WantedBy=multi-user.target`（user：`default.target`） | plist 位于 `LaunchDaemons`/`LaunchAgents` | 系统级开机起，用户级登录起 |
+| 自启 | `WantedBy=multi-user.target` | plist 位于 `LaunchDaemons` | 系统级开机起 |
 
 ### 重新安装必须重建进程
 
@@ -180,10 +180,9 @@ supervisor。后者让“谁在管、怎么重启、日志去哪”都有唯一�
 2. **环境变量只在 Linux systemd 下可注入**：launchd 没有 `EnvironmentFile` 等价物（plist 只显式补
    `PATH`），macOS 需要长期环境变量时只能手工维护 plist；`agentd.env` 仅用于 Linux systemd。
 3. **root 采集能力**：audit / TCC / 统一日志仍需 root helper，见第 1 节“非目标”。
-4. **macOS 用户级需要 GUI 会话**：`gui/<uid>` domain 依赖登录会话；无人登录的后台机请用 `--system`。
-5. **定义里没有 `User=` / `Group=` 降权项**：需要非 root 运行时，安装后手工编辑 unit，
+4. **定义里没有 `User=` / `Group=` 降权项**：需要非 root 运行时，安装后手工编辑 unit，
    或后续给 `service install` 增加 `--run-as`。
-6. **连续执行之间有固定空档（3s 取舍的副作用）**：`scheduler::drain_next_async` 每轮只处理一个队列项、
+5. **连续执行之间有固定空档（3s 取舍的副作用）**：`scheduler::drain_next_async` 每轮只处理一个队列项、
    且等它跑完才返回，循环末尾又固定 sleep 一个 tick。因此队列繁忙时两个执行之间最多插 3s 空档。
    当前 `src/` 内没有 `submit_local_plan` 的调用方（等网关接入），所以现在没有实际吞吐影响；
    负载上来后可按“该 tick 真的派发了任务就不 sleep”优化。

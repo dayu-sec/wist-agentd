@@ -33,7 +33,7 @@ use crate::control::uplink::{UplinkFetch, fetch_uplink_grant};
 use crate::enrollment::is_registered_agent_id;
 use crate::error::AgentdResult;
 use crate::runtime::daemon::telemetry_support::effective_output;
-use crate::service::{self, ServiceLayout, ServicePlatform, ServiceScope, ServiceSpec};
+use crate::service::{self, ServiceLayout, ServicePlatform, ServiceSpec};
 use crate::state_store::{agent_runtime, auth_terminal, client_identity, work};
 use crate::upgrade::{UPGRADE_RECORD_FILE, UPGRADER_DEAD_AFTER, UpgradeRecord, heartbeat_is_fresh};
 
@@ -582,7 +582,7 @@ async fn identity_checks(config: &AgentConfig) -> Vec<Check> {
                 "还没注册（拿不到已注册身份）",
                 format!("state 里的身份是占位值：{}", runtime_state.agent_id),
             )
-            .hint("用一次性 token 注册：`wist-agentd service install --system --enrollment-token <token>`"),
+            .hint("用一次性 token 注册：`wist-agentd service install --enrollment-token <token>`"),
         ),
     }
 
@@ -644,13 +644,17 @@ fn credential_check(config: &AgentConfig) -> Check {
         .map(str::trim)
         .filter(|id| !id.is_empty())
     {
-        Some(id) => Check::ok("identity.credential", "已注册身份", format!("credential_id={id}")),
+        Some(id) => Check::ok(
+            "identity.credential",
+            "已注册身份",
+            format!("credential_id={id}"),
+        ),
         None => Check::warn(
             "identity.credential",
             "本机没有已注册身份",
             "未注册，或 state 被清过".to_string(),
         )
-        .hint("用一次性 token 重新注册：`wist-agentd service install --system --enrollment-token <token>`"),
+        .hint("用一次性 token 重新注册：`wist-agentd service install --enrollment-token <token>`"),
     }
 }
 
@@ -731,18 +735,15 @@ fn service_checks(config_root: &Path, config: &AgentConfig) -> Vec<Check> {
         return checks;
     };
 
-    let installed = [ServiceScope::System, ServiceScope::User]
-        .into_iter()
-        .find_map(|scope| {
-            let layout = ServiceLayout::resolve(platform, scope).ok()?;
-            layout.definition_path.is_file().then_some((scope, layout))
-        });
+    let installed = ServiceLayout::resolve(platform)
+        .ok()
+        .filter(|layout| layout.definition_path.is_file());
 
     let state_dir = PathBuf::from(&config.paths.state_dir);
     match installed {
-        Some((scope, layout)) => {
+        Some(layout) => {
             let bin = service::default_bin().unwrap_or_default();
-            let spec = ServiceSpec::new(scope, bin, config_root.to_path_buf());
+            let spec = ServiceSpec::new(bin, config_root.to_path_buf());
             match service::status(&layout, &spec) {
                 Ok(status) => {
                     let detail = format!(
@@ -809,7 +810,7 @@ fn service_checks(config_root: &Path, config: &AgentConfig) -> Vec<Check> {
                         "没有托管服务定义，也没有在跑的 agentd",
                         "这台机器当前不会上报、也不会执行工作",
                     )
-                    .hint("`wist-agentd service install --system --enrollment-token <token>`"),
+                    .hint("`wist-agentd service install --enrollment-token <token>`"),
                 );
             }
         }

@@ -10,8 +10,7 @@ use crate::enrollment::is_registered_agent_id;
 use crate::error::{AgentdReason, AgentdResult};
 use crate::self_observability;
 use crate::service::{
-    self, ServiceCommand, ServiceCommandOutcome, ServiceLayout, ServicePlatform, ServiceScope,
-    ServiceSpec,
+    self, ServiceCommand, ServiceCommandOutcome, ServiceLayout, ServicePlatform, ServiceSpec,
 };
 use crate::state_store;
 
@@ -55,7 +54,6 @@ const SERVICE_ACTIONS: &str = "print | install | uninstall | status";
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ServiceRequest {
     action: ServiceAction,
-    scope: ServiceScope,
     /// 仅 `print` 可用：为目标平台渲染定义（例如在 macOS 上为 Linux 生成 unit）。
     platform: Option<ServicePlatform>,
     bin: Option<PathBuf>,
@@ -405,8 +403,6 @@ fn looks_like_option(value: &OsString) -> bool {
                 | "--token"
                 | "--token-stdin"
                 | "--enrollment-token"
-                | "--system"
-                | "--user"
                 | "--force"
                 | "--no-activate"
                 | "--json"
@@ -415,7 +411,7 @@ fn looks_like_option(value: &OsString) -> bool {
     })
 }
 
-/// 解析 `service <action> [--system|--user] [--bin <path>] [--force] [--no-activate] [--enrollment-token <t>]`。
+/// 解析 `service <action> [--bin <path>] [--force] [--no-activate] [--enrollment-token <t>]`。
 ///
 /// 返回 `(请求, 本段解析到的 --config-dir, 下一个待扫描下标)`：子命令参数与全局参数可以**任意顺序**混用
 /// （`--config-dir` 在子解析器里一并吃掉，否则 `service install --config-dir X --force` 会把 `--force`
@@ -448,8 +444,6 @@ fn parse_service_request(
 
     let mut request = ServiceRequest {
         action,
-        // 常驻 Agent 需要读 /var/log 等受限路径，默认系统级；开发机可用 --user。
-        scope: ServiceScope::System,
         platform: None,
         bin: None,
         force: false,
@@ -464,16 +458,6 @@ fn parse_service_request(
             let value = option_value(args, index + 1, "--config-dir")?;
             set_config_dir(&mut config_dir, PathBuf::from(value))?;
             index += 2;
-            continue;
-        }
-        if arg == "--system" {
-            request.scope = ServiceScope::System;
-            index += 1;
-            continue;
-        }
-        if arg == "--user" {
-            request.scope = ServiceScope::User;
-            index += 1;
             continue;
         }
         if arg == "--force" {
@@ -926,14 +910,14 @@ async fn run_service(
     };
     let config_dir = match config_dir {
         Some(path) => resolve_config_dir_arg(&root, path),
-        None => service::default_config_dir(request.scope)?,
+        None => service::default_config_dir(),
     };
     let bin = match request.bin.as_ref() {
         Some(path) => path.clone(),
         None => service::default_bin()?,
     };
-    let spec = ServiceSpec::new(request.scope, bin, config_dir);
-    let layout = ServiceLayout::resolve(platform, request.scope)?;
+    let spec = ServiceSpec::new(bin, config_dir);
+    let layout = ServiceLayout::resolve(platform)?;
 
     match request.action {
         ServiceAction::Print => {
@@ -998,7 +982,7 @@ async fn run_service_install(
             println!("  {}", command.display_line());
         }
     }
-    println!("logs: {}", service::log_hint(layout, spec)?);
+    println!("logs: {}", service::log_hint(layout)?);
     for command in service::inspect_commands(layout.platform, spec) {
         println!("check: {}", command.display_line());
     }
@@ -1024,7 +1008,6 @@ fn run_service_uninstall(
 fn run_service_status(layout: &ServiceLayout, spec: &ServiceSpec) -> AgentdResult<()> {
     let status = service::status(layout, spec)?;
     println!("platform={}", status.platform.as_str());
-    println!("scope={}", status.scope.as_str());
     println!("definition={}", status.definition_path.display());
     println!("definition_present={}", status.definition_present);
     println!("bin={}", service::path_state(&status.bin));
@@ -1126,7 +1109,7 @@ fn usage_message() -> &'static str {
         "  wist-agentd help\n",
         "  wist-agentd version\n",
         "  wist-agentd init-config [--stdout] [--config-dir <path>]\n",
-        "  wist-agentd service <print|install|uninstall|status> [--system|--user] [--bin <path>] [--force] [--no-activate] [--config-dir <path>]\n",
+        "  wist-agentd service <print|install|uninstall|status> [--bin <path>] [--force] [--no-activate] [--config-dir <path>]\n",
         "  wist-agentd service print --for <systemd|launchd>   (render for another platform)\n",
         "  wist-agentd enroll [--token <token> | --token-stdin] [--config-dir <path>]\n",
         "  wist-agentd diagnose [--json] [--offline] [--config-dir <path>]\n",
@@ -1145,8 +1128,6 @@ fn usage_message() -> &'static str {
         "                       Exits nonzero when anything FAILs, so scripts can gate on it.\n",
         "\n",
         "Service options (Linux uses systemd, macOS uses launchd):\n",
-        "  --system             Install for the whole host (default; /etc paths, root-owned).\n",
-        "  --user               Install for the current user (systemd --user / launchd LaunchAgent).\n",
         "  --bin <path>         Installed path of the wist-agentd binary (default: current executable).\n",
         "  --for <platform>     Only with `service print`: render systemd or launchd output.\n",
         "  --force              Overwrite an existing service definition.\n",

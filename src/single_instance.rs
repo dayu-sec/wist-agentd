@@ -111,7 +111,7 @@ pub fn is_held(state_dir: &Path) -> io::Result<bool> {
         return Ok(false);
     }
     // 只读打开：`flock` 不要求写权限，这样非 root 用户也能探测 root 所属的锁文件
-    // （`service status --system` 不该因为读不到写权限就整个失败）。
+    // （`service status` 不该因为读不到写权限就整个失败）。
     let file = OpenOptions::new().read(true).open(&path)?;
     match try_lock(&file) {
         Ok(()) => Ok(false),

@@ -173,7 +173,7 @@ dirs_ready() {
 }
 
 status_reports_running() {
-  "${AGENTD_BIN}" service status --system 2>/dev/null | grep -q '^running=true$'
+  "${AGENTD_BIN}" service status 2>/dev/null | grep -q '^running=true$'
 }
 
 read_startup_line() {
@@ -201,9 +201,9 @@ install_service() {
   local force="${1:-}"
   # 定义已存在（例如没 --cleanup 的重跑）时必须 --force，否则 install 会直接拒绝。
   if [ "${force}" = "force" ] || [ -e "$(definition_path)" ]; then
-    run "${AGENTD_BIN}" service install --system --bin "${AGENTD_BIN}" --config-dir "${CONFIG_DIR}" --force
+    run "${AGENTD_BIN}" service install --bin "${AGENTD_BIN}" --config-dir "${CONFIG_DIR}" --force
   else
-    run "${AGENTD_BIN}" service install --system --bin "${AGENTD_BIN}" --config-dir "${CONFIG_DIR}"
+    run "${AGENTD_BIN}" service install --bin "${AGENTD_BIN}" --config-dir "${CONFIG_DIR}"
   fi
 }
 
@@ -217,7 +217,7 @@ phase_install() {
   if [ -n "${WIST_VERIFY_ENDPOINT:-}" ]; then
     : "${WIST_VERIFY_TOKEN:?WIST_VERIFY_ENDPOINT 需要同时给 WIST_VERIFY_TOKEN}"
     info "顺带验收注册（endpoint=${WIST_VERIFY_ENDPOINT}，token 不落盘）"
-    run "${AGENTD_BIN}" service install --system --bin "${AGENTD_BIN}" \
+    run "${AGENTD_BIN}" service install --bin "${AGENTD_BIN}" \
       --config-dir "${CONFIG_DIR}" --enrollment-token "${WIST_VERIFY_TOKEN}"
   else
     info "standalone 模式：不需要控制面与 token，只验服务托管与目录落点"
@@ -243,7 +243,7 @@ phase_assert_definition() {
   if service_is_running; then pass "服务 running（pid=$(service_main_pid)）"; else fail "服务不在 running"; fi
 
   local status_out
-  status_out="$("${AGENTD_BIN}" service status --system 2>&1 || true)"
+  status_out="$("${AGENTD_BIN}" service status 2>&1 || true)"
   printf '%s\n' "${status_out}" | sed 's/^/  | /'
   if wait_until "${READY_WAIT_SECS}" "单实例锁被持有" status_reports_running; then
     pass "service status 报告 running=true"
@@ -408,7 +408,7 @@ phase_after_reboot() {
 dump_diagnostics() {
   step "诊断信息（自动采集）"
   info "service status："
-  "${AGENTD_BIN}" service status --system 2>&1 | sed 's/^/  | /' || true
+  "${AGENTD_BIN}" service status 2>&1 | sed 's/^/  | /' || true
   info "服务管理器视图："
   case "${PLATFORM}" in
     systemd)
@@ -442,7 +442,7 @@ phase_cleanup() {
     echo "没有找到 ${MARKER_FILE}：本脚本没有安装记录，拒绝清理（避免误删别人的部署）" >&2
     exit 2
   fi
-  run "${AGENTD_BIN}" service uninstall --system || true
+  run "${AGENTD_BIN}" service uninstall || true
   info "将删除本脚本创建的：${CONFIG_DIR} ${DATA_DIR} ${LOG_DIR}"
   info "以及 ${BIN_DST_DIR}/${SERVICE_NAME} ${BIN_DST_DIR}/wist-exec ${BIN_DST_DIR}/wist-upgrader ${SAMPLE_LOG}"
   run rm -rf "${CONFIG_DIR}" "${DATA_DIR}" "${LOG_DIR}"

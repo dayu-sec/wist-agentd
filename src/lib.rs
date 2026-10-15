@@ -24,7 +24,7 @@ pub use exec::{
 };
 pub use reporting::{exporter, reporting_pipeline};
 pub use runtime::{daemon, scheduler, self_observability};
-pub use service::{ServicePlatform, ServiceScope, ServiceSpec};
+pub use service::{ServicePlatform, ServiceSpec};
 
 /// 进程入口：返回值是**进程退出码**（`doctor` 有 FAIL 时为 1，其余命令为 0）。
 pub async fn run() -> error::AgentdResult<i32> {

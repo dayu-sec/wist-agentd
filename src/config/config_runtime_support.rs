@@ -25,7 +25,7 @@ kind = "file"
 
 # 采集输出（file sink）路径：不写则按“它是数据”处理，跟数据根目录走 ——
 #   系统级部署（配置在 /etc/wist-agentd）→ /var/lib/wist-agentd/data/wist-records.ndjson
-#   开发机 / --user 安装　　→ <配置目录>/data/wist-records.ndjson
+#   开发机 / 自定义配置目录安装 → <配置目录>/data/wist-records.ndjson
 # 需要指定就显式声明（相对路径相对本配置文件所在目录，绝对路径原样使用）：
 # [telemetry.logs.output.file]
 # path = "/var/lib/wist-agentd/data/wist-records.ndjson"
@@ -54,7 +54,7 @@ container_enabled = false
 # trust_bundle = ""
 #
 # 注册 token（一次性）不写配置，装的时候传一次就行（不落盘）：
-#   sudo wist-agentd service install --system --enrollment-token <token>
+#   sudo wist-agentd service install --enrollment-token <token>
 # 已装好但还没注册，也可以单独补注册：
 #   sudo wist-agentd enroll --token <token>            # 或： echo <token> | sudo wist-agentd enroll --token-stdin
 #
@@ -63,7 +63,7 @@ container_enabled = false
 # # 数据/日志目录默认值随**配置目录**而定（只填充未声明的键，显式声明优先）：
 # #   配置在 /etc/wist-agentd（系统级部署）→ 数据（run/state/spool + 采集输出 data/）落 /var/lib/wist-agentd，
 # #                                         日志落 /var/log/wist-agentd
-# #   其它位置（开发机 / --user 安装）→ 数据与日志就放在配置目录下
+# #   其它位置（开发机 / 自定义配置目录安装）→ 数据与日志就放在配置目录下
 # # 解析规则：相对路径相对本配置文件所在目录，绝对路径原样使用。
 # # root_dir = "/var/lib/wist-agentd"   # run/state/spool 的基准
 # # run_dir = "run"
@@ -196,7 +196,7 @@ pub(super) struct DefaultPaths {
 ///
 /// - 配置在 `/etc/wist-agentd`（系统级部署）→ 配置与数据分离：
 ///   `run/state/spool` 落 `/var/lib/wist-agentd`，日志（含采集输出）落 `/var/log/wist-agentd`；
-/// - 其它位置（开发机 / `--user` 安装）→ 数据就放在配置目录下（`run` / `state` / `log`）。
+/// - 其它位置（开发机 / 自定义配置目录）→ 数据就放在配置目录下（`run` / `state` / `log`）。
 ///
 /// `run/state` 保持相对 `root_dir`，`log_dir` 在系统级下是绝对的 `/var/log/wist-agentd`。
 pub(super) fn default_paths_for(config_dir: &Path) -> DefaultPaths {
@@ -268,7 +268,7 @@ pub(super) fn apply_path_defaults(config: &mut AgentConfig, config_path: &Path, 
 
 /// 采集输出（file sink）未显式声明时的默认路径：它是**数据**，跟数据根目录走 ——
 /// 系统级 `/var/lib/wist-agentd/data/wist-records.ndjson`，
-/// 开发机 / `--user` `<配置目录>/data/wist-records.ndjson`。
+/// 开发机 / 自定义配置目录 `<配置目录>/data/wist-records.ndjson`。
 fn collected_output_default(system: bool) -> String {
     let relative = format!("{COLLECTED_OUTPUT_SUBDIR}/{COLLECTED_OUTPUT_FILE}");
     if system {

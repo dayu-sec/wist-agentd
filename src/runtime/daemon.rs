@@ -1705,19 +1705,9 @@ fn dispatch_upgrade(
         launch.program.display(),
         log_path.display()
     );
-    // 作用域：与升级器自己挑重启手段（`systemctl [--user] restart`）是同一个判据
-    // —— 配置目录在 `/etc` 下 = system。它决定瞬态 unit 走系统实例还是 `--user`。
-    let scope_is_system =
-        crate::config_runtime::system_data_root_for(loop_ctx.config_dir).is_some();
     // 瞬态 unit 不继承 agentd 的进程环境，把同一份长期环境变量文件交给它。
     let env_file = loop_ctx.config_dir.join(crate::service::ENV_FILE_NAME);
-    crate::upgrade::spawn_upgrader(
-        &launch,
-        &log_path,
-        &entry.work_id,
-        scope_is_system,
-        &env_file,
-    )
+    crate::upgrade::spawn_upgrader(&launch, &log_path, &entry.work_id, &env_file)
 }
 
 /// 从升级器落盘的记录里同步进度/结果，返回「本机视图是否因此变了」。

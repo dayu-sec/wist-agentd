@@ -34,7 +34,7 @@
 
 ## 2. 方式一：开发环境安装
 
-目标：在一台开发机上从源码构建、**不需要 sudo** 地跑起来（前台或用户级常驻），配置、数据、日志全部就地。
+目标：在一台开发机上从源码构建并跑起来（前台运行免 sudo，配置/数据/日志全部就地）；要装成常驻服务（自启 + 崩溃拉起）则需 sudo，见§2.3。
 
 ### 2.1 构建与放置
 
@@ -63,7 +63,7 @@ install -m 0755 target/release/wist-agentd target/release/wist-exec ~/bin/   # �
 ./dev-conf/
   agentd.toml            # 配置（可 gitignore）
   tasks/*.toml           # 可选：外置采集清单
-  agentd.env             # 可选：长期环境变量（systemd --user 会读）
+  agentd.env             # 可选：长期环境变量（Linux 系统级 systemd 会读）
   run/ state/            # 数据
   data/                  # 采集输出（默认 data/wist-records.ndjson）
   log/                   # 日志
@@ -81,9 +81,10 @@ install -m 0755 target/release/wist-agentd target/release/wist-exec ~/bin/   # �
 # 仓库自带的开发机后台脚本（& + disown + pidfile，无自启/无崩溃拉起）
 cd dev && ./start.sh && ./stop.sh
 
-# 需要“登录即起 + 崩溃拉起”时，装成用户级常驻（仍不需要 sudo）
-./target/release/wist-agentd service install --user \
-    --bin "$PWD/target/release/wist-agentd" --config-dir ./dev-conf
+# 需要“开机即起 + 崩溃拉起”时，装成系统级常驻（会写 /etc/systemd/system
+# 或 /Library/LaunchDaemons，需要 sudo；配置/数据仍可留在 ./dev-conf）
+sudo ./target/release/wist-agentd service install \
+    --bin "$PWD/target/release/wist-agentd" --config-dir "$PWD/dev-conf"
 ```
 
 联调小抄：
@@ -91,10 +92,10 @@ cd dev && ./start.sh && ./stop.sh
 ```bash
 WIST_AGENTD_LOG_HEARTBEAT_SECS=0 ./target/release/wist-agentd --config-dir ./dev-conf   # 逐轮全量日志
 WIST_AGENTD_RUN_ONCE=1 ./target/release/wist-agentd --config-dir ./dev-conf             # 只跑一轮后退出
-./target/release/wist-agentd service status --user --config-dir ./dev-conf              # 只读自检
+./target/release/wist-agentd service status --config-dir ./dev-conf              # 只读自检
 ```
 
-用户级常驻的日志：systemd 看 `journalctl --user -u wist-agentd -f`；launchd 看 `~/Library/Logs/wist-agentd/agentd.err`。
+系统级常驻的日志：Linux `journalctl -u wist-agentd -f`；macOS `/var/log/wist-agentd/agentd.err`。
 
 ## 3. 方式二：通过 Wist-Gateway 安装
 
@@ -114,8 +115,8 @@ WIST_AGENTD_RUN_ONCE=1 ./target/release/wist-agentd --config-dir ./dev-conf     
 
 3. 安装脚本负责：下载安装包并校验摘要 → 放二进制（tarball 形态连 `wist-exec`、`wist-upgrader` 一起，
    三者同版本才能升级）→ 下载
-   initial-config 写 `agentd.toml` → `service install --system --enrollment-token <token>`
-   （普通用户执行时为 `--user`）→ 交给 launchd / systemd 拉起；
+   initial-config 写 `agentd.toml` → `service install --enrollment-token <token>`
+   → 交给 launchd / systemd 拉起；
 4. 注册结果（`agent_id`、凭据）落 state，网关侧能看到该主机上线。
 
 ### 3.2 当前已经具备（agent 侧）
@@ -123,8 +124,8 @@ WIST_AGENTD_RUN_ONCE=1 ./target/release/wist-agentd --config-dir ./dev-conf     
 | 能力 | 命令/机制 | 状态 |
 | --- | --- | --- |
 | 一次性 token 注册，不落盘 | `wist-agentd enroll --token <token>`（或 `--token-stdin`） | ✅ 已实现 |
-| 装服务时一并注册（失败不留半成品） | `service install --system --enrollment-token <token>` | ✅ 已实现 |
-| 系统级常驻 + 自启 + 崩溃拉起 | `service install --system`（systemd / launchd） | ✅ 已实现 |
+| 装服务时一并注册（失败不留半成品） | `service install --enrollment-token <token>` | ✅ 已实现 |
+| 系统级常驻 + 自启 + 崩溃拉起 | `service install`（systemd / launchd） | ✅ 已实现 |
 | 配置 / 数据（含采集输出）/ 日志分离 | `[paths]` 与采集输出的默认推导 | ✅ 已实现 |
 | 幂等注册、重复执行安全 | 已注册时直接返回 `already enrolled` | ✅ 已实现 |
 | 安装脚本 / 网关下发 | 网关 `wist-gateway/src/api/install.sh`（签名 + 摘要校验 + `service install`） | ✅ 已实现 |
@@ -152,8 +153,8 @@ WIST_AGENTD_RUN_ONCE=1 ./target/release/wist-agentd --config-dir ./dev-conf     
 sudo install -m 0755 target/release/wist-agentd target/release/wist-exec /usr/local/bin/
 sudo wist-agentd init-config --config-dir /etc/wist-agentd
 sudo vi /etc/wist-agentd/agentd.toml          # 填 [control_plane] endpoint；[paths] 不用写（§4.3）
-sudo wist-agentd service install --system --enrollment-token <token>
-wist-agentd service status --system
+sudo wist-agentd service install --enrollment-token <token>
+wist-agentd service status
 systemctl status wist-agentd && journalctl -u wist-agentd -f
 ```
 
@@ -163,8 +164,8 @@ systemctl status wist-agentd && journalctl -u wist-agentd -f
 sudo install -m 0755 target/release/wist-agentd target/release/wist-exec /usr/local/bin/
 sudo wist-agentd init-config --config-dir /etc/wist-agentd
 sudo vi /etc/wist-agentd/agentd.toml
-sudo wist-agentd service install --system --enrollment-token <token>
-wist-agentd service status --system
+sudo wist-agentd service install --enrollment-token <token>
+wist-agentd service status
 launchctl print system/com.dayu-sec.wist-agentd
 ```
 
@@ -178,13 +179,13 @@ launchctl print system/com.dayu-sec.wist-agentd
 
 ```bash
 wist-agentd init-config --config-dir /etc/wist-agentd   # 系统级（需要 sudo）
-wist-agentd init-config --config-dir ~/.wist-agentd     # 用户级
+wist-agentd init-config --config-dir ./dev-conf        # 开发机（自定义目录）
 wist-agentd init-config                                 # 不给 --config-dir → /etc/wist-agentd
 wist-agentd init-config --stdout                        # 只看默认模板，不落盘
 ```
 
 已存在则不会覆盖，只提示。`--config-dir` 的规则只有两条：**绝对路径原样用，相对路径相对当前工作目录**；
-不给就是系统默认目录 `/etc/wist-agentd`（非 root 会得到权限错误，请显式指定或用 `--user`）。
+不给就是系统默认目录 `/etc/wist-agentd`（非 root 会得到权限错误，请显式指定一个可写的 `--config-dir`）。
 
 ### 4.2 配置目录布局
 
@@ -201,7 +202,7 @@ wist-agentd init-config --stdout                        # 只看默认模板，�
 
 **放哪里不用手写 `[paths]`**：agentd 按配置目录的位置自动分三类落点。
 
-| 类别 | `/etc/wist-agentd`（系统级部署） | 其它位置（开发机 / `--user`） |
+| 类别 | `/etc/wist-agentd`（系统级部署） | 其它位置（开发机 / 自定义配置目录） |
 | --- | --- | --- |
 | 配置（`agentd.toml`、`tasks/`、`agentd.env`） | `/etc/wist-agentd/` | `<配置目录>/` |
 | 数据：运行/状态（`run/`、`state/`） | `/var/lib/wist-agentd/` | `<配置目录>/` |
@@ -270,7 +271,7 @@ enrollment token 只在注册时用一次，注册成功后即无用（换来的
 
 ```bash
 # 装服务时一并注册（推荐）
-sudo wist-agentd service install --system --enrollment-token <token>
+sudo wist-agentd service install --enrollment-token <token>
 
 # 或者单独补注册（服务已装好、只想注册）
 sudo wist-agentd enroll --token <token>
@@ -302,8 +303,7 @@ echo <token> | sudo wist-agentd enroll --token-stdin
 | --- | --- | --- | --- | --- |
 | 5.1 前台 | ✗ | ✗ | 终端 | 联调 |
 | 5.2 `dev/start.sh` | ✗ | ✗ | `~/.wist-agentd/log/agentd.out` | 开发机挂着跑 |
-| 5.3 `service install --user` | ✓（登录起） | ✓ | journald `--user` / `~/Library/Logs/wist-agentd` | 用户级常驻（开发机/个人机） |
-| 5.3 `service install --system` | ✓（开机起） | ✓ | journald / `/var/log/wist-agentd` | **生产常驻** |
+| 5.3 `service install` | ✓（开机起） | ✓ | journald / `/var/log/wist-agentd` | **生产常驻** |
 
 > 单实例由 `state/.agentd.lock` 的 `flock` 保证：同一 state 目录下第二个进程会以
 > `another wist-agentd instance is already running` 退出（崩溃/kill -9 后锁自动释放，无需手工清理）。
@@ -312,16 +312,16 @@ echo <token> | sudo wist-agentd enroll --token-stdin
 ### 5.1 前台运行
 
 ```bash
-wist-agentd --config-dir ~/.wist-agentd
+wist-agentd --config-dir ./dev-conf
 ```
 
 启动第一行会输出运行上下文，可用来确认版本与路径：
 
 ```
-wist-agentd 0.1.2 starting: config=/Users/me/.wist-agentd/agentd.toml mode=managed run_dir=... state_dir=... log_dir=...
+wist-agentd 0.1.2 starting: config=/Users/me/dev-conf/agentd.toml mode=managed run_dir=... state_dir=... log_dir=...
 ```
 
-`Ctrl-C` 退出。想看逐轮全量日志：`WIST_AGENTD_LOG_HEARTBEAT_SECS=0 wist-agentd --config-dir ~/.wist-agentd`。
+`Ctrl-C` 退出。想看逐轮全量日志：`WIST_AGENTD_LOG_HEARTBEAT_SECS=0 wist-agentd --config-dir ./dev-conf`。
 
 ### 5.2 开发机后台（`dev/start.sh`）
 
@@ -337,23 +337,13 @@ cd wist-agentd/dev
 
 ### 5.3 常驻托管（`service install`）
 
-**macOS — 用户级**（不需要 sudo，登录即起）
-
-```bash
-wist-agentd service print   --user --bin ~/bin/wist-agentd          # 先看要装成什么样，不落盘
-wist-agentd service install --user --bin ~/bin/wist-agentd          # config-dir 默认 ~/.wist-agentd
-wist-agentd service status  --user
-launchctl print gui/$(id -u)/com.dayu-sec.wist-agentd
-tail -f ~/Library/Logs/wist-agentd/agentd.err
-```
-
 **macOS — 系统级**（LaunchDaemon，以 root 运行；读 `/var/log` 受限路径需要）
 
 ```bash
 sudo wist-agentd init-config --config-dir /etc/wist-agentd
 sudo vi /etc/wist-agentd/agentd.toml
-sudo wist-agentd service install --system --bin /usr/local/bin/wist-agentd --enrollment-token <token>
-wist-agentd service status --system
+sudo wist-agentd service install --bin /usr/local/bin/wist-agentd --enrollment-token <token>
+wist-agentd service status
 ```
 
 **Linux — 系统级**（systemd）
@@ -361,19 +351,9 @@ wist-agentd service status --system
 ```bash
 sudo wist-agentd init-config --config-dir /etc/wist-agentd
 sudo vi /etc/wist-agentd/agentd.toml                                # [paths] 不用写（见 §4.3）
-sudo wist-agentd service install --system --bin /usr/local/bin/wist-agentd --enrollment-token <token>
+sudo wist-agentd service install --bin /usr/local/bin/wist-agentd --enrollment-token <token>
 systemctl status wist-agentd
 journalctl -u wist-agentd -f
-```
-
-**Linux — 用户级**（`systemd --user`）
-
-```bash
-wist-agentd init-config --config-dir ~/.wist-agentd
-wist-agentd service install --user --bin ~/bin/wist-agentd --enrollment-token <token>
-sudo loginctl enable-linger "$USER"      # 不开机登录也要跑
-systemctl --user status wist-agentd
-journalctl --user -u wist-agentd -f
 ```
 
 只想写定义文件、自己手动加载（配置管理/发行包场景）：加 `--no-activate`，命令会打印出需要执行的
@@ -382,10 +362,10 @@ journalctl --user -u wist-agentd -f
 ## 6. `service` 命令参考
 
 ```
-wist-agentd service print     [--system|--user] [--bin <path>] [--config-dir <path>] [--for <systemd|launchd>]
-wist-agentd service install   [--system|--user] [--bin <path>] [--config-dir <path>] [--force] [--no-activate] [--enrollment-token <token>]
-wist-agentd service uninstall [--system|--user] [--bin <path>] [--config-dir <path>]
-wist-agentd service status    [--system|--user] [--bin <path>] [--config-dir <path>]
+wist-agentd service print     [--bin <path>] [--config-dir <path>] [--for <systemd|launchd>]
+wist-agentd service install   [--bin <path>] [--config-dir <path>] [--force] [--no-activate] [--enrollment-token <token>]
+wist-agentd service uninstall [--bin <path>] [--config-dir <path>]
+wist-agentd service status    [--bin <path>] [--config-dir <path>]
 wist-agentd enroll            [--token <token> | --token-stdin] [--config-dir <path>]
 ```
 
@@ -396,10 +376,8 @@ wist-agentd enroll            [--token <token> | --token-stdin] [--config-dir <p
 | `uninstall` | 先停止并取消托管，再删除定义文件（不删配置/状态目录） |
 | `status` | 只读自检：定义、二进制、`wist-exec`、配置、state 目录、**单实例锁**、日志入口 |
 | `enroll` | 用一次性 token 注册（`--token` 或 `--token-stdin`）；不落盘、幂等 |
-| `--system` | 系统级（**默认**）：`/etc` 路径、root 所有、开机自启 |
-| `--user` | 用户级：`systemd --user` / launchd LaunchAgent，以当前用户身份运行 |
 | `--bin <path>` | 写入定义里的 `wist-agentd` 路径；默认取当前可执行文件 |
-| `--config-dir <path>` | 写入定义里的配置目录；不传时按作用域取默认值（见下表） |
+| `--config-dir <path>` | 写入定义里的配置目录；不传时默认 `/etc/wist-agentd` |
 | `--force` | 覆盖已存在的定义（仅 `install`）。**会重建服务进程**，因此升级二进制或改配置后必须用它才能生效 |
 | `--no-activate` | 只落盘定义，并打印需要手动执行的加载命令（仅 `install`） |
 | `--enrollment-token <token>` | 安装前先用该一次性 token 注册（token 不落盘；注册失败则不写服务定义）（仅 `install`） |
@@ -407,12 +385,12 @@ wist-agentd enroll            [--token <token> | --token-stdin] [--config-dir <p
 
 ### 6.1 安装位置
 
-| 作用域 | 平台 | 服务定义 | 默认配置目录 | 数据默认落点（含采集输出） | 日志 |
-| --- | --- | --- | --- | --- | --- |
-| `--system` | Linux | `/etc/systemd/system/wist-agentd.service` | `/etc/wist-agentd` | `/var/lib/wist-agentd`（采集输出 `/var/lib/wist-agentd/data/wist-records.ndjson`） | `log_dir=/var/log/wist-agentd` + journald（服务自身） |
-| `--system` | macOS | `/Library/LaunchDaemons/com.dayu-sec.wist-agentd.plist` | `/etc/wist-agentd` | `/var/lib/wist-agentd`（同上） | `/var/log/wist-agentd/agentd.{out,err}` |
-| `--user` | Linux | `~/.config/systemd/user/wist-agentd.service` | `~/.wist-agentd` | 同配置目录 | 同配置目录 + `journalctl --user` |
-| `--user` | macOS | `~/Library/LaunchAgents/com.dayu-sec.wist-agentd.plist` | `~/.wist-agentd` | 同配置目录 | 同配置目录 + `~/Library/Logs/wist-agentd/agentd.err` |
+| 平台 | 服务定义 | 默认配置目录 | 数据默认落点（含采集输出） | 日志 |
+| --- | --- | --- | --- | --- |
+| Linux | `/etc/systemd/system/wist-agentd.service` | `/etc/wist-agentd` | `/var/lib/wist-agentd`（采集输出 `/var/lib/wist-agentd/data/wist-records.ndjson`） | `log_dir=/var/log/wist-agentd` + journald（服务自身） |
+| macOS | `/Library/LaunchDaemons/com.dayu-sec.wist-agentd.plist` | `/etc/wist-agentd` | `/var/lib/wist-agentd`（同上） | `/var/log/wist-agentd/agentd.{out,err}` |
+
+开发机 / 自定义配置目录安装（`--config-dir` 指向非 `/etc` 路径）时，配置/数据/日志都就地落在该配置目录下（见 §4.3）。
 
 落点由配置目录推导（见 §4.3）；`[paths]` 里显式声明的键（含显式指定的采集输出路径）优先。
 
@@ -422,19 +400,18 @@ wist-agentd enroll            [--token <token> | --token-stdin] [--config-dir <p
 
 ```
 platform=launchd                 # 本机服务管理器
-scope=user                       # 作用域
-definition=/Users/me/Library/LaunchAgents/com.dayu-sec.wist-agentd.plist
+definition=/Library/LaunchDaemons/com.dayu-sec.wist-agentd.plist
 definition_present=true          # 定义文件是否存在
-bin=/Users/me/bin/wist-agentd (present)
-exec_bin=/Users/me/bin/wist-exec (present)     # 不同目录/缺失会导致启动失败
-config=/Users/me/.wist-agentd/agentd.toml (present)
-root_dir=/Users/me/.wist-agentd                # 配置解析出的数据落点（系统级安装会是 /var/lib/wist-agentd）
-run_dir=/Users/me/.wist-agentd/run
-state_dir=/Users/me/.wist-agentd/state
-log_dir=/Users/me/.wist-agentd/log
+bin=/usr/local/bin/wist-agentd (present)
+exec_bin=/usr/local/bin/wist-exec (present)     # 不同目录/缺失会导致启动失败
+config=/etc/wist-agentd/agentd.toml (present)
+root_dir=/var/lib/wist-agentd                  # 配置解析出的数据落点（开发机 / 自定义配置目录则为配置目录）
+run_dir=/var/lib/wist-agentd/run
+state_dir=/var/lib/wist-agentd/state
+log_dir=/var/log/wist-agentd
 running=true                     # state/.agentd.lock 是否被持有（= 是否真有实例在跑）
-logs=tail -f ~/Library/Logs/wist-agentd/agentd.err
-check=launchctl print gui/501/com.dayu-sec.wist-agentd
+logs=tail -f /var/log/wist-agentd/agentd.err
+check=launchctl print system/com.dayu-sec.wist-agentd
 ```
 
 `root_dir / run_dir / state_dir / log_dir` 是**配置经解析后的真实绝对路径**（含“/etc → /var/lib”的推导），
@@ -449,7 +426,7 @@ check=launchctl print gui/501/com.dayu-sec.wist-agentd
 
 ```bash
 wist-agentd version                       # 已部署版本
-wist-agentd service status --system       # 只读自检（含真实数据/日志落点）
+wist-agentd service status       # 只读自检（含真实数据/日志落点）
 sudo wist-agentd diagnose                   # 一屏诊断（配置/身份/服务/连通/上送）；退出码非零 = 有 FAIL
 ```
 
@@ -478,9 +455,7 @@ sudo wist-agentd diagnose                   # 一屏诊断（配置/身份/服�
 | 启动 | `systemctl start wist-agentd` | `launchctl kickstart -k system/com.dayu-sec.wist-agentd` |
 | 停止 | `systemctl stop wist-agentd` | `launchctl bootout system/com.dayu-sec.wist-agentd` |
 | 重启 | `systemctl restart wist-agentd` | `launchctl kickstart -k system/com.dayu-sec.wist-agentd` |
-| 是否自启 | `systemctl is-enabled wist-agentd` | plist 在 `LaunchDaemons`/`LaunchAgents` 即自启（`RunAtLoad`） |
-
-用户级同理，命令加 `--user`（systemd）或把 `system/` 换成 `gui/$(id -u)/`（launchd）。
+| 是否自启 | `systemctl is-enabled wist-agentd` | plist 在 `LaunchDaemons` 即自启（`RunAtLoad`） |
 
 ### 7.3 升级与回滚
 
@@ -489,7 +464,7 @@ sudo wist-agentd diagnose                   # 一屏诊断（配置/身份/服�
 ```bash
 sudo install -m 0755 wist-agentd.new /usr/local/bin/wist-agentd
 sudo install -m 0755 wist-exec.new   /usr/local/bin/wist-exec
-sudo wist-agentd service install --system --force   # Linux: enable + restart；macOS: bootout + bootstrap
+sudo wist-agentd service install --force   # Linux: enable + restart；macOS: bootout + bootstrap
 wist-agentd version                                  # 核对版本
 ```
 
@@ -514,13 +489,13 @@ wist-agentd version                                  # 核对版本
 
 ```bash
 # 停止 + 删除服务定义（系统级需要 sudo）
-sudo wist-agentd service uninstall --system    # 用户级：wist-agentd service uninstall --user
+sudo wist-agentd service uninstall    # 停止 + 删定义
 
 # 其余目录按需人工清理（保留数据以便排查/复装）
 #   /etc/wist-agentd/        配置与 tasks
 #   /var/lib/wist-agentd/    数据：run/ state/ data/
 #   /var/log/wist-agentd/    日志：agentd.{out,err}（macOS 系统级）
-#   （--user / 开发机安装则全在配置目录下）
+#   （开发机 / 自定义配置目录安装则全在配置目录下）
 ```
 
 `uninstall` 只删服务定义，**不会**删除配置、state、日志，这是有意的。
@@ -581,16 +556,15 @@ wist-agentd diagnose --offline     # 不碰网络，只查本机配置/身份/�
 
 | 现象 | 原因 / 处理 |
 | --- | --- |
-| `another wist-agentd instance is already running (lock file: ...)` | 同一 state 目录已有实例。用 `wist-agentd service status --system`（或 `--user`，看 `running=`）或 `lsof <state>/.agentd.lock` 确认；换运行方式前先停旧实例 |
+| `another wist-agentd instance is already running (lock file: ...)` | 同一 state 目录已有实例。用 `wist-agentd service status`（看 `running=`）或 `lsof <state>/.agentd.lock` 确认；换运行方式前先停旧实例 |
 | 服务启动即退出，报 `no enrollment token available` | 还没注册。`wist-agentd enroll --token <token>`（或 `echo <token> \| wist-agentd enroll --token-stdin`）补注册后重启服务 |
 | 服务启动即退出，报 `wist-exec was not found ...` | `wist-exec` 不在同目录、或不在 `PATH`、或没有可执行位。`install -m 0755` 两个一起放，或用 `WARP_INSIGHT_EXEC_BIN` 指定 |
 | `install` 提示 `warning: config dir ... does not exist` | 首次启动会自动写默认 `agentd.toml`。建议先 `init-config` 并审阅后再启动 |
-| `service install` 报权限错误 | 系统级安装需要 root：写 `/etc/systemd/system/` 或 `/Library/LaunchDaemons/` 会 `Permission denied`。用 `sudo`，或改 `--user` |
-| `service install` 报 `launchctl bootstrap` 失败 | 用户级需要已登录的 GUI 会话（domain `gui/<uid>`）；无人登录的后台机请用 `--system` |
+| `service install` 报权限错误 | 系统级安装需要 root：写 `/etc/systemd/system/` 或 `/Library/LaunchDaemons/` 会 `Permission denied`。用 `sudo` |
 | 采不到 `/var/log/xxx` | 权限不足：系统级安装（root）或给二进制授予 Full Disk Access；失败会体现为输入读取失败/暂停 |
 | `service install` 提示定义已存在 | 加 `--force` 覆盖；先 `wist-agentd service print` 对比差异 |
 | 磁盘被日志吃满 | 调大 `WIST_AGENTD_LOG_HEARTBEAT_SECS`（默认 300s），并确认 macOS 已配 newsyslog / Linux 用 journald |
-| 配置或数据写不进去（`Permission denied`） | 系统级部署要 root：配置 `/etc/wist-agentd`、数据 `/var/lib/wist-agentd`、日志 `/var/log/wist-agentd`。非 root 开发请把配置放到非 `/etc` 路径（数据/日志就地，见 §2），或用 `--user` |
+| 配置或数据写不进去（`Permission denied`） | 系统级部署要 root：配置 `/etc/wist-agentd`、数据 `/var/lib/wist-agentd`、日志 `/var/log/wist-agentd`。非 root 开发请把配置放到非 `/etc` 路径（数据/日志就地，见 §2） |
 | 不确定数据写到哪了 | 看启动行的 `run_dir= / state_dir= / log_dir=`（解析后的绝对路径），或 `wist-agentd service status` 的 `root_dir/run_dir/state_dir/log_dir` |
 | 想确认跑的是哪份配置/版本 | 启动行 `wist-agentd <version> starting: config=... mode=...`；`wist-agentd service status` 看 `config=` |
 | `diagnose` 报 `network.tcp` FAIL（TCP 连不上 `host:443`） | endpoint 不写端口时按 **443** 连，网关可能发布在别的端口（如 3000）。`config.control_plane` 那项会打出**推导出的 `host:port`**；改 endpoint 为 `https://<域名>:<端口>`（或让网关监听 443） |

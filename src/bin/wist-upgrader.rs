@@ -21,7 +21,7 @@ Usage:
   wist-upgrader apply --config-dir <dir> --work-id <id> --current-version <v>
                       --package-url <url> --package-sha256 <sha>
                       [--target-version <v>] [--bin <agentd path>] [--apply]
-                      [--allow-downgrade] [--scope system|user] [--ready-wait-secs <n>]
+                      [--allow-downgrade] [--ready-wait-secs <n>]
   wist-upgrader version
   wist-upgrader help
 
@@ -30,7 +30,6 @@ Options:
   --apply                真的换件并重启（不加 = 演练：取包/验摘要/解包/验版本，不动已装二进制）
   --allow-downgrade      允许同版本/降级（**默认只前进**；要降级必须显式加这个开关）
   --bin <path>           要替换的 wist-agentd 路径（默认：本可执行文件同级的 wist-agentd）
-  --scope <system|user>  服务作用域（默认：配置目录在 /etc/wist-agentd 下即 system）
   --ready-wait-secs <n>  换件后等新版起来的秒数（默认 60）
 ";
 
@@ -44,8 +43,6 @@ struct Args {
     current_version: String,
     package_url: String,
     package_sha256: String,
-    scope_is_system: bool,
-    scope_explicit: bool,
     dry_run: bool,
     /// 是否允许同版本/降级。默认 `false`：只前进（见 `--allow-downgrade`）。
     allow_downgrade: bool,
@@ -89,7 +86,6 @@ where
     let mut current_version: Option<String> = None;
     let mut package_url: Option<String> = None;
     let mut package_sha256: Option<String> = None;
-    let mut scope: Option<String> = None;
     let mut dry_run = true;
     let mut allow_downgrade = false;
     let mut ready_wait = DEFAULT_READY_WAIT;
@@ -107,7 +103,6 @@ where
             "--current-version" => current_version = Some(value()?),
             "--package-url" => package_url = Some(value()?),
             "--package-sha256" => package_sha256 = Some(value()?),
-            "--scope" => scope = Some(value()?),
             "--ready-wait-secs" => {
                 let raw = value()?;
                 let secs = raw
@@ -121,14 +116,6 @@ where
         }
     }
 
-    let scope_explicit = scope.is_some();
-    let scope_is_system = match scope.as_deref() {
-        Some("system") => true,
-        Some("user") => false,
-        Some(other) => return Err(format!("--scope must be system or user, got {other}")),
-        None => false,
-    };
-
     Ok(Args {
         config_dir: config_dir.ok_or("missing --config-dir")?,
         bin,
@@ -137,8 +124,6 @@ where
         current_version: current_version.ok_or("missing --current-version")?,
         package_url: package_url.ok_or("missing --package-url")?,
         package_sha256: package_sha256.ok_or("missing --package-sha256")?,
-        scope_is_system,
-        scope_explicit,
         dry_run,
         allow_downgrade,
         ready_wait,
@@ -151,11 +136,6 @@ async fn execute(args: Args) -> Result<(), String> {
     let agentd_bin = match args.bin {
         Some(path) => path,
         None => default_agentd_bin()?,
-    };
-    let system_scope = if args.scope_explicit {
-        args.scope_is_system
-    } else {
-        config_runtime::system_data_root_for(&args.config_dir).is_some()
     };
 
     let request = UpgradeRequest {
@@ -173,7 +153,7 @@ async fn execute(args: Args) -> Result<(), String> {
         restart: if args.dry_run {
             RestartPlan::None
         } else {
-            default_restart_plan(system_scope)
+            default_restart_plan()
         },
     };
 
@@ -274,7 +254,6 @@ mod tests {
         ])
         .expect("parse");
         assert!(args.dry_run, "must not replace anything unless --apply");
-        assert!(!args.scope_explicit);
         assert_eq!(args.ready_wait, Duration::from_secs(60));
         assert_eq!(args.bin, None);
     }
@@ -308,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_accepts_apply_bin_scope_and_wait() {
+    fn parse_accepts_apply_bin_and_wait() {
         let args = parse(&[
             "--config-dir",
             "/etc/wist-agentd",
@@ -324,42 +303,24 @@ mod tests {
             "/tmp/package.tar.gz",
             "--package-sha256",
             "sha256:abc",
-            "--scope",
-            "user",
             "--ready-wait-secs",
             "5",
             "--apply",
         ])
         .expect("parse");
         assert!(!args.dry_run);
-        assert!(args.scope_explicit);
-        assert!(!args.scope_is_system);
         assert_eq!(args.ready_wait, Duration::from_secs(5));
         assert_eq!(args.bin, Some(PathBuf::from("/usr/local/bin/wist-agentd")));
     }
 
     #[test]
-    fn parse_rejects_unknown_flags_and_bad_values() {
+    fn parse_rejects_unknown_flags() {
         let unknown = parse(&["--nope"]).expect_err("unknown flag");
         assert!(unknown.contains("unsupported flag"), "{unknown}");
-        let bad_scope = parse(&[
-            "--config-dir",
-            "/etc/wist-agentd",
-            "--work-id",
-            "w",
-            "--target-version",
-            "1.0.0",
-            "--current-version",
-            "0.1.0",
-            "--package-url",
-            "/x",
-            "--package-sha256",
-            "abc",
-            "--scope",
-            "global",
-        ])
-        .expect_err("bad scope");
-        assert!(bad_scope.contains("system or user"), "{bad_scope}");
+        // 作用域已移除：`--scope` 现在是未知旗标。
+        let scope = parse(&["--scope", "user"]).expect_err("removed flag");
+        assert!(scope.contains("unsupported flag"), "{scope}");
+        assert!(scope.contains("--scope"), "{scope}");
     }
 
     /// 升级器必须带上 agent 身份：身份只落在 state（`agent_runtime.json`），`agentd.toml` 里没有

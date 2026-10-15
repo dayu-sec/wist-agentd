@@ -857,35 +857,26 @@ fn spawn_heartbeat(state_dir: PathBuf) {
     });
 }
 
-/// 按平台给默认重启手段。
+/// 按平台给默认重启手段（系统级）。
 ///
-/// `system` 作用域：launchd 用 `system/<label>`、systemd 用系统 unit；用户级换成 gui 域 / `--user`。
 /// 只做**重启**（定义不动）：换的是二进制，不是服务定义。
-pub fn default_restart_plan(system_scope: bool) -> RestartPlan {
+pub fn default_restart_plan() -> RestartPlan {
     #[cfg(target_os = "macos")]
     {
-        let domain = if system_scope {
-            format!("system/{LAUNCHD_LABEL}")
-        } else {
-            let uid = unsafe { libc::getuid() };
-            format!("gui/{uid}/{LAUNCHD_LABEL}")
-        };
         RestartPlan::Command {
             program: "launchctl".to_string(),
-            args: vec!["kickstart".to_string(), "-k".to_string(), domain],
+            args: vec![
+                "kickstart".to_string(),
+                "-k".to_string(),
+                format!("system/{LAUNCHD_LABEL}"),
+            ],
         }
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let mut args = Vec::new();
-        if !system_scope {
-            args.push("--user".to_string());
-        }
-        args.push("restart".to_string());
-        args.push(SERVICE_NAME.to_string());
         RestartPlan::Command {
             program: "systemctl".to_string(),
-            args,
+            args: vec!["restart".to_string(), SERVICE_NAME.to_string()],
         }
     }
 }
@@ -1044,15 +1035,11 @@ pub fn upgrader_unit_name(work_id: &str) -> String {
 /// 拉成瞬态 unit 后它自带一个新 cgroup，restart 收不到它，`wait_ready` 才有机会跑完并上报成功。
 pub fn build_systemd_run_launch(
     inner: &UpgradeLaunch,
-    scope_is_system: bool,
     unit_name: &str,
     log_path: &Path,
     env_file: &Path,
 ) -> UpgradeLaunch {
     let mut args = Vec::new();
-    if !scope_is_system {
-        args.push("--user".to_string());
-    }
     args.push(format!("--unit={unit_name}"));
     // 退出即清（成功失败都清）：留着同名 unit 会让下一次同 work_id 的升级起不来。
     args.push("--collect".to_string());
@@ -1104,7 +1091,6 @@ pub fn spawn_upgrader(
     launch: &UpgradeLaunch,
     log_path: &Path,
     work_id: &str,
-    scope_is_system: bool,
     env_file: &Path,
 ) -> Result<String, String> {
     #[cfg(target_os = "linux")]
@@ -1115,7 +1101,7 @@ pub fn spawn_upgrader(
             std::fs::create_dir_all(parent).map_err(|err| format!("create log dir: {err}"))?;
         }
         let unit = upgrader_unit_name(work_id);
-        let wrapped = build_systemd_run_launch(launch, scope_is_system, &unit, log_path, env_file);
+        let wrapped = build_systemd_run_launch(launch, &unit, log_path, env_file);
         match std::process::Command::new(&wrapped.program)
             .args(&wrapped.args)
             .output()
@@ -1139,7 +1125,7 @@ pub fn spawn_upgrader(
         }
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = (work_id, scope_is_system, env_file);
+    let _ = (work_id, env_file);
     launch_detached(launch, log_path)
         .map(|pid| pid.to_string())
         .map_err(|err| format!("launch {}: {err}", launch.program.display()))
@@ -1739,13 +1725,8 @@ mod tests {
         let log = Path::new("/var/log/wist-agentd/wist-upgrader.log");
         let env_file = Path::new("/etc/wist-agentd/agentd.env");
 
-        let system = build_systemd_run_launch(&inner, true, "wist-upgrader-work-1", log, env_file);
+        let system = build_systemd_run_launch(&inner, "wist-upgrader-work-1", log, env_file);
         assert_eq!(system.program, PathBuf::from("systemd-run"));
-        assert!(
-            !system.args.iter().any(|arg| arg == "--user"),
-            "system 作用域不带 --user：{:?}",
-            system.args
-        );
         assert!(
             system
                 .args
@@ -1787,10 +1768,12 @@ mod tests {
         );
         assert_eq!(system.args[sep + 1], "/usr/local/bin/wist-upgrader");
         assert_eq!(&system.args[sep + 2..], &inner.args[..]);
-
-        // user 作用域要带 `--user`（走用户的 systemd 实例）。
-        let user = build_systemd_run_launch(&inner, false, "wist-upgrader-work-1", log, env_file);
-        assert!(user.args.iter().any(|arg| arg == "--user"));
+        // 用户级已移除：瞬态 unit 绝不能带 `--user`（会走到不存在的用户 systemd 实例）。
+        assert!(
+            !system.args.iter().any(|arg| arg == "--user"),
+            "{:?}",
+            system.args
+        );
     }
 
     /// 命令（会被当成 `ExecStart`）里带 `$` / `%` 必须转义：systemd-run 会把它们当变量 / specifier
@@ -1806,7 +1789,6 @@ mod tests {
         };
         let wrapped = build_systemd_run_launch(
             &inner,
-            true,
             "wist-upgrader-w",
             Path::new("/var/log/x.log"),
             Path::new("/etc/wist-agentd/agentd.env"),
@@ -1826,7 +1808,6 @@ mod tests {
         };
         let wrapped = build_systemd_run_launch(
             &inner,
-            true,
             "wist-upgrader-w",
             Path::new("/var/log/%d/up.log"),
             Path::new("/etc/%n/agentd.env"),
@@ -1881,7 +1862,6 @@ mod tests {
             &launch,
             &log_path,
             "work-fallback",
-            true,
             Path::new("/etc/wist-agentd/agentd.env"),
         )
         .expect("spawn");
@@ -1904,7 +1884,7 @@ mod tests {
 
     #[test]
     fn default_restart_plan_targets_the_agentd_service() {
-        match default_restart_plan(true) {
+        match default_restart_plan() {
             RestartPlan::Command { program, args } => {
                 #[cfg(target_os = "macos")]
                 {
@@ -1920,8 +1900,11 @@ mod tests {
                 {
                     assert_eq!(program, "systemctl");
                     assert_eq!(
-                        args.last().map(String::as_str),
-                        Some(crate::service::SERVICE_NAME)
+                        args,
+                        vec![
+                            "restart".to_string(),
+                            crate::service::SERVICE_NAME.to_string()
+                        ]
                     );
                 }
             }

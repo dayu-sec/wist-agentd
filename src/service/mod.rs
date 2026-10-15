@@ -2,7 +2,7 @@
 //!
 //! 两种落地形态：
 //! - Linux：systemd unit（`Restart=always`，日志进 journald）。
-//! - macOS：launchd plist（`KeepAlive`，日志进 `/Library/Logs` 或 `~/Library/Logs`）。
+//! - macOS：launchd plist（`KeepAlive`，日志进 `/var/log/wist-agentd`）。
 //!
 //! 设计前提：agentd 自身**只前台运行**（不 fork / 不 double-fork daemonize），
 //! 开机自启、崩溃拉起、退出后重启全部由服务管理器负责；重复实例由 state 目录下的
@@ -27,35 +27,11 @@ pub mod systemd;
 pub const SERVICE_NAME: &str = "wist-agentd";
 /// macOS launchd label（反向域名，全机唯一）。
 pub const LAUNCHD_LABEL: &str = "com.dayu-sec.wist-agentd";
-/// user 作用域默认配置目录的目录名（挂在 `$HOME` 下）。
-pub const USER_CONFIG_DIR_NAME: &str = ".wist-agentd";
 /// 可选的环境变量文件（systemd `EnvironmentFile`），只放长期环境变量；
 /// 一次性注册 token 走命令行（`service install --enrollment-token` / `enroll --token`），不落盘。
 pub const ENV_FILE_NAME: &str = "agentd.env";
 /// 与 `wist-agentd` 同目录发布、由守护进程拉起的执行器。
 pub const EXEC_BIN_NAME: &str = "wist-exec";
-
-/// 安装作用域。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ServiceScope {
-    /// 系统级：开机即起、以 root 运行（读 `/var/log` 等受限路径需要）。
-    System,
-    /// 用户级：登录后启动，以当前用户身份运行。
-    User,
-}
-
-impl ServiceScope {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ServiceScope::System => "system",
-            ServiceScope::User => "user",
-        }
-    }
-
-    pub fn is_system(self) -> bool {
-        matches!(self, ServiceScope::System)
-    }
-}
 
 /// 服务管理器形态（由编译目标决定；渲染函数显式接收，便于测试两个平台）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,11 +60,10 @@ impl ServicePlatform {
     }
 }
 
-/// 服务定义与日志的落盘位置。
+/// 服务定义与日志的落盘位置（系统级）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceLayout {
     pub platform: ServicePlatform,
-    pub scope: ServiceScope,
     /// service 定义文件（`*.service` / `*.plist`）。
     pub definition_path: PathBuf,
     /// launchd 标准输出/错误目录；systemd 走 journald，故为 `None`。
@@ -96,17 +71,14 @@ pub struct ServiceLayout {
 }
 
 impl ServiceLayout {
-    /// 按平台/作用域解析标准安装位置。
-    pub fn resolve(platform: ServicePlatform, scope: ServiceScope) -> AgentdResult<Self> {
+    /// 按平台解析标准安装位置（系统级）。
+    pub fn resolve(platform: ServicePlatform) -> AgentdResult<Self> {
         let (definition_path, log_dir) = match platform {
-            ServicePlatform::Systemd => (systemd::unit_path(scope)?, None),
-            ServicePlatform::Launchd => {
-                (launchd::plist_path(scope)?, Some(launchd::log_dir(scope)?))
-            }
+            ServicePlatform::Systemd => (systemd::unit_path()?, None),
+            ServicePlatform::Launchd => (launchd::plist_path()?, Some(launchd::log_dir()?)),
         };
         Ok(Self {
             platform,
-            scope,
             definition_path,
             log_dir,
         })
@@ -115,13 +87,11 @@ impl ServiceLayout {
     /// 使用显式路径构造（测试 / 非标准布局）。
     pub fn for_paths(
         platform: ServicePlatform,
-        scope: ServiceScope,
         definition_path: PathBuf,
         log_dir: Option<PathBuf>,
     ) -> Self {
         Self {
             platform,
-            scope,
             definition_path,
             log_dir,
         }
@@ -131,7 +101,6 @@ impl ServiceLayout {
 /// 一条服务定义（渲染 systemd unit 或 launchd plist 所需的全部信息）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceSpec {
-    pub scope: ServiceScope,
     /// 已安装的 `wist-agentd` 绝对路径。
     pub bin: PathBuf,
     /// 绝对配置目录（必须绝对：服务启动时的工作目录不确定）。
@@ -139,12 +108,8 @@ pub struct ServiceSpec {
 }
 
 impl ServiceSpec {
-    pub fn new(scope: ServiceScope, bin: PathBuf, config_dir: PathBuf) -> Self {
-        Self {
-            scope,
-            bin,
-            config_dir,
-        }
+    pub fn new(bin: PathBuf, config_dir: PathBuf) -> Self {
+        Self { bin, config_dir }
     }
 
     /// 与 `wist-agentd` 同目录的执行器路径。
@@ -157,20 +122,9 @@ impl ServiceSpec {
         self.config_dir.join(ENV_FILE_NAME)
     }
 
-    /// systemd 服务管理器操作的 scope 参数（user 作用域需要 `--user`）。
-    pub fn systemctl_scope_args(&self) -> Vec<String> {
-        match self.scope {
-            ServiceScope::System => Vec::new(),
-            ServiceScope::User => vec!["--user".to_string()],
-        }
-    }
-
-    /// launchd 的 domain target（`system` 或 `gui/<uid>`）。
+    /// launchd 的 domain target（系统级固定为 `system`）。
     pub fn launchd_domain(&self) -> String {
-        match self.scope {
-            ServiceScope::System => "system".to_string(),
-            ServiceScope::User => format!("gui/{}", current_uid()),
-        }
+        "system".to_string()
     }
 
     /// launchd 运维 target（`<domain>/<label>`）。
@@ -187,27 +141,9 @@ pub fn render(layout: &ServiceLayout, spec: &ServiceSpec) -> String {
     }
 }
 
-/// `$HOME` 目录（user 作用域的所有路径都挂在它下面）。
-pub fn home_dir() -> AgentdResult<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            AgentdReason::ServicePathUnresolved
-                .to_err()
-                .with_detail("HOME is not set; pass --config-dir / --bin explicitly")
-        })
-}
-
-/// 作用域的默认配置目录。
-///
-/// - system：`/etc/wist-agentd`
-/// - user：`$HOME/.wist-agentd`
-pub fn default_config_dir(scope: ServiceScope) -> AgentdResult<PathBuf> {
-    match scope {
-        ServiceScope::System => Ok(PathBuf::from(crate::config_runtime::SYSTEM_CONFIG_DIR)),
-        ServiceScope::User => Ok(home_dir()?.join(USER_CONFIG_DIR_NAME)),
-    }
+/// 默认配置目录（系统级：`/etc/wist-agentd`）。
+pub fn default_config_dir() -> PathBuf {
+    PathBuf::from(crate::config_runtime::SYSTEM_CONFIG_DIR)
 }
 
 /// 当前可执行文件（规范化后的绝对路径），作为 `--bin` 的默认值。
@@ -364,25 +300,23 @@ pub fn activate_commands(
 ) -> AgentdResult<Vec<ServiceCommand>> {
     match layout.platform {
         ServicePlatform::Systemd => {
-            let mut reload_args = spec.systemctl_scope_args();
-            reload_args.push("daemon-reload".to_string());
-
-            let mut enable_args = spec.systemctl_scope_args();
-            enable_args.push("enable".to_string());
-            enable_args.push(SERVICE_NAME.to_string());
-
             // 必须是 `restart` 而不是 `enable --now`：`--now` 在**已 active** 的 unit 上
             // 等同于 start，是 no-op。这样 `service install --force`（换二进制 / 改定义）
             // 在 Linux 上会留着旧进程跑旧二进制。restart 在「首次安装（未启动）」时
             // 也会把服务拉起来，因此两种情形都正确。
-            let mut restart_args = spec.systemctl_scope_args();
-            restart_args.push("restart".to_string());
-            restart_args.push(SERVICE_NAME.to_string());
-
             Ok(vec![
-                ServiceCommand::new("systemctl", reload_args, false),
-                ServiceCommand::new("systemctl", enable_args, false),
-                ServiceCommand::new("systemctl", restart_args, false).retryable(ACTIVATE_RETRIES),
+                ServiceCommand::new("systemctl", vec!["daemon-reload".to_string()], false),
+                ServiceCommand::new(
+                    "systemctl",
+                    vec!["enable".to_string(), SERVICE_NAME.to_string()],
+                    false,
+                ),
+                ServiceCommand::new(
+                    "systemctl",
+                    vec!["restart".to_string(), SERVICE_NAME.to_string()],
+                    false,
+                )
+                .retryable(ACTIVATE_RETRIES),
             ])
         }
         ServicePlatform::Launchd => {
@@ -419,20 +353,18 @@ pub fn activate_commands(
 /// 停止并取消托管（卸载前调用，幂等）。
 pub fn deactivate_commands(platform: ServicePlatform, spec: &ServiceSpec) -> Vec<ServiceCommand> {
     match platform {
-        ServicePlatform::Systemd => {
-            let mut disable_args = spec.systemctl_scope_args();
-            disable_args.push("disable".to_string());
-            disable_args.push("--now".to_string());
-            disable_args.push(SERVICE_NAME.to_string());
-
-            let mut reload_args = spec.systemctl_scope_args();
-            reload_args.push("daemon-reload".to_string());
-
-            vec![
-                ServiceCommand::new("systemctl", disable_args, true),
-                ServiceCommand::new("systemctl", reload_args, false),
-            ]
-        }
+        ServicePlatform::Systemd => vec![
+            ServiceCommand::new(
+                "systemctl",
+                vec![
+                    "disable".to_string(),
+                    "--now".to_string(),
+                    SERVICE_NAME.to_string(),
+                ],
+                true,
+            ),
+            ServiceCommand::new("systemctl", vec!["daemon-reload".to_string()], false),
+        ],
         ServicePlatform::Launchd => vec![ServiceCommand::new(
             "launchctl",
             vec!["bootout".to_string(), spec.launchd_target()],
@@ -444,21 +376,18 @@ pub fn deactivate_commands(platform: ServicePlatform, spec: &ServiceSpec) -> Vec
 /// 运维检查命令（只打印，不执行）。
 pub fn inspect_commands(platform: ServicePlatform, spec: &ServiceSpec) -> Vec<ServiceCommand> {
     match platform {
-        ServicePlatform::Systemd => {
-            let mut status_args = spec.systemctl_scope_args();
-            status_args.push("status".to_string());
-            status_args.push(SERVICE_NAME.to_string());
-
-            let mut log_args = spec.systemctl_scope_args();
-            log_args.push("-u".to_string());
-            log_args.push(SERVICE_NAME.to_string());
-            log_args.push("-f".to_string());
-
-            vec![
-                ServiceCommand::new("systemctl", status_args, false),
-                ServiceCommand::new("journalctl", log_args, false),
-            ]
-        }
+        ServicePlatform::Systemd => vec![
+            ServiceCommand::new(
+                "systemctl",
+                vec!["status".to_string(), SERVICE_NAME.to_string()],
+                false,
+            ),
+            ServiceCommand::new(
+                "journalctl",
+                vec!["-u".to_string(), SERVICE_NAME.to_string(), "-f".to_string()],
+                false,
+            ),
+        ],
         ServicePlatform::Launchd => vec![ServiceCommand::new(
             "launchctl",
             vec!["print".to_string(), spec.launchd_target()],
@@ -471,7 +400,6 @@ pub fn inspect_commands(platform: ServicePlatform, spec: &ServiceSpec) -> Vec<Se
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceStatus {
     pub platform: ServicePlatform,
-    pub scope: ServiceScope,
     pub definition_path: PathBuf,
     pub definition_present: bool,
     pub bin: PathBuf,
@@ -522,7 +450,6 @@ pub fn status(layout: &ServiceLayout, spec: &ServiceSpec) -> AgentdResult<Servic
 
     Ok(ServiceStatus {
         platform: layout.platform,
-        scope: layout.scope,
         definition_present: layout.definition_path.is_file(),
         definition_path: layout.definition_path.clone(),
         bin_present: spec.bin.is_file(),
@@ -543,20 +470,14 @@ pub fn status(layout: &ServiceLayout, spec: &ServiceSpec) -> AgentdResult<Servic
             .map(|config| PathBuf::from(&config.paths.log_dir)),
         state_dir,
         running,
-        log_hint: log_hint(layout, spec)?,
+        log_hint: log_hint(layout)?,
     })
 }
 
 /// 日志查看提示（systemd 走 journald，launchd 走落盘文件）。
-pub fn log_hint(layout: &ServiceLayout, spec: &ServiceSpec) -> AgentdResult<String> {
+pub fn log_hint(layout: &ServiceLayout) -> AgentdResult<String> {
     match layout.platform {
-        ServicePlatform::Systemd => {
-            let scope = match spec.scope {
-                ServiceScope::System => "",
-                ServiceScope::User => "--user ",
-            };
-            Ok(format!("journalctl {scope}-u {SERVICE_NAME} -f"))
-        }
+        ServicePlatform::Systemd => Ok(format!("journalctl -u {SERVICE_NAME} -f")),
         ServicePlatform::Launchd => {
             let log_dir = layout
                 .log_dir
@@ -610,18 +531,6 @@ pub struct ServiceCommandOutcome {
     pub success: bool,
     pub stdout: String,
     pub stderr: String,
-}
-
-/// 当前进程 uid（launchd 的 `gui/<uid>` domain 需要）。
-fn current_uid() -> u32 {
-    #[cfg(unix)]
-    {
-        unsafe { libc::getuid() }
-    }
-    #[cfg(not(unix))]
-    {
-        0
-    }
 }
 
 /// 把多行错误链压成一行（`service status` 的 `key=value` 输出用）。

@@ -402,14 +402,13 @@ fn parse_command_accepts_version_variants() {
 }
 
 #[test]
-fn parse_command_accepts_service_action_and_defaults_to_system_scope() {
+fn parse_command_accepts_service_action() {
     let parsed = parse_command(["service", "print"]).expect("parse");
     assert_eq!(parsed.config_dir, None);
     assert_eq!(
         parsed.command,
         super::Command::Service(super::ServiceRequest {
             action: super::ServiceAction::Print,
-            scope: super::ServiceScope::System,
             platform: None,
             bin: None,
             force: false,
@@ -424,7 +423,6 @@ fn parse_command_accepts_service_install_flags() {
     let parsed = parse_command([
         "service",
         "install",
-        "--user",
         "--bin",
         "/opt/wist/bin/wist-agentd",
         "--force",
@@ -439,7 +437,6 @@ fn parse_command_accepts_service_install_flags() {
         parsed.command,
         super::Command::Service(super::ServiceRequest {
             action: super::ServiceAction::Install,
-            scope: super::ServiceScope::User,
             platform: None,
             bin: Some(PathBuf::from("/opt/wist/bin/wist-agentd")),
             force: true,
@@ -468,6 +465,16 @@ fn parse_command_rejects_invalid_service_arguments() {
 }
 
 #[test]
+fn parse_command_rejects_removed_scope_flags() {
+    // 作用域旗标已彻底移除：`--user` 与 `--system` 现在都是未知参数。
+    let err = parse_command(["service", "install", "--user"]).expect_err("removed --user");
+    assert!(err.to_string().contains("unknown argument"), "{err}");
+
+    let err = parse_command(["service", "status", "--system"]).expect_err("removed --system");
+    assert!(err.to_string().contains("unknown argument"), "{err}");
+}
+
+#[test]
 fn parse_command_accepts_service_flags_after_config_dir() {
     // 真正的调用顺序（脚本/文档里）：子命令参数跟在 --config-dir 后面也必须能解析。
     let parsed = parse_command([
@@ -488,7 +495,6 @@ fn parse_command_accepts_service_flags_after_config_dir() {
         parsed.command,
         super::Command::Service(super::ServiceRequest {
             action: super::ServiceAction::Install,
-            scope: super::ServiceScope::System,
             platform: None,
             bin: Some(PathBuf::from("/usr/local/bin/wist-agentd")),
             force: true,
@@ -531,7 +537,6 @@ fn parse_command_accepts_cross_platform_render_target() {
         parsed.command,
         super::Command::Service(super::ServiceRequest {
             action: super::ServiceAction::Print,
-            scope: super::ServiceScope::System,
             platform: Some(super::ServicePlatform::Launchd),
             bin: None,
             force: false,
@@ -633,7 +638,6 @@ fn parse_command_accepts_service_install_enrollment_token() {
         parsed.command,
         super::Command::Service(super::ServiceRequest {
             action: super::ServiceAction::Install,
-            scope: super::ServiceScope::System,
             platform: None,
             bin: None,
             force: false,
@@ -654,20 +658,15 @@ fn parse_command_accepts_service_install_enrollment_token() {
 fn run_service_install_does_not_write_a_definition_when_enrollment_fails() {
     let root = temp_dir("cli-install-enroll-fail");
     // 配置目录里没有 agentd.toml → 注册失败 → 不应留下服务定义。
-    let spec = crate::service::ServiceSpec::new(
-        super::ServiceScope::System,
-        root.join("bin/wist-agentd"),
-        root.join("missing-conf"),
-    );
+    let spec =
+        crate::service::ServiceSpec::new(root.join("bin/wist-agentd"), root.join("missing-conf"));
     let layout = crate::service::ServiceLayout::for_paths(
         crate::service::ServicePlatform::Systemd,
-        super::ServiceScope::System,
         root.join("wist-agentd.service"),
         None,
     );
     let request = super::ServiceRequest {
         action: super::ServiceAction::Install,
-        scope: super::ServiceScope::System,
         platform: None,
         bin: Some(spec.bin.clone()),
         force: false,
@@ -700,7 +699,6 @@ fn run_service_print_renders_without_side_effects() {
     let config_dir = root.join("etc/wist-agentd");
     let definition = crate::service::ServiceLayout::resolve(
         crate::service::ServicePlatform::current().expect("linux or macos"),
-        super::ServiceScope::System,
     )
     .expect("layout")
     .definition_path;
@@ -710,7 +708,6 @@ fn run_service_print_renders_without_side_effects() {
         Some(&config_dir),
         super::ServiceRequest {
             action: super::ServiceAction::Print,
-            scope: super::ServiceScope::System,
             platform: None,
             bin: Some(PathBuf::from("/usr/local/bin/wist-agentd")),
             force: false,

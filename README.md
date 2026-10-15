@@ -40,24 +40,24 @@ host/process metrics, and reports status, health, and execution results back ups
 ### 运行模式
 
 `agentd` 自身**只前台运行**，常驻/自启/崩溃拉起交给 OS 服务管理器。**[安装与使用手册](docs/usage/agentd-install-and-usage.md)**
-按安装方式组织：**方式一 开发环境安装**（本地构建、免 sudo、数据日志就地）、**方式二 通过 Wist-Gateway 安装**
+按安装方式组织：**方式一 开发环境安装**（本地构建、前台运行免 sudo、数据日志就地）、**方式二 通过 Wist-Gateway 安装**
 （控制面下发，`install.sh` 已可用）；配置/运行方式/命令参考/升级/验收/排障两者通用。出问题先翻
 **[使用帮助（常见问题处理）](docs/usage/README.md)**；设计取舍见
 [后台长期运行方案](docs/design/agentd-service-deployment.md)。
 
 ```bash
-# 长期后台运行（Linux systemd / macOS launchd；Linux 需 sudo，macOS 可加 --user）
+# 长期后台运行（Linux systemd / macOS launchd；需 sudo）
 # 注册 token 一次性传入、不落盘（先注册再装服务，注册失败不会留下半成品服务）
-sudo wist-agentd service install --system --enrollment-token <token>
+sudo wist-agentd service install --enrollment-token <token>
 
 # 已经装好但还没注册，可以单独补注册：
 sudo wist-agentd enroll --token <token>          # 或 echo <token> | sudo wist-agentd enroll --token-stdin
 
 # 只看不装：把 unit / plist 渲染到 stdout
-wist-agentd service print --system
+wist-agentd service print
 
 # 自检：定义 / 二进制 / 配置 / 单实例锁 / 数据与日志落点
-wist-agentd service status --system
+wist-agentd service status
 
 # 一屏诊断「这台机器现在有什么问题」（配置/身份/服务/连通/上送）；退出码非零 = 有 FAIL
 sudo wist-agentd diagnose
@@ -108,7 +108,7 @@ wist-agentd --config-dir /etc/wist-agentd
 由配置目录下的 `agentd.toml` 驱动，主要段：`[agent]`（实例名/身份）、`[control_plane]`（网关端点、TLS 模式、注册 token）、`[telemetry.logs]`（日志输入、缓冲、spool、输出）、`[paths]`（root / run / state / log 目录）。
 
 `[paths]` 不用手写：配置位于 `/etc/wist-agentd`（系统级部署）时 `/etc` 只放配置，数据（`run/state/spool`
-与采集输出 `data/`）自动落到 `/var/lib/wist-agentd`、日志落到 `/var/log/wist-agentd`；开发机或 `--user`
+与采集输出 `data/`）自动落到 `/var/lib/wist-agentd`、日志落到 `/var/log/wist-agentd`；开发机或自定义配置目录
 安装则配置/数据/日志全部就地放在配置目录下。显式声明的键优先。
 
 ## Features
@@ -177,7 +177,7 @@ Usage:
   wist-agentd help
   wist-agentd version
   wist-agentd init-config [--stdout] [--config-dir <path>]
-  wist-agentd service <print|install|uninstall|status> [--system|--user] [--bin <path>] [--force] [--no-activate] [--config-dir <path>]
+  wist-agentd service <print|install|uninstall|status> [--bin <path>] [--force] [--no-activate] [--config-dir <path>]
   wist-agentd service print --for <systemd|launchd>   (render for another platform)
   wist-agentd enroll [--token <token> | --token-stdin] [--config-dir <path>]
   wist-agentd diagnose [--json] [--offline] [--config-dir <path>]
@@ -196,8 +196,6 @@ Commands:
                        Exits nonzero when anything FAILs, so scripts can gate on it.
 
 Service options (Linux uses systemd, macOS uses launchd):
-  --system             Install for the whole host (default; /etc paths, root-owned).
-  --user               Install for the current user (systemd --user / launchd LaunchAgent).
   --bin <path>         Installed path of the wist-agentd binary (default: current executable).
   --for <platform>     Only with `service print`: render systemd or launchd output.
   --force              Overwrite an existing service definition.
@@ -220,11 +218,10 @@ Options:
 `wist-agentd` runs in the foreground by design; keeping it alive across logouts, crashes,
 and reboots is delegated to the OS service manager:
 
-- **Linux** — systemd unit at `/etc/systemd/system/wist-agentd.service` (or
-  `~/.config/systemd/user/` with `--user`), `Restart=always`, logs to journald.
-- **macOS** — launchd plist at `/Library/LaunchDaemons/com.dayu-sec.wist-agentd.plist` (or
-  `~/Library/LaunchAgents/` with `--user`), `KeepAlive`, logs to `/var/log/wist-agentd/`
-  (`~/Library/Logs/wist-agentd/` with `--user`, where a non-root daemon cannot write `/var/log`).
+- **Linux** — systemd unit at `/etc/systemd/system/wist-agentd.service`,
+  `Restart=always`, logs to journald.
+- **macOS** — launchd plist at `/Library/LaunchDaemons/com.dayu-sec.wist-agentd.plist`,
+  `KeepAlive`, logs to `/var/log/wist-agentd/`.
 
 See [`docs/usage/agentd-install-and-usage.md`](docs/usage/agentd-install-and-usage.md) for the install and
 operations manual — organized by install path: **dev environment install** (local, no sudo) and
@@ -246,7 +243,7 @@ sections:
 - `[paths]` — root / run / state / log directories. Defaults follow the config location: a config in
   `/etc/wist-agentd` (system install) keeps only configuration there, puts data (`run/state/spool` and
   the collected output `data/wist-records.ndjson`) under `/var/lib/wist-agentd` and logs under
-  `/var/log/wist-agentd`; elsewhere (dev box, `--user`) config, data and logs stay together next to
+  `/var/log/wist-agentd`; elsewhere (dev box, custom config dir) config, data and logs stay together next to
   the config file. Any key you declare explicitly wins.
 
 Ready-to-run examples live under [`examples/`](examples):

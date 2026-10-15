@@ -16,7 +16,6 @@ fn temp_dir(name: &str) -> PathBuf {
 
 fn spec_in(root: &Path) -> ServiceSpec {
     ServiceSpec::new(
-        ServiceScope::System,
         root.join("bin").join("wist-agentd"),
         root.join("etc").join("wist-agentd"),
     )
@@ -31,23 +30,20 @@ fn layout_in(root: &Path, platform: ServicePlatform) -> ServiceLayout {
         ServicePlatform::Systemd => None,
         ServicePlatform::Launchd => Some(root.join("logs")),
     };
-    ServiceLayout::for_paths(platform, ServiceScope::System, definition_path, log_dir)
+    ServiceLayout::for_paths(platform, definition_path, log_dir)
 }
 
 #[test]
-fn system_scope_paths_follow_platform_conventions() {
+fn system_paths_follow_platform_conventions() {
+    assert_eq!(default_config_dir(), PathBuf::from("/etc/wist-agentd"));
     assert_eq!(
-        default_config_dir(ServiceScope::System).expect("system config dir"),
-        PathBuf::from("/etc/wist-agentd")
-    );
-    assert_eq!(
-        ServiceLayout::resolve(ServicePlatform::Systemd, ServiceScope::System)
+        ServiceLayout::resolve(ServicePlatform::Systemd)
             .expect("systemd system layout")
             .definition_path,
         PathBuf::from("/etc/systemd/system/wist-agentd.service")
     );
     assert_eq!(
-        ServiceLayout::resolve(ServicePlatform::Launchd, ServiceScope::System)
+        ServiceLayout::resolve(ServicePlatform::Launchd)
             .expect("launchd system layout")
             .definition_path,
         PathBuf::from("/Library/LaunchDaemons/com.dayu-sec.wist-agentd.plist")
@@ -75,27 +71,6 @@ fn systemd_unit_runs_in_foreground_and_restarts_always() {
     // 前导 `-` 表示环境变量文件可缺失。
     assert!(text.contains(&format!("EnvironmentFile=-{}", spec.env_file().display())));
     assert!(text.contains("WantedBy=multi-user.target"));
-}
-
-#[test]
-fn systemd_user_scope_targets_default_target_with_user_flag() {
-    let root = temp_dir("unit-user");
-    let spec = ServiceSpec::new(
-        ServiceScope::User,
-        root.join("bin/wist-agentd"),
-        root.join("conf"),
-    );
-    let layout = ServiceLayout::for_paths(
-        ServicePlatform::Systemd,
-        ServiceScope::User,
-        root.join("wist-agentd.service"),
-        None,
-    );
-
-    let text = render(&layout, &spec);
-
-    assert!(text.contains("WantedBy=default.target"));
-    assert_eq!(spec.systemctl_scope_args(), vec!["--user".to_string()]);
 }
 
 #[test]
@@ -176,7 +151,6 @@ fn install_rejects_paths_that_cannot_be_represented_in_a_definition() {
     let root = temp_dir("install-newline");
     let layout = layout_in(&root, ServicePlatform::Systemd);
     let spec = ServiceSpec::new(
-        ServiceScope::System,
         PathBuf::from("/opt/wist\nbin/wist-agentd"),
         root.join("conf"),
     );
@@ -192,7 +166,6 @@ fn install_quotes_paths_with_specials_in_the_rendered_unit() {
     let root = temp_dir("install-quoted");
     let layout = layout_in(&root, ServicePlatform::Systemd);
     let spec = ServiceSpec::new(
-        ServiceScope::System,
         PathBuf::from("/opt/my app/wist-agentd"),
         PathBuf::from("/etc/my 100%/wist-agentd"),
     );
@@ -383,46 +356,35 @@ fn attempts(counter: &Path) -> usize {
 }
 
 #[test]
-fn deactivate_and_inspect_commands_match_scope() {
+fn deactivate_and_inspect_commands_target_the_system_domain() {
     let root = temp_dir("deactivate");
-    let user_spec = ServiceSpec::new(
-        ServiceScope::User,
-        root.join("bin/wist-agentd"),
-        root.join("conf"),
-    );
+    let spec = spec_in(&root);
 
-    let systemd = deactivate_commands(ServicePlatform::Systemd, &user_spec);
+    let systemd = deactivate_commands(ServicePlatform::Systemd, &spec);
     assert_eq!(
         systemd[0].display_line(),
-        "systemctl --user disable --now wist-agentd"
+        "systemctl disable --now wist-agentd"
     );
     assert!(systemd[0].ignore_failure);
 
-    let inspect = inspect_commands(ServicePlatform::Systemd, &user_spec);
-    assert_eq!(
-        inspect[0].display_line(),
-        "systemctl --user status wist-agentd"
-    );
-    assert_eq!(
-        inspect[1].display_line(),
-        "journalctl --user -u wist-agentd -f"
-    );
+    let inspect = inspect_commands(ServicePlatform::Systemd, &spec);
+    assert_eq!(inspect[0].display_line(), "systemctl status wist-agentd");
+    assert_eq!(inspect[1].display_line(), "journalctl -u wist-agentd -f");
 
-    let launchd = deactivate_commands(ServicePlatform::Launchd, &user_spec);
+    let launchd = deactivate_commands(ServicePlatform::Launchd, &spec);
     assert_eq!(launchd[0].args[0], "bootout");
-    assert!(launchd[0].args[1].starts_with("gui/"));
+    assert_eq!(launchd[0].args[1], format!("system/{LAUNCHD_LABEL}"));
 }
 
 #[test]
 fn log_hint_points_at_journal_or_log_file() {
     let root = temp_dir("log-hint");
-    let spec = spec_in(&root);
 
     assert_eq!(
-        log_hint(&layout_in(&root, ServicePlatform::Systemd), &spec).expect("systemd hint"),
+        log_hint(&layout_in(&root, ServicePlatform::Systemd)).expect("systemd hint"),
         "journalctl -u wist-agentd -f"
     );
-    let launchd = log_hint(&layout_in(&root, ServicePlatform::Launchd), &spec).expect("launchd");
+    let launchd = log_hint(&layout_in(&root, ServicePlatform::Launchd)).expect("launchd");
     assert_eq!(
         launchd,
         format!("tail -f {}", root.join("logs/agentd.err").display())
