@@ -3,6 +3,24 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.5.0] - 2026-10-18
+
+### 新增
+
+- **路径存在性事实（`path_exists` 的采集端）**：网关把发现策略里 `path_exists:<绝对路径>`
+  条件推导出的路径白名单（`DiscoveryAspectPolicySet.probe_paths`）随策略下发；agentd 在压缩事实摘要时
+  逐条探测（`build_summary(snapshot, probe_paths)`），并把「探测过」与「存在」分开上报
+  （`probed_paths` / `present_paths`）。这样采集目录里的 `match = "path_exists:…"` 才能区分
+  **无法判定**（没探测过）、**不存在**（探测过但不在）与**存在**。
+  - 只探**绝对路径**：相对路径的结果取决于进程 cwd，同一台机器换个启动方式就会翻面，不当事实。
+  - 内容摘要随契约升级到 `fact-v2`（`probed_paths` / `present_paths` 参与摘要计算）。
+
+### 变更（依赖）
+
+- 对齐 `wist-contracts` / `wist-api` **0.9**、`wist-validate` **0.6**、`wist-metrics` **0.4**。
+  **升级顺序**：本版会多报两个字段，旧网关（`deny_unknown_fields`）会拒整份事实上报 ——
+  必须**先升网关**（≥ 0.14.0），再升 agentd。
+
 ## [0.4.0-alpha] - 2026-10-15
 
 ### 变更（不兼容）
