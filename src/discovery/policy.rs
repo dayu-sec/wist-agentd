@@ -118,6 +118,11 @@ impl AppliedDiscoveryPolicy {
         self.set.policy_version
     }
 
+    /// 网关下发的待探测路径白名单（空 = 不探测）。
+    pub fn probe_paths(&self) -> &[String] {
+        &self.set.probe_paths
+    }
+
     /// 取某方向的观测周期；表里没有该方向、或该方向的区间不可用，返回 `None`
     /// （调用方回退探针内建周期）。
     pub fn interval_for(&self, aspect: &str) -> Option<Duration> {
@@ -179,6 +184,19 @@ mod tests {
 
     fn set(policies: Vec<DiscoveryAspectPolicy>) -> DiscoveryAspectPolicySet {
         DiscoveryAspectPolicySet::new(3, "2026-09-22T00:00:00Z".to_string(), policies)
+    }
+
+    #[test]
+    fn carries_the_probe_path_whitelist_through() {
+        let applied = AppliedDiscoveryPolicy::new(
+            set(vec![policy("host", 900, 60, 3600)])
+                .with_probe_paths(vec!["/var/log/sudo.log".to_string()]),
+        );
+        assert_eq!(applied.probe_paths(), ["/var/log/sudo.log"]);
+
+        // 旧网关不带这个字段 = 空表（不探测，`path_exists` 求值为无法判定）。
+        let legacy = AppliedDiscoveryPolicy::new(set(vec![policy("host", 900, 60, 3600)]));
+        assert!(legacy.probe_paths().is_empty());
     }
 
     #[test]

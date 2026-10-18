@@ -754,6 +754,8 @@ async fn report_fact_summary(
         summary.listen_ports.clone(),
         reported_at.clone(),
     )
+    // 路径探测结果：参与内容摘要（它决定 `path_exists` 求值）。
+    .with_probe_paths(summary.probed_paths.clone(), summary.present_paths.clone())
     // 主机标识与网卡地址：**留痕/展示**，不进内容摘要（见 `ReportAgentFactSummary` 的注释）。
     .with_display(
         summary.host_id.clone(),
@@ -1894,7 +1896,8 @@ async fn refresh_discovery_snapshot(
     // 事实摘要**在这里压缩，不在这里上送**：摘要要从快照算（快照就在手上，不必再读一遍
     // discovery 缓存再解析一次），但上行走 TCP uplink，而 sink 在调用方（主 tick）才建。
     // 所以带回主 tick，与指标一起发 —— 同一条连接、同一个全局 `seq`。
-    let fact_summary = fact_summary::build_summary(&result.persisted_snapshot);
+    let fact_summary =
+        fact_summary::build_summary(&result.persisted_snapshot, &runtime.probe_paths());
 
     let readiness = if result.used_cached_snapshot {
         DiscoveryReadiness::ReadyWithStaleSnapshot
@@ -2565,6 +2568,8 @@ mod tests {
             process_executables: executables.iter().map(|value| value.to_string()).collect(),
             packages: Vec::new(),
             listen_ports: Vec::new(),
+            probed_paths: Vec::new(),
+            present_paths: Vec::new(),
             host_id: "machine-id".to_string(),
             host_name: "demo-host".to_string(),
             network_addresses: vec!["en0 192.168.1.5/24".to_string()],
@@ -2682,10 +2687,13 @@ mod tests {
         assert!(frame.contains("\"agent_id\":\"agent-x\""));
         assert!(frame.contains("\"instance_id\":\"instance-x\""));
         assert!(frame.contains("\"kind\":\"report_agent_fact_summary\""));
-        // 声明用的是与网关同源的实现（版本前缀 fact-v1）。
-        assert!(frame.contains("\"content_digest\":\"fact-v1:sha256:"));
+        // 声明用的是与网关同源的实现（版本前缀 fact-v2）。
+        assert!(frame.contains("\"content_digest\":\"fact-v2:sha256:"));
         assert!(frame.contains("\"process_executables\":[\"/usr/bin/xcodebuild\"]"));
         assert!(frame.contains("\"process_count\":1"));
+        // 路径探测结果随摘要上送（参与内容摘要，与「没探测」区分开）。
+        assert!(frame.contains("\"probed_paths\":[]"));
+        assert!(frame.contains("\"present_paths\":[]"));
         // 主机标识与网卡地址随摘要一起上去（留痕/展示，不进内容摘要）。
         assert!(frame.contains("\"host_id\":\"machine-id\""));
         assert!(frame.contains("\"host_name\":\"demo-host\""));
@@ -2697,7 +2705,7 @@ mod tests {
         assert!(!frame.contains("/api/v1/agent/facts"));
 
         assert!(loaded_attempt(&state_dir).await > 0);
-        assert!(summary.content_digest().starts_with("fact-v1:sha256:"));
+        assert!(summary.content_digest().starts_with("fact-v2:sha256:"));
     }
 
     #[tokio::test]

@@ -73,6 +73,14 @@ impl DiscoveryRuntime {
         self.policy.as_ref().map(|policy| policy.policy_version())
     }
 
+    /// 当前生效策略里的待探测路径；没拉到策略 = 不探测。
+    pub fn probe_paths(&self) -> Vec<String> {
+        self.policy
+            .as_ref()
+            .map(|policy| policy.probe_paths().to_vec())
+            .unwrap_or_default()
+    }
+
     /// 已应用策略里被**夹取/弃用**的周期摘要；没有调整时为空串。
     ///
     /// 夹取本身是对的（宁可采慢一点，也不能让被管机器被打满），但**静默**夹取会把
