@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use wist_contracts::discovery::StringKeyValue;
 
 use super::runtime::{MetricsCollectionOutcome, MetricsRuntimeSnapshot};
 use super::spec::find_metric_spec;
@@ -45,6 +46,9 @@ pub struct MetricsSampleRecord {
     pub unit: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// 实例标签（如 `mount` / `fstype`），用于区分同一指标下的多个实例。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<StringKeyValue>,
 }
 
 /// VM（VictoriaMetrics）`/api/v1/import` 的 JSON line 导入格式的单条指标。
@@ -69,6 +73,10 @@ pub struct VmMetricLabels {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_ref: Option<String>,
     pub unit: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mount: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fstype: Option<String>,
 }
 
 /// 把样本快照拍平成 VM JSON lines（一 sample 一行）。
@@ -98,6 +106,8 @@ pub fn build_vm_metric_lines(
                     target_ref: group.target_ref.clone(),
                     resource_ref: group.resource_ref.clone(),
                     unit: sample.unit.clone(),
+                    mount: label_value(&sample.labels, "mount").map(str::to_string),
+                    fstype: label_value(&sample.labels, "fstype").map(str::to_string),
                 },
                 values: vec![value],
                 timestamps: vec![timestamp_ms],
@@ -134,20 +144,24 @@ fn build_outcome_groups(outcome: &MetricsCollectionOutcome, groups: &mut Vec<Met
         let mut samples = Vec::new();
 
         for fact in &target.runtime_facts {
-            let Some(spec) = find_metric_spec(&outcome.collection_kind, fact.key.as_str()) else {
-                continue;
-            };
-            samples.push(MetricsSampleRecord {
-                name: spec.name.to_string(),
-                value: sample_value(spec.value_type, &fact.value),
-                value_type: spec.value_type.to_string(),
-                unit: spec.unit.to_string(),
-                status: if target.status == "succeeded" {
-                    None
-                } else {
-                    Some(target.status.clone())
-                },
-            });
+            push_metric_sample(
+                &mut samples,
+                &outcome.collection_kind,
+                &fact.key,
+                &fact.value,
+                &target.status,
+                Vec::new(),
+            );
+        }
+        for fact in &target.labeled_facts {
+            push_metric_sample(
+                &mut samples,
+                &outcome.collection_kind,
+                &fact.key,
+                &fact.value,
+                &target.status,
+                fact.labels.clone(),
+            );
         }
 
         if !samples.is_empty() {
@@ -159,6 +173,38 @@ fn build_outcome_groups(outcome: &MetricsCollectionOutcome, groups: &mut Vec<Met
             });
         }
     }
+}
+
+fn push_metric_sample(
+    samples: &mut Vec<MetricsSampleRecord>,
+    collection_kind: &str,
+    fact_key: &str,
+    raw_value: &str,
+    target_status: &str,
+    labels: Vec<StringKeyValue>,
+) {
+    let Some(spec) = find_metric_spec(collection_kind, fact_key) else {
+        return;
+    };
+    samples.push(MetricsSampleRecord {
+        name: spec.name.to_string(),
+        value: sample_value(spec.value_type, raw_value),
+        value_type: spec.value_type.to_string(),
+        unit: spec.unit.to_string(),
+        status: if target_status == "succeeded" {
+            None
+        } else {
+            Some(target_status.to_string())
+        },
+        labels,
+    });
+}
+
+fn label_value<'a>(labels: &'a [StringKeyValue], key: &str) -> Option<&'a str> {
+    labels
+        .iter()
+        .find(|label| label.key == key)
+        .map(|label| label.value.as_str())
 }
 
 fn sample_value(value_type: &str, raw: &str) -> Value {
@@ -185,7 +231,8 @@ mod tests {
         build_vm_metric_lines,
     };
     use crate::telemetry::metrics::runtime::{
-        MetricsCollectionOutcome, MetricsCollectionTargetSample, MetricsRuntimeSnapshot,
+        MetricsCollectionOutcome, MetricsCollectionTargetSample, MetricsLabeledFact,
+        MetricsRuntimeSnapshot,
     };
 
     #[test]
@@ -204,6 +251,7 @@ mod tests {
                 failed_targets: 0,
                 last_error: None,
                 runtime_facts: vec![StringKeyValue::new("host.loadavg.1m", "0.25")],
+                labeled_facts: Vec::new(),
                 sample_targets: vec![MetricsCollectionTargetSample {
                     candidate_id: "host-1".to_string(),
                     target_ref: "host-1:host".to_string(),
@@ -215,6 +263,7 @@ mod tests {
                         StringKeyValue::new("host.loadavg.1m", "0.25"),
                         StringKeyValue::new("host.uptime.seconds", "3600"),
                     ],
+                    labeled_facts: Vec::new(),
                 }],
             }],
         };
@@ -262,6 +311,7 @@ mod tests {
                 failed_targets: 0,
                 last_error: None,
                 runtime_facts: vec![],
+                labeled_facts: Vec::new(),
                 sample_targets: vec![MetricsCollectionTargetSample {
                     candidate_id: "host-1".to_string(),
                     target_ref: "host-1:host".to_string(),
@@ -274,6 +324,7 @@ mod tests {
                         StringKeyValue::new("host.memory.total_kb", "8388608"),
                         StringKeyValue::new("host.memory.available_kb", "4194304"),
                     ],
+                    labeled_facts: Vec::new(),
                 }],
             }],
         };
@@ -304,6 +355,221 @@ mod tests {
     }
 
     #[test]
+    fn labeled_facts_become_labeled_samples_and_vm_lines() {
+        let runtime = MetricsRuntimeSnapshot {
+            generated_at: "2026-04-19T00:00:00Z".to_string(),
+            total_targets: 1,
+            host_targets: 1,
+            process_targets: 0,
+            container_targets: 0,
+            outcomes: vec![MetricsCollectionOutcome {
+                collection_kind: "host_metrics".to_string(),
+                status: "succeeded".to_string(),
+                attempted_targets: 1,
+                succeeded_targets: 1,
+                failed_targets: 0,
+                last_error: None,
+                runtime_facts: Vec::new(),
+                labeled_facts: Vec::new(),
+                sample_targets: vec![MetricsCollectionTargetSample {
+                    candidate_id: "host-1".to_string(),
+                    target_ref: "host-1:host".to_string(),
+                    status: "succeeded".to_string(),
+                    last_error: None,
+                    resource_ref: "host-1".to_string(),
+                    execution_hints: Vec::new(),
+                    runtime_facts: Vec::new(),
+                    labeled_facts: vec![MetricsLabeledFact {
+                        key: "host.filesystem.usage_percent".to_string(),
+                        value: "95".to_string(),
+                        labels: vec![
+                            StringKeyValue::new("mount", "/var"),
+                            StringKeyValue::new("fstype", "xfs"),
+                        ],
+                    }],
+                }],
+            }],
+        };
+
+        let snapshot = build_samples_snapshot(&runtime);
+        let sample = snapshot.groups[0]
+            .samples
+            .iter()
+            .find(|sample| sample.name == "system.filesystem.usage")
+            .expect("filesystem usage sample");
+        assert_eq!(sample.value, serde_json::json!(95.0));
+        assert_eq!(sample.labels.len(), 2);
+
+        let lines = build_vm_metric_lines(&snapshot, "agent-001", 1_234_567_890_000);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].metric.mount.as_deref(), Some("/var"));
+        assert_eq!(lines[0].metric.fstype.as_deref(), Some("xfs"));
+    }
+
+    #[test]
+    fn multiple_mounts_produce_distinct_samples() {
+        let runtime = MetricsRuntimeSnapshot {
+            generated_at: "2026-04-19T00:00:00Z".to_string(),
+            total_targets: 1,
+            host_targets: 1,
+            process_targets: 0,
+            container_targets: 0,
+            outcomes: vec![MetricsCollectionOutcome {
+                collection_kind: "host_metrics".to_string(),
+                status: "succeeded".to_string(),
+                attempted_targets: 1,
+                succeeded_targets: 1,
+                failed_targets: 0,
+                last_error: None,
+                runtime_facts: Vec::new(),
+                labeled_facts: Vec::new(),
+                sample_targets: vec![MetricsCollectionTargetSample {
+                    candidate_id: "host-1".to_string(),
+                    target_ref: "host-1:host".to_string(),
+                    status: "succeeded".to_string(),
+                    last_error: None,
+                    resource_ref: "host-1".to_string(),
+                    execution_hints: Vec::new(),
+                    runtime_facts: Vec::new(),
+                    labeled_facts: ["/", "/var"]
+                        .into_iter()
+                        .map(|mount| MetricsLabeledFact {
+                            key: "host.filesystem.usage_percent".to_string(),
+                            value: "50".to_string(),
+                            labels: vec![StringKeyValue::new("mount", mount)],
+                        })
+                        .collect(),
+                }],
+            }],
+        };
+
+        let snapshot = build_samples_snapshot(&runtime);
+        let mounts: Vec<&str> = snapshot.groups[0]
+            .samples
+            .iter()
+            .filter(|sample| sample.name == "system.filesystem.usage")
+            .map(|sample| {
+                sample
+                    .labels
+                    .iter()
+                    .find(|label| label.key == "mount")
+                    .expect("mount label")
+                    .value
+                    .as_str()
+            })
+            .collect();
+        assert_eq!(mounts, vec!["/", "/var"]);
+    }
+
+    #[test]
+    fn unlabeled_samples_omit_labels_from_json_and_vm_lines() {
+        let snapshot = MetricsSamplesSnapshot {
+            batch_seq: 1,
+            collected_at: "2026-04-19T00:00:00Z".to_string(),
+            groups: vec![MetricsSampleGroup {
+                kind: "host_metrics".to_string(),
+                target_ref: "host-1:host".to_string(),
+                resource_ref: Some("host-1".to_string()),
+                samples: vec![MetricsSampleRecord {
+                    name: "system.load_average.1m".to_string(),
+                    value: serde_json::json!(0.25),
+                    value_type: "gauge_f64".to_string(),
+                    unit: "1".to_string(),
+                    status: None,
+                    labels: Vec::new(),
+                }],
+            }],
+        };
+
+        let json = serde_json::to_value(&snapshot).expect("serialize snapshot");
+        assert!(json["groups"][0]["samples"][0].get("labels").is_none());
+
+        let lines = build_vm_metric_lines(&snapshot, "agent-001", 1);
+        let line = serde_json::to_value(&lines[0]).expect("serialize vm line");
+        assert!(line["metric"].get("mount").is_none());
+        assert!(line["metric"].get("fstype").is_none());
+    }
+
+    #[test]
+    fn labeled_facts_with_unknown_keys_are_skipped() {
+        let runtime = MetricsRuntimeSnapshot {
+            generated_at: "2026-04-19T00:00:00Z".to_string(),
+            total_targets: 1,
+            host_targets: 1,
+            process_targets: 0,
+            container_targets: 0,
+            outcomes: vec![MetricsCollectionOutcome {
+                collection_kind: "host_metrics".to_string(),
+                status: "succeeded".to_string(),
+                attempted_targets: 1,
+                succeeded_targets: 1,
+                failed_targets: 0,
+                last_error: None,
+                runtime_facts: Vec::new(),
+                labeled_facts: Vec::new(),
+                sample_targets: vec![MetricsCollectionTargetSample {
+                    candidate_id: "host-1".to_string(),
+                    target_ref: "host-1:host".to_string(),
+                    status: "succeeded".to_string(),
+                    last_error: None,
+                    resource_ref: "host-1".to_string(),
+                    execution_hints: Vec::new(),
+                    runtime_facts: Vec::new(),
+                    labeled_facts: vec![MetricsLabeledFact {
+                        key: "host.unmapped.fact".to_string(),
+                        value: "1".to_string(),
+                        labels: vec![StringKeyValue::new("mount", "/var")],
+                    }],
+                }],
+            }],
+        };
+
+        let snapshot = build_samples_snapshot(&runtime);
+        assert!(snapshot.groups.is_empty());
+    }
+
+    #[test]
+    fn failed_labeled_facts_keep_failed_status() {
+        let runtime = MetricsRuntimeSnapshot {
+            generated_at: "2026-04-19T00:00:00Z".to_string(),
+            total_targets: 1,
+            host_targets: 1,
+            process_targets: 0,
+            container_targets: 0,
+            outcomes: vec![MetricsCollectionOutcome {
+                collection_kind: "host_metrics".to_string(),
+                status: "failed".to_string(),
+                attempted_targets: 1,
+                succeeded_targets: 0,
+                failed_targets: 1,
+                last_error: Some("probe failed".to_string()),
+                runtime_facts: Vec::new(),
+                labeled_facts: Vec::new(),
+                sample_targets: vec![MetricsCollectionTargetSample {
+                    candidate_id: "host-1".to_string(),
+                    target_ref: "host-1:host".to_string(),
+                    status: "failed".to_string(),
+                    last_error: Some("probe failed".to_string()),
+                    resource_ref: "host-1".to_string(),
+                    execution_hints: Vec::new(),
+                    runtime_facts: Vec::new(),
+                    labeled_facts: vec![MetricsLabeledFact {
+                        key: "host.filesystem.usage_percent".to_string(),
+                        value: "95".to_string(),
+                        labels: vec![StringKeyValue::new("mount", "/var")],
+                    }],
+                }],
+            }],
+        };
+
+        let snapshot = build_samples_snapshot(&runtime);
+        assert_eq!(
+            snapshot.groups[0].samples[0].status.as_deref(),
+            Some("failed")
+        );
+    }
+
+    #[test]
     fn build_vm_metric_lines_flattens_numeric_samples_and_skips_strings() {
         let snapshot = MetricsSamplesSnapshot {
             batch_seq: 3,
@@ -319,6 +585,7 @@ mod tests {
                         value_type: "gauge_f64".to_string(),
                         unit: "1".to_string(),
                         status: None,
+                        labels: Vec::new(),
                     },
                     MetricsSampleRecord {
                         name: "process.state".to_string(),
@@ -326,6 +593,7 @@ mod tests {
                         value_type: "gauge_string".to_string(),
                         unit: "state".to_string(),
                         status: None,
+                        labels: Vec::new(),
                     },
                 ],
             }],

@@ -80,6 +80,7 @@ ControlPlaneSection {
 - `enabled = true` 表示 `managed` 模式
 - 当 `enabled = false` 时，`endpoint / tls_mode / auth_mode` 可为空
 - 当 `enabled = true` 时，`endpoint` 为必填
+- 当 `enabled = false` 时，数据面（`[telemetry.logs]` / `[discovery]`）整体不生效：不采集、不缓冲、不上送，也不产生 spool
 
 也就是说：
 
@@ -176,6 +177,9 @@ LogsSection {
 ```
 
 字段说明（契约定义与默认值见 `wist-contracts-0.1.2/src/agent_config.rs:167-215`）：
+
+> **`standalone` 下整段不生效**（`[control_plane] enabled = false`）：不读 `file_inputs` / `file_inputs_file`，
+> 不落 spool，`output` 的 `tcp` / `file` 两种都不写。配置里保留这些键不报错，但运行时忽略。
 
 - `file_inputs[]?`
   内联采集清单，默认空数组
@@ -291,6 +295,9 @@ DiscoverySection {
 整段 `[discovery]` 不写时走 `DiscoverySection::default()`：host / network / endpoint / process 为 `true`、container 为 `false`。
 默认模板把五个键都显式写出（`src/config/config_runtime_support.rs:33-40`）。
 五个开关不能全为 `false`，否则报 `missing_discovery_probe`（`wist-validate-0.1.2/src/config.rs:43-51`）。
+
+> **`standalone` 下 discovery 不运行**：五个开关即使为 `true` 也不启动探针（与「不采、不缓、不发」同一口径）。
+> 配置校验仍按上面规则执行，不因运行模式改变。
 
 ---
 

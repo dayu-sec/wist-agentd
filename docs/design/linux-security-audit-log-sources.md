@@ -149,6 +149,22 @@
 - 网络与连接：`/proc/net/dev`、`ss -s`；
 - GPU：`nvidia-smi`（算力机）。
 
+**磁盘容量要分角色看**（Linux 首版口径，`sysinfo::Disks`）：
+
+| 角色 | 口径 | 关心的数 |
+|---|---|---|
+| 系统盘 `system` | 根文件系统 `/` | 使用率（系统盘被日志/包缓存写满会直接拖垮主机） |
+| 数据盘 `data` | 其余本地块设备挂载点（如 `/data`、`/home`、独立数据分区） | 剩余可用（数据盘写满通常是业务故障的第一现场） |
+
+- 多块数据盘**按容量汇总**；同一设备被 bind mount 到多个路径只计一次。
+- 排除 `/boot`、`/run`、`/sys`、`/proc`、`/dev` 与 `overlay` / `fuse` 等系统或虚拟挂载，
+  避免把引导分区、容器叠加层、网络盘混进「数据盘」。
+- 单盘明细已进指标：每个本地挂载点产出 `system.filesystem.{usage,total,available}`，
+  带 `mount` / `fstype` 标签；`system.disk.system` / `system.disk.data` 只是兼容汇总。
+
+逐挂载点的完整方案（指标名、`mount`/`fstype` 标签、Linux/macOS 过滤规则、告警与成本）见
+`wist-design/doc/design/edge/disk-capacity-collection.md`。
+
 ## 6. journald 采集建议
 
 - 只读入口是 `journalctl`，不支持直接 tail 底层文件（`/var/log/journal` 是私有格式）；

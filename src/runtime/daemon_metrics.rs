@@ -361,6 +361,7 @@ mod tests {
                     failed_targets: 0,
                     last_error: None,
                     runtime_facts: vec![StringKeyValue::new("host.loadavg.1m", "0.10")],
+                    labeled_facts: Vec::new(),
                     sample_targets: Vec::new(),
                 },
                 crate::telemetry::metrics::runtime::MetricsCollectionOutcome {
@@ -371,6 +372,7 @@ mod tests {
                     failed_targets: 0,
                     last_error: None,
                     runtime_facts: vec![StringKeyValue::new("process.pid", "42")],
+                    labeled_facts: Vec::new(),
                     sample_targets: Vec::new(),
                 },
                 crate::telemetry::metrics::runtime::MetricsCollectionOutcome {
@@ -381,6 +383,7 @@ mod tests {
                     failed_targets: 0,
                     last_error: None,
                     runtime_facts: vec![StringKeyValue::new("container.runtime", "containerd")],
+                    labeled_facts: Vec::new(),
                     sample_targets: Vec::new(),
                 },
             ],
@@ -438,6 +441,7 @@ mod tests {
                 failed_targets: 0,
                 last_error: None,
                 runtime_facts: vec![StringKeyValue::new("host.loadavg.1m", "0.25")],
+                labeled_facts: Vec::new(),
                 sample_targets: vec![MetricsCollectionTargetSample {
                     candidate_id: "host-1".to_string(),
                     target_ref: "host-1:host".to_string(),
@@ -446,6 +450,7 @@ mod tests {
                     resource_ref: "host-1".to_string(),
                     execution_hints: vec![StringKeyValue::new("host.name", "host-a")],
                     runtime_facts: vec![StringKeyValue::new("host.loadavg.1m", "0.25")],
+                    labeled_facts: Vec::new(),
                 }],
             }],
         };
@@ -517,6 +522,7 @@ mod tests {
                 failed_targets: 0,
                 last_error: None,
                 runtime_facts: vec![],
+                labeled_facts: Vec::new(),
                 sample_targets: vec![MetricsCollectionTargetSample {
                     candidate_id: "host-1".to_string(),
                     target_ref: "host-1:host".to_string(),
@@ -528,6 +534,7 @@ mod tests {
                         StringKeyValue::new("host.loadavg.1m", "0.25"),
                         StringKeyValue::new("host.uptime.seconds", "3600"),
                     ],
+                    labeled_facts: Vec::new(),
                 }],
             }],
         };

@@ -1,5 +1,6 @@
 //! Minimal metrics runtime tick built from target view.
 
+use std::collections::HashSet;
 #[cfg(target_os = "linux")]
 use std::fs;
 use std::io;
@@ -13,7 +14,7 @@ use wist_contracts::discovery::StringKeyValue;
 use wist_shared::fs::write_json_atomic;
 
 pub use wist_metrics::provider::{
-    MetricProvider, MetricsCollectionOutcome, MetricsCollectionTargetSample,
+    MetricProvider, MetricsCollectionOutcome, MetricsCollectionTargetSample, MetricsLabeledFact,
 };
 
 #[cfg(test)]
@@ -100,12 +101,15 @@ fn build_host_outcome(
             failed_targets: 0,
             last_error: None,
             runtime_facts: vec![StringKeyValue::new("host.target.count", "0")],
+            labeled_facts: Vec::new(),
             sample_targets,
         };
     }
 
-    let runtime_facts = collect_host_runtime_facts(&sample_targets);
-    if runtime_facts.is_empty() {
+    let collected = collect_host_runtime_facts(&sample_targets);
+    let runtime_facts = collected.facts;
+    let labeled_facts = collected.labeled_facts;
+    if runtime_facts.is_empty() && labeled_facts.is_empty() {
         for sample in &mut sample_targets {
             sample.status = "failed".to_string();
             sample.last_error = Some("host metrics probe produced no runtime facts".to_string());
@@ -121,6 +125,7 @@ fn build_host_outcome(
                 "host.target.count",
                 attempted_targets.to_string(),
             )],
+            labeled_facts: Vec::new(),
             sample_targets,
         }
     } else {
@@ -132,6 +137,7 @@ fn build_host_outcome(
         for sample in &mut sample_targets {
             sample.status = "succeeded".to_string();
             sample.runtime_facts = runtime_facts.clone();
+            sample.labeled_facts = labeled_facts.clone();
         }
         MetricsCollectionOutcome {
             collection_kind: "host_metrics".to_string(),
@@ -141,6 +147,7 @@ fn build_host_outcome(
             failed_targets: 0,
             last_error: None,
             runtime_facts,
+            labeled_facts,
             sample_targets,
         }
     }
@@ -156,6 +163,7 @@ fn build_process_outcome(targets: Vec<&MetricsTargetViewEntry>) -> MetricsCollec
             failed_targets: 0,
             last_error: None,
             runtime_facts: Vec::new(),
+            labeled_facts: Vec::new(),
             sample_targets: Vec::new(),
         };
     }
@@ -200,6 +208,7 @@ fn build_process_outcome(targets: Vec<&MetricsTargetViewEntry>) -> MetricsCollec
             StringKeyValue::new("process.probe.success_count", succeeded_targets.to_string()),
             StringKeyValue::new("process.probe.failed_count", failed_targets.to_string()),
         ],
+        labeled_facts: Vec::new(),
         sample_targets,
     }
 }
@@ -214,6 +223,7 @@ fn build_container_outcome(targets: Vec<&MetricsTargetViewEntry>) -> MetricsColl
             failed_targets: 0,
             last_error: None,
             runtime_facts: Vec::new(),
+            labeled_facts: Vec::new(),
             sample_targets: Vec::new(),
         };
     }
@@ -261,6 +271,7 @@ fn build_container_outcome(targets: Vec<&MetricsTargetViewEntry>) -> MetricsColl
             ),
             StringKeyValue::new("container.probe.failed_count", failed_targets.to_string()),
         ],
+        labeled_facts: Vec::new(),
         sample_targets,
     }
 }
@@ -312,10 +323,16 @@ impl MetricProvider for ContainerMetricsProvider {
     }
 }
 
+struct HostRuntimeFacts {
+    facts: Vec<StringKeyValue>,
+    labeled_facts: Vec<MetricsLabeledFact>,
+}
+
 fn collect_host_runtime_facts(
     sample_targets: &[MetricsCollectionTargetSample],
-) -> Vec<StringKeyValue> {
+) -> HostRuntimeFacts {
     let mut facts = Vec::new();
+    let mut labeled_facts = Vec::new();
 
     for sample in sample_targets {
         for hint in &sample.execution_hints {
@@ -361,22 +378,33 @@ fn collect_host_runtime_facts(
         ),
     );
 
-    collect_host_disk_usage(&mut facts);
+    let disks = Disks::new_with_refreshed_list();
+    collect_host_disk_usage(&disks, &mut facts);
+    collect_host_filesystem_usage(&disks, &mut labeled_facts);
 
-    facts
+    HostRuntimeFacts {
+        facts,
+        labeled_facts,
+    }
 }
 
-fn collect_host_disk_usage(facts: &mut Vec<StringKeyValue>) {
-    // The primary writable filesystem differs across platforms: macOS APFS keeps
-    // user data on the Data volume while `/` is a small sealed system snapshot, so
-    // pick the Data volume first and fall back to `/`. Linux and others use `/`.
+fn collect_host_disk_usage(disks: &Disks, facts: &mut Vec<StringKeyValue>) {
+    if cfg!(target_os = "linux") {
+        collect_linux_disk_usage(disks, facts);
+    } else {
+        collect_primary_disk_usage(disks, facts);
+    }
+}
+
+/// 非 Linux 平台只报「主盘」：macOS APFS 把用户数据放在 Data 卷（`/` 只是只读系统快照），
+/// 所以优先取 Data、回落到 `/`；其它 Unix 取 `/`。
+fn collect_primary_disk_usage(disks: &Disks, facts: &mut Vec<StringKeyValue>) {
     let mounts: &[&str] = if cfg!(target_os = "macos") {
         &["/System/Volumes/Data", "/"]
     } else {
         &["/"]
     };
 
-    let disks = Disks::new_with_refreshed_list();
     for mount in mounts {
         let Some(disk) = disks
             .list()
@@ -385,28 +413,366 @@ fn collect_host_disk_usage(facts: &mut Vec<StringKeyValue>) {
         else {
             continue;
         };
-        let total = disk.total_space();
-        let available = disk.available_space();
-        let used = total.saturating_sub(available);
-        let usage_percent = if total == 0 {
-            0.0
-        } else {
-            used as f64 / total as f64 * 100.0
-        };
-        push_fact_if_absent(
-            facts,
-            StringKeyValue::new("host.disk.usage_percent", usage_percent.to_string()),
-        );
-        push_fact_if_absent(
-            facts,
-            StringKeyValue::new("host.disk.total_kb", (total / 1024).to_string()),
-        );
-        push_fact_if_absent(
-            facts,
-            StringKeyValue::new("host.disk.available_kb", (available / 1024).to_string()),
-        );
+        push_disk_capacity_facts(facts, "", disk.total_space(), disk.available_space());
         return;
     }
+}
+
+/// Linux 把容量拆成两个角色：
+/// - `system`：根文件系统 `/`（系统盘）；
+/// - `data`：其余本地块设备挂载点（数据盘）。多块数据盘按容量汇总，
+///   同一设备被 bind mount 到多个路径时只算一次。
+///
+/// 原有的 `host.disk.*` 保持为系统盘，兼容既有网关接口与页面。
+fn collect_linux_disk_usage(disks: &Disks, facts: &mut Vec<StringKeyValue>) {
+    let Some(root) = disks
+        .list()
+        .iter()
+        .find(|disk| disk.mount_point() == Path::new("/"))
+    else {
+        return;
+    };
+    let root_total = root.total_space();
+    let root_available = root.available_space();
+    push_disk_capacity_facts(facts, "", root_total, root_available);
+    push_disk_capacity_facts(facts, "system.", root_total, root_available);
+
+    let mut seen_devices = HashSet::new();
+    // 根文件系统的 bind mount 也是「系统盘」，不能重复计入数据盘。
+    let root_device = root.name().to_string_lossy();
+    if !root_device.is_empty() {
+        seen_devices.insert(root_device.into_owned());
+    }
+    let mut data_total = 0u64;
+    let mut data_available = 0u64;
+    let mut data_mounts = 0usize;
+    for disk in disks.list() {
+        if !is_linux_data_mount(disk) {
+            continue;
+        }
+        // 同一设备可能被 bind mount 到多个路径（如 /data 与 /mnt/data），只算一次。
+        let device = disk.name().to_string_lossy();
+        let key = if device.is_empty() {
+            format!("mount:{}", disk.mount_point().display())
+        } else {
+            device.into_owned()
+        };
+        if !seen_devices.insert(key) {
+            continue;
+        }
+        data_total = data_total.saturating_add(disk.total_space());
+        data_available = data_available.saturating_add(disk.available_space());
+        data_mounts += 1;
+    }
+
+    if data_mounts > 0 {
+        push_disk_capacity_facts(facts, "data.", data_total, data_available);
+        push_fact_if_absent(
+            facts,
+            StringKeyValue::new("host.disk.data.mount_count", data_mounts.to_string()),
+        );
+    }
+}
+
+/// 是否计入 Linux「数据盘」。
+///
+/// `sysinfo::Disks` 已经过滤掉 proc/sys/devtmpfs/tmpfs/NFS 等虚拟或网络挂载；
+/// 这里再排除根（系统盘）、引导分区、运行期目录与容器叠加层，避免把系统自身
+/// 或临时文件系统误算成数据盘。
+fn is_linux_data_mount(disk: &sysinfo::Disk) -> bool {
+    is_linux_data_mount_point(
+        &disk.mount_point().to_string_lossy(),
+        &disk.file_system().to_string_lossy(),
+        disk.total_space(),
+    )
+}
+
+fn is_linux_data_mount_point(mount: &str, file_system: &str, total_space: u64) -> bool {
+    if total_space == 0 || mount == "/" {
+        return false;
+    }
+    if mount == "/boot" || mount.starts_with("/boot/") {
+        return false;
+    }
+    if mount == "/run"
+        || mount.starts_with("/run/")
+        || mount == "/sys"
+        || mount.starts_with("/sys/")
+        || mount == "/proc"
+        || mount.starts_with("/proc/")
+        || mount == "/dev"
+        || mount.starts_with("/dev/")
+    {
+        return false;
+    }
+    !is_excluded_filesystem(file_system)
+}
+
+fn push_disk_capacity_facts(
+    facts: &mut Vec<StringKeyValue>,
+    prefix: &str,
+    total: u64,
+    available: u64,
+) {
+    let available = available.min(total);
+    let used = total.saturating_sub(available);
+    let usage_percent = if total == 0 {
+        0.0
+    } else {
+        used as f64 / total as f64 * 100.0
+    };
+    push_fact_if_absent(
+        facts,
+        StringKeyValue::new(
+            format!("host.disk.{prefix}usage_percent"),
+            usage_percent.to_string(),
+        ),
+    );
+    push_fact_if_absent(
+        facts,
+        StringKeyValue::new(
+            format!("host.disk.{prefix}total_kb"),
+            (total / 1024).to_string(),
+        ),
+    );
+    push_fact_if_absent(
+        facts,
+        StringKeyValue::new(
+            format!("host.disk.{prefix}available_kb"),
+            (available / 1024).to_string(),
+        ),
+    );
+}
+
+/// 逐挂载点文件系统容量：同一 fact key 的多条实例用 `mount` / `fstype` 标签区分。
+///
+/// 这是 `system.filesystem.*` 的来源；过渡版的 `host.disk.*` 汇总仍由
+/// [`collect_host_disk_usage`] 产出，两者并存。
+fn collect_host_filesystem_usage(disks: &Disks, facts: &mut Vec<MetricsLabeledFact>) {
+    if cfg!(target_os = "linux") {
+        collect_linux_filesystems(disks, facts);
+    } else if cfg!(target_os = "macos") {
+        collect_macos_filesystems(disks, facts);
+    }
+}
+
+fn collect_linux_filesystems(disks: &Disks, facts: &mut Vec<MetricsLabeledFact>) {
+    let mut seen_devices = HashSet::new();
+    // 先固定根文件系统为规范挂载点，避免它的 bind mount 先出现时把 `/` 顶掉。
+    if let Some(root) = disks
+        .list()
+        .iter()
+        .find(|disk| disk.mount_point() == Path::new("/"))
+        && is_linux_filesystem_mount(root)
+    {
+        let device = root.name().to_string_lossy();
+        seen_devices.insert(filesystem_dedupe_key(&device, "/"));
+        push_filesystem_facts(facts, root);
+    }
+    for disk in disks.list() {
+        if !is_linux_filesystem_mount(disk) {
+            continue;
+        }
+        let device = disk.name().to_string_lossy();
+        let key = filesystem_dedupe_key(&device, &disk.mount_point().to_string_lossy());
+        // 同一文件系统被 bind mount 到多个路径时只报一次（取最先出现的挂载点）。
+        if !seen_devices.insert(key) {
+            continue;
+        }
+        push_filesystem_facts(facts, disk);
+    }
+}
+
+fn collect_macos_filesystems(disks: &Disks, facts: &mut Vec<MetricsLabeledFact>) {
+    let mut seen_devices = HashSet::new();
+    // Data 卷优先作为内部容量的规范挂载点；`/` 只读，排在它后面。
+    for preferred in ["/System/Volumes/Data", "/"] {
+        if let Some(disk) = disks
+            .list()
+            .iter()
+            .find(|disk| disk.mount_point() == Path::new(preferred))
+            && is_macos_filesystem_mount(disk)
+        {
+            let device = disk.name().to_string_lossy();
+            seen_devices.insert(filesystem_dedupe_key(&device, preferred));
+            push_filesystem_facts(facts, disk);
+        }
+    }
+    for disk in disks.list() {
+        if !is_macos_filesystem_mount(disk) {
+            continue;
+        }
+        let device = disk.name().to_string_lossy();
+        let key = filesystem_dedupe_key(&device, &disk.mount_point().to_string_lossy());
+        if !seen_devices.insert(key) {
+            continue;
+        }
+        push_filesystem_facts(facts, disk);
+    }
+}
+
+/// 同一设备（bind mount / btrfs 子卷）只保留第一条；设备名为空时用挂载点兜底。
+fn filesystem_dedupe_key(device: &str, mount: &str) -> String {
+    if device.is_empty() {
+        format!("mount:{mount}")
+    } else {
+        device.to_string()
+    }
+}
+
+fn is_linux_filesystem_mount(disk: &sysinfo::Disk) -> bool {
+    is_linux_filesystem_mount_point(
+        &disk.mount_point().to_string_lossy(),
+        &disk.file_system().to_string_lossy(),
+        disk.total_space(),
+    )
+}
+
+fn is_linux_filesystem_mount_point(mount: &str, file_system: &str, total_space: u64) -> bool {
+    if total_space == 0 {
+        return false;
+    }
+    if mount == "/boot" || mount.starts_with("/boot/") {
+        return false;
+    }
+    if mount == "/run"
+        || mount.starts_with("/run/")
+        || mount == "/sys"
+        || mount.starts_with("/sys/")
+        || mount == "/proc"
+        || mount.starts_with("/proc/")
+        || mount == "/dev"
+        || mount.starts_with("/dev/")
+    {
+        return false;
+    }
+    !is_excluded_filesystem(file_system)
+}
+
+fn is_macos_filesystem_mount(disk: &sysinfo::Disk) -> bool {
+    is_macos_filesystem_mount_point(
+        &disk.mount_point().to_string_lossy(),
+        &disk.file_system().to_string_lossy(),
+        disk.total_space(),
+    )
+}
+
+fn is_macos_filesystem_mount_point(mount: &str, file_system: &str, total_space: u64) -> bool {
+    if total_space == 0 {
+        return false;
+    }
+    if mount == "/" || mount == "/System/Volumes/Data" {
+        return true;
+    }
+    // 其它系统辅助卷（Preboot / VM / Update / xarts / iSCPreboot / Hardware）
+    // 与 Data 共享 APFS container，逐卷上报会重复计数。
+    if mount.starts_with("/System/Volumes/") {
+        return false;
+    }
+    if mount.starts_with("/Volumes/") {
+        return !is_excluded_filesystem(file_system) && !file_system.contains("fuse");
+    }
+    false
+}
+
+fn is_excluded_filesystem(file_system: &str) -> bool {
+    matches!(
+        file_system,
+        "proc"
+            | "sysfs"
+            | "devtmpfs"
+            | "devpts"
+            | "tmpfs"
+            | "cgroup"
+            | "cgroup2"
+            | "pstore"
+            | "securityfs"
+            | "debugfs"
+            | "tracefs"
+            | "hugetlbfs"
+            | "mqueue"
+            | "configfs"
+            | "fusectl"
+            | "binfmt_misc"
+            | "rpc_pipefs"
+            | "nsfs"
+            | "efivarfs"
+            | "ramfs"
+            | "rootfs"
+            | "overlay"
+            | "aufs"
+            | "squashfs"
+            | "iso9660"
+            | "nfs"
+            | "nfs4"
+            | "cifs"
+            | "smb3"
+            | "ceph"
+            | "glusterfs"
+            | "lustre"
+            | "beegfs"
+            | "gpfs"
+            | "orangefs"
+            | "pvfs2"
+            | "afs"
+            | "ncpfs"
+            | "coda"
+            | "davfs"
+            | "shfs"
+            | "9p"
+            | "virtiofs"
+            | "autofs"
+            | "devfs"
+            | "map"
+            | "smbfs"
+            | "webdav"
+            | "afpfs"
+    ) || file_system.starts_with("fuse")
+}
+
+fn push_filesystem_facts(facts: &mut Vec<MetricsLabeledFact>, disk: &sysinfo::Disk) {
+    facts.extend(filesystem_facts(
+        &disk.mount_point().to_string_lossy(),
+        &disk.file_system().to_string_lossy(),
+        disk.total_space(),
+        disk.available_space(),
+    ));
+}
+
+fn filesystem_facts(
+    mount: &str,
+    file_system: &str,
+    total: u64,
+    available: u64,
+) -> Vec<MetricsLabeledFact> {
+    let available = available.min(total);
+    let used = total.saturating_sub(available);
+    let usage_percent = if total == 0 {
+        0.0
+    } else {
+        used as f64 / total as f64 * 100.0
+    };
+    let mut labels = vec![StringKeyValue::new("mount", mount)];
+    if !file_system.is_empty() {
+        labels.push(StringKeyValue::new("fstype", file_system));
+    }
+    vec![
+        MetricsLabeledFact {
+            key: "host.filesystem.usage_percent".to_string(),
+            value: usage_percent.to_string(),
+            labels: labels.clone(),
+        },
+        MetricsLabeledFact {
+            key: "host.filesystem.total_kb".to_string(),
+            value: (total / 1024).to_string(),
+            labels: labels.clone(),
+        },
+        MetricsLabeledFact {
+            key: "host.filesystem.available_kb".to_string(),
+            value: (available / 1024).to_string(),
+            labels,
+        },
+    ]
 }
 
 fn push_fact_if_absent(facts: &mut Vec<StringKeyValue>, candidate: StringKeyValue) {
@@ -434,6 +800,7 @@ fn maybe_push_sample(
         resource_ref: target.resource_ref.clone(),
         execution_hints: target.execution_hints.clone(),
         runtime_facts: Vec::new(),
+        labeled_facts: Vec::new(),
     });
 }
 
@@ -446,6 +813,7 @@ fn probe_process_target(target: &MetricsTargetViewEntry) -> MetricsCollectionTar
         resource_ref: target.resource_ref.clone(),
         execution_hints: target.execution_hints.clone(),
         runtime_facts: Vec::new(),
+        labeled_facts: Vec::new(),
     };
 
     let Some(pid) = target
@@ -480,6 +848,7 @@ fn probe_container_target(target: &MetricsTargetViewEntry) -> MetricsCollectionT
         resource_ref: target.resource_ref.clone(),
         execution_hints: target.execution_hints.clone(),
         runtime_facts: Vec::new(),
+        labeled_facts: Vec::new(),
     };
 
     let mut facts = Vec::new();
@@ -793,6 +1162,7 @@ mod tests {
                     failed_targets: 0,
                     last_error: None,
                     runtime_facts: Vec::new(),
+                    labeled_facts: Vec::new(),
                     sample_targets: Vec::new(),
                 },
                 super::MetricsCollectionOutcome {
@@ -803,6 +1173,7 @@ mod tests {
                     failed_targets: 0,
                     last_error: None,
                     runtime_facts: Vec::new(),
+                    labeled_facts: Vec::new(),
                     sample_targets: Vec::new(),
                 },
                 super::MetricsCollectionOutcome {
@@ -813,6 +1184,7 @@ mod tests {
                     failed_targets: 0,
                     last_error: None,
                     runtime_facts: Vec::new(),
+                    labeled_facts: Vec::new(),
                     sample_targets: Vec::new(),
                 },
             ],
@@ -961,7 +1333,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_host_runtime_facts_are_collected() {
-        let facts = super::collect_host_runtime_facts(&[]);
+        let facts = super::collect_host_runtime_facts(&[]).facts;
         let fact_value = |key: &str| {
             facts
                 .iter()
@@ -996,7 +1368,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn host_disk_runtime_facts_are_collected() {
-        let facts = super::collect_host_runtime_facts(&[]);
+        let facts = super::collect_host_runtime_facts(&[]).facts;
         let fact_value = |key: &str| {
             facts
                 .iter()
@@ -1021,5 +1393,244 @@ mod tests {
             available >= 0,
             "available disk should be non-negative, got {available}"
         );
+
+        // Linux 额外提供系统盘 / 数据盘两个显式角色；兼容键等同系统盘。
+        #[cfg(target_os = "linux")]
+        {
+            let system_usage = fact_value("host.disk.system.usage_percent")
+                .expect("host.disk.system.usage_percent");
+            assert_eq!(
+                system_usage,
+                fact_value("host.disk.usage_percent").expect("host.disk.usage_percent")
+            );
+            let system_total =
+                fact_value("host.disk.system.total_kb").expect("host.disk.system.total_kb");
+            assert_eq!(
+                system_total,
+                fact_value("host.disk.total_kb").expect("host.disk.total_kb")
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn host_filesystem_runtime_facts_carry_mount_labels() {
+        let collected = super::collect_host_runtime_facts(&[]);
+        let usage = collected
+            .labeled_facts
+            .iter()
+            .find(|fact| fact.key == "host.filesystem.usage_percent")
+            .expect("host.filesystem.usage_percent");
+        let mount = usage
+            .labels
+            .iter()
+            .find(|label| label.key == "mount")
+            .expect("mount label");
+        let fstype = usage
+            .labels
+            .iter()
+            .find(|label| label.key == "fstype")
+            .expect("fstype label");
+        assert!(!mount.value.is_empty());
+        assert!(!fstype.value.is_empty());
+        let usage: f64 = usage.value.parse().expect("usage should parse as f64");
+        assert!(
+            (0.0..=100.0).contains(&usage),
+            "usage should be 0..=100, got {usage}"
+        );
+
+        #[cfg(target_os = "linux")]
+        assert!(
+            collected
+                .labeled_facts
+                .iter()
+                .any(|fact| fact.key == "host.filesystem.usage_percent"
+                    && fact
+                        .labels
+                        .iter()
+                        .any(|label| label.key == "mount" && label.value == "/")),
+            "root filesystem should be collected on Linux"
+        );
+    }
+
+    #[test]
+    fn host_provider_carries_labeled_facts_to_outcome_and_sample_targets() {
+        use super::MetricProvider;
+
+        let target = MetricsTargetViewEntry {
+            candidate_id: "host-1:host:host_metrics".to_string(),
+            collection_kind: "host_metrics".to_string(),
+            target_ref: "host-1:host".to_string(),
+            resource_ref: "host-1".to_string(),
+            execution_hints: vec![StringKeyValue::new("host.name", "host-a")],
+        };
+
+        let outcome = super::HostMetricsProvider.collect(vec![&target]);
+
+        assert_eq!(outcome.status, "succeeded");
+        assert!(
+            outcome
+                .labeled_facts
+                .iter()
+                .any(|fact| fact.key == "host.filesystem.usage_percent"),
+            "outcome should carry filesystem facts"
+        );
+        assert_eq!(outcome.sample_targets.len(), 1);
+        assert_eq!(
+            outcome.sample_targets[0].labeled_facts,
+            outcome.labeled_facts
+        );
+    }
+
+    #[test]
+    fn disk_capacity_facts_derive_usage_from_total_and_available() {
+        let mut facts = Vec::new();
+        super::push_disk_capacity_facts(&mut facts, "data.", 4096, 1024);
+        let value = |key: &str| {
+            facts
+                .iter()
+                .find(|fact| fact.key == key)
+                .map(|fact| fact.value.as_str())
+        };
+
+        assert_eq!(value("host.disk.data.usage_percent"), Some("75"));
+        assert_eq!(value("host.disk.data.total_kb"), Some("4"));
+        assert_eq!(value("host.disk.data.available_kb"), Some("1"));
+    }
+
+    #[test]
+    fn linux_data_mounts_exclude_system_and_virtual_filesystems() {
+        let is_data = super::is_linux_data_mount_point;
+
+        assert!(is_data("/data", "ext4", 100));
+        assert!(is_data("/home", "xfs", 100));
+        assert!(is_data("/var/lib/docker", "ext4", 100));
+
+        assert!(!is_data("/", "ext4", 100));
+        assert!(!is_data("/boot", "ext4", 100));
+        assert!(!is_data("/boot/efi", "vfat", 100));
+        assert!(!is_data("/run/media/u/disk", "ext4", 100));
+        assert!(!is_data("/sys/fs/cgroup", "cgroup2", 100));
+        assert!(!is_data("/proc", "proc", 100));
+        assert!(!is_data("/data", "overlay", 100));
+        assert!(!is_data("/data", "fuse.sshfs", 100));
+        assert!(!is_data("/data", "nfs", 100));
+        assert!(!is_data("/data", "ceph", 100));
+        assert!(!is_data("/data", "tmpfs", 100));
+        assert!(!is_data("/data", "ext4", 0));
+    }
+
+    #[test]
+    fn linux_filesystem_mount_filter_excludes_virtual_and_network_mounts() {
+        let include = super::is_linux_filesystem_mount_point;
+
+        assert!(include("/", "ext4", 100));
+        assert!(include("/data", "xfs", 100));
+        assert!(include("/var/lib/docker", "ext4", 100));
+        assert!(include("/data", "zfs", 100));
+
+        assert!(!include("/boot", "ext4", 100));
+        assert!(!include("/boot/efi", "vfat", 100));
+        assert!(!include("/run", "tmpfs", 100));
+        assert!(!include("/run/media/u/disk", "ext4", 100));
+        assert!(!include("/sys/fs/cgroup", "cgroup2", 100));
+        assert!(!include("/proc", "proc", 100));
+        assert!(!include("/dev/shm", "tmpfs", 100));
+        assert!(!include("/data", "overlay", 100));
+        assert!(!include("/data", "squashfs", 100));
+        assert!(!include("/data", "fuse.sshfs", 100));
+        assert!(!include("/data", "nfs4", 100));
+        assert!(!include("/data", "ceph", 100));
+        assert!(!include("/data", "lustre", 100));
+        assert!(!include("/data", "virtiofs", 100));
+        assert!(!include("/data", "ext4", 0));
+    }
+
+    #[test]
+    fn macos_filesystem_mount_filter_keeps_data_and_local_volumes() {
+        let include = super::is_macos_filesystem_mount_point;
+
+        assert!(include("/", "apfs", 100));
+        assert!(include("/System/Volumes/Data", "apfs", 100));
+        assert!(include("/Volumes/Backup", "apfs", 100));
+        assert!(include("/Volumes/USB", "exfat", 100));
+        assert!(include("/Volumes/Installer", "hfs", 100));
+
+        assert!(!include("/System/Volumes/Preboot", "apfs", 100));
+        assert!(!include("/System/Volumes/VM", "apfs", 100));
+        assert!(!include("/Volumes/net", "smbfs", 100));
+        assert!(!include("/Volumes/net", "nfs", 100));
+        assert!(!include("/Volumes/net", "webdav", 100));
+        assert!(!include("/Volumes/net", "afpfs", 100));
+        assert!(!include("/private/var/vm", "apfs", 100));
+        assert!(!include("/Volumes/Backup", "apfs", 0));
+    }
+
+    #[test]
+    fn filesystem_facts_use_kib_and_mount_labels() {
+        let facts = super::filesystem_facts("/var", "xfs", 4096, 1024);
+        assert_eq!(facts.len(), 3);
+        let value = |key: &str| {
+            facts
+                .iter()
+                .find(|fact| fact.key == key)
+                .map(|fact| fact.value.as_str())
+        };
+
+        assert_eq!(value("host.filesystem.usage_percent"), Some("75"));
+        assert_eq!(value("host.filesystem.total_kb"), Some("4"));
+        assert_eq!(value("host.filesystem.available_kb"), Some("1"));
+        for fact in &facts {
+            assert!(
+                fact.labels
+                    .iter()
+                    .any(|label| label.key == "mount" && label.value == "/var")
+            );
+            assert!(
+                fact.labels
+                    .iter()
+                    .any(|label| label.key == "fstype" && label.value == "xfs")
+            );
+        }
+    }
+
+    #[test]
+    fn filesystem_dedupe_key_groups_bind_mounts_by_device() {
+        assert_eq!(
+            super::filesystem_dedupe_key("/dev/sda1", "/data"),
+            super::filesystem_dedupe_key("/dev/sda1", "/mnt/data")
+        );
+        assert_ne!(
+            super::filesystem_dedupe_key("", "/data"),
+            super::filesystem_dedupe_key("", "/mnt/data")
+        );
+        assert_eq!(
+            super::filesystem_dedupe_key("", "/data"),
+            "mount:/data".to_string()
+        );
+    }
+
+    #[test]
+    fn filesystem_facts_skip_empty_fstype_label() {
+        let facts = super::filesystem_facts("/data", "", 100, 50);
+        assert!(
+            facts
+                .iter()
+                .all(|fact| fact.labels.iter().all(|label| label.key != "fstype"))
+        );
+    }
+
+    #[test]
+    fn filesystem_facts_clamp_available_to_total() {
+        let facts = super::filesystem_facts("/", "ext4", 100, 200);
+        let value = |key: &str| {
+            facts
+                .iter()
+                .find(|fact| fact.key == key)
+                .map(|fact| fact.value.as_str())
+        };
+
+        assert_eq!(value("host.filesystem.usage_percent"), Some("0"));
+        assert_eq!(value("host.filesystem.available_kb"), Some("0"));
     }
 }

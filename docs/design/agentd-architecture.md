@@ -87,6 +87,8 @@
 
 > 实现对齐：`wist-agentd` 当前尚未完全按本表收敛（如 standalone 下 `[telemetry.logs]` 的本地 file 输出
 > 与部分 discovery 默认值仍可能开启）；实现侧需按本表逐项落地并在 `agent-config-schema.md` 同步约束。
+> 逐项核对清单（判据 / 验收方式 / 现状）见
+> [`standalone-convergence-checklist.md`](../../../../wist-design/doc/design/foundation/standalone-convergence-checklist.md)。
 
 ---
 

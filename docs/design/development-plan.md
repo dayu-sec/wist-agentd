@@ -143,6 +143,14 @@ flowchart LR
     **进程 CPU 的 user/system 累计 ticks 暂不实现**（sysinfo 只有总量/百分比，不做拆分）。
   - disk：`Disks`；macOS 先选 `/System/Volumes/Data`（APFS 数据卷）再回退 `/`
     （`/` 在 macOS 只反映封存系统卷，非用户数据）；`usage = (total − available) / total`。
+  - disk（Linux 细化）：拆成 `system`（根文件系统 `/`，即系统盘）与 `data`（其余本地块设备挂载点，
+    即数据盘；多块汇总、同一设备 bind mount 只算一次）两个角色，各自产出
+    `system.disk.{system,data}.{usage,total,available}`。原 `system.disk.*` 保留为系统盘，兼容旧消费方。
+    排除 `/boot`、`/run`、`/sys`、`/proc`、`/dev`、`overlay`/`fuse` 等系统或虚拟挂载。
+  - **逐挂载点容量（主指标）**：`host.filesystem.{usage_percent,total_kb,available_kb}`，
+    带 `mount`/`fstype` 标签，映射为 `system.filesystem.{usage,total,available}`；
+    Linux/macOS 各自过滤本地挂载点，网络/虚拟/临时挂载排除。上面的 `system`/`data` 仅作兼容汇总。
+    完整方案见 `wist-design/doc/design/edge/disk-capacity-collection.md`。
   - 实测：macOS P0 实例（host 1 + process ~1044 目标）在 VM 可查到上述 series。
 
 ### W4 指标扩展机制（设计 + 落地）

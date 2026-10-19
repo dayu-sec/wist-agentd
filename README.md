@@ -26,7 +26,7 @@ host/process metrics, and reports status, health, and execution results back ups
 - **指标采样** — 主机与进程运行时指标。
 - **注册（Enrollment）** — 向控制面注册并轮换凭据。
 - **上报与自观测** — 聚合执行结果，输出健康/状态快照。
-- **运行模式** — `standalone`（无控制面）与 `managed`。
+- **运行模式** — `standalone`（无控制面：不采集、不缓冲、不上送，只保留本地执行与状态机）与 `managed`。
 
 ### 组件关系
 
@@ -123,7 +123,7 @@ wist-agentd --config-dir /etc/wist-agentd
 - **Enrollment** — registers with the control plane and rotates credentials.
 - **Reporting & self-observability** — aggregates execution results and emits health/state
   snapshots.
-- **Run modes** — `standalone` (no control plane) and `managed`.
+- **Run modes** — `standalone` (no control plane: no collection, buffering, or uplink; local execution and state machine only) and `managed`.
 - **Self-diagnosis** — `wist-agentd diagnose` probes config / identity / service /
   connectivity / uplink, prints per-check hints, and exits nonzero when anything FAILs.
 

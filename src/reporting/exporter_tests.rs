@@ -233,6 +233,7 @@ fn export_metrics_writes_flattened_samples() {
         failed_targets: 0,
         last_error: None,
         runtime_facts: vec![],
+        labeled_facts: Vec::new(),
         sample_targets: vec![MetricsCollectionTargetSample {
             candidate_id: "host-1".to_string(),
             target_ref: "host-1:host".to_string(),
@@ -241,6 +242,7 @@ fn export_metrics_writes_flattened_samples() {
             resource_ref: "host-1".to_string(),
             execution_hints: vec![],
             runtime_facts: vec![StringKeyValue::new("host.uptime.seconds", "42")],
+            labeled_facts: Vec::new(),
         }],
     };
     let runtime_snapshot = MetricsRuntimeSnapshot {

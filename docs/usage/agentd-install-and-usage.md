@@ -254,7 +254,7 @@ defaults to /var/lib/wist-agentd, logs to /var/log/wist-agentd (declare [paths] 
 # instance_name = "host-01"           # 留空则自动生成
 
 [control_plane]
-enabled = true                        # false = standalone（不连控制面）
+enabled = true                        # false = standalone（不连控制面；不采集 / 不缓冲 / 不上送）
 endpoint = "https://10.0.1.1"
 # enrollment_token 不走配置，见 §4.5（命令行传入）
 

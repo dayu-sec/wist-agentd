@@ -3,6 +3,26 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.6.0-alpha] - 2026-10-19
+
+### 新增
+
+- **主机磁盘容量按挂载点采集**：新增 `host.filesystem.{usage_percent,total_kb,available_kb}`，
+  带 `mount` / `fstype` 标签，规范化成 `system.filesystem.{usage,total,available}`。
+  - Linux 排除引导/运行期/虚拟/网络挂载；macOS 计入 Data 卷与本地 `/Volumes/*`，
+    排除其它 `/System/Volumes/*` 与网络卷。
+  - 同一文件系统被 bind mount 到多个路径时只报一次；旧 `host.disk.*` 保留兼容。
+- 指标样本 / VM line 支持 `labels`，数据面可按 `mount` / `fstype` 透传。
+
+### 变更（依赖）
+
+- 对齐 `wist-metrics 0.5`；发布顺序：先发 `wist-metrics 0.5.0`，再发本版。
+
+### 文档
+
+- 明确 `standalone`（`control_plane.enabled = false`）不采集、不缓冲、不上送；
+  file input 与 discovery 只在 `managed` 下运行。
+
 ## [0.5.0] - 2026-10-18
 
 ### 新增

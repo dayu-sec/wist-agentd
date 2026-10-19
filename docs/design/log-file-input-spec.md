@@ -58,7 +58,7 @@
 
 实施阶段边界固定为：
 
-- `M4` 实现其受控子集，用于先验证 `standalone` 替代切片
+- `M4` 实现其受控子集，用于在 `managed` 下验证数据面替代切片（`standalone` 不运行数据面）
 - `M4` 的实现边界收敛为：
   - 显式单路径输入（`input_id` + `path`），而不是通用 `path_patterns[]` 发现模型
   - 最小 `parser / multiline / checkpoint / rotate / truncate / restart recovery` 链路
@@ -107,7 +107,7 @@
 - record 自带来源定位字段（`source_path` / `file_offset` / `file_offset_end`）与归属字段 `input_id`，不依赖后置 filter 拼装
 - 交付语义显式：per-`agent` 全局 `seq` + at-least-once（见 §10.1.1）
 - spool 超限是显式的「暂停采集 + 工作状态通知」状态，而不是静默丢弃
-- `standalone` / `managed` 模式下行为一致
+- 仅在 `managed` 模式下运行；`standalone`（无网关）下不采集、不缓冲、不上送
 
 ---
 
@@ -562,11 +562,11 @@ record 的可读内容是 `body`（原文）加来源定位字段
 
 `M4` 只按受控子集验收，不以完整通用 `file input` 为交付门：
 
-1. 在 `control_plane.enabled = false` 时，能稳定读取一个显式配置的文件路径。
+1. 在 `control_plane.enabled = true`（`managed`）时，能稳定读取一个显式配置的文件路径。
 2. 能在 restart 后基于已提交 checkpoint 恢复，并满足 at-least-once。
 3. 能正确处理 append、rename-rotate、truncate 与最小 multiline 基线。
 4. 能把 `input_id`、`source_path`、`file_offset`、`file_offset_end` 与 `seq` 稳定挂入 `TelemetryRecord`。
-5. 能通过 `warp-parse` 或本地 fallback 输出，验证至少一类 `standalone` 替代链路。
+5. 能通过 `warp-parse` 或本地 fallback 输出，验证至少一类 `managed` 数据面替代链路。
 6. 单 input 只对应一个显式路径，且不提供事件驱动 watcher 与多路径发现（见 §5.1）。
 
 ---
@@ -575,11 +575,13 @@ record 的可读内容是 `body`（原文）加来源定位字段
 
 当前阶段固定以下结论：
 
+- **运行模式边界（2026-10-18 定）**：`standalone`（无网关）不采集、不缓冲、不上送；
+  本文描述的 file input 只在 `managed` 下运行
 - 文件日志输入必须进入 `wist-agentd` 第一版 logs 设计范围
 - 其目标是对标 Fluent Bit `tail`，不是依赖 Fluent Bit
 - 配置、checkpoint、rotate、multiline、budget 必须一起设计，不能拆成零散补丁
 - `file.tail` 不能替代常驻文件日志采集
-- `M4` 先落受控单路径替代切片（单 `input_id` + 单 `path`，轮询 tick 驱动，见 §5.1）
+- `M4` 先落受控单路径替代切片（`managed`，单 `input_id` + 单 `path`，轮询 tick 驱动，见 §5.1）
 - **长行策略**固定为“截断提交 + 计数”（`max_line_bytes`，默认 1 MiB，见 §6.3）
 - **spool 有上限，超限策略**固定为“暂停采集 + 工作状态通知”（保完整，见 §6.4/§11）；`drop_oldest` 为未来备选（v1 校验只接受 `pause`）
 - **交付语义**为 at-least-once（可能重复、不丢）：spool 接纳成功即推进 checkpoint；去重采用 per-`agent` 全局
