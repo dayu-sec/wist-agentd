@@ -745,9 +745,9 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "orion-error"
-version = "0.8.2"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbe9152fc994472b27b45759c8a9206fe133363c6a53a1d5164e7cefaf4baf43"
+checksum = "575552089359a03595b39776384dac800d02938e8821eadf2b57ccef28477044"
 dependencies = [
  "log",
  "orion-error-derive",
@@ -759,13 +759,13 @@ dependencies = [
 
 [[package]]
 name = "orion-error-derive"
-version = "0.8.2"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c65661e12ef3a6bccf07c117c222c8d97339ba8170367463f137f635ab20b81"
+checksum = "e9864158ef9ac77e9540459781704e6706080bc3f795e7be2fbb8947b6d5e3dc"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.5",
 ]
 
 [[package]]
