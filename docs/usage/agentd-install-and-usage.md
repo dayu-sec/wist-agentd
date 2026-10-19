@@ -551,7 +551,7 @@ wist-agentd diagnose --json        # 机器可读：checks[].id/status/hint + su
 wist-agentd diagnose --offline     # 不碰网络，只查本机配置/身份/服务/落点
 ```
 
-先看**第一条 FAIL**（`结论` 行点了它的名字），再读该项的 `→` 提示（断点已分层：DNS → TCP → TLS/HTTP/鉴权）。
+先看**第一条 FAIL**（`结论` 行点了它的名字），再读该项的 `→` 提示（断点已分层：DNS → TCP → TLS（证书主机名/信任） → HTTP/鉴权）。
 再对照下表看具体现象：
 
 | 现象 | 原因 / 处理 |
@@ -568,6 +568,7 @@ wist-agentd diagnose --offline     # 不碰网络，只查本机配置/身份/�
 | 不确定数据写到哪了 | 看启动行的 `run_dir= / state_dir= / log_dir=`（解析后的绝对路径），或 `wist-agentd service status` 的 `root_dir/run_dir/state_dir/log_dir` |
 | 想确认跑的是哪份配置/版本 | 启动行 `wist-agentd <version> starting: config=... mode=...`；`wist-agentd service status` 看 `config=` |
 | `diagnose` 报 `network.tcp` FAIL（TCP 连不上 `host:443`） | endpoint 不写端口时按 **443** 连，网关可能发布在别的端口（如 3000）。`config.control_plane` 那项会打出**推导出的 `host:port`**；改 endpoint 为 `https://<域名>:<端口>`（或让网关监听 443） |
+| `diagnose` 报 `network.tls_cert` FAIL（控制面证书不含 endpoint 主机名） | 网关叶证书是给**另一个主机名**签的（换域名、共享 `identity/` 被另一条部署路径重签、反代 SNI 不对）。dev 栈用 `./dev/setup-domain.sh <域名>` 重签（复用 CA，agent 无需重装）；发布栈把 `WEB_DOMAIN` 设成 endpoint 主机名后跑 `gops sys localize`。也可以把 endpoint 改到证书 SAN 里的主机名；detail 里会打出证书的 `subject` 与 `SAN` |
 | `diagnose` 报 `network.control_plane` FAIL 且提到 TLS/证书 | 网关是自签/私有 CA，但本机没配信任锚。把网关 CA 写进 `[control_plane] trust_bundle`（安装脚本会自动填；**公有 CA 的网关不需要**，没配 trust_bundle 不算问题） |
 | `diagnose` 报 `identity.terminal` FAIL | 守护进程停在**凭据终态**（被网关明确拒了），已停发控制面请求 —— 这就是「机器哑了好几天没人知道」的形态。按 hint 里的 code 处置（被拒名单 → 先在网关解除；证书身份对不上 → 用一次性 token 重注册）。**一般不需要重装**：守护进程每 5 分钟会自己重试一次，网关一恢复接受即自动清除终态 |
 | `diagnose` 报 `uplink.effective` WARN，标题是「待命」 | 网关按「有生效工作 **或** 上送开关打开」且「有上送目标」现算授权，任一条不成立都是待命。到管理面查两处：①「Gateway 信息 → 数据面上送地址与开关」—— 目标在不在、开关开没开；②「采集工作」页 —— 这台有没有派工。补上任一条后下一个上报周期（≤30s）自动开始上送。注意 detail 里那个 `addr` 是**本机配置**的，待命期不生效 |

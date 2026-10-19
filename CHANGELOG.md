@@ -3,6 +3,17 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.7.0-alpha] - 2026-10-19
+
+### 新增
+
+- **`diagnose` 新增控制面证书主机名检查**：`network.tls_cert` 只读地开一次 TLS 握手，读取网关
+  叶证书的 `subject` / `SAN` 并与 endpoint 主机名比对（支持 DNS、通配符与 IP SAN）。
+  主机名不匹配时直接 FAIL 并给出重签提示，不再只表现为一句 `transport error`（换域名、
+  共享 `identity/` 被另一条部署路径重签、反代 SNI 不对都会命中）。
+  取不到证书时**不额外报项**（避免把“网关要求客户端证书”误报成故障），真正结论仍由
+  `network.control_plane` 给出。
+
 ## [0.6.0-alpha] - 2026-10-19
 
 ### 新增

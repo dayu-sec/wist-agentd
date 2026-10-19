@@ -12,17 +12,24 @@
 //! 1. **复用守护进程同款判定**：生效的上送输出用 [`effective_output`]、
 //!    控制面探测用 [`fetch_uplink_grant`] —— 所以「`diagnose` 说通」与「守护进程能通」是同一套规则，
 //!    不会出现工具说一套、进程做一套；
-//! 2. **分层报错**：DNS → TCP → TLS/HTTP/鉴权 逐层报，断在哪层就说哪层（这正是「端口不对」与
-//!    「证书不受信」的区别所在），并给出该改哪里；
+//! 2. **分层报错**：DNS → TCP → TLS（证书主机名）→ HTTP/鉴权 逐层报，断在哪层就说哪层（这正是「端口不对」与
+//!    「证书主机名不对」的区别所在），并给出该改哪里；
 //! 3. **只读**：不发心跳（不改网关状态）、不改配置、不建目录；唯一副作用是 `paths.writable`
 //!    会临时建/删一个空探针文件。`--offline` 跳过网络探测，但**本地能得出的结论**
 //!    （生效输出 / spool / 本地工作）照常报。
 
 use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Write as _};
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::CryptoProvider;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
+use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::config::agent_config::AgentConfig;
 use wist_api::uplink::AgentUplinkGrant;
@@ -974,6 +981,17 @@ async fn network_checks(config: &AgentConfig) -> (Vec<Check>, Option<AgentUplink
         }
     }
 
+    // 域名不匹配是常见现场问题：证书链、端口都对，只是叶证书是给另一个域名签的。
+    // 这一项单独报，避免它只以「transport error」的形式藏在实际请求的失败里。
+    // 拿不到证书（握手失败）时不报：那属于 `network.control_plane` 的结论，
+    // 在这里再报一条 WARN 会把「网关要求客户端证书」这类正常配置误报成问题。
+    let tls_mode = effective_tls_mode(config.control_plane.tls_mode.as_deref(), endpoint);
+    if matches!(tls_mode.as_str(), "https" | "verify")
+        && let Some(check) = tls_certificate_check(&target, &addrs).await
+    {
+        checks.push(check);
+    }
+
     // 应用层：复用守护进程那句「拉一次上送授权」——它自带证书校验/鉴权/超时的同一套判定。
     let fetch = fetch_uplink_grant(config).await;
     let (check, grant) = classify_control_plane_probe(fetch);
@@ -1424,6 +1442,239 @@ async fn connect_tcp(addrs: &[SocketAddr]) -> Result<SocketAddr, String> {
     Err(last)
 }
 
+/// 控制面证书的域名自检：只读地开一次 TLS 握手，把对端叶证书的 SAN 与 endpoint 主机名对一遍。
+///
+/// 为什么单列一项：证书链是对的可信任锚也对，但叶证书是给**另一个域名**签的 —— 这时
+/// 真实请求只会得到一句 `transport error`（rustls 的 `NotValidForName`），从日志里很难
+/// 看出是「域名不对」。网关与 agent 共享同一份站点身份，重签叶证书时漏掉 endpoint 域名
+/// 是常见现场问题（换域名、跑错部署路径、前面加了反代）。
+///
+/// 刻意不借助 reqwest：它拿不到对端证书。这里用一个「接受任意证书」的校验器，只为把证书
+/// 读出来做域名判断；**信任链仍由 `network.control_plane` 那次真实请求负责**，本项不重复判。
+///
+/// 返回 `None` = 握手没完成、取不到证书（含服务端要求客户端证书的情形）：这时不额外报一项，
+/// 避免把正常的 mTLS 配置误报成故障 —— 真正的结论由 `network.control_plane` 给出。
+async fn tls_certificate_check(target: &EndpointTarget, addrs: &[SocketAddr]) -> Option<Check> {
+    let der = fetch_presented_certificate(target, addrs).await.ok()?;
+    Some(match presented_certificate(&der) {
+        Ok(cert) => classify_presented_certificate(&target.host, &cert),
+        Err(err) => Check::warn(
+            "network.tls_cert",
+            "控制面证书解析失败",
+            format!("{}:{}：{err}", target.host, target.port),
+        )
+        .hint("服务端返回的不是可解析的 X.509 叶证书；检查网关的 TLS 配置"),
+    })
+}
+
+/// 取对端叶证书 DER。逐个试解析出的地址，任何一个握手成功即可。
+async fn fetch_presented_certificate(
+    target: &EndpointTarget,
+    addrs: &[SocketAddr],
+) -> Result<CertificateDer<'static>, String> {
+    let provider = CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
+    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|err| format!("TLS 配置失败：{err}"))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(CertificateCapture { provider }))
+        .with_no_client_auth();
+    let server_name = ServerName::try_from(target.host.clone())
+        .map_err(|err| format!("endpoint 主机名不能用于 TLS：{err}"))?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+
+    let mut last = String::from("没有可用地址");
+    for addr in addrs {
+        let stream =
+            match tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(addr)).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(err)) => {
+                    last = err.to_string();
+                    continue;
+                }
+                Err(_) => {
+                    last = format!("连接 {addr} 超时（{}s）", PROBE_TIMEOUT.as_secs());
+                    continue;
+                }
+            };
+        match tokio::time::timeout(
+            PROBE_TIMEOUT,
+            connector.connect(server_name.clone(), stream),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => {
+                let (_, conn) = stream.get_ref();
+                return conn
+                    .peer_certificates()
+                    .and_then(|chain| chain.first())
+                    .cloned()
+                    .ok_or_else(|| "TLS 握手成功但服务端没有出示证书".to_string());
+            }
+            Ok(Err(err)) => last = err.to_string(),
+            Err(_) => {
+                last = format!("TLS 握手 {addr} 超时（{}s）", PROBE_TIMEOUT.as_secs());
+            }
+        }
+    }
+    Err(last)
+}
+
+/// 只为读取证书而存在的校验器：**不做任何信任判断**（那是真实请求的事）。
+#[derive(Debug)]
+struct CertificateCapture {
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for CertificateCapture {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// 从叶证书里取出域名判断要用的信息（只保留 DNS / IP 两类 SAN）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PresentedCertificate {
+    subject: String,
+    dns_names: Vec<String>,
+    ip_addresses: Vec<String>,
+}
+
+fn presented_certificate(der: &CertificateDer<'_>) -> Result<PresentedCertificate, String> {
+    let (_, certificate) = X509Certificate::from_der(der.as_ref())
+        .map_err(|err| format!("不是可解析的 X.509 证书：{err}"))?;
+    let mut dns_names = Vec::new();
+    let mut ip_addresses = Vec::new();
+    if let Ok(Some(extension)) = certificate.subject_alternative_name() {
+        for name in &extension.value.general_names {
+            match name {
+                x509_parser::extensions::GeneralName::DNSName(name) => {
+                    dns_names.push((*name).to_string());
+                }
+                x509_parser::extensions::GeneralName::IPAddress(bytes) => {
+                    if let Some(ip) = ip_address_string(bytes) {
+                        ip_addresses.push(ip);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(PresentedCertificate {
+        subject: certificate.subject().to_string(),
+        dns_names,
+        ip_addresses,
+    })
+}
+
+fn ip_address_string(bytes: &[u8]) -> Option<String> {
+    match bytes.len() {
+        4 => Some(std::net::Ipv4Addr::from(<[u8; 4]>::try_from(bytes).ok()?).to_string()),
+        16 => Some(std::net::Ipv6Addr::from(<[u8; 16]>::try_from(bytes).ok()?).to_string()),
+        _ => None,
+    }
+}
+
+/// endpoint 的主机名是否被证书覆盖；证书信息原样写进 detail，便于一眼看出「签给了谁」。
+fn classify_presented_certificate(host: &str, certificate: &PresentedCertificate) -> Check {
+    let san = if certificate.dns_names.is_empty() && certificate.ip_addresses.is_empty() {
+        "（无 DNS/IP SAN）".to_string()
+    } else {
+        certificate
+            .dns_names
+            .iter()
+            .map(|name| format!("DNS:{name}"))
+            .chain(certificate.ip_addresses.iter().map(|ip| format!("IP:{ip}")))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let detail = format!("endpoint={host} subject={} SAN={san}", certificate.subject);
+    if certificate_covers_host(host, certificate) {
+        Check::ok(
+            "network.tls_cert",
+            format!("控制面证书包含 endpoint 主机名 {host}"),
+            detail,
+        )
+    } else {
+        Check::fail(
+            "network.tls_cert",
+            format!("控制面证书不包含 endpoint 主机名 {host}"),
+            detail,
+        )
+        .hint(
+            "网关叶证书是给别的主机名签的：dev 栈可用 `./dev/setup-domain.sh <域名>` 重签\
+             （复用 CA，agent 不用重装）；发布栈把 `WEB_DOMAIN` 设成 endpoint 主机名后跑\
+             `gops sys localize`。也可以把 endpoint 改成证书 SAN 里的主机名；\
+             前面有反代时确认 SNI 透传的是 endpoint 主机名",
+        )
+    }
+}
+
+fn certificate_covers_host(host: &str, certificate: &PresentedCertificate) -> bool {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return certificate
+            .ip_addresses
+            .iter()
+            .any(|candidate| candidate.parse::<IpAddr>().ok() == Some(ip));
+    }
+    certificate
+        .dns_names
+        .iter()
+        .any(|pattern| dns_name_matches(&host, pattern))
+}
+
+/// DNS SAN 匹配：大小写不敏感、忽略末尾点；`*.example.com` 只多吃一个最左标签。
+fn dns_name_matches(host: &str, pattern: &str) -> bool {
+    let pattern = pattern.trim().trim_end_matches('.').to_ascii_lowercase();
+    if pattern == host {
+        return true;
+    }
+    let Some(suffix) = pattern.strip_prefix("*.") else {
+        return false;
+    };
+    match host.split_once('.') {
+        Some((label, rest)) => !label.is_empty() && rest == suffix,
+        None => false,
+    }
+}
+
 /// 目标目录能不能写：**不新建目录**（说好只读就得真只读）。
 ///
 /// - 目录已存在 → 在其中建/删一个空探针文件，返回 `Ok(true)`；
@@ -1560,6 +1811,253 @@ mod tests {
         assert_eq!(effective_tls_mode(None, "http://gw"), "http");
         assert_eq!(effective_tls_mode(Some("none"), "https://gw"), "none");
         assert_eq!(effective_tls_mode(Some("  "), "https://gw"), "https");
+    }
+
+    #[test]
+    fn certificate_host_matching_handles_dns_wildcards_and_ips() {
+        let certificate = PresentedCertificate {
+            subject: "CN=gw.example.com".into(),
+            dns_names: vec![
+                "gw.example.com".into(),
+                "*.dev.example.com".into(),
+                "MiXeD.Example.COM".into(),
+            ],
+            ip_addresses: vec!["127.0.0.1".into(), "::1".into()],
+        };
+
+        assert!(certificate_covers_host("gw.example.com", &certificate));
+        assert!(certificate_covers_host("GW.EXAMPLE.COM.", &certificate));
+        assert!(certificate_covers_host("mixed.example.com", &certificate));
+        // 通配符只吃一个最左标签。
+        assert!(certificate_covers_host("a.dev.example.com", &certificate));
+        assert!(!certificate_covers_host(
+            "a.b.dev.example.com",
+            &certificate
+        ));
+        assert!(!certificate_covers_host("dev.example.com", &certificate));
+        assert!(certificate_covers_host("127.0.0.1", &certificate));
+        assert!(!certificate_covers_host("127.0.0.2", &certificate));
+        assert!(certificate_covers_host("::1", &certificate));
+        assert!(!certificate_covers_host(
+            "c-dev01.test.gw.jingang.cloud",
+            &certificate
+        ));
+        assert!(dns_name_matches("a.dev.example.com", "*.DEV.example.com."));
+    }
+
+    #[test]
+    fn ip_address_string_ignores_non_ip_san_lengths() {
+        assert_eq!(
+            ip_address_string(&[127, 0, 0, 1]),
+            Some("127.0.0.1".to_string())
+        );
+        assert_eq!(ip_address_string(&[0; 5]), None);
+    }
+
+    #[test]
+    fn presented_certificate_reads_dns_and_ip_sans_from_der() {
+        let certified = rcgen::generate_simple_self_signed(vec![
+            "c-dev01.test.gw.jingang.cloud".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .expect("self-signed certificate");
+        let certificate = presented_certificate(certified.cert.der()).expect("parse certificate");
+
+        assert!(
+            certificate
+                .dns_names
+                .iter()
+                .any(|name| name == "c-dev01.test.gw.jingang.cloud")
+        );
+        assert!(certificate.ip_addresses.iter().any(|ip| ip == "127.0.0.1"));
+        assert!(certificate_covers_host(
+            "c-dev01.test.gw.jingang.cloud",
+            &certificate
+        ));
+    }
+
+    #[test]
+    fn presented_certificate_reads_ipv6_sans() {
+        let certified = rcgen::generate_simple_self_signed(vec!["::1".to_string()])
+            .expect("self-signed certificate");
+        let certificate = presented_certificate(certified.cert.der()).expect("parse certificate");
+
+        assert!(certificate.ip_addresses.iter().any(|ip| ip == "::1"));
+        assert!(certificate_covers_host("::1", &certificate));
+        assert!(!certificate_covers_host("127.0.0.1", &certificate));
+    }
+
+    #[test]
+    fn presented_certificate_rejects_non_x509_bytes() {
+        let der = CertificateDer::from(vec![0x30, 0x00]);
+        assert!(presented_certificate(&der).is_err());
+    }
+
+    #[test]
+    fn classifier_fails_a_certificate_without_dns_or_ip_san() {
+        let certificate = PresentedCertificate {
+            subject: "CN=gw.example.com".into(),
+            dns_names: Vec::new(),
+            ip_addresses: Vec::new(),
+        };
+        let check = classify_presented_certificate("gw.example.com", &certificate);
+        assert_eq!(check.status, Status::Fail);
+        assert!(
+            check.detail.contains("无 DNS/IP SAN"),
+            "no SAN must be visible in the detail: {}",
+            check.detail
+        );
+    }
+
+    /// 起一个只接受一次握手的本地 TLS 服务（证书由 rcgen 现造），用于端到端验证探针。
+    async fn spawn_test_tls_server(
+        subject_alt_names: Vec<String>,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        use rustls::pki_types::PrivateKeyDer;
+
+        if CryptoProvider::get_default().is_none() {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        }
+        let certified =
+            rcgen::generate_simple_self_signed(subject_alt_names).expect("self-signed certificate");
+        let key = PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![certified.cert.der().clone()], key)
+            .expect("server TLS config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let handle = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = acceptor.accept(stream).await;
+            }
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn tls_certificate_check_accepts_a_matching_server_certificate() {
+        let (addr, server) = spawn_test_tls_server(vec!["localhost".to_string()]).await;
+        let target = EndpointTarget {
+            host: "localhost".to_string(),
+            port: addr.port(),
+            port_explicit: true,
+        };
+
+        let check = tls_certificate_check(&target, &[addr])
+            .await
+            .expect("the probe must read the presented certificate");
+        assert_eq!(check.status, Status::Ok);
+        assert!(check.detail.contains("localhost"), "{}", check.detail);
+        assert!(check.hint.is_none());
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+    }
+
+    #[tokio::test]
+    async fn tls_certificate_check_matches_an_ip_san_and_skips_dead_addresses() {
+        let (addr, server) = spawn_test_tls_server(vec!["127.0.0.1".to_string()]).await;
+        let dead = {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind dead address");
+            let dead = listener.local_addr().expect("dead addr");
+            drop(listener);
+            dead
+        };
+        let target = EndpointTarget {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            port_explicit: true,
+        };
+
+        // 第一个地址已关闭：探针必须继续试下一个，而不是直接放弃。
+        let check = tls_certificate_check(&target, &[dead, addr])
+            .await
+            .expect("the probe must fall through to the live address");
+        assert_eq!(check.status, Status::Ok);
+        assert!(check.detail.contains("IP:127.0.0.1"), "{}", check.detail);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+    }
+
+    #[tokio::test]
+    async fn tls_certificate_check_fails_a_mismatching_server_certificate() {
+        let (addr, server) = spawn_test_tls_server(vec!["wrong.example.com".to_string()]).await;
+        let target = EndpointTarget {
+            host: "localhost".to_string(),
+            port: addr.port(),
+            port_explicit: true,
+        };
+
+        let check = tls_certificate_check(&target, &[addr])
+            .await
+            .expect("the probe must read the presented certificate");
+        assert_eq!(check.status, Status::Fail);
+        assert_eq!(check.id, "network.tls_cert");
+        assert!(
+            check.detail.contains("wrong.example.com"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("setup-domain.sh")),
+            "mismatch must point at the repair path"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+    }
+
+    #[tokio::test]
+    async fn tls_certificate_check_stays_silent_when_no_certificate_can_be_read() {
+        // 拿一个刚释放的回环端口：连接会立刻被拒 —— 探针不应再单独报一项 WARN，
+        // 否则「网关要求客户端证书」之类正常配置会被误报。
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener);
+        let target = EndpointTarget {
+            host: "localhost".to_string(),
+            port: addr.port(),
+            port_explicit: true,
+        };
+
+        assert!(
+            tls_certificate_check(&target, &[addr]).await.is_none(),
+            "an unreachable TLS peer must not add a check of its own"
+        );
+    }
+
+    #[test]
+    fn tls_certificate_mismatch_is_a_fail_with_actionable_hint() {
+        let certificate = PresentedCertificate {
+            subject: "CN=gw.example.com".into(),
+            dns_names: vec!["gw.example.com".into(), "localhost".into()],
+            ip_addresses: vec!["127.0.0.1".into()],
+        };
+
+        let check = classify_presented_certificate("c-dev01.test.gw.jingang.cloud", &certificate);
+        assert_eq!(check.status, Status::Fail);
+        assert_eq!(check.id, "network.tls_cert");
+        assert!(check.detail.contains("gw.example.com"), "{}", check.detail);
+        assert!(
+            check.detail.contains("c-dev01.test.gw.jingang.cloud"),
+            "{}",
+            check.detail
+        );
+        let hint = check
+            .hint
+            .as_deref()
+            .expect("mismatch must tell what to do");
+        assert!(hint.contains("setup-domain.sh"), "{hint}");
+
+        let ok = classify_presented_certificate("gw.example.com", &certificate);
+        assert_eq!(ok.status, Status::Ok);
+        assert!(ok.hint.is_none());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "wist-agentd"
-version = "0.6.0" #@gxl:set(version)
+version = "0.7.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -20,6 +20,10 @@ rcgen = "0.13"
 # 从本地证书读 `notAfter` 做**本地**过期自检（服务端在握手期就拒过期证书，给不出错误码）。
 x509-parser = "0.16"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+# diagnose 的证书主机名自检：reqwest 拿不到对端证书，所以单独开一次只读 TLS 握手把叶证书读出来。
+# 与网关共用同一套 rustls；不参与真实请求，真实信任判定仍由 `network.control_plane` 负责。
+rustls = "0.23"
+tokio-rustls = "0.26"
 # 注：不写 `webpki-roots` —— 0.13 里 TLS 根由 `rustls`（rustls-platform-verifier，系统根）决定；
 # 而 `webpki-roots` 只是可选依赖的隐式 feature（reqwest 源码并不引用它），0.13.5 已把它去掉，
 # 留着会把本仓**钉死在 0.13.1**（任何 forward 更新都解析失败）。
