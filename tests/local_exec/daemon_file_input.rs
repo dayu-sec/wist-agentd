@@ -77,6 +77,7 @@ fn granted_work_multiline(
                 kind: source_kind.to_string(),
                 target: source_target.to_string(),
                 multiline: multiline.to_string(),
+                exclude_globs: Vec::new(),
             }],
         }],
     };
@@ -724,15 +725,16 @@ fn daemon_run_once_uses_cached_metrics_snapshot_when_target_view_is_missing() {
 #[cfg(unix)]
 #[test]
 fn daemon_run_once_continues_when_one_file_input_fails() {
+    // 「失败」用**不存在的显式路径**：W1 起目录/glob 是合法目标，且无匹配不算失败，
+    // 所以目录不再能当这个用例的失败样本。
     let root = temp_dir("daemon-file-input-error-isolated");
     let run_dir = root.join("run");
     let state_dir = root.join("state");
     let log_dir = root.join("log");
     let good_input = root.join("good.log");
-    let bad_input = root.join("bad-dir");
+    let bad_input = root.join("missing-dir").join("bad.log");
     bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
     fs::write(&good_input, "good\n").expect("write good input");
-    fs::create_dir_all(&bad_input).expect("create bad input dir");
 
     let config = standalone_config_with_file_inputs(
         &root,
@@ -742,12 +744,14 @@ fn daemon_run_once_continues_when_one_file_input_fails() {
                 path: bad_input.display().to_string(),
                 startup_position: "head".to_string(),
                 multiline_mode: "none".to_string(),
+                exclude_globs: Vec::new(),
             },
             LogFileInputSection {
                 input_id: "good".to_string(),
                 path: good_input.display().to_string(),
                 startup_position: "head".to_string(),
                 multiline_mode: "none".to_string(),
+                exclude_globs: Vec::new(),
             },
         ],
     );
@@ -776,7 +780,72 @@ fn daemon_run_once_continues_when_one_file_input_fails() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].body, "good\n");
     assert_eq!(checkpoint.files.len(), 1);
+    // 失败的输入不产生采集任务：连 checkpoint 文件都不该建。
     assert!(!wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "bad").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_run_once_collects_a_file_family_glob_with_excludes() {
+    // W1 端到端：一条 glob 输入采目录里所有匹配的文件，`exclude_globs` 把它们剔掉，
+    // 同一个 input 的多份文件各有一条 checkpoint。
+    let root = temp_dir("daemon-file-family");
+    let run_dir = root.join("run");
+    let state_dir = root.join("state");
+    let log_dir = root.join("log");
+    let containers = root.join("containers");
+    bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
+    fs::create_dir_all(&containers).expect("create containers");
+    let first = containers.join("a.log");
+    let second = containers.join("b.log");
+    let skipped = containers.join("skip-me.log");
+    fs::write(&first, "a\n").expect("write a");
+    fs::write(&second, "b\n").expect("write b");
+    fs::write(&skipped, "skipped\n").expect("write skipped");
+
+    let config = standalone_config_with_file_inputs(
+        &root,
+        vec![LogFileInputSection {
+            input_id: "family".to_string(),
+            path: containers.join("*.log").display().to_string(),
+            startup_position: "head".to_string(),
+            multiline_mode: "none".to_string(),
+            exclude_globs: vec![containers.join("skip-*.log").display().to_string()],
+        }],
+    );
+    daemon::run_once(&daemon::DaemonLoop {
+        config: &config,
+        exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
+    })
+    .expect("daemon run once");
+
+    let output =
+        fs::read_to_string(root.join("log").join("wist-records.ndjson")).expect("read output");
+    let mut bodies: Vec<String> = output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<TelemetryRecord>(line)
+                .expect("parse telemetry record")
+                .body
+        })
+        .collect();
+    bodies.sort();
+    assert_eq!(bodies, vec!["a\n", "b\n"]);
+
+    let checkpoint_path = wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "family");
+    let checkpoint: TestLogCheckpointState = read_json(&checkpoint_path).expect("read checkpoint");
+    assert_eq!(checkpoint.files.len(), 2, "{:?}", checkpoint.files);
+    assert!(
+        checkpoint
+            .files
+            .iter()
+            .all(|entry| !entry.path.contains("skip-me")),
+        "{:?}",
+        checkpoint.files
+    );
 }
 
 #[cfg(unix)]
@@ -800,12 +869,14 @@ fn daemon_run_once_assigns_globally_monotonic_seq_across_inputs() {
                 path: input_a.display().to_string(),
                 startup_position: "head".to_string(),
                 multiline_mode: "none".to_string(),
+                exclude_globs: Vec::new(),
             },
             LogFileInputSection {
                 input_id: "b".to_string(),
                 path: input_b.display().to_string(),
                 startup_position: "head".to_string(),
                 multiline_mode: "none".to_string(),
+                exclude_globs: Vec::new(),
             },
         ],
     );
@@ -835,13 +906,13 @@ fn daemon_run_once_assigns_globally_monotonic_seq_across_inputs() {
 #[cfg(unix)]
 #[test]
 fn daemon_run_once_marks_active_when_only_file_input_fails() {
+    // 同上的样本口径：不存在的显式路径 = 采集失败（MissingInput），目录 = 合法文件族目标。
     let root = temp_dir("daemon-file-input-only-error");
     let run_dir = root.join("run");
     let state_dir = root.join("state");
     let log_dir = root.join("log");
-    let bad_input = root.join("bad-dir");
+    let bad_input = root.join("missing-dir").join("bad.log");
     bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
-    fs::create_dir_all(&bad_input).expect("create bad input dir");
 
     let config = standalone_config_with_file_inputs(
         &root,
@@ -850,6 +921,7 @@ fn daemon_run_once_marks_active_when_only_file_input_fails() {
             path: bad_input.display().to_string(),
             startup_position: "head".to_string(),
             multiline_mode: "none".to_string(),
+            exclude_globs: Vec::new(),
         }],
     );
     let snapshot = daemon::run_once(&daemon::DaemonLoop {
@@ -884,6 +956,7 @@ fn daemon_run_once_marks_active_when_configured_file_is_missing() {
             path: missing_input.display().to_string(),
             startup_position: "head".to_string(),
             multiline_mode: "none".to_string(),
+            exclude_globs: Vec::new(),
         }],
     );
     let snapshot = daemon::run_once(&daemon::DaemonLoop {
@@ -949,6 +1022,7 @@ fn daemon_run_once_replays_existing_spool_even_when_source_file_is_missing() {
             path: missing_input.display().to_string(),
             startup_position: "head".to_string(),
             multiline_mode: "none".to_string(),
+            exclude_globs: Vec::new(),
         }],
     );
     let snapshot = daemon::run_once(&daemon::DaemonLoop {

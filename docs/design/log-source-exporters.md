@@ -153,6 +153,12 @@ target = "<id>"                 # 无参
 
 - **通配/目录型 + 运行中新发现文件起始位置**（`discovered_file_position`）：解锁 `crash-panic`（coredump）、`database-service`、`backup-job`、`network-service`、`compute-workload` 的通配部分、`storage-health` 的 `fsck*`。这批是**文件输入发现**能力，与 Exporter 正交，单独出稿。
 
+  > **W1 已落地**：单层 glob / 目录目标 + `exclude_globs` + 新发现文件从 head 读
+  > 已经可用（见 [`log-file-input-spec.md`](./log-file-input-spec.md) §2.1，
+  > `is_executable_source("FileGlob", …)` 也放宽到绝对路径 + 单层通配）。
+  > 但这些单元仍然保持 `draft`：机队里还有不认识 glob 的旧 agentd，
+  > 要等能力协商/机队验证后再单独翻 `active`（见设计文档 D7、D13）。
+
 ## 11. 相关文档
 
 - [`log-file-input-spec.md`](./log-file-input-spec.md)：文件输入（tail/checkpoint/rotate）规格

@@ -219,28 +219,39 @@ LogFileInputSection {
   path
   startup_position?
   multiline_mode?
+  exclude_globs?
 }
 ```
 
-字段说明（契约定义见 `wist-contracts-0.1.2/src/agent_config.rs:274-283`、`377-383`）：
+字段说明（类型定义已迁入本仓：`src/config/agent_config.rs`）：
 
 - `input_id`
   采集任务标识，必填非空，同一配置内不可重复（重复报 `duplicate_log_input_id`）
 - `path`
-  目标文件路径，必填非空；相对路径相对 `paths.root_dir` 解析（`src/config/config_runtime_support.rs:292-301`）
+  采集目标：**绝对路径**。三种形态行为不同（见 [`./log-file-input-spec.md`](./log-file-input-spec.md) §2.1）：
+  - 显式单文件（`/var/log/auth.log`）→ 单文件读取器，行为与 W1 前一致；
+  - 单层 glob（`/var/log/containers/*.log`）→ 文件族读取器（`*` 不跨目录，`**` 被拒）；
+  - 目录（`/var/log/postgresql`）→ 文件族读取器（目录下**直接子文件**）。
+  相对路径相对 `paths.root_dir` 解析（`src/config/config_runtime_support.rs:292-301`）
 - `startup_position?`
   首次观测该文件（尚无 checkpoint）时的起点，省略时默认 **`tail`**：
   - `tail`：从文件当前长度开始，只收新增行（**默认**，不重放历史）
   - `head`：从文件头开始，回放已有内容（要看历史才显式写）
-  映射见 `src/runtime/daemon_telemetry_support.rs:107-112`、`src/telemetry/logs/files/file_watcher.rs:28-38`
+  映射见 `src/runtime/daemon_telemetry_support.rs:107-112`、`src/telemetry/logs/files/file_watcher.rs:28-38`。
+  文件族里**运行中/重启后新出现**的文件不看它，一律从 head 读（D10）。
 - `multiline_mode?`
   多行折叠模式，省略时默认 `none`：
   - `none`：一行一条记录
   - `indented`：以空格或 Tab 开头的行并入上一条，形成一条多行记录；未闭合的组跨 tick 保留在
-    `pending_multiline` 状态里，下个 tick 遇到非缩进行时提交（`src/telemetry/logs/multiline.rs:57-103`）
+    `pending_multiline` 状态里，下个 tick 遇到非缩进行时提交（`src/telemetry/logs/multiline.rs:57-103`）。
+    文件族下**每个文件各持一份**未闭合块（`TrackedFileCheckpoint.pending_multiline`）。
+- `exclude_globs?`
+  只对文件族目标有意义：从匹配集里剔掉的**绝对路径** glob（按展开后的完整路径匹配），为空则不输出。
+  典型用法：`path = "/var/log/containers/*.log"` + `exclude_globs = ["/var/log/containers/*_kube-system_*.log"]`。
+  写在非文件族目标上不报错（无匹配集可剔），但相对路径会被校验拒绝（`invalid_log_input_exclude_glob`）。
 
-两个字段省略时走契约默认值；非法取值被校验拒绝（`invalid_log_startup_position` / `invalid_log_multiline_mode`，
-`wist-validate-0.1.2/src/config.rs:103-109`）。
+前两个字段省略时走契约默认值；非法取值被校验拒绝（`invalid_log_startup_position` / `invalid_log_multiline_mode`，
+`src/config/validate.rs`）。
 
 ### 7.2 `output`
 

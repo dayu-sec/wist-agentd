@@ -2,7 +2,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::state_store::log_checkpoint_state::{LogCheckpointState, TrackedFileCheckpoint};
+use crate::state_store::log_checkpoint_state::{
+    LogCheckpointState, PendingMultilineState, TrackedFileCheckpoint,
+};
 use crate::telemetry::logs::files::file_reader::{
     ObservedFileIdentity, checkpoint_probe_async, inspect_path_async, stable_file_id_async,
 };
@@ -101,45 +103,73 @@ fn inode_pair_matches(
     }
 }
 
+/// 一次 checkpoint 写入中与「观测事实」无关的载荷。
+///
+/// 文件族输入要给每个文件单独落 `real_path`（symlink 解析结果）与未封口的多行块，
+/// 显式单文件输入这两项固定为空；把它们收进结构体，避免参数列表越滚越长。
+pub(super) struct CheckpointUpdate<'a> {
+    pub(super) checkpoint_offset: u64,
+    pub(super) observed_at: &'a str,
+    pub(super) real_path: &'a str,
+    pub(super) pending_multiline: Option<&'a PendingMultilineState>,
+    pub(super) rotated_from_path: Option<String>,
+}
+
 pub(super) async fn upsert_checkpoint_async(
     state: &mut LogCheckpointState,
     source_path: &Path,
     identity: &ObservedFileIdentity,
-    checkpoint_offset: u64,
-    observed_at: &str,
-    rotated_from_path: Option<String>,
+    update: CheckpointUpdate<'_>,
 ) {
     let source_path = source_path.display().to_string();
     let file_id = stable_file_id_async(Path::new(&source_path), identity).await;
-    let checkpoint_probe = checkpoint_probe_async(Path::new(&source_path), checkpoint_offset)
-        .await
-        .ok()
-        .flatten();
-    if let Some(existing) = state.files.iter_mut().find(|entry| {
+    let checkpoint_probe =
+        checkpoint_probe_async(Path::new(&source_path), update.checkpoint_offset)
+            .await
+            .ok()
+            .flatten();
+    // 先找到「要写哪一条」：同一文件（file_id / inode / path+fingerprint）就地更新，
+    // 否则新增一条。轮转时旧文件已经用 `relocate_checkpoint_path` 换了 path，所以两边互不抢。
+    let existing_index = state.files.iter().position(|entry| {
         entry.file_id == file_id || stored_identity_matches(entry, identity, &source_path)
-    }) {
-        let path = existing.path.clone();
-        *existing = checkpoint_from_observation(
-            file_id,
-            path,
-            identity,
-            checkpoint_offset,
-            checkpoint_probe,
-            observed_at,
-            rotated_from_path,
-        );
-        return;
-    }
+    });
+    let path = existing_index
+        .map(|index| state.files[index].path.clone())
+        .unwrap_or_else(|| source_path.clone());
+    let dedupe_path = path.clone();
+    let checkpoint = checkpoint_from_observation(file_id, path, identity, checkpoint_probe, update);
+    let keep_index = match existing_index {
+        Some(index) => {
+            state.files[index] = checkpoint;
+            index
+        }
+        None => {
+            state.files.push(checkpoint);
+            state.files.len() - 1
+        }
+    };
+    // 一个路径只能留一条 checkpoint：同 `path` 上旧文件留下的条目（inode / 指纹都已变化，
+    // 所以上面没匹配上）必须让位。否则 `checkpoint_for_path` 只取第一条，新文件永远读不到。
+    keep_only_newest_at_path(state, &dedupe_path, keep_index);
+}
 
-    state.files.push(checkpoint_from_observation(
-        file_id,
-        source_path,
-        identity,
-        checkpoint_offset,
-        checkpoint_probe,
-        observed_at,
-        rotated_from_path,
-    ));
+/// 保留 `keep_index` 这一条，删掉同一 `path` 的其它条目。
+fn keep_only_newest_at_path(state: &mut LogCheckpointState, path: &str, keep_index: usize) {
+    let mut index = 0usize;
+    state.files.retain(|entry| {
+        let keep = index == keep_index || entry.path != path;
+        index += 1;
+        keep
+    });
+}
+
+/// 一个 checkpoint 对应的**真实路径**：旧状态 / 普通文件没有 `real_path`，就用 `path`。
+pub(super) fn checkpoint_real_path(checkpoint: &TrackedFileCheckpoint) -> &str {
+    if checkpoint.real_path.is_empty() {
+        &checkpoint.path
+    } else {
+        &checkpoint.real_path
+    }
 }
 
 /// 由一次观测结果构造/更新 checkpoint：除 `file_id`/`path` 外全部取观测值。
@@ -147,10 +177,8 @@ fn checkpoint_from_observation(
     file_id: String,
     path: String,
     identity: &ObservedFileIdentity,
-    checkpoint_offset: u64,
     checkpoint_probe: Option<String>,
-    observed_at: &str,
-    rotated_from_path: Option<String>,
+    update: CheckpointUpdate<'_>,
 ) -> TrackedFileCheckpoint {
     TrackedFileCheckpoint {
         file_id,
@@ -158,12 +186,14 @@ fn checkpoint_from_observation(
         device_id: identity.device_id,
         inode: identity.inode,
         fingerprint: identity.fingerprint.clone(),
-        checkpoint_offset,
+        checkpoint_offset: update.checkpoint_offset,
         checkpoint_probe,
         last_size: Some(identity.file_len),
-        last_read_at: Some(observed_at.to_string()),
-        last_commit_point_at: Some(observed_at.to_string()),
-        rotated_from_path,
+        last_read_at: Some(update.observed_at.to_string()),
+        last_commit_point_at: Some(update.observed_at.to_string()),
+        rotated_from_path: update.rotated_from_path,
+        real_path: update.real_path.to_string(),
+        pending_multiline: update.pending_multiline.cloned(),
     }
 }
 
@@ -180,9 +210,13 @@ pub(super) fn upsert_checkpoint(
         state,
         source_path,
         identity,
-        checkpoint_offset,
-        observed_at,
-        rotated_from_path,
+        CheckpointUpdate {
+            checkpoint_offset,
+            observed_at,
+            real_path: "",
+            pending_multiline: None,
+            rotated_from_path,
+        },
     ))
 }
 
@@ -270,6 +304,8 @@ mod tests {
             last_read_at: None,
             last_commit_point_at: None,
             rotated_from_path: None,
+            real_path: String::new(),
+            pending_multiline: None,
         }
     }
 
@@ -472,6 +508,70 @@ mod tests {
             state.files[0].rotated_from_path.as_deref(),
             Some("/tmp/app.log")
         );
+    }
+
+    #[test]
+    fn upsert_checkpoint_replaces_the_stale_entry_at_the_same_path() {
+        // 同一个 `path` 上旧文件留下的条目（inode / 指纹都变了）必须让位：
+        // `checkpoint_for_path` 只取第一条，旧条目占着位置会让新文件永远读不到。
+        let observed_at = "2026-04-13T00:00:00Z";
+        let mut state = LogCheckpointState::new("input-app".to_string(), observed_at.to_string());
+
+        upsert_checkpoint(
+            &mut state,
+            Path::new("/tmp/app.log"),
+            &identity(Some(1), Some(2), Some("old")),
+            10,
+            observed_at,
+            None,
+        );
+        upsert_checkpoint(
+            &mut state,
+            Path::new("/tmp/app.log"),
+            &identity(Some(1), Some(3), Some("new")),
+            0,
+            observed_at,
+            None,
+        );
+
+        assert_eq!(state.files.len(), 1, "{:?}", state.files);
+        assert_eq!(state.files[0].inode, Some(3));
+        assert_eq!(state.files[0].checkpoint_offset, 0);
+    }
+
+    #[test]
+    fn upsert_checkpoint_keeps_a_relocated_entry_and_a_new_file_at_the_old_path() {
+        // 轮转：旧条目已被 `relocate_checkpoint_path` 换到 `.1`，新文件占回原路径 —— 两条共存。
+        let observed_at = "2026-04-13T00:00:00Z";
+        let mut state = LogCheckpointState::new("input-app".to_string(), observed_at.to_string());
+
+        upsert_checkpoint(
+            &mut state,
+            Path::new("/tmp/app.log"),
+            &identity(Some(1), Some(2), Some("old")),
+            10,
+            observed_at,
+            None,
+        );
+        let previous = state.files[0].clone();
+        relocate_checkpoint_path(&mut state, &previous, Path::new("/tmp/app.log.1"));
+
+        upsert_checkpoint(
+            &mut state,
+            Path::new("/tmp/app.log"),
+            &identity(Some(1), Some(3), Some("new")),
+            0,
+            observed_at,
+            None,
+        );
+
+        let mut paths: Vec<&str> = state
+            .files
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        paths.sort();
+        assert_eq!(paths, vec!["/tmp/app.log", "/tmp/app.log.1"]);
     }
 
     #[test]

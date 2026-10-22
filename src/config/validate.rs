@@ -108,6 +108,13 @@ fn validate_logs_section(logs: &LogsSection) -> Result<(), ValidationError> {
             "none" | "indented" => {}
             _ => return Err(ValidationError::new("invalid_log_multiline_mode")),
         }
+        // 排除项是绝对路径 glob：相对路径的结果取决于进程 cwd，同一台机器换一种启动方式
+        // 就少采一个文件，那不是配置。
+        for exclude in &input.exclude_globs {
+            if !exclude.starts_with('/') {
+                return Err(ValidationError::new("invalid_log_input_exclude_glob"));
+            }
+        }
     }
 
     Ok(())
@@ -159,6 +166,7 @@ mod tests {
                 path: "/tmp/root/app.log".to_string(),
                 startup_position: "tail".to_string(),
                 multiline_mode: "none".to_string(),
+                exclude_globs: Vec::new(),
             }],
             file_inputs_file: None,
             in_memory_buffer_bytes: 1024,
@@ -405,6 +413,22 @@ mod tests {
             })),
             "invalid_log_multiline_mode",
         );
+        assert_code(
+            validate_config(&with_inputs(|input| {
+                input.exclude_globs = vec!["relative/*.log".to_string()]
+            })),
+            "invalid_log_input_exclude_glob",
+        );
+    }
+
+    #[test]
+    fn a_file_family_input_accepts_globs_and_absolute_excludes() {
+        let mut logs = valid_logs();
+        logs.file_inputs[0].path = "/var/log/containers/*.log".to_string();
+        logs.file_inputs[0].exclude_globs =
+            vec!["/var/log/containers/*_kube-system_*.log".to_string()];
+        let config = base_config().with_telemetry(TelemetrySection { logs });
+        validate_config(&config).expect("glob input with excludes");
     }
 
     #[test]

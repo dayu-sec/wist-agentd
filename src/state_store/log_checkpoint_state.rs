@@ -17,6 +17,8 @@ pub(crate) struct LogCheckpointState {
     #[serde(default)]
     pub next_seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_scan_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_multiline: Option<PendingMultilineState>,
     pub files: Vec<TrackedFileCheckpoint>,
 }
@@ -28,6 +30,7 @@ impl LogCheckpointState {
             input_id,
             updated_at,
             next_seq: 0,
+            last_scan_ms: None,
             pending_multiline: None,
             files: Vec::new(),
         }
@@ -63,4 +66,14 @@ pub(crate) struct TrackedFileCheckpoint {
     pub last_read_at: Option<String>,
     pub last_commit_point_at: Option<String>,
     pub rotated_from_path: Option<String>,
+    /// 符号链接解析后的真实路径；空 = 与 `path` 相同（旧状态 / 普通文件）。
+    ///
+    /// 用途：容器日志的 `path` 是 `/var/log/containers/...` 的 symlink，而轮转发生在
+    /// `/var/log/pods/...` 的真实目录里 —— 按 `path` 的父目录找旧文件永远找不到。
+    #[serde(default)]
+    pub real_path: String,
+    /// 这个文件自己的未封口多行块。多文件 input 不能共用 input 级的一份，
+    /// 否则两个文件交错写入时会把块粘错。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_multiline: Option<PendingMultilineState>,
 }

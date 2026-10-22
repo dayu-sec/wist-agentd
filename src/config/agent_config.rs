@@ -311,12 +311,19 @@ impl Default for LogsTcpOutputSection {
 #[serde(deny_unknown_fields)]
 pub struct LogFileInputSection {
     pub input_id: String,
+    /// 采集目标：显式绝对路径、目录，或文件族 glob（绝对路径，`*` 不跨目录，不支持 `**`）。
     pub path: String,
     /// 首次读到这个文件时从哪里开始：`tail`（默认，只采新增）| `head`（从文件头读一遍）。
     #[serde(default = "default_startup_position")]
     pub startup_position: String,
     #[serde(default = "default_multiline_mode")]
     pub multiline_mode: String,
+    /// 从文件族匹配集里剔掉的**绝对路径** glob（默认空，只对 glob / 目录目标有意义）。
+    ///
+    /// 容器日志的选源就是一条 glob + 若干排除项：`/var/log/containers/*.log` 里同时有
+    /// init / sidecar / 平台自身的容器，不该只能靠把业务名写进 pattern 来避开。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_globs: Vec<String>,
 }
 
 /// 外置采集任务清单文件的顶层结构（`[telemetry.logs] file_inputs_file` 指向的文件）。

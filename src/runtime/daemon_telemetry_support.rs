@@ -7,7 +7,10 @@ use wist_api::uplink::AgentUplinkGrant;
 use crate::telemetry::logs::InputOrigin;
 use crate::telemetry::logs::files::file_reader::ReadLimits;
 use crate::telemetry::logs::files::file_watcher::StartupPosition;
-use crate::telemetry::logs::files::{FileInputConfig, ProcessOutcome};
+use crate::telemetry::logs::files::{
+    DEFAULT_MAX_FILES_PER_INPUT, DEFAULT_MAX_NEW_FILES_PER_TICK, DEFAULT_RESCAN_INTERVAL_MS,
+    FileInputConfig, ProcessOutcome,
+};
 use crate::telemetry::logs::gate::Withheld;
 use crate::telemetry::logs::multiline::MultilineMode;
 use crate::telemetry::spool;
@@ -101,6 +104,10 @@ pub(super) fn build_file_input_config(
         input_id: input.input_id.clone(),
         origin: origin.clone(),
         source_path,
+        exclude_globs: input.exclude_globs.clone(),
+        max_files: DEFAULT_MAX_FILES_PER_INPUT,
+        max_new_files: DEFAULT_MAX_NEW_FILES_PER_TICK,
+        rescan_interval_ms: DEFAULT_RESCAN_INTERVAL_MS,
         state_dir: PathBuf::from(&config.paths.state_dir),
         spool_path: spool_path_for(config, input),
         startup_position: startup_position_for(input),
@@ -142,17 +149,23 @@ pub(super) fn missing_input_failure(input: &LogFileInputSection) -> TelemetryFai
 ///
 /// 为什么单独一条（不复用 [`missing_input_failure`]）：
 ///   那个说的是“路径不存在”（去查权限/拼写），这个是“这种目标形态还没实现”
-///   （去改成显式绝对路径，或等 glob 展开落地）——两句话把人引向不同的下一步。
+///   （去改成显式绝对路径 / 单层 glob）——两句话把人引向不同的下一步。
 pub(super) fn unsupported_target(input: &LogFileInputSection) -> Option<TelemetryFailure> {
-    if wist_contracts::work::is_explicit_path(&input.path) {
+    let target = input.path.as_str();
+    let shape_ok = target.starts_with('/')
+        && !target.contains('~')
+        // `**` 没实现：先扫固定前缀目录、`*` 不跨目录。放在这里拒，是为了报「形态不支持」
+        // 而不是让文件族处理器每轮抛一次 InvalidInput（那会被当成目录不可读）。
+        && !target.contains("**");
+    if shape_ok {
         return None;
     }
     Some(TelemetryFailure {
         kind: TelemetryFailureKind::MissingInput,
         input_id: input.input_id.clone(),
         path: input.path.clone(),
-        detail: "target must be an explicit absolute path \
-                 (glob expansion and `~` are not implemented on this agent)"
+        detail: "target must be an absolute path without `**` \
+                 (single-level globs are supported; `~`, relative paths and recursive globs are not)"
             .to_string(),
         magnitude: None,
     })
@@ -215,6 +228,29 @@ pub(super) fn withheld_failure(
     })
 }
 
+/// 文件族触顶（`max_files`）：**没采全**，不是"没匹配"。
+///
+/// `detail` 必须稳定（去重按 `kind|input_id|path|detail`）：同一次触顶反复出现应当是同一行字；
+/// 会变的量（拒绝了多少、当前跟踪多少）放 `magnitude`。
+pub(super) fn capacity_failure(
+    input: &LogFileInputSection,
+    capacity: &crate::telemetry::logs::files::file::FamilyCapacity,
+) -> TelemetryFailure {
+    TelemetryFailure {
+        kind: TelemetryFailureKind::CapacityExceeded,
+        input_id: input.input_id.clone(),
+        path: input.path.clone(),
+        detail: format!(
+            "file family reached max_files={} ; new files are not tracked              (raise the limit or narrow the pattern)",
+            capacity.max_files
+        ),
+        magnitude: Some(format!(
+            "refused={} tracked={}",
+            capacity.refused, capacity.tracked
+        )),
+    }
+}
+
 pub(super) fn spool_paused_reason(spool_bytes: u64) -> String {
     format!("spool over limit ({spool_bytes} bytes); source read paused")
 }
@@ -243,8 +279,9 @@ fn startup_position_for(input: &LogFileInputSection) -> StartupPosition {
 #[cfg(test)]
 mod tests {
     use super::{
-        InputOrigin, TelemetryFailureKind, Withheld, build_file_input_config, effective_output,
-        startup_position_for, unsupported_target, uplink_failure, withheld_failure,
+        InputOrigin, TelemetryFailureKind, Withheld, build_file_input_config, capacity_failure,
+        effective_output, startup_position_for, unsupported_target, uplink_failure,
+        withheld_failure,
     };
     use crate::config::agent_config::{
         AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, LogFileInputSection,
@@ -273,6 +310,7 @@ mod tests {
             path: "/var/log/app.log".to_string(),
             startup_position: "head".to_string(),
             multiline_mode: "none".to_string(),
+            exclude_globs: Vec::new(),
         }
     }
 
@@ -295,28 +333,56 @@ mod tests {
     }
 
     #[test]
-    fn a_target_that_is_not_an_explicit_path_is_reported_as_such() {
-        // 通配 / `~` / 相对路径今天都采不到。必须报成“形态不支持”，
-        // 而不是拖到下面报“路径不存在” —— 那会把人引去查权限。
+    fn a_relative_or_tilde_target_is_reported_as_such() {
+        // `~` 不展开、相对路径依赖 cwd、`**` 未实现：必须报成“形态不支持”，
+        // 而不是拖到下面报“路径不存在”或让文件族处理器每轮抛一次 IO 错误。
         for target in [
-            "/var/log/wifi.log*",
             "~/Library/Logs/Homebrew/*",
             "relative/app.log",
+            "/var/log/**/*.log",
         ] {
             let mut entry = input();
             entry.path = target.to_string();
             let failure = unsupported_target(&entry).expect("must be rejected as unsupported");
             assert_eq!(failure.path, target);
-            assert!(
-                failure.detail.contains("explicit absolute path"),
-                "{failure:?}"
-            );
+            assert!(failure.detail.contains("absolute path"), "{failure:?}");
         }
 
-        // 显式绝对路径放行：存在与否由后面的 `exists()` 分支管，不在这里拦。
-        let mut ok = input();
-        ok.path = "/var/log/install.log".to_string();
-        assert!(unsupported_target(&ok).is_none());
+        // 显式绝对路径、单层 glob、目录都放行：存在性 / 匹配由后面的处理器管。
+        for target in [
+            "/var/log/install.log",
+            "/var/log/containers/*.log",
+            "/var/log/postgresql",
+        ] {
+            let mut ok = input();
+            ok.path = target.to_string();
+            assert!(unsupported_target(&ok).is_none(), "{target}");
+        }
+    }
+
+    #[test]
+    fn a_capacity_report_becomes_a_stable_failure() {
+        // `detail` 稳定（去重按它），会变的量放 `magnitude`。
+        use crate::telemetry::logs::files::file::FamilyCapacity;
+        let mut entry = input();
+        entry.path = "/var/log/containers/*.log".to_string();
+        let capacity = FamilyCapacity {
+            tracked: 512,
+            max_files: 512,
+            refused: 37,
+        };
+        let failure = capacity_failure(&entry, &capacity);
+        assert!(failure.detail.contains("max_files=512"), "{failure:?}");
+        assert_eq!(failure.magnitude.as_deref(), Some("refused=37 tracked=512"));
+        let again = capacity_failure(
+            &entry,
+            &FamilyCapacity {
+                tracked: 512,
+                max_files: 512,
+                refused: 5,
+            },
+        );
+        assert_eq!(failure.detail, again.detail, "签名不含量");
     }
 
     #[test]

@@ -8,7 +8,9 @@ use crate::control::work::AppliedWorkGrant;
 use crate::state_store::log_seq_state;
 use crate::telemetry::exporters;
 use crate::telemetry::logs::InputOrigin;
-use crate::telemetry::logs::files::{FileInputProcessor, ProcessOutcome};
+use crate::telemetry::logs::files::{
+    FileFamilyProcessor, FileInputProcessor, ProcessOutcome, is_family_target,
+};
 use crate::telemetry::warp_parse::{
     RecordSink, TcpFraming, TelemetryRecordSink, uplink_write_detail,
 };
@@ -17,9 +19,9 @@ use crate::telemetry::warp_parse::{
 mod support;
 
 use support::{
-    build_file_input_config, build_record_sink, invalid_output_failure, missing_input_failure,
-    processing_failure, replay_spool_only, spool_paused_reason, unsupported_target, uplink_failure,
-    withheld_failure,
+    build_file_input_config, build_record_sink, capacity_failure, invalid_output_failure,
+    missing_input_failure, processing_failure, replay_spool_only, spool_paused_reason,
+    unsupported_target, uplink_failure, withheld_failure,
 };
 
 // 生效输出解析要给主循环用（它在短路前算），所以在同一层再导出一次；
@@ -43,6 +45,8 @@ pub(super) enum TelemetryFailureKind {
     /// 有记录因**内容不全**被挡下不转发（边界判据在这个文件上没起作用）。
     /// 不是"采集失败"，但必须说出来 —— 否则一条永不结束的块会静默消失。
     RecordWithheld,
+    /// 文件族匹配数超过 `max_files`：新文件不再纳入跟踪（**没采全**，不是"没匹配"）。
+    CapacityExceeded,
     /// **出口写失败**：记录已安全进 spool 等重发，但「写出口」这一步没成功。
     ///
     /// 单列一类是因为它与「读文件失败」的处置完全不同：输入没问题，是出口（数据面目标）
@@ -394,7 +398,7 @@ async fn process_telemetry_input<S: RecordSink>(
     tick: &mut TelemetryTick,
     next_seq: &mut u64,
 ) {
-    // 目标形态先过一道：通配 / `~` / 相对路径今天采不了，要报成“形态不支持”，
+    // 目标形态先过一道：`**` / `~` / 相对路径采不了，要报成“形态不支持”，
     // 而不是拖到下面报“路径不存在”（那会把运维引去查权限）。
     if let Some(failure) = unsupported_target(input) {
         tick.failures.push(failure);
@@ -402,7 +406,8 @@ async fn process_telemetry_input<S: RecordSink>(
     }
 
     let source_path = PathBuf::from(&input.path);
-    if !source_path.exists() {
+    let family_target = is_family_target(&input.path);
+    if !family_target && !source_path.exists() {
         tick.failures.push(missing_input_failure(input));
         match replay_spool_only(config, input, sink).await {
             Ok(Some(outcome)) => tick.outcomes.push(outcome),
@@ -430,6 +435,10 @@ async fn process_telemetry_input<S: RecordSink>(
             // （量放 `magnitude`：它会变，不能进签名，否则每 tick 都算新问题。）
             if let Some(failure) = withheld_failure(input, &outcome.withheld) {
                 tick.failures.push(failure);
+            }
+            // 触顶：不说出来，「为什么这台机器的某个容器没数据」就只能靠猜。
+            if let Some(capacity) = outcome.capacity.as_ref() {
+                tick.failures.push(capacity_failure(input, capacity));
             }
             // 出口写失败：记录已安全进 spool，但**写出口**没成。必须说出来 ——
             // 旧行为里第一次失败是完全静默的（只有下一轮的回放失败才会报），
@@ -459,11 +468,14 @@ async fn process_input_with_sink<S: RecordSink>(
     sink: &mut S,
     next_seq: &mut u64,
 ) -> io::Result<ProcessOutcome> {
-    let mut processor = FileInputProcessor::new(
-        build_file_input_config(config, input, source_path, origin),
-        sink,
-    );
-    processor.process_once_async(next_seq).await
+    let config = build_file_input_config(config, input, source_path, origin);
+    if is_family_target(&input.path) {
+        let mut processor = FileFamilyProcessor::new(config, sink);
+        processor.process_once_async(next_seq).await
+    } else {
+        let mut processor = FileInputProcessor::new(config, sink);
+        processor.process_once_async(next_seq).await
+    }
 }
 
 #[cfg(test)]
@@ -515,6 +527,7 @@ mod tests {
             path: "/var/log/app.log".to_string(),
             startup_position: "tail".to_string(),
             multiline_mode: multiline.to_string(),
+            exclude_globs: Vec::new(),
         }
     }
 

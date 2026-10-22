@@ -3,6 +3,65 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.0-alpha] - 2026-10-22
+
+### 新增
+
+- **文件族输入（W1）：一条输入可以盯一个 glob 或一个目录**。`path` 为绝对路径时按形态分流：
+  显式单文件走既有单文件读取器（行为逐字不变），单层 glob（`/var/log/containers/*.log`）
+  与目录走新的 `FileFamilyProcessor`。`*` 不跨目录、`**` 不支持、`~` 不展开。
+- **`exclude_globs`**（`LogFileInputSection`，默认空）：从文件族匹配集里剔掉绝对路径 glob，
+  按展开后的完整路径匹配。容器日志的选源就是 `*.log` + 排除平台自身的 pod。
+- **`exclude_globs` 从工作参数透传**：网关派活的单元里声明的排除项会原样进入本机采集任务。
+- **起始位置（写死）**：input 首次扫描用 `startup_position`（默认 tail）；运行中/重启后
+  **新发现**的文件从 head 读（停机期间的日志不整段丢）；已跟踪的文件按 checkpoint 续读。
+- **symlink 轮转**：发现时持久化 `real_path`（`/var/log/containers/*.log` 是 symlink，
+  轮转发生在 `/var/log/pods/...`）；排空与找回轮转文件都在真实路径上进行。
+- **每文件独立的多行块**：`pending_multiline` 下移到 `TrackedFileCheckpoint`，
+  旧 checkpoint 的 input 级块在首轮自动迁到对应文件（多文件交错不会再把两个块粘错）。
+- 保护：`max_files` 512（跟踪上限）、`max_new_files` 32/轮、目录重扫 15s（与 3s tick 解耦）、
+  单轮读取预算跨文件递减（预算耗尽时后面的文件留到下一轮，且不落 offset=0 的 checkpoint）。
+- **触顶上报**：匹配数超过 `max_files` 时新增失败类 `CapacityExceeded`（`refused/tracked`
+  进 `magnitude`，按稳定签名去重）—— 否则「这台机器的某个容器为什么没数据」只能靠猜。
+
+### 变更
+
+- **`FileGlob` 来源的「可执行」判据放宽**（随 `wist-contracts` 0.9.1）：绝对路径 + 单层通配
+  现在会被折算成采集任务；`**` / `~` / 相对路径仍进 `unsupported_units`，文案改为
+  「not a collectable absolute path」。`**` 也在本机配置这一层被 `unsupported_target()`
+  拒成「目标形态不支持」（而不是让文件族每轮抛一次 IO 错误）。
+- 目录目标不再被当作「采集失败」：无匹配是正常空集合（目录不可读才报错）。
+- **checkpoint 只在真的变了时重写**：位置没推进、集合没变、也没扫描的 tick 不落盘
+  （512 个文件的全量状态每 3s 重写一次是数 GB/天的写放大）。
+
+### 修复
+
+- 文件在轮转/删除后找不到旧文件时，手里的未封口多行块现在会按到期封口交出去，
+  不再既不发也不清（此前会一直挂在 checkpoint 里）。
+- **一个路径只保留一条 checkpoint**：同一路径换了 inode（轮转但旧文件已不在、或停机期间被替换）
+  时旧条目让位 —— 否则 `checkpoint_for_path` 只取第一条，新文件永远读不到。
+- **单文件读失败不拖垮整族**：其余文件照常交付并提交 checkpoint，错误在本轮末尾上报。
+- **扫描失败不推进扫描时钟**：目录不可读时每轮都重试并报错，而不是 15s 才报一次、
+  中间那些 tick 看着「一切正常」。
+- **同一真实文件只读一次**：目录里同时有 symlink 与其目标文件时按 `realpath` 去重。
+- 轮转 / 截断后起点确定为 0 时，即使本轮预算已耗尽也会留下 offset=0 的 checkpoint，
+  否则下一轮会把新文件当「新出现的文件」从 head 读，这中间写入的内容整段丢。
+- 旧状态里迁移不上文件的 input 级未封口块，改为按到期封口交出去（此前会随迁移静默消失）。
+
+### 升级提示
+
+- **依赖 `wist-contracts` 0.9.1**（`is_glob_path` / `is_file_target` / `WorkSpecSource.exclude_globs`）。
+  发布顺序：先发 contracts，再发本仓；本地同期开发时用 `Cargo.toml` 末尾的
+  `[patch.crates-io]`（注释块）指向 `../wist-contracts`。
+- 旧网关不会派 glob 来源，因此升级本仓本身不改变现有采集行为。
+- **降级**：本版 checkpoint 新增 `last_scan_ms` / `real_path` / 每文件的 `pending_multiline`，
+  旧版 agentd 的 `LogCheckpointState` 是 `deny_unknown_fields` 的 —— 它会把整份状态读成
+  「读不动」，打一条 `LogCheckpointUnreadable` 警告后按 `startup_position` 重新定位。
+  `tail` 下不重放也不丢；**glob/目录输入在旧版会被报成 unsupported**（旧版不认这种形态）。
+- 本版工作参数会带 `exclude_globs`（仅当单元声明了排除项）：旧版 agentd 的
+  `WorkSpecSource` 同样 `deny_unknown_fields`，会把**整份 spec** 判为解析失败。所以目录里带
+  排除项的单元必须等机队升级后再翻 `active`（见设计文档 D7）。
+
 ## [0.7.0-alpha] - 2026-10-19
 
 ### 新增

@@ -161,6 +161,7 @@ mod tests {
                         kind: "FileGlob".to_string(),
                         target: "/Library/Logs/DiagnosticReports/*.ips".to_string(),
                         multiline: "none".to_string(),
+                        exclude_globs: Vec::new(),
                     }],
                 }],
                 tasks: vec![WorkTaskRecord {

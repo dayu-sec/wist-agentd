@@ -10,8 +10,8 @@
 //!   2. **暂停 ≠ 撤回**：`paused` 的工作仍被持有（记得版本、保留确认），但折算不出任务；
 //!      恢复沿用同一版本，不重新审定。
 //!   3. **折算不了就说**：`UnifiedLogPredicate` 这类来源 agentd 现在接不了，`Exporter` 里
-//!      **未知 ID**、以及目标不是显式路径的（通配 / `~`）同样接不了 —— 都如实记进 `unsupported`，
-//!      绝不当成"没这回事"，也不造一条永远报错的采集任务。
+//!      **未知 ID**、以及目标不是「可采绝对路径」的（`**` / `~` / 相对路径）同样接不了 ——
+//!      都如实记进 `unsupported`，绝不当成"没这回事"，也不造一条永远报错的采集任务。
 //!
 //! 关于确认（ack）：只对**真正应用了**的工作回报版本。工作参数解析不了就**不回报** ——
 //! 网关那边「期望版本一直没被确认」正是漂移的可见形态，回一个确认反而把问题盖住。
@@ -511,8 +511,8 @@ impl AppliedWorkGrant {
                 if unit.capability != "collect_logs" {
                     continue;
                 }
-                // 只折算**今天真能采**的来源：目标不是显式路径的（通配 / `~`）会被
-                // `unsupported_units()` 如实报出来，而不是在这里造一条永远报"路径不存在"的输入。
+                // 只折算**今天真能采**的来源：`**` / `~` / 相对路径等形态会被
+                // `unsupported_units()` 如实报出来，而不是在这里造一条永远报错的输入。
                 let globs: Vec<&WorkSpecSource> = unit
                     .file_sources()
                     .into_iter()
@@ -546,6 +546,9 @@ impl AppliedWorkGrant {
                             // 怎么读这个文件由**策展在目录里声明**（跟着单元走），
                             // agentd 不自己猜：猜错会把多行记录拆散、或把独立记录粘成一条。
                             multiline_mode: source.multiline.clone(),
+                            // 选源排除项也跟单元走：它们是这份采集面的「不该采什么」，
+                            // 不是本机偏好。
+                            exclude_globs: source.exclude_globs.clone(),
                         },
                     });
                 }
@@ -693,10 +696,10 @@ impl AppliedWorkGrant {
 /// 合成笼统一句就会把人引向错误的下一步。
 fn unsupported_reason(source: &WorkSpecSource) -> String {
     match source.kind.as_str() {
-        // 认识 kind，目标形态不对：把目标改成显式绝对路径就行。
+        // 认识 kind，目标形态不对：改成绝对路径（显式或单层 glob）就行。
         "FileGlob" => format!(
-            "source target {:?} is not an explicit absolute path \
-             (glob/~ expansion is not implemented on this agent)",
+            "source target {:?} is not a collectable absolute path \
+             (recursive `**`, `~` and relative paths are not supported)",
             source.target
         ),
         // 认识 kind，ID 不认识：旧网关发了新 ID，或写错了。
@@ -1553,9 +1556,29 @@ mod tests {
     }
 
     #[test]
-    fn a_glob_target_is_reported_not_turned_into_an_input() {
-        // `FileGlob` 这个类型名不等于可采：**目标形态**也得是采集端能执行的。
-        // 通配今天展开不了 —— 既不能造一条永远报"路径不存在"的任务，也不能当没看见。
+    fn a_glob_source_becomes_an_input_and_recursive_globs_are_reported() {
+        // W1：`FileGlob` 的单层通配是可采的来源（容器日志就靠它）。
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![standing(
+                "work-1",
+                "ContainerStdout",
+                1,
+                "active",
+                &spec(&[(
+                    "linux-container-stdout",
+                    "collect_logs",
+                    "FileGlob:/var/log/containers/*.log",
+                )]),
+            )],
+        ));
+        let inputs = applied.log_inputs();
+        assert_eq!(inputs.len(), 1, "glob 目标应变成采集任务");
+        assert_eq!(inputs[0].input.path, "/var/log/containers/*.log");
+        assert!(applied.unsupported_units().is_empty());
+
+        // `**` 仍不可执行：递归展开没实现 —— 既不能造一条永远报错的任务，也不能当没看见。
         let mut applied = AppliedWorkGrant::default();
         applied.apply(&grant(
             1,
@@ -1567,17 +1590,41 @@ mod tests {
                 &spec(&[(
                     "mac-network-wifi",
                     "collect_logs",
-                    "FileGlob:/var/log/wifi.log*",
+                    "FileGlob:/var/log/**/*.log",
                 )]),
             )],
         ));
-        assert!(applied.log_inputs().is_empty(), "通配目标不应变成采集任务");
+        assert!(applied.log_inputs().is_empty(), "递归通配不应变成采集任务");
         let unsupported = applied.unsupported_units();
         assert_eq!(unsupported.len(), 1);
         assert!(
-            unsupported[0].detail.contains("explicit absolute path"),
+            unsupported[0].detail.contains("absolute path"),
             "{}",
             unsupported[0].detail
+        );
+    }
+
+    #[test]
+    fn exclude_globs_travel_from_the_spec_into_the_input() {
+        // 选源排除项是「这份采集面不该采什么」，属于单元而不是本机偏好 ——
+        // 不多带一层就等于把容器日志又退回成「把业务名写进 pattern」。
+        let spec_text = r#"{"units":[{"unit_id":"linux-container-stdout","capability":"collect_logs","rule_ref":"r","requires_privilege":"root","sources":[{"kind":"FileGlob","target":"/var/log/containers/*.log","multiline":"none","exclude_globs":["/var/log/containers/*_kube-system_*.log"]}]}]}"#;
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![standing(
+                "work-1",
+                "ContainerStdout",
+                1,
+                "active",
+                spec_text,
+            )],
+        ));
+        let inputs = applied.log_inputs();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(
+            inputs[0].input.exclude_globs,
+            vec!["/var/log/containers/*_kube-system_*.log".to_string()]
         );
     }
 

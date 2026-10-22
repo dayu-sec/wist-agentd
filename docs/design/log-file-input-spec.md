@@ -35,17 +35,22 @@
 - 该清单**不包含**以下机制（代码中无落点，不作为已实现能力）：
   - resource 绑定与资源引用（`resource_refs`）注入
     （契约 `TelemetryRecord` 固定为 `schema_version / agent_id / observed_at / input_id / source_path / body / file_offset / file_offset_end / seq` 九个字段，无资源引用字段）
-  - glob/路径匹配与排除，以及新发现文件的起始位置策略
-    （契约 `LogFileInputSection` 只有 `input_id / path / startup_position / multiline_mode`，是**单个显式路径**，无 `path_patterns` / `exclude_path_patterns`）
   - `file watcher` 与轮询 fallback
     （`src/` 下无 `inotify` / `native_notify` 相关代码；读取由主循环 tick 逐轮驱动，
     见 `src/runtime/daemon_telemetry.rs` 中逐 input 的 `process_once_async`）
-- **轮转不用通配表达**（这是**策略**，不是缺能力）：一个文件是不是“历史”，不看它叫什么名字，
-  看它是不是**当前正在被写的那个**。所以文件族（`wifi.log` → `wifi.log.0` → `wifi.log.1`）
+  - 递归 glob（`**`）与 `~` 展开（W1 明确不支持，见 §2.1）
+  - k8s API 标签选择（`namespace` / `label` 过滤器）：W2 的结构化 `filters`，今天只有
+    `exclude_globs` 这一种选择手段
+- **W1 起支持文件族（glob / 目录）**：见 §2.1。它是**同一个**读取器的一条输入形态，
+  不是第二套实现。
+- **单文件轮转不用通配表达**（这是**策略**，不是缺能力）：一个文件是不是“历史”，不看它叫什么名字，
+  看它是不是**当前正在被写的那个**。所以单个轮转文件（`wifi.log` → `wifi.log.0` → `wifi.log.1`）
   应当写成**单个显式路径**（`/var/log/wifi.log`），轮转由采集器按 **inode** 跟踪：
   文件被改名后**只把剩余的尾巴读完**（不读完会丢数据），再跟到新建的主文件。
   写成 `wifi.log*` 是**错的** —— 它把轮转产物当成独立采集对象，而那些是历史
   （实测教训：按名字/扩展名过滤永远列不全，`wifi.log.0` 没压缩但同样是历史）。
+  文件**族**（目录 / 同构造多文件的 glob，如容器日志、DB csvlog 目录）才用 glob，
+  并用 `exclude_globs` 剔掉归档产物（见 §2.1）。
   落地见 `src/telemetry/logs/files/file_watcher.rs` 的 `decide_resume`（`rotated_from_path` / `rotated`）
   与 `src/telemetry/logs/files/checkpoint_support.rs` 的 `find_rotated_path_async`；
   测试：`tests/rotation.rs::rotate_keeps_draining_old_file_tail_and_tracks_new_file_separately`。
@@ -60,10 +65,70 @@
 
 - `M4` 实现其受控子集，用于在 `managed` 下验证数据面替代切片（`standalone` 不运行数据面）
 - `M4` 的实现边界收敛为：
-  - 显式单路径输入（`input_id` + `path`），而不是通用 `path_patterns[]` 发现模型
+  - 显式单路径输入（`input_id` + `path`），**以及 W1 加的文件族目标**（glob / 目录）
   - 最小 `parser / multiline / checkpoint / rotate / truncate / restart recovery` 链路
   - 最小 `buffer / spool -> warp-parse / file output` 主线
 - 本文档旧版本中的通用能力描述（discovery、watcher 策略、完整调度、保护模式与自观测扩展）没有代码落点，不作为已实现能力引用
+
+### 2.1 文件族（W1）的能力边界
+
+`path` 可以是三种形态，**行为分流看 `is_family_target`**：
+
+| `path` | 形态 | 处理器 |
+|---|---|---|
+| `/var/log/auth.log` | 显式单文件 | `FileInputProcessor`（**行为与 W1 前逐字不变**）|
+| `/var/log/containers/*.log` | 单层 glob | `FileFamilyProcessor` |
+| `/var/log/postgresql`（目录）| 目录 = 直接子文件 | `FileFamilyProcessor` |
+
+**支持**（`src/telemetry/logs/files/glob_match.rs`）：
+
+- 只支持**绝对路径**；`~` 不展开。
+- `*` / `?` / `[` 是元字符，**`*` 不跨目录**（`literal_separator(true)`）。
+- `**` **被拒**：递归展开既没实现也给不出上限。工作参数/目录装载期由
+  `wist-contracts::work::is_file_target` 拦住；本机配置由 `unsupported_target()`
+  报成「目标形态不支持」；万一绕过两层，文件族解析也返回 `InvalidInput`。
+- 目录目标 = 该目录下**直接子文件**（不递归）；最终文件判定**跟随 symlink**
+  （`/var/log/containers/*.log` 就是 symlink）。
+- `exclude_globs`（绝对路径 glob，按**展开后的完整路径**匹配）从匹配集里剔掉来源。
+  排除只影响**新发现**：已经在跟踪的文件会把剩下的尾巴读完再释放（改排除项不等于丢数据）。
+- **同一个真实文件只读一次**：目录里同时有 `link.log` 与其真实文件（或两条指向同一 inode 的
+  symlink）时，按 `realpath` 去重，只保留先遇到的那条。
+- 无匹配**不是失败**（空集合）；目录不可读是失败（要能看见）；**目录不存在**按
+  `MissingInput` 报（与显式单文件一致 —— 目标还不存在是配置问题，不是「暂时没匹配」）。
+
+**起始位置**（写死，见设计文档 D5/D10）：
+
+| 情形 | 起点 |
+|---|---|
+| input 首次扫描（checkpoint 里没有任何文件）| `startup_position`（默认 `tail`）|
+| 运行中 / 重启后**新出现**的文件（checkpoint 里没有它）| **head**（停机期间新建的文件不能整段丢）|
+| 已在跟踪的文件 | checkpoint 续读 |
+| 轮转（inode 变了）| 先按 `real_path` 找到被改名的旧文件把尾巴读完，再跟新主文件 |
+
+**保护与分页**：`max_files`（默认 512，跟踪上限）、`max_new_files`（默认 32/轮，
+新发现上限）、`rescan_interval_ms`（默认 15s，目录重扫与 3s tick 解耦）。
+单轮预算（行 / 字节）**跨文件递减**；预算耗尽时后面的文件留到下一轮，
+且**不落 offset=0 的 checkpoint**（那会把内容当成“已读过”永久跳过）——
+除非轮转 / 截断已确定起点就是 0。
+
+**错误隔离**：某个文件读失败（权限 / IO）不会拖垮整族 —— 其余文件照常交付并提交
+checkpoint，错误在本轮末尾报给上层（下一轮重试那个文件）。扫描（打开目录）失败则是
+整个 input 失败，并且**不推进扫描时钟**（每轮都会重试、都会报，而不是 15s 才报一次）。
+
+**触顶上报**：匹配数超过 `max_files` 时，本轮拒绝的新文件数会作为 `CapacityExceeded`
+失败上报（`detail` 稳定、`refused/tracked` 进 `magnitude`）。行为仍是「不再接纳新文件、
+已跟踪的继续」—— 不淘汰，免得把正在采的文件踢掉又从头读。
+
+**状态写盘**：只有**真的变了**（位置推进 / 集合变化 / 扫描）才重写 checkpoint。
+空闲 tick 不重写：512 个文件的全量状态每 3s 写一次是数 GB/天的写放大。
+
+**多行与 checkpoint**：`pending_multiline` 下移到**每个文件一份**
+（`TrackedFileCheckpoint.pending_multiline`）；旧 checkpoint 的 input 级块会在首轮
+自动迁到对应文件，迁移不上（文件条目已不在）的那块按到期封口交出去，不丢。
+`real_path` 持久化 symlink 解析结果（轮转发生在真实目录里）。一个 `path` 只保留一条
+checkpoint（同一路径换了 inode 时旧条目让位，否则新文件永远读不到）。
+
+**不做**（D1 的红线）：不解析正文、不拆 CRI 头、不按容器名分派 —— agentd 只搬原文。
 
 ---
 

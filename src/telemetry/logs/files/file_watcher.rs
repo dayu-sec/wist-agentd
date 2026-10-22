@@ -197,6 +197,8 @@ mod tests {
             last_read_at: None,
             last_commit_point_at: None,
             rotated_from_path: None,
+            real_path: String::new(),
+            pending_multiline: None,
         }
     }
 
@@ -363,6 +365,8 @@ mod tests {
             last_read_at: None,
             last_commit_point_at: None,
             rotated_from_path: None,
+            real_path: String::new(),
+            pending_multiline: None,
         };
         fs::write(&path, "1234567890abcdef\nnew-tail\nmore\n").expect("rewrite file");
 

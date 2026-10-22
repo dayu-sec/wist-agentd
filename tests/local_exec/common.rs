@@ -25,6 +25,7 @@ pub(crate) struct TestLogCheckpointState {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct TestTrackedFileCheckpoint {
+    pub(crate) path: String,
     pub(crate) checkpoint_offset: u64,
 }
 
@@ -150,6 +151,7 @@ pub(crate) fn standalone_config_with_file_input(
                 path: input_path.display().to_string(),
                 startup_position: "head".to_string(),
                 multiline_mode: "none".to_string(),
+                exclude_globs: Vec::new(),
             }],
             file_inputs_file: None,
             max_line_bytes: 1_048_576,
@@ -228,6 +230,7 @@ pub(crate) fn standalone_config_with_tcp_file_input(
                 path: input_path.display().to_string(),
                 startup_position: "head".to_string(),
                 multiline_mode: "none".to_string(),
+                exclude_globs: Vec::new(),
             }],
             file_inputs_file: None,
             max_line_bytes: 1_048_576,

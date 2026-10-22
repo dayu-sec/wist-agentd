@@ -3124,6 +3124,7 @@ mod tests {
                         kind: "FileGlob".to_string(),
                         target: "/Library/Logs/DiagnosticReports/crash.ips".to_string(),
                         multiline: "none".to_string(),
+                        exclude_globs: Vec::new(),
                     }],
                 }],
                 tasks: Vec::new(),
@@ -3171,6 +3172,7 @@ mod tests {
                 path: "/var/log/manual.log".to_string(),
                 startup_position: "tail".to_string(),
                 multiline_mode: "none".to_string(),
+                exclude_globs: Vec::new(),
             }];
         let grant = grant_with_a_log_task();
         let outcome = report_status_to_control_plane(

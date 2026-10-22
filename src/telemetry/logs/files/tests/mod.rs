@@ -16,6 +16,7 @@ use crate::telemetry::warp_parse::RecordSink;
 
 mod basic;
 mod checkpoint_state;
+mod family;
 mod missing;
 mod multiline;
 #[cfg(unix)]
@@ -59,6 +60,10 @@ fn config(root: &Path, source_path: &Path) -> FileInputConfig {
         // 测试里的输入默认不带来源身份（相当于本机手工配置的那类）。
         origin: crate::telemetry::logs::InputOrigin::default(),
         source_path: source_path.to_path_buf(),
+        exclude_globs: Vec::new(),
+        max_files: super::DEFAULT_MAX_FILES_PER_INPUT,
+        max_new_files: super::DEFAULT_MAX_NEW_FILES_PER_TICK,
+        rescan_interval_ms: super::DEFAULT_RESCAN_INTERVAL_MS,
         state_dir: root.join("state"),
         spool_path: root.join("state").join("spool").join("input-app.ndjson"),
         startup_position: StartupPosition::Head,
