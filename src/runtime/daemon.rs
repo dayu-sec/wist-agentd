@@ -13,11 +13,15 @@ use wist_api::discovery_policies::{
 use wist_api::facts::ReportAgentFactSummary;
 use wist_api::status::{AgentStatusReport, AgentWorkState, AgentWorkStateChange};
 use wist_contracts::agent_uplink::AgentUplinkState;
+use wist_contracts::capability_report::LogsCapabilities;
 use wist_contracts::discovery_policy::DiscoveryAspectPolicySet;
 use wist_contracts::local_work::{
     AgentLocalOneShotWork, AgentLocalStandingWork, AgentLocalTask, AgentLocalWork,
 };
 use wist_contracts::telemetry_record::DataFrame;
+use wist_contracts::work::{
+    EXPORTER_IDS, FILE_INPUT_ABSOLUTE_PATH, FILE_INPUT_GLOB, MULTILINE_MODES,
+};
 use wist_shared::time::{now_rfc3339, now_ts_ms};
 
 use crate::enrollment::enrollment_http_client;
@@ -441,6 +445,28 @@ impl StatusReportOutcome {
 /// `uplink` / `uplink_health` 用来构造**本机实际生效的上送状态**（[`build_uplink_state`]）：
 /// 同样是「网关不知道我生效成了什么」的那类事实，与 `discovery_policy_version` 同口径。
 // 参数多但每一个来源不同（采样值 / 差量 / 策略版本 / 两份期望状态），
+/// 本版 agentd **声明的日志能力**（D7）。
+///
+/// 不从配置/环境读：能力是**版本属性**，写死在代码里；从契约常量派生，
+/// 新增一种导出器或 multiline 模式时自动跟上（避免手抄一份名单然后漂）。
+///
+/// 为什么不声明 `parsers` / `watcher_modes`：解析不在 agent 侧（agentd 只搬原文），
+/// 监视器首版也没有 —— 声明一个本版真没有的能力，比不报更糟。
+fn declared_logs_capabilities() -> LogsCapabilities {
+    LogsCapabilities {
+        file_inputs: vec![
+            FILE_INPUT_ABSOLUTE_PATH.to_string(),
+            FILE_INPUT_GLOB.to_string(),
+        ],
+        multiline_modes: MULTILINE_MODES
+            .iter()
+            .map(|mode| mode.to_string())
+            .collect(),
+        exporters: EXPORTER_IDS.iter().map(|id| id.to_string()).collect(),
+        ..LogsCapabilities::default()
+    }
+}
+
 // 打包成结构体只会把构造点与调用点都弄长 —— 与 `run_once_with_failure_cache` 同一取舍。
 #[allow(clippy::too_many_arguments)]
 async fn report_status_to_control_plane(
@@ -489,6 +515,10 @@ async fn report_status_to_control_plane(
         // 机器画像：注册表里「这是哪台机器」的展示依据（机器名 / node_id / 网卡地址）。
         // 凭证书首触重建登记时机器画像是空的，靠每次状态上报带上、由网关回填。
         machine_profile: Some(crate::enrollment::build_host_profile(config)),
+        // D7 能力清单：**契约说能执行的，本版就都实现了**（两边同源：
+        // `EXPORTER_IDS` 与 `telemetry::exporters::EXPORTERS` 的一致性由单测钉住）。
+        // 硬写一份名单会漂；从这里取，新增一种能力时自动跟上。
+        logs_capabilities: Some(declared_logs_capabilities()),
     };
     let client = match enrollment_http_client(config) {
         Ok(client) => client,
@@ -2518,6 +2548,74 @@ mod tests {
                 ),
                 "{request}"
             );
+            let response =
+                "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let mut config = test_config();
+        config.control_plane.endpoint = Some(endpoint);
+        let uplink = applied_uplink(AgentUplinkGrant::enabled_at(
+            "10.0.1.9".to_string(),
+            9000,
+            "2026-09-26T00:00:00Z".to_string(),
+        ));
+        let outcome = report_status_to_control_plane(
+            &config,
+            None,
+            None,
+            None,
+            None,
+            &AppliedWorkGrant::default(),
+            &uplink,
+            &UplinkHealth::default(),
+            false,
+        )
+        .await;
+        server.await.expect("server task");
+        assert!(outcome.latency_ms.is_some());
+    }
+
+    /// D7：能力清单必须**真的进**上送报文（不是构造了却忘了接上 `AgentStatusReport`）。
+    #[tokio::test]
+    async fn report_status_carries_the_logs_capabilities() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let request = read_http_request(&mut socket).await;
+            // 不光看字串：把报文体**真解一遍**，确认能回到 `AgentStatusReport` 且
+            // 清单与契约常量逐项相等（少一项就会让某个面在派活时被静默裁掉）。
+            let body = request
+                .split_once("\r\n\r\n")
+                .map(|(_, body)| body)
+                .expect("status report has a body");
+            let report: AgentStatusReport =
+                serde_json::from_str(body).expect("status report decodes");
+            let logs = report.logs_capabilities.expect("logs_capabilities present");
+            assert_eq!(
+                logs.file_inputs,
+                vec![
+                    FILE_INPUT_ABSOLUTE_PATH.to_string(),
+                    FILE_INPUT_GLOB.to_string()
+                ]
+            );
+            assert_eq!(
+                logs.multiline_modes,
+                MULTILINE_MODES
+                    .iter()
+                    .map(|mode| mode.to_string())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                logs.exporters,
+                EXPORTER_IDS
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+            );
+            // 本版真没有的能力不报（多报比漏报更糟：网关会据此派活）。
+            assert!(logs.parsers.is_empty() && logs.watcher_modes.is_empty());
             let response =
                 "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
             socket.write_all(response.as_bytes()).await.expect("write");
