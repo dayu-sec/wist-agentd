@@ -3,6 +3,31 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.0-alpha] - 2026-10-23
+
+### 新增
+
+- **一条输入可以盯一个文件族（W2 收口）**：容器日志的结构化选源 `filters`（`namespace_in` /
+  `pod_not_in`）在**发现阶段**求值（展开 → 剔 `exclude_globs` → 剔 filters），
+  读取器（tail / checkpoint / 轮转 / 预算）一行未改。
+- **内核日志改走 journald（W3）**：新导出器 `journalctl-kernel`（`journalctl -k -p 4 -o json`，
+  周期 60s）。游标续读，重启不重放；`--show-cursor` 不可靠，改用 JSON 里的 `__CURSOR`。
+  journal 被 vacuum 时 journalctl **不报错**（实测 systemd 255 / 259）而是静默重读，
+  所以带游标超时会清游标退回有界的 `--since`，不会永久卡死。
+- **状态上报带日志能力清单（D7）**：`logs_capabilities`（`file_inputs` / `multiline_modes` /
+  `exporters`），从契约常量派生。网关据此不再把「这台机器接不了的来源」派下来。
+
+### 变更
+
+- 上送失败时不推进游标（至少一次）：宁可下一轮重读，不把没送达的一段永久跳过。
+
+### 升级提示
+
+- **依赖 `wist-contracts` 0.9.4 / `wist-api` 0.9.1**。
+- ⚠ **先升级网关再升级本版**：`AgentStatusReport` 是 `deny_unknown_fields` 的，
+  旧网关收到 `logs_capabilities` 会**整份拒收**，本版会一直报 400。
+- 新增导出器 `journalctl-kernel`：需要本机有 `/usr/bin/journalctl`（非 systemd 主机不派这个面）。
+
 ## [0.8.0-alpha] - 2026-10-22
 
 ### 新增
