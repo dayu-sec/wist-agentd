@@ -38,6 +38,35 @@ jobs:
       - name: Cargo test (release)
         run: cargo test --release --all
 
+  # 内核日志导出器（W3）的**真 journald** 验收：不需要编译，所以单开一个 job，
+  # 也不用等 Rust 缓存。验的是「agentd 对 journalctl 的假设」：
+  # 一行一条 JSON / `__CURSOR` 可取 / 续读不重放 / 畸形游标措辞 / `-p 4` 过滤。
+  # 环境采不到内核日志时脚本退 77：这里当**明确的 SKIP**（写进 step summary + 告警），
+  # 而不是硬红（硬红会逼人加 `if: false`，比告警更容易被永久忽略）。
+  journal-contract:
+    name: Journal contract (real journald)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Verify journalctl contract
+        run: |
+          set +e
+          sudo env WIST_VERIFY_ALLOW_SKIP=1 dev/verify-journal-exporter.sh
+          rc=$?
+          set -e
+          {
+            echo "### journal 契约（真 journald）"
+            echo ""
+            echo "- 退出码：\`$rc\`（0 = 通过且无 SKIP，77 = 环境无法验证）"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" -eq 77 ]; then
+            echo "::warning::runner 采不到内核日志，journal 契约被跳过（这不是“通过”）"
+            exit 0
+          fi
+          exit "$rc"
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest

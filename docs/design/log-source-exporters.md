@@ -60,6 +60,7 @@ target = "<id>"                 # 无参
 | `smartctl` | `smartctl` | linux | `smartctl -a` 逐盘 |
 | `dmesg:panic` | `dmesg` + `arg=panic` | linux | 内核 `panic`/`Oops`/`BUG:` |
 | `dmesg:nvidia-xid` | `dmesg` + `arg=nvidia-xid` | linux | `NVRM`/`Xid` |
+| `journalctl-kernel` | `journalctl-kernel` | linux | 内核日志（W3）：`-k -p 4 -o json` + **游标续读** |
 | `auditd-execve` | `auditd-execve` | linux | audit 日志里的 execve |
 | `last,lastb` | `last` | macos | `last`/`lastb` 会话 |
 | `praudit(/var/audit)` | `praudit` + `arg=/var/audit` | macos | OpenBSM 审计链 |
@@ -102,6 +103,31 @@ target = "<id>"                 # 无参
   - `file_offset` / `file_offset_end` = 该次快照内的字节位（快照型无「历史游标」，语义仅作定位）；
   - `seq` = 全局序号（与日志/事实共用）。
 - **不走 checkpoint**：快照型没有「上次读到哪」，重启不补历史。
+
+**有状态导出器（W3 起的唯一例外）**
+
+`journalctl-kernel` 不是快照型：它把上一次读到的游标落 `state/exporters/<run_id>.cursor`
+（临时文件 + rename），下一轮用 `--after-cursor` 接着读。命令：
+`journalctl -k -p 4 -o json --no-pager --quiet`（有游标时附 `--after-cursor=<c>`，否则 `--since -5m`）。
+
+- 游标取自 `-o json` 最后一行的 `__CURSOR`。这是 D1「只搬原文」的**唯一例外**，而且是**传输层**
+  字段：只决定“下次从哪读”，不进记录、不改 body。为什么不用 `--show-cursor`：它写哪个流、
+  空窗口时是否输出，随版本/输出模式变 —— 写进 stdout 会变成假记录，取不到会让每轮重读同一段。
+- `--quiet` + `--no-pager`：stdout 必须是**纯记录**（`-- No entries --` 这类 UI 提示不能变成日志）。
+- 游标键是**运行标识**（`input_id`，与 `last_run_ms` 同一把），不是导出器 ID：两个单元盯同一个
+  导出器时共享游标会让其中一个永远读到空窗口。
+- 周期 60s；没有游标（首跑 / 手动删除）时用 `--since=-5m`。
+- **`--after-cursor` 替换时间窗口，不与它共存**：实测 journalctl 拒绝两者同时出现
+  （`Please specify only one of --since=, --cursor=, --after-cursor=`）。
+- 畸形游标 → 退出码 1、stderr `Failed to seek to cursor` → 回退一次 `--since`
+  并记 `event=ExporterCursorFallback`；回退后仍取不到新游标 → 清掉死游标。
+- **格式合法但已不存在的游标不会报错**（systemd 259 实测）：journalctl 静默从 journal 起点重读。
+  这次重读没有窗口上限（不能与 `--since` 同用），journal 大时会超过 30s 超时；
+  所以带游标超时时会**清游标**并记 `event=ExporterCursorReset`，下一轮退回有界的 `--since`。
+- **上送失败时不推进游标**（下一轮重读同一段）：宁可在交付路径上重复一次，也不把未送达的一段
+  永久跳过。
+- 为什么不用 `journalctl -f` 流式跟进：那需要进程监督与重连语义；60s 轮询已满足
+  「事故解释」的需求，将来真要求秒级延迟再加流式 source，数据模型不返工。
 
 ## 6. 权限
 
@@ -162,6 +188,10 @@ target = "<id>"                 # 无参
 ## 11. 相关文档
 
 - [`log-file-input-spec.md`](./log-file-input-spec.md)：文件输入（tail/checkpoint/rotate）规格
+- `dev/verify-journal-exporter.sh`：内核导出器的**真机**验收（任意 systemd Linux；
+  验一行一条 JSON、`__CURSOR`、续读不重放、畸形游标措辞、`-p 4` 过滤）。
+  CI 里由 `build-and-test.yml` 的 `journal-contract` job 在 ubuntu-24.04 上跑（不编译）；
+  采不到内核日志时退 77 → 明确 SKIP（summary + 告警），不假绿。
 - [`linux-security-audit-log-sources.md`](./linux-security-audit-log-sources.md) §8：接入分级（A 现成 / B 需定时导出器）
 - [`macos-security-audit-log-sources.md`](./macos-security-audit-log-sources.md)：macOS 源清单
 - `wist-contracts/src/work.rs`：`EXECUTABLE_SOURCE_KINDS` / `is_executable_source` / `WorkSpecSource`

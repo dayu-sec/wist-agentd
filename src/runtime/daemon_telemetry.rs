@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::config::agent_config::{AgentConfig, LogFileInputSection, LogsOutputSection};
 use wist_shared::time::now_rfc3339;
 
-use crate::control::work::AppliedWorkGrant;
+use crate::control::work::{AppliedWorkGrant, WorkExporterRun};
 use crate::state_store::log_seq_state;
 use crate::telemetry::exporters;
 use crate::telemetry::logs::InputOrigin;
@@ -276,7 +276,9 @@ pub(super) async fn process_telemetry_inputs(
 ///
 /// 与 [`process_telemetry_inputs`] 平行，但导出器不是「读一个文件」而是「**周期跑一条固定命令**」：
 ///   * 周期是导出器属性（`crate::telemetry::exporters`），到点才跑；上次运行时刻落本地状态；
-///   * 跑**无论成败都推进下次时间**（失败不每 tick 重试，避免刷屏）；
+///   * 调度上**无论成败都推进下次时间**（失败不每 tick 重试，避免刷屏）；
+///   * 但**有状态导出器的游标只在数据交出去之后才推进**：上送失败时下一轮重读同一段
+///     （至少一次），宁可重复也不把没送达的一段永久跳过；
 ///   * 失败/写失败都如实打到自观测（`agentd.err`），不静默。
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn process_exporters(
@@ -311,7 +313,19 @@ pub(super) async fn process_exporters(
         let Some(def) = exporters::def(&run.exporter_id) else {
             continue;
         };
-        let argv = match exporters::argv_for(&run.exporter_id, run.arg.as_deref()) {
+        // 有状态导出器（内核日志）用上次落盘的游标续读；无状态的一律 `None`。
+        // 游标的键是**运行标识**（与 `last_run_ms` 同一把钥匙）：两个单元盯同一个导出器时
+        // 各读各的位置，最差重复，不会让其中一边静默收不到。
+        let cursor = if exporters::uses_cursor(&run.exporter_id) {
+            exporters::load_cursor(state_dir, &run.input_id)
+        } else {
+            None
+        };
+        let argv = match exporters::argv_for_run(
+            &run.exporter_id,
+            run.arg.as_deref(),
+            cursor.as_deref(),
+        ) {
             Ok(argv) => argv,
             Err(err) => {
                 log::error!("wist-agentd exporter {} failed: {err}", run.exporter_id);
@@ -353,8 +367,24 @@ pub(super) async fn process_exporters(
         state.last_run_ms.insert(run.input_id.clone(), now);
         changed = true;
         ran_any = true;
-        match exporters::run_argv(&argv, def.timeout_secs).await {
-            Ok(output) => {
+        match exporters::run_with_cursor_fallback(
+            &run.exporter_id,
+            run.arg.as_deref(),
+            cursor.as_deref(),
+            def.timeout_secs,
+        )
+        .await
+        {
+            Ok((output, fell_back)) => {
+                if fell_back {
+                    // 这条自观测就是“采集没有静默退回文件 / 没有卡死”的证据（见 D6）。
+                    log::warn!(
+                        "event=ExporterCursorFallback exporter={} action=\"游标已失效（可能被 journal vacuum 清掉）；已回退 --since {} 重读\"",
+                        run.exporter_id,
+                        exporters::KERNEL_INITIAL_SINCE
+                    );
+                }
+                // 一行一条 JSON = 一条记录（body 原样）。
                 let records = exporters::records_from_output(
                     agent_id,
                     &run.input_id,
@@ -364,11 +394,23 @@ pub(super) async fn process_exporters(
                     &output,
                     next_seq,
                 );
+                // 游标只在**这一段真的交出去**之后才推进：上送失败还推进，等于把这一段
+                // 永久丢掉（journal 不会因为你没发成功就回滚）。宁可下一轮重读一次。
+                let mut delivered = true;
                 if !records.is_empty()
                     && let Err(err) = sink.write_records(&records).await
                 {
+                    delivered = false;
                     log::error!(
                         "wist-agentd exporter {} uplink failed: {err}",
+                        run.exporter_id
+                    );
+                }
+                if delivered {
+                    persist_cursor(state_dir, &run, &output, fell_back);
+                } else {
+                    log::warn!(
+                        "event=ExporterCursorHeld exporter={} note=\"本轮上送失败，游标不推进；下一轮重读同一段（至少一次）\"",
                         run.exporter_id
                     );
                 }
@@ -379,7 +421,24 @@ pub(super) async fn process_exporters(
                     records.len()
                 );
             }
-            Err(err) => log::error!("wist-agentd exporter {} failed: {err}", run.exporter_id),
+            Err(err) => {
+                // 带游标却超时 → 游标指向旧位置，journalctl 静默重读整份 journal（实测），
+                // 留它只会每轮超时。清掉，下一轮走有界的 `--since`。
+                let reset = exporters::should_reset_cursor(cursor.as_deref(), &err);
+                if reset {
+                    if let Err(clear_err) = exporters::clear_cursor(state_dir, &run.input_id) {
+                        log::error!(
+                            "wist-agentd exporter {} cursor clear failed: {clear_err}",
+                            run.exporter_id
+                        );
+                    }
+                    log::warn!(
+                        "event=ExporterCursorReset exporter={} reason=timeout action=\"游标可能指向已不存在的旧位置（重读整份 journal 超时）；已清游标，下一轮从 --since 重读\"",
+                        run.exporter_id
+                    );
+                }
+                log::error!("wist-agentd exporter {} failed: {err}", run.exporter_id)
+            }
         }
     }
     if changed {
@@ -387,6 +446,44 @@ pub(super) async fn process_exporters(
     }
     if ran_any && let Err(err) = log_seq_state::store_async(global_seq_path, *next_seq).await {
         log::error!("wist-agentd exporter seq persist failed: {err}");
+    }
+}
+
+/// 把本轮取到的游标落盘；取不到就如实说，不静默丢下一段。
+///
+/// 四种情形分开处理，因为「没游标」的原因决定了下一轮会不会重复读：
+///   * 有新游标 → 原子落盘；
+///   * 窗口里**真没条目**（输出为空）→ 什么都不做（内核安静是常态，不该每 60s 告警一次）；
+///   * 回退过、且窗口里没条目 → 旧游标已证明是死的，**清掉**（否则每轮都失败一次再回退一次）；
+///   * 有内容但取不到游标 → 保留旧游标并告警（宁可下一轮重复读一段，也不假装读到了）。
+fn persist_cursor(state_dir: &Path, run: &WorkExporterRun, output: &str, fell_back: bool) {
+    let exporter_id = run.exporter_id.as_str();
+    let run_id = run.input_id.as_str();
+    if !exporters::uses_cursor(exporter_id) {
+        return;
+    }
+    match exporters::cursor_from_output(output) {
+        Some(next) => {
+            if let Err(err) = exporters::save_cursor(state_dir, run_id, &next) {
+                log::error!("wist-agentd exporter {exporter_id} cursor persist failed: {err}");
+            }
+        }
+        // 输出为空 = 这段时间没有新条目（正常）；但若刚回退过，说明旧游标确实是死的。
+        None if output.trim().is_empty() => {
+            if fell_back {
+                if let Err(err) = exporters::clear_cursor(state_dir, run_id) {
+                    log::error!("wist-agentd exporter {exporter_id} cursor clear failed: {err}");
+                }
+                log::warn!(
+                    "event=ExporterCursorDropped exporter={exporter_id} \
+                     note=\"回退后仍没有新游标；已清掉旧游标，下一轮从 --since 重新开始\""
+                );
+            }
+        }
+        None => log::warn!(
+            "event=ExporterCursorMissing exporter={exporter_id} \
+             note=\"本轮输出里没有 __CURSOR（journalctl 输出格式变了？）；保留旧游标，下一轮可能重复读同一段\""
+        ),
     }
 }
 

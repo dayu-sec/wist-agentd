@@ -52,7 +52,7 @@
 | `NetworkFirewall` 网络与防火墙 | P1 | P1 | `nft list ruleset` / `iptables-save` 快照、`firewalld`/`ufw` journal |
 | `RebootPower` 关机与重启 | P1 | P0 | journald shutdown/reboot、`last reboot` |
 | `MiscSystem` 系统杂项 | P2 | P1 | `/var/log/cron`、`syslog` 杂项、`alternatives.log` |
-| `KernelSystem` 内核与系统 | P0 | P0 | `kern.log`/`messages`、`dmesg`、OOM killer |
+| `KernelSystem` 内核与系统 | P0 | P0 | **journald `journalctl -k`**（权威源；`kern.log`/`messages` 是派生副本，不作为来源）、`dmesg`、OOM killer |
 | `DatabaseService` 数据库服务 | — | P0 | `/var/log/postgresql/*`、MySQL/MariaDB error log、Redis、MongoDB |
 | `StorageHealth` 存储与文件系统 | P1 | P0 | `smartctl`、`/var/log/fsck*`、`/proc/mdstat`、LVM、`df`/inode |
 | `ComputeWorkload` 作业/调度/加速卡 | P0 | P1 | `/var/log/slurm/*`、`journalctl -u kubelet`、`/var/log/pods/*`、`dmesg` NVRM/Xid |
@@ -110,7 +110,11 @@
 
 ### 5.9 内核与系统（`KernelSystem`）
 
-- `/var/log/kern.log`（Debian 系）/ `/var/log/messages`（RHEL 系）、`dmesg`；
+- **journald 是唯一权威源**（W3）：`Exporter journalctl-kernel`（`journalctl -k -p 4 -o json` + 游标续读）。
+  文件侧的 `/var/log/kern.log` / `/var/log/messages` 只是 rsyslog 的派生副本：**没有 `PRIORITY`**、
+  留下的是 `ForwardToSyslog` 决定的内容、保留期也和 journal 不同步 —— 两源并存只会重复 + 漂移，
+  所以**不做文件回退**（见 `linux-server-log-coverage-plan.md` D6）；非 systemd 主机该面不采集。
+- `dmesg` 导出器只用作「ring buffer 快照」（`dmesg:panic`）；增量语义以 journal 为准。
 - **OOM killer**（`Out of memory: Killed process`）：算力/数据服务器最高频的“事故解释”，单独打标。
 
 ### 5.10 数据库服务（`DatabaseService`）
@@ -195,8 +199,8 @@
 | C. 需新 source | 无 | —— | Linux 不需要 macOS 那种 predicate source |
 | D. 直发 | 已结构化事件 | `[telemetry.logs.output] kind = "tcp"`（NDJSON） | 见 `macos-agent-uplink-to-warp-parse.md` |
 
-推荐首版最小集（P0 且改动小）：`secure`/`auth.log`、`dpkg.log`/`dnf.log`、`kern.log`/`messages`（OOM）、
-DB 日志（数据服务器）、SMART + `df`、主机指标。
+推荐首版最小集（P0 且改动小）：`secure`/`auth.log`、`dpkg.log`/`dnf.log`、
+`journalctl -k -p 4`（OOM / panic，W3）、DB 日志（数据服务器）、SMART + `df`、主机指标。
 
 ## 9. 缺口清单（这是与 macOS 侧最大的差别）
 

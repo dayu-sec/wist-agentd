@@ -150,6 +150,9 @@
     execution_queue.json
     fact_report.json
     work.json
+    exporters.json
+    exporters/
+      <run_id>.cursor
     running/
       <execution_id>.json
     reporting/
@@ -163,8 +166,13 @@
 ```
 
 约定：**单例状态扁平放在 `state/` 根下**（`agent_runtime.json` / `auth_terminal.json` /
-`execution_queue.json` / `fact_report.json` / `work.json`），**「一个实体多实例」才用目录**
-（`running/<execution_id>.json`、`logs/file_inputs/<input_id>/`）。
+`execution_queue.json` / `fact_report.json` / `work.json` / `exporters.json`），**「一个实体多实例」才用目录**
+（`running/<execution_id>.json`、`logs/file_inputs/<input_id>/`、`exporters/<run_id>.cursor`）。
+
+> 导出器的游标单独一个文件（不是塞进 `exporters.json`）：它是**外部进程定义的格式**
+> （journalctl 的游标串），混进 JSON 状态里会把「游标读坏了」放大成「整份调度状态读坏了」。
+> 键是**运行标识**（与「上次运行时刻」同一把），不是导出器 ID（见
+> [`log-source-exporters.md`](log-source-exporters.md) §5）。
 
 ### 4.1 `agent_runtime.json`
 

@@ -1079,6 +1079,38 @@ mod tests {
     }
 
     #[test]
+    fn the_kernel_log_unit_becomes_a_scheduled_export_run() {
+        // W3：目录里 `linux-kernel-system` 的唯一来源就是它。这条验的是“只有契约认识的 ID
+        // 才能折算成任务”—— 词表漏了这个 ID，整台机器的内核日志会安静地变成 unsupported。
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![standing(
+                "work-1",
+                "KernelSystem",
+                1,
+                "active",
+                &spec(&[(
+                    "linux-kernel-system",
+                    "collect_logs",
+                    "Exporter:journalctl-kernel",
+                )]),
+            )],
+        ));
+        let runs = applied.exporter_runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].exporter_id, "journalctl-kernel");
+        assert_eq!(runs[0].target, "journalctl-kernel");
+        assert_eq!(
+            runs[0].input_id,
+            "work-KernelSystem-linux-kernel-system-exporter"
+        );
+        assert!(applied.unsupported_units().is_empty());
+        // 也不是文件输入。
+        assert!(applied.log_inputs().is_empty());
+    }
+
+    #[test]
     fn an_exporter_argument_is_kept_out_of_the_id() {
         let mut applied = AppliedWorkGrant::default();
         applied.apply(&grant(
