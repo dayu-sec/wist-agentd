@@ -45,7 +45,7 @@ use multiline_support::{
 };
 use state_support::{CollectedReadBatch, DeliveryOutcome, PendingCheckpoint, RuntimeState};
 
-use super::glob_match::{has_glob, resolve_family_paths};
+use super::glob_match::{FamilySelection, has_glob, resolve_family_paths};
 
 const SPOOL_REPLAY_BATCH_SIZE: usize = 128;
 
@@ -66,6 +66,8 @@ pub struct FileInputConfig {
     pub source_path: PathBuf,
     /// 文件族排除的路径（glob）；只对 glob/目录目标生效。
     pub exclude_globs: Vec<String>,
+    /// 容器选源的结构化过滤器（默认空）；在**发现阶段**求值，只影响“哪些文件进工作集”。
+    pub filters: wist_contracts::work::ContainerFilters,
     /// 每个 input 最多跟踪多少个文件。
     pub max_files: usize,
     /// 每 tick 最多接入多少个新文件。
@@ -664,10 +666,11 @@ where
                 .log_state
                 .last_scan_ms
                 .is_none_or(|last| now_ms.saturating_sub(last) >= self.config.rescan_interval_ms);
-        let matched = if should_scan {
-            let matched = resolve_family_paths(
+        let selection = if should_scan {
+            let selection = resolve_family_paths(
                 &self.config.source_path,
                 &self.config.exclude_globs,
+                &self.config.filters,
                 // 扫描上限 ≠ 跟踪上限：匹配集要足够全，否则「超过 max_files 的已跟踪文件」
                 // 会被当作“不再匹配”错误清理。
                 self.config.max_files.saturating_mul(4).max(1024),
@@ -676,10 +679,12 @@ where
             // 只在**扫描成功**后推进时钟：扫描失败（目录不可读）时每轮都重试，
             // 否则错误只每 15s 报一次，中间那些 tick 看着「一切正常」。
             runtime.log_state.last_scan_ms = Some(now_ms);
-            matched
+            selection
         } else {
-            Vec::new()
+            FamilySelection::none()
         };
+        let matched = &selection.selected;
+        let deselected = &selection.deselected;
         let matched_keys: BTreeSet<String> = matched
             .iter()
             .map(|path| path.display().to_string())
@@ -690,6 +695,8 @@ where
             .log_state
             .files
             .iter()
+            // 策展人本轮刚取消选择的：**这一轮就停**，不再多读一 tick。
+            .filter(|entry| !deselected.contains(&entry.path))
             .map(|entry| (entry.path.clone(), PathBuf::from(&entry.path)))
             .collect();
         // 同一个真实文件只能读一次：目录里可能同时有 `link.log` 和它的真实文件
@@ -764,7 +771,12 @@ where
             }
         }
         if should_scan {
-            prune_family_state(&mut runtime.log_state, &matched_keys, &observed_at);
+            prune_family_state(
+                &mut runtime.log_state,
+                &matched_keys,
+                deselected,
+                &observed_at,
+            );
         }
         batch.withheld = gate.withheld();
         Ok(batch)
@@ -1102,11 +1114,21 @@ fn migrate_input_pending_to_files(state: &mut LogCheckpointState) -> Option<Pend
 fn prune_family_state(
     state: &mut LogCheckpointState,
     matched: &BTreeSet<String>,
+    deselected: &BTreeSet<String>,
     observed_at: &str,
 ) {
     state.files.retain(|entry| {
         if matched.contains(&entry.path) {
             return true;
+        }
+        // **策展人取消选择**（filters / exclude_globs / target 改了）：立刻停，不排空。
+        //
+        // 容器日志是持续增长的：靠“排空到 EOF”永远排不完，现场表现就是
+        // 「把 namespace 从 filters 里去掉后，那条流还在往里进」。
+        // 轮转 / 删除后的旧名字根本不在枚举结果里（不在 deselected 中），
+        // 所以它们仍走下面的排空逻辑，W1 的行为不变。
+        if deselected.contains(&entry.path) {
+            return false;
         }
         // 还有未封口块：它在等空闲封口，不能现在丢。
         if entry.pending_multiline.is_some() {

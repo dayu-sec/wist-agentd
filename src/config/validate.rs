@@ -115,6 +115,23 @@ fn validate_logs_section(logs: &LogsSection) -> Result<(), ValidationError> {
                 return Err(ValidationError::new("invalid_log_input_exclude_glob"));
             }
         }
+        // 容器过滤器是**精确名字**：空串 / 空白 / 通配符都永远匹配不上，当面拒掉。
+        // （这里只能给 code，不带 detail —— `ValidationError` 就是这个形状；
+        //   填错的具体原因在网关装载目录时会带着单元 id 报出来。）
+        input
+            .filters
+            .validate()
+            .map_err(|_| ValidationError::new("invalid_log_input_container_filters"))?;
+        if !input.filters.is_empty() {
+            // 过滤器靠文件名 `<pod>_<ns>_<container>-<id>.log` 求值：写在别的路径上
+            // 只会“一个都匹配不上”。与网关装载期同一条口径（这里也拦一道）：
+            // 本机直配的输入同样不该静默空载。
+            let root = wist_contracts::work::CONTAINER_LOG_ROOT;
+            let under_root = input.path == root || input.path.starts_with(&format!("{root}/"));
+            if !under_root {
+                return Err(ValidationError::new("invalid_log_input_container_filters"));
+            }
+        }
     }
 
     Ok(())
@@ -167,6 +184,7 @@ mod tests {
                 startup_position: "tail".to_string(),
                 multiline_mode: "none".to_string(),
                 exclude_globs: Vec::new(),
+                filters: Default::default(),
             }],
             file_inputs_file: None,
             in_memory_buffer_bytes: 1024,

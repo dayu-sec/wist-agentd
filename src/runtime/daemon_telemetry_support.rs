@@ -105,6 +105,7 @@ pub(super) fn build_file_input_config(
         origin: origin.clone(),
         source_path,
         exclude_globs: input.exclude_globs.clone(),
+        filters: input.filters.clone(),
         max_files: DEFAULT_MAX_FILES_PER_INPUT,
         max_new_files: DEFAULT_MAX_NEW_FILES_PER_TICK,
         rescan_interval_ms: DEFAULT_RESCAN_INTERVAL_MS,
@@ -311,6 +312,7 @@ mod tests {
             startup_position: "head".to_string(),
             multiline_mode: "none".to_string(),
             exclude_globs: Vec::new(),
+            filters: Default::default(),
         }
     }
 

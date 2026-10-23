@@ -206,6 +206,7 @@ fn config_with_duplicate_log_input_ids_is_rejected() {
                     startup_position: "head".to_string(),
                     multiline_mode: "none".to_string(),
                     exclude_globs: Vec::new(),
+                    filters: Default::default(),
                 },
                 LogFileInputSection {
                     input_id: "app".to_string(),
@@ -213,6 +214,7 @@ fn config_with_duplicate_log_input_ids_is_rejected() {
                     startup_position: "head".to_string(),
                     multiline_mode: "none".to_string(),
                     exclude_globs: Vec::new(),
+                    filters: Default::default(),
                 },
             ],
             file_inputs_file: None,
@@ -277,6 +279,7 @@ fn config_with_invalid_log_startup_position_is_rejected() {
                 startup_position: "middle".to_string(),
                 multiline_mode: "none".to_string(),
                 exclude_globs: Vec::new(),
+                filters: Default::default(),
             }],
             file_inputs_file: None,
             max_line_bytes: 1_048_576,
@@ -340,6 +343,7 @@ fn config_with_invalid_log_spool_over_limit_is_rejected() {
                 startup_position: "head".to_string(),
                 multiline_mode: "none".to_string(),
                 exclude_globs: Vec::new(),
+                filters: Default::default(),
             }],
             file_inputs_file: None,
             max_line_bytes: 1_048_576,
@@ -449,6 +453,7 @@ fn config_with_invalid_tcp_output_framing_is_rejected() {
                 startup_position: "head".to_string(),
                 multiline_mode: "none".to_string(),
                 exclude_globs: Vec::new(),
+                filters: Default::default(),
             }],
             file_inputs_file: None,
             max_line_bytes: 1_048_576,
@@ -472,4 +477,67 @@ fn config_with_invalid_tcp_output_framing_is_rejected() {
 
     let err = validate_config(&fixture).expect_err("config should be rejected");
     assert_eq!(err.code, "invalid_logs_output_tcp_framing");
+}
+
+/// 容器过滤器（W2）的接线校验：**名字是精确值、且只许用在容器选源根下**。
+///
+/// 与网关装载期同一口径：本机直配的输入写错了同样会「一个都匹配不上」，
+/// 与其在运行时静默空载，不如在配置校验阶段就拒绝。
+fn container_input(
+    path: &str,
+    filters: wist_contracts::work::ContainerFilters,
+) -> LogFileInputSection {
+    LogFileInputSection {
+        input_id: "containers".to_string(),
+        path: path.to_string(),
+        startup_position: "head".to_string(),
+        multiline_mode: "none".to_string(),
+        exclude_globs: Vec::new(),
+        filters,
+    }
+}
+
+fn config_with_input(input: LogFileInputSection) -> AgentConfig {
+    let mut fixture = config_fixture("contracts/config/valid/standalone.toml");
+    fixture.telemetry.logs.file_inputs = vec![input];
+    fixture
+}
+
+#[test]
+fn container_filters_are_accepted_under_the_container_root() {
+    let config = config_with_input(container_input(
+        "/var/log/containers/*.log",
+        wist_contracts::work::ContainerFilters {
+            namespace_in: vec!["prod".to_string()],
+            pod_not_in: vec!["debug-pod".to_string()],
+        },
+    ));
+    validate_config(&config).expect("container filters with a container source");
+}
+
+#[test]
+fn container_filters_are_rejected_off_the_container_root() {
+    let config = config_with_input(container_input(
+        "/var/log/postgresql/*.log",
+        wist_contracts::work::ContainerFilters {
+            namespace_in: vec!["prod".to_string()],
+            pod_not_in: Vec::new(),
+        },
+    ));
+    let err = validate_config(&config).expect_err("filters off the container root");
+    assert_eq!(err.code, "invalid_log_input_container_filters");
+}
+
+#[test]
+fn container_filters_reject_pattern_values() {
+    // 过滤器存的是**精确名字**：`prod*` 永远匹配不上（那是 pattern 的写法）。
+    let config = config_with_input(container_input(
+        "/var/log/containers/*.log",
+        wist_contracts::work::ContainerFilters {
+            namespace_in: vec!["prod*".to_string()],
+            pod_not_in: Vec::new(),
+        },
+    ));
+    let err = validate_config(&config).expect_err("wildcard filter value");
+    assert_eq!(err.code, "invalid_log_input_container_filters");
 }

@@ -61,6 +61,7 @@ fn config(root: &Path, source_path: &Path) -> FileInputConfig {
         origin: crate::telemetry::logs::InputOrigin::default(),
         source_path: source_path.to_path_buf(),
         exclude_globs: Vec::new(),
+        filters: Default::default(),
         max_files: super::DEFAULT_MAX_FILES_PER_INPUT,
         max_new_files: super::DEFAULT_MAX_NEW_FILES_PER_TICK,
         rescan_interval_ms: super::DEFAULT_RESCAN_INTERVAL_MS,

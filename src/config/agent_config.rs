@@ -324,6 +324,15 @@ pub struct LogFileInputSection {
     /// init / sidecar / 平台自身的容器，不该只能靠把业务名写进 pattern 来避开。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude_globs: Vec<String>,
+    /// 容器选源的结构化过滤器（默认空，只对容器选源有意义）。
+    ///
+    /// 与 `exclude_globs` 的区别：它是**结构化**的（namespace / pod），不随集群漂移；
+    /// 求值在发现阶段，读取器不参与。空的时候**不序列化**（与目录里空排除项同一条纪律）。
+    #[serde(
+        default,
+        skip_serializing_if = "wist_contracts::work::ContainerFilters::is_empty"
+    )]
+    pub filters: wist_contracts::work::ContainerFilters,
 }
 
 /// 外置采集任务清单文件的顶层结构（`[telemetry.logs] file_inputs_file` 指向的文件）。

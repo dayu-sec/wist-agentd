@@ -528,6 +528,7 @@ mod tests {
             startup_position: "tail".to_string(),
             multiline_mode: multiline.to_string(),
             exclude_globs: Vec::new(),
+            filters: Default::default(),
         }
     }
 

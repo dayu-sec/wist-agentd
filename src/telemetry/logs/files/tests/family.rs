@@ -903,7 +903,7 @@ fn prune_keeps_unmatched_entries_only_when_they_still_matter() {
     ];
     let matched: BTreeSet<String> = ["/var/log/matched.log".to_string()].into_iter().collect();
 
-    prune_family_state(&mut state, &matched, now);
+    prune_family_state(&mut state, &matched, &BTreeSet::new(), now);
 
     let mut kept: Vec<&str> = state
         .files
@@ -918,5 +918,123 @@ fn prune_keeps_unmatched_entries_only_when_they_still_matter() {
             "/var/log/pending.log",
             "/var/log/unfinished.log",
         ]
+    );
+}
+
+#[test]
+fn prune_drops_a_deselected_entry_immediately() {
+    // 策展人取消了选择（filters / exclude_globs / target 变了）：**没读完也停**。
+    // 与“轮转/删除”不同 —— 那些旧名字已不在枚举结果里，不属于 deselected，仍照旧排空。
+    let now = "2026-04-13T00:00:00Z";
+    let mut state = LogCheckpointState::new("input-app".to_string(), now.to_string());
+    state.files = vec![
+        tracked(
+            "/var/log/containers/web-1_prod_nginx-a1.log",
+            3,
+            Some(10),
+            false,
+            Some(now),
+        ),
+        // 未封口块也挡不住取消选择（否则那个块永远等不到下一轮）。
+        tracked(
+            "/var/log/containers/dbg-1_prod_dbg-b1.log",
+            3,
+            Some(10),
+            true,
+            Some(now),
+        ),
+        // 仅轮转离场（不在 deselected 里）：仍旧保留着排空尾巴。
+        tracked("/var/log/rotated-away.log", 3, Some(10), false, Some(now)),
+    ];
+    let matched: BTreeSet<String> = BTreeSet::new();
+    let deselected: BTreeSet<String> = [
+        "/var/log/containers/web-1_prod_nginx-a1.log".to_string(),
+        "/var/log/containers/dbg-1_prod_dbg-b1.log".to_string(),
+    ]
+    .into_iter()
+    .collect();
+
+    prune_family_state(&mut state, &matched, &deselected, now);
+
+    let kept: Vec<&str> = state
+        .files
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
+    assert_eq!(kept, vec!["/var/log/rotated-away.log"]);
+}
+
+#[test]
+fn tightening_filters_stops_reading_an_already_tracked_growing_file() {
+    // 容器日志一直在增长：靠“排空到 EOF”永远排不完。
+    // 把某个 pod 从 filters 里剔掉之后，必须**当轮**就停（而不是继续往里进）。
+    let root = temp_dir("family-filter-drop");
+    fs::create_dir_all(root.join("state")).expect("create state");
+    let kept = root.join("web-1_prod_nginx-a1.log");
+    let dropped = root.join("debug-1_prod_debug-b1.log");
+    fs::write(&kept, "k1\n").expect("write kept");
+    fs::write(&dropped, "d1\n").expect("write dropped");
+    let output = output_path(&root);
+
+    let mut cfg = family_config(&root, &root.join("*.log"));
+    cfg.startup_position = StartupPosition::Head;
+    // 第一轮：没有过滤器 → 两个都进跟踪集。
+    let mut first = FileFamilyProcessor::new(cfg.clone(), FileRecordSink::new(output.clone()));
+    assert_eq!(first.process_once().expect("first").records_processed, 2);
+    assert_eq!(read_state(&root).files.len(), 2);
+
+    // 第二轮：策展人收紧 filters，同时被剔的那个文件**又长了**。
+    cfg.filters = wist_contracts::work::ContainerFilters {
+        namespace_in: vec!["prod".to_string()],
+        pod_not_in: vec!["debug-1".to_string()],
+    };
+    fs::write(&dropped, "d1\nd2\n").expect("append dropped");
+    let mut second = FileFamilyProcessor::new(cfg.clone(), FileRecordSink::new(output.clone()));
+    let outcome = second.process_once().expect("second");
+    assert_eq!(outcome.records_processed, 0, "取消选择后不该再读它");
+    let bodies: Vec<String> = read_output_records(&output)
+        .into_iter()
+        .map(|record| record.body)
+        .collect();
+    assert!(!bodies.iter().any(|body| body == "d2\n"), "{bodies:?}");
+
+    // checkpoint 也要放掉：否则状态里永远挂着一条没人读的文件。
+    let tracked: Vec<String> = read_state(&root)
+        .files
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect();
+    assert_eq!(tracked, vec![kept.display().to_string()]);
+}
+
+#[test]
+fn a_deselected_file_that_comes_back_is_read_from_head_like_a_new_file() {
+    // 已知取舍（与 W1 对“曾排除的文件”同一语义）：取消选择会释放 checkpoint，
+    // 之后再选上时它就是一个“新文件” —— 从 head 读。这条测试把这个取舍钉住，
+    // 以免以后有人以为“重新选上能续读”而踩到重复数据。
+    let root = temp_dir("family-filter-return");
+    fs::create_dir_all(root.join("state")).expect("create state");
+    let file = root.join("dbg-1_prod_dbg-b1.log");
+    fs::write(&file, "d1\n").expect("write");
+    let output = output_path(&root);
+
+    let mut cfg = family_config(&root, &root.join("*.log"));
+    cfg.startup_position = StartupPosition::Head;
+    cfg.filters = wist_contracts::work::ContainerFilters {
+        namespace_in: vec!["prod".to_string()],
+        pod_not_in: vec!["dbg-1".to_string()],
+    };
+    let mut excluded = FileFamilyProcessor::new(cfg.clone(), FileRecordSink::new(output.clone()));
+    assert_eq!(
+        excluded.process_once().expect("excluded").records_processed,
+        0
+    );
+
+    // 再选上：按新文件从 head 读（重新产出一条 d1）。
+    cfg.filters = Default::default();
+    let mut included = FileFamilyProcessor::new(cfg, FileRecordSink::new(output.clone()));
+    assert_eq!(
+        included.process_once().expect("included").records_processed,
+        1
     );
 }

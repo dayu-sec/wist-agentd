@@ -78,6 +78,7 @@ fn granted_work_multiline(
                 target: source_target.to_string(),
                 multiline: multiline.to_string(),
                 exclude_globs: Vec::new(),
+                filters: Default::default(),
             }],
         }],
     };
@@ -745,6 +746,7 @@ fn daemon_run_once_continues_when_one_file_input_fails() {
                 startup_position: "head".to_string(),
                 multiline_mode: "none".to_string(),
                 exclude_globs: Vec::new(),
+                filters: Default::default(),
             },
             LogFileInputSection {
                 input_id: "good".to_string(),
@@ -752,6 +754,7 @@ fn daemon_run_once_continues_when_one_file_input_fails() {
                 startup_position: "head".to_string(),
                 multiline_mode: "none".to_string(),
                 exclude_globs: Vec::new(),
+                filters: Default::default(),
             },
         ],
     );
@@ -811,6 +814,7 @@ fn daemon_run_once_collects_a_file_family_glob_with_excludes() {
             startup_position: "head".to_string(),
             multiline_mode: "none".to_string(),
             exclude_globs: vec![containers.join("skip-*.log").display().to_string()],
+            filters: Default::default(),
         }],
     );
     daemon::run_once(&daemon::DaemonLoop {
@@ -870,6 +874,7 @@ fn daemon_run_once_assigns_globally_monotonic_seq_across_inputs() {
                 startup_position: "head".to_string(),
                 multiline_mode: "none".to_string(),
                 exclude_globs: Vec::new(),
+                filters: Default::default(),
             },
             LogFileInputSection {
                 input_id: "b".to_string(),
@@ -877,6 +882,7 @@ fn daemon_run_once_assigns_globally_monotonic_seq_across_inputs() {
                 startup_position: "head".to_string(),
                 multiline_mode: "none".to_string(),
                 exclude_globs: Vec::new(),
+                filters: Default::default(),
             },
         ],
     );
@@ -922,6 +928,7 @@ fn daemon_run_once_marks_active_when_only_file_input_fails() {
             startup_position: "head".to_string(),
             multiline_mode: "none".to_string(),
             exclude_globs: Vec::new(),
+            filters: Default::default(),
         }],
     );
     let snapshot = daemon::run_once(&daemon::DaemonLoop {
@@ -957,6 +964,7 @@ fn daemon_run_once_marks_active_when_configured_file_is_missing() {
             startup_position: "head".to_string(),
             multiline_mode: "none".to_string(),
             exclude_globs: Vec::new(),
+            filters: Default::default(),
         }],
     );
     let snapshot = daemon::run_once(&daemon::DaemonLoop {
@@ -1023,6 +1031,7 @@ fn daemon_run_once_replays_existing_spool_even_when_source_file_is_missing() {
             startup_position: "head".to_string(),
             multiline_mode: "none".to_string(),
             exclude_globs: Vec::new(),
+            filters: Default::default(),
         }],
     );
     let snapshot = daemon::run_once(&daemon::DaemonLoop {

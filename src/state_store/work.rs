@@ -162,6 +162,7 @@ mod tests {
                         target: "/Library/Logs/DiagnosticReports/*.ips".to_string(),
                         multiline: "none".to_string(),
                         exclude_globs: Vec::new(),
+                        filters: Default::default(),
                     }],
                 }],
                 tasks: vec![WorkTaskRecord {

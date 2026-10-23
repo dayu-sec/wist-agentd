@@ -547,8 +547,10 @@ impl AppliedWorkGrant {
                             // agentd 不自己猜：猜错会把多行记录拆散、或把独立记录粘成一条。
                             multiline_mode: source.multiline.clone(),
                             // 选源排除项也跟单元走：它们是这份采集面的「不该采什么」，
-                            // 不是本机偏好。
+                            // 不是本机偏好。结构化过滤器（W2）同理：namespace / pod 的选择
+                            // 是**策展结论**，不是 agent 本地调整。
                             exclude_globs: source.exclude_globs.clone(),
+                            filters: source.filters.clone(),
                         },
                     });
                 }
@@ -1625,6 +1627,34 @@ mod tests {
         assert_eq!(
             inputs[0].input.exclude_globs,
             vec!["/var/log/containers/*_kube-system_*.log".to_string()]
+        );
+    }
+
+    #[test]
+    fn container_filters_travel_from_the_spec_into_the_input() {
+        // W2：结构化过滤器同样是**单元的选择结论**，不多带一层就等于把 namespace
+        // 白名单又退回成“写 N 条 path pattern”。
+        let spec_text = r#"{"units":[{"unit_id":"linux-container-stdout","capability":"collect_logs","rule_ref":"r","requires_privilege":"root","sources":[{"kind":"FileGlob","target":"/var/log/containers/*.log","multiline":"none","filters":{"namespace_in":["prod","kube-system"],"pod_not_in":["debug-pod"]}}]}]}"#;
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![standing(
+                "work-1",
+                "ContainerStdout",
+                1,
+                "active",
+                spec_text,
+            )],
+        ));
+        let inputs = applied.log_inputs();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(
+            inputs[0].input.filters.namespace_in,
+            vec!["prod".to_string(), "kube-system".to_string()]
+        );
+        assert_eq!(
+            inputs[0].input.filters.pod_not_in,
+            vec!["debug-pod".to_string()]
         );
     }
 
