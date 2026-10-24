@@ -91,8 +91,10 @@ jobs:
 
       # 需要 wist-contracts 0.9.5 已发布（见 CHANGELOG 升级提示）：agentd 0.9.1 用到
       # 本轮新增的能力轴，否则这里会因契约版本不够而编译失败。
+      # 必须**所有 bin**（`--bins`）：agentd 从自己的目录旁边找 `wist-exec`，
+      # 只编 `--bin wist-agentd` 会让它在启动时报 `exec bin unavailable`。
       - name: Cargo build (release)
-        run: cargo build --release --bin wist-agentd
+        run: cargo build --release --bins
 
       - name: Verify log collection on real files
         env:

@@ -61,6 +61,13 @@ if [[ -z "${BIN}" || ! -x "${BIN}" ]]; then
   echo "FAIL  找不到 wist-agentd（先 cargo build --release，或设 WIST_AGENTD_BIN）" >&2
   exit 1
 fi
+# agentd 从**自己所在目录**旁边找 `wist-exec`，缺了会在启动时直接退出
+# （`exec bin unavailable`）。在这里一次性说清楚，省得每个 phase 都红一次。
+if [[ ! -x "$(cd -- "$(dirname -- "${BIN}")" && pwd)/wist-exec" ]]; then
+  echo "FAIL  ${BIN} 旁边没有 wist-exec（agentd 启动时要用它）" >&2
+  echo "      用 cargo build --release --bins 一起构建" >&2
+  exit 1
+fi
 printf 'agentd  %s\n' "${BIN}"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wist-log-accept.XXXXXX")" || exit 1
