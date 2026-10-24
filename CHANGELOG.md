@@ -3,6 +3,23 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.4-alpha] - 2026-10-24
+
+### 新增（M1：容器身份）
+
+- **纯 Docker 主机的容器日志记录带上 `container { name, image, id }`**：从日志同目录的
+  `config.v2.json` 读（`Name` 去前导 `/`、`Config.Image`），**只读元数据、不碰正文**。
+  k8s 侧这个信息编码在文件名里，Docker 侧文件名只有容器 id —— 不带它，数据面只能看到
+  一串十六进制，分不出哪个是业务 / 网关 / 数据库容器。
+- 识别靠**路径形状**（`<root>/containers/<id>/<file>`），不写死 `/var/lib/docker`：
+  改过 `data-root` 的现场照样能认。配置缺失 / 坏 JSON / 容器创建中 → `None`（下一轮重试），
+  不会把半个身份发出去；按 `(mtime, size)` 缓存，容器重建自然失效。
+- 取开销：每轮每**文件**问一次（不是每条记录），非容器路径只是一次字符串扫描。
+
+### 依赖
+
+- `wist-contracts` 0.9.6（`ContainerRef` + 帧字段）。
+
 ## [0.9.3-alpha] - 2026-10-24
 
 ### 变更

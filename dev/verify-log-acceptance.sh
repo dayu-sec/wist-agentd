@@ -148,6 +148,17 @@ def docker_layout(phase):
             ok = fail("docker 正文不是原始 JSON 行：%r" % body)
     if len(by_source) != 2:
         ok = fail("docker 来源文件数 = %d（期望 2：当前 + 轮转产物）" % len(by_source))
+    # 容器身份（M1）：从同目录 `config.v2.json` 读，不是从正文里猜。
+    for r in recs:
+        container = r.get("container") or {}
+        if container.get("name") != "mysql":
+            ok = fail("container.name = %r（期望 mysql）" % container.get("name"))
+        if container.get("image") != "bitnami/mysql:8.0":
+            ok = fail("container.image = %r" % container.get("image"))
+        # id 必须等于容器目录名。
+        expected_id = r["source_path"].split("/")[-2]
+        if container.get("id") != expected_id:
+            ok = fail("container.id = %r（期望 %r）" % (container.get("id"), expected_id))
     return ok
 
 
@@ -561,13 +572,17 @@ fi
 # 目录里 `linux-docker-container-stdout` 就是这个形态：通配在**中间段**（容器 id 是目录名），
 # 正文**原样**（docker 的 JSON 信封不在这里解——解码归数据面）。
 P7="${WORK}/p7"
-DOCK="${P7}/fixtures/dockerroot"
+DOCK="${P7}/fixtures/dockerroot/containers"
 ID="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 mkdir -p "${DOCK}/${ID}"
 printf '{"log":"D1 line\\n","stream":"stdout","time":"2026-10-24T00:00:00.000000000Z"}\n' > "${DOCK}/${ID}/${ID}-json.log"
 printf '{"log":"D2 line\\n","stream":"stderr","time":"2026-10-24T00:00:01.000000000Z"}\n' >> "${DOCK}/${ID}/${ID}-json.log"
 # 轮转产物（设了 max-size 时 docker 转成 `-json.log.1`），同一 glob 要能覆盖。
 printf '{"log":"D3 rotated\\n","stream":"stdout","time":"2026-10-24T00:00:02.000000000Z"}\n' > "${DOCK}/${ID}/${ID}-json.log.1"
+# 容器身份只存在于同目录的 config.v2.json（文件名里只有容器 id）。
+cat > "${DOCK}/${ID}/config.v2.json" <<EOF
+{"ID":"${ID}","Name":"/mysql","Config":{"Image":"bitnami/mysql:8.0"}}
+EOF
 write_config "${P7}" "$(cat <<EOF
 [[telemetry.logs.file_inputs]]
 input_id = "docker"
