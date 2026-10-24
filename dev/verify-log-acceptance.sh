@@ -127,6 +127,30 @@ def body_multiset(recs):
     return sorted(r["body"] for r in recs)
 
 
+def docker_layout(phase):
+    """纯 Docker 主机的容器日志形态：多层 glob + 正文原样 + 轮转产物。"""
+    recs = by_input(records(phase), "docker")
+    if len(recs) != 3:
+        return fail("docker 记录数 = %d（期望 3：两行 + 一份轮转产物）" % len(recs))
+    ok = True
+    by_source = {}
+    for r in recs:
+        by_source.setdefault(r["source_path"], []).append(r)
+    for source, group in by_source.items():
+        ok = check_offsets(group, source, "docker") and ok
+    bodies = sorted(r["body"] for r in recs)
+    for marker in ("D1 line", "D2 line", "D3 rotated"):
+        if not any(marker in b for b in bodies):
+            ok = fail("docker 缺少 %s" % marker)
+    # 正文**原样**：docker 的 JSON 信封不在这里解（解码归数据面）。
+    for body in bodies:
+        if not (body.startswith("{") and '"log"' in body and '"stream"' in body):
+            ok = fail("docker 正文不是原始 JSON 行：%r" % body)
+    if len(by_source) != 2:
+        ok = fail("docker 来源文件数 = %d（期望 2：当前 + 轮转产物）" % len(by_source))
+    return ok
+
+
 def check_offsets(recs, source, label):
     """每条记录的 [file_offset, file_offset_end) 必须与来源字节一致，且互不重叠。"""
     raw = open(source, "rb").read()
@@ -284,6 +308,8 @@ if __name__ == "__main__":
         ok = rotate(sys.argv[2], "RESTART", 6, "restart")
     elif cmd == "container-rotation":
         ok = container_rotation(sys.argv[2])
+    elif cmd == "docker-layout":
+        ok = docker_layout(sys.argv[2])
     elif cmd == "torn-resume":
         ok = torn_resume(sys.argv[2])
     elif cmd == "torn-recovery":
@@ -527,6 +553,31 @@ printf 'CR-TAIL after rotate\n' >>"${REAL}.20261024-000000"
 printf 'CR-NEW in new file\n' >>"${REAL}"
 if run_phase "${P4}"; then
   check "容器：symlink 不变时按 realpath 排空旧尾巴 + 采新文件" container-rotation "${P4}"
+else
+  fail=1
+fi
+
+# ── phase 7：纯 Docker 主机的容器日志目录（`containers/<id>/<id>-json.log*`）──
+# 目录里 `linux-docker-container-stdout` 就是这个形态：通配在**中间段**（容器 id 是目录名），
+# 正文**原样**（docker 的 JSON 信封不在这里解——解码归数据面）。
+P7="${WORK}/p7"
+DOCK="${P7}/fixtures/dockerroot"
+ID="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+mkdir -p "${DOCK}/${ID}"
+printf '{"log":"D1 line\\n","stream":"stdout","time":"2026-10-24T00:00:00.000000000Z"}\n' > "${DOCK}/${ID}/${ID}-json.log"
+printf '{"log":"D2 line\\n","stream":"stderr","time":"2026-10-24T00:00:01.000000000Z"}\n' >> "${DOCK}/${ID}/${ID}-json.log"
+# 轮转产物（设了 max-size 时 docker 转成 `-json.log.1`），同一 glob 要能覆盖。
+printf '{"log":"D3 rotated\\n","stream":"stdout","time":"2026-10-24T00:00:02.000000000Z"}\n' > "${DOCK}/${ID}/${ID}-json.log.1"
+write_config "${P7}" "$(cat <<EOF
+[[telemetry.logs.file_inputs]]
+input_id = "docker"
+path = "${DOCK}/*/*-json.log*"
+startup_position = "head"
+multiline_mode = "none"
+EOF
+)"
+if run_phase "${P7}"; then
+  check "docker：多层 glob + 正文原样 + 轮转产物" docker-layout "${P7}"
 else
   fail=1
 fi

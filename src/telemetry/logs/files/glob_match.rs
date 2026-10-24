@@ -345,6 +345,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_wildcard_directory_segment_expands_one_level() {
+        // Docker 容器日志：`containers/<id>/<id>-json.log*` —— 通配在**中间段**（容器 id 是目录名）。
+        // 目录里的 `linux-docker-container-stdout` 就靠这个形态，它必须能展开，
+        // 否则那条来源会静默采到 0 个文件。
+        let dir = temp_dir("two-level");
+        for id in ["aaa", "bbb"] {
+            let sub = dir.join(id);
+            fs::create_dir_all(&sub).unwrap();
+            fs::write(sub.join(format!("{id}-json.log")), "{\n").unwrap();
+            fs::write(sub.join(format!("{id}-json.log.1")), "{\n").unwrap();
+        }
+        // 同层但名字不匹配的文件不应被收。
+        fs::write(dir.join("notes.txt"), "x\n").unwrap();
+
+        let pattern = dir.join("*").join("*-json.log*");
+        let paths = resolve_selected(&pattern, &[], &no_filters(), 512)
+            .await
+            .unwrap();
+        assert_eq!(
+            names(&paths),
+            vec![
+                "aaa-json.log",
+                "aaa-json.log.1",
+                "bbb-json.log",
+                "bbb-json.log.1"
+            ]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn excludes_match_full_paths() {
         let dir = temp_dir("exclude");
         fs::write(dir.join("a.log"), "a\n").unwrap();
