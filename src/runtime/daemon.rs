@@ -912,11 +912,17 @@ async fn fetch_discovery_policies(config: &AgentConfig) -> Option<DiscoveryAspec
     {
         Ok(response) if response.status().is_success() => {
             match response.json::<DiscoveryPoliciesReturned>().await {
-                Ok(returned) => Some(DiscoveryAspectPolicySet::new(
-                    returned.policy_version,
-                    returned.published_at,
-                    returned.policies,
-                )),
+                Ok(returned) => Some(
+                    DiscoveryAspectPolicySet::new(
+                        returned.policy_version,
+                        returned.published_at,
+                        returned.policies,
+                    )
+                    // 白名单是**网关从采集目录推导**后随表下发的，不属于策略表本身；
+                    // 忘了带过来就等于「永远不探测」——`path_exists:` 条件恒为无法判定，
+                    // 那些面（数据库 / 容器 stdout）会永远授不了权。
+                    .with_probe_paths(returned.probe_paths),
+                ),
                 Err(err) => {
                     log::warn!(
                         "wist-agentd discovery policy fetch failed: invalid response from {endpoint}: {err}"
@@ -3127,7 +3133,7 @@ mod tests {
             assert!(request.contains("\"agent_id\":\"agent-x\""));
             assert!(request.contains("\"instance_id\":\"instance-x\""));
             assert!(request.contains("\"requested_at\":\""));
-            let body = r#"{"policy_version":4,"published_at":"2026-09-22T00:00:00Z","policies":[{"aspect":"host","default_interval_seconds":900,"min_interval_seconds":300,"max_interval_seconds":3600,"baseline":true,"enabled_by_default":true,"platforms":["macos","linux"],"yields":"os/arch"}],"returned_at":"2026-09-22T00:00:00Z"}"#;
+            let body = r#"{"policy_version":4,"published_at":"2026-09-22T00:00:00Z","policies":[{"aspect":"host","default_interval_seconds":900,"min_interval_seconds":300,"max_interval_seconds":3600,"baseline":true,"enabled_by_default":true,"platforms":["macos","linux"],"yields":"os/arch"}],"probe_paths":["/var/log/postgresql","/var/log/auth.log"],"returned_at":"2026-09-22T00:00:00Z"}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 body.len(),
@@ -3145,6 +3151,15 @@ mod tests {
 
         assert_eq!(set.policy_version, 4);
         assert_eq!(set.interval_seconds_for("host"), Some(900));
+        // 白名单必须完整带过来：丢了它，`path_exists:` 类的面（数据库 / 容器 stdout）
+        // 会因为「从未探测」而永远无法授权。
+        assert_eq!(
+            set.probe_paths,
+            vec![
+                "/var/log/postgresql".to_string(),
+                "/var/log/auth.log".to_string()
+            ]
+        );
     }
 
     #[tokio::test]

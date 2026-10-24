@@ -3,6 +3,21 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.2-alpha] - 2026-10-24
+
+### 修复
+
+- **网关下发的探测白名单被丢掉，导致按路径判定的面永远授不了权**：agentd 收到策略表后
+  用 `DiscoveryAspectPolicySet::new(..)` 重建了一份，而那个构造器把 `probe_paths` 置空，
+  且**漏了**链上 `.with_probe_paths(returned.probe_paths)`。后果：agentd 从不探测任何路径，
+  事实摘要里的 `probed_paths` / `present_paths` 恒为空；网关侧的 `path_exists:` 条件只能判成
+  「无法判定」——`linux-db-service`（csvlog / slow log）与 `linux-container-stdout` 因此
+  **永远授不了权**，`POST /api/v1/admin/agents/<id>/work` 回
+  `work_conflict: no unit selected for DatabaseService: linux-db-service=fact_not_collected`。
+  升级到本版并重启 agentd 即可：下一轮策略拉取（≤5 分钟）后开始探测，事实重报后就能授权。
+- 补上回归位：`fetch_discovery_policies` 的用例现在断言白名单**完整带过来**
+  （以前假响应里根本没有 `probe_paths`，所以这个 bug 静默了很久）。
+
 ## [0.9.1-alpha] - 2026-10-24
 
 ### 新增
