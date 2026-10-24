@@ -912,17 +912,7 @@ async fn fetch_discovery_policies(config: &AgentConfig) -> Option<DiscoveryAspec
     {
         Ok(response) if response.status().is_success() => {
             match response.json::<DiscoveryPoliciesReturned>().await {
-                Ok(returned) => Some(
-                    DiscoveryAspectPolicySet::new(
-                        returned.policy_version,
-                        returned.published_at,
-                        returned.policies,
-                    )
-                    // 白名单是**网关从采集目录推导**后随表下发的，不属于策略表本身；
-                    // 忘了带过来就等于「永远不探测」——`path_exists:` 条件恒为无法判定，
-                    // 那些面（数据库 / 容器 stdout）会永远授不了权。
-                    .with_probe_paths(returned.probe_paths),
-                ),
+                Ok(returned) => Some(DiscoveryAspectPolicySet::from(returned)),
                 Err(err) => {
                     log::warn!(
                         "wist-agentd discovery policy fetch failed: invalid response from {endpoint}: {err}"

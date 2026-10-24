@@ -3,6 +3,14 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.3-alpha] - 2026-10-24
+
+### 变更
+
+- **策略表收编改用契约提供的唯一转换**：`DiscoveryAspectPolicySet::from(returned)`
+  （wist-api 0.9.2）取代手写的 `::new(..)` 重建。那处重建正是 0.9.2 那个白名单丢失 bug 的源头；
+  现在转换实现在两侧都**穷尽解构**，以后无论哪边加字段，编译器会直接报错，而不是静默丢掉。
+
 ## [0.9.2-alpha] - 2026-10-24
 
 ### 修复
