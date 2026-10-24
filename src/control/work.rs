@@ -551,6 +551,9 @@ impl AppliedWorkGrant {
                             // 是**策展结论**，不是 agent 本地调整。
                             exclude_globs: source.exclude_globs.clone(),
                             filters: source.filters.clone(),
+                            // W4 的噪音行子串：也是**策展结论**（哪些行对这条面没信息量），
+                            // 跟单元一起发下去；agentd 不自己维护一份“噪音词典”。
+                            drop_if_contains: source.drop_if_contains.clone(),
                         },
                     });
                 }
@@ -1687,6 +1690,26 @@ mod tests {
         assert_eq!(
             inputs[0].input.filters.pod_not_in,
             vec!["debug-pod".to_string()]
+        );
+    }
+
+    #[test]
+    fn noise_needles_travel_from_the_spec_into_the_input() {
+        // W4：丢哪些噪音行也是**策展结论**（跟着单元走），agentd 不自己维护一份字典。
+        let spec_text = r#"{"units":[{"unit_id":"linux-auth-session","capability":"collect_logs","rule_ref":"r","requires_privilege":"root","sources":[{"kind":"FileGlob","target":"/var/log/auth.log","multiline":"none","drop_if_contains":["pam_unix(cron:session)","systemd-logind"]}]}]}"#;
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![standing("work-1", "LoginSession", 1, "active", spec_text)],
+        ));
+        let inputs = applied.log_inputs();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(
+            inputs[0].input.drop_if_contains,
+            vec![
+                "pam_unix(cron:session)".to_string(),
+                "systemd-logind".to_string()
+            ]
         );
     }
 

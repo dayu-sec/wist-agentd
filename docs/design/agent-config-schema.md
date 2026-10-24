@@ -220,6 +220,8 @@ LogFileInputSection {
   startup_position?
   multiline_mode?
   exclude_globs?
+  filters?
+  drop_if_contains?
 }
 ```
 
@@ -243,12 +245,24 @@ LogFileInputSection {
   多行折叠模式，省略时默认 `none`：
   - `none`：一行一条记录
   - `indented`：以空格或 Tab 开头的行并入上一条，形成一条多行记录；未闭合的组跨 tick 保留在
-    `pending_multiline` 状态里，下个 tick 遇到非缩进行时提交（`src/telemetry/logs/multiline.rs:57-103`）。
+    `pending_multiline` 状态里，下个 tick 遇到非缩进行时提交（`src/telemetry/logs/multiline.rs`）。
     文件族下**每个文件各持一份**未闭合块（`TrackedFileCheckpoint.pending_multiline`）。
+  - `mysql_slow`（W4）：MySQL slow log，`# Time:` 起块，下一条 `# Time:` 或空闲超时封口。
+  - `postgres_csv`（W4）：PostgreSQL csvlog，**引号外**的换行才切记录（引号状态跨行，
+    未封口块跨读批时从正文重算）。
 - `exclude_globs?`
   只对文件族目标有意义：从匹配集里剔掉的**绝对路径** glob（按展开后的完整路径匹配），为空则不输出。
   典型用法：`path = "/var/log/containers/*.log"` + `exclude_globs = ["/var/log/containers/*_kube-system_*.log"]`。
   写在非文件族目标上不报错（无匹配集可剔），但相对路径会被校验拒绝（`invalid_log_input_exclude_glob`）。
+- `filters?`（W2）
+  容器选源的结构化过滤器：`namespace_in` / `pod_not_in`（精确名字，不是 pattern）。在**发现阶段**
+  求值（展开 glob、剔完 `exclude_globs` 之后），读取器不参与；只允许用在 `/var/log/containers` 下，
+  否则报 `invalid_log_input_container_filters`。
+- `drop_if_contains?`（W4）
+  含这些**精确子串**的记录**整条**丢弃（空 = 不丢）。不进闸门、**不消耗 `seq`**（取号不上报会让
+  接收端报假的数据丢失），丢弃数进自观测（`telemetry noise dropped …`，`info`、按签名去重）。
+  形状校验与网关共用（`validate_drop_if_contains`：限条数 / 长度、拒空串 / 首尾空白 / 控制字符 /
+  重复），不合法报 `invalid_log_input_drop_if_contains`。
 
 前两个字段省略时走契约默认值；非法取值被校验拒绝（`invalid_log_startup_position` / `invalid_log_multiline_mode`，
 `src/config/validate.rs`）。

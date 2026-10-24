@@ -20,7 +20,8 @@ use wist_contracts::local_work::{
 };
 use wist_contracts::telemetry_record::DataFrame;
 use wist_contracts::work::{
-    EXPORTER_IDS, FILE_INPUT_ABSOLUTE_PATH, FILE_INPUT_GLOB, MULTILINE_MODES,
+    CONTAINER_FILTERS, DROP_IF_CONTAINS_MODES, EXPORTER_IDS, FILE_INPUT_ABSOLUTE_PATH,
+    FILE_INPUT_GLOB, MULTILINE_MODES,
 };
 use wist_shared::time::{now_rfc3339, now_ts_ms};
 
@@ -463,6 +464,14 @@ fn declared_logs_capabilities() -> LogsCapabilities {
             .map(|mode| mode.to_string())
             .collect(),
         exporters: EXPORTER_IDS.iter().map(|id| id.to_string()).collect(),
+        // 容器过滤器（W2）：agentd 在发现阶段真的会求值这两个维度。
+        // 与 `ContainerFilters::used_dimensions` 同源：新增维度时这里自动跟上。
+        filters: CONTAINER_FILTERS.iter().map(|di| di.to_string()).collect(),
+        // 噪音行丢弃（W4）：目前只有 `substring` 一种求值方式。
+        drop_if_contains: DROP_IF_CONTAINS_MODES
+            .iter()
+            .map(|mode| mode.to_string())
+            .collect(),
         ..LogsCapabilities::default()
     }
 }
@@ -2164,6 +2173,38 @@ mod tests {
     use crate::telemetry::warp_parse::{FileRecordSink, TcpFraming, TcpRecordSink};
     use wist_api::uplink::AgentUplinkGrant;
 
+    #[test]
+    fn declared_logs_capabilities_cover_the_whole_contract_vocabulary() {
+        // 能力清单是 agentd 对网关的承诺：契约里“可执行”的每一种形态（文件输入 / 读法 /
+        // 容器过滤维度 / 导出器）都必须声明一遍。漏一个，网关就会保守地裁掉对应来源
+        // ——表面上看像“这台机器采不了”，实际是本版忘了报。
+        let caps = declared_logs_capabilities();
+        for need in [FILE_INPUT_ABSOLUTE_PATH, FILE_INPUT_GLOB] {
+            assert!(caps.file_inputs.iter().any(|value| value == need), "{need}");
+        }
+        for mode in MULTILINE_MODES {
+            assert!(
+                caps.multiline_modes.iter().any(|value| value == mode),
+                "{mode}"
+            );
+        }
+        for dimension in CONTAINER_FILTERS {
+            assert!(
+                caps.filters.iter().any(|value| value == dimension),
+                "{dimension}"
+            );
+        }
+        for mode in DROP_IF_CONTAINS_MODES {
+            assert!(
+                caps.drop_if_contains.iter().any(|value| value == mode),
+                "{mode}"
+            );
+        }
+        for id in EXPORTER_IDS {
+            assert!(caps.exporters.iter().any(|value| value == id), "{id}");
+        }
+    }
+
     fn test_config() -> AgentConfig {
         AgentConfig::new(
             AgentSection {
@@ -2785,8 +2826,8 @@ mod tests {
         assert!(frame.contains("\"agent_id\":\"agent-x\""));
         assert!(frame.contains("\"instance_id\":\"instance-x\""));
         assert!(frame.contains("\"kind\":\"report_agent_fact_summary\""));
-        // 声明用的是与网关同源的实现（版本前缀 fact-v2）。
-        assert!(frame.contains("\"content_digest\":\"fact-v2:sha256:"));
+        // 声明用的是与网关同源的实现（版本前缀 fact-v3）。
+        assert!(frame.contains("\"content_digest\":\"fact-v3:sha256:"));
         assert!(frame.contains("\"process_executables\":[\"/usr/bin/xcodebuild\"]"));
         assert!(frame.contains("\"process_count\":1"));
         // 路径探测结果随摘要上送（参与内容摘要，与「没探测」区分开）。
@@ -2803,7 +2844,7 @@ mod tests {
         assert!(!frame.contains("/api/v1/agent/facts"));
 
         assert!(loaded_attempt(&state_dir).await > 0);
-        assert!(summary.content_digest().starts_with("fact-v2:sha256:"));
+        assert!(summary.content_digest().starts_with("fact-v3:sha256:"));
     }
 
     #[tokio::test]
@@ -3224,6 +3265,7 @@ mod tests {
                         multiline: "none".to_string(),
                         exclude_globs: Vec::new(),
                         filters: Default::default(),
+                        drop_if_contains: Vec::new(),
                     }],
                 }],
                 tasks: Vec::new(),
@@ -3273,6 +3315,7 @@ mod tests {
                 multiline_mode: "none".to_string(),
                 exclude_globs: Vec::new(),
                 filters: Default::default(),
+                drop_if_contains: Vec::new(),
             }];
         let grant = grant_with_a_log_task();
         let outcome = report_status_to_control_plane(

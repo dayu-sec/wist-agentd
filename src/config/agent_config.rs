@@ -333,6 +333,12 @@ pub struct LogFileInputSection {
         skip_serializing_if = "wist_contracts::work::ContainerFilters::is_empty"
     )]
     pub filters: wist_contracts::work::ContainerFilters,
+    /// 含这些**精确子串**的记录整条丢弃（默认空 = 不丢）。
+    ///
+    /// 只对文件来源有意义；与 `multiline_mode` 正交（先在记录层面折叠，再整条丢）。
+    /// 空的时候**不序列化**（与 `exclude_globs` / `filters` 同一条纪律）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drop_if_contains: Vec<String>,
 }
 
 /// 外置采集任务清单文件的顶层结构（`[telemetry.logs] file_inputs_file` 指向的文件）。

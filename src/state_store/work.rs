@@ -163,6 +163,7 @@ mod tests {
                         multiline: "none".to_string(),
                         exclude_globs: Vec::new(),
                         filters: Default::default(),
+                        drop_if_contains: Vec::new(),
                     }],
                 }],
                 tasks: vec![WorkTaskRecord {

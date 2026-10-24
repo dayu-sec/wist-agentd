@@ -67,6 +67,53 @@ jobs:
           fi
           exit "$rc"
 
+  # 日志采集（W1–W4 / G1–G3）的**真文件系统**验收。验的是单测证明不了的那一层：
+  #   * glob / symlink / realpath / inode 轮转（容器场景就是 symlink 指向 pod 文件）；
+  #   * checkpoint 跨**进程**续读（重启不重放、不丢行）；
+  #   * 噪音行丢弃且不占 `seq`；
+  #   * `postgres_csv` 引号内换行跨读批、`mysql_slow` 的 `# Time:` 分块；
+  #   * 写到一半的记录（torn write）按 Oversized 挡下并清掉 pending。
+  # 不验数据面解析（log_type / 字段抽取），那是另一层的责任。
+  # 只在 Linux 跑：脚本在 macOS 也能过（本地已验），但两个平台跑只是时长翻倍。
+  log-acceptance:
+    name: Log acceptance (real filesystem)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 需要 wist-contracts 0.9.5 已发布（见 CHANGELOG 升级提示）：agentd 0.9.1 用到
+      # 本轮新增的能力轴，否则这里会因契约版本不够而编译失败。
+      - name: Cargo build (release)
+        run: cargo build --release --bin wist-agentd
+
+      - name: Verify log collection on real files
+        env:
+          WIST_AGENTD_BIN: ${{ github.workspace }}/target/release/wist-agentd
+          WIST_ACCEPT_ALLOW_SKIP: "1"
+        run: |
+          set +e
+          bash dev/verify-log-acceptance.sh
+          rc=$?
+          set -e
+          {
+            echo "### 日志采集验收（真文件系统）"
+            echo ""
+            echo "- 退出码：\`$rc\`（0 = 通过，1 = 有 FAIL，77 = 环境无法验证）"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" -eq 77 ]; then
+            echo "::warning::runner 环境无法验证日志采集（缺 python3？），本次验收被跳过（这不是“通过”）"
+            exit 0
+          fi
+          exit "$rc"
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest

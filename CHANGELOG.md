@@ -3,6 +3,46 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.1-alpha] - 2026-10-24
+
+### 新增
+
+- **能力上报补全（G1 / G3）**：`logs_capabilities` 增 `filters`（`namespace_in` /
+  `pod_not_in`）与 `drop_if_contains`（`substring`），从契约常量派生。网关据此在派活时
+  判断旧机队能不能承接对应的来源。
+- **噪音行丢弃（W4）**：输入配置 / 目录单元支持 `drop_if_contains` —— 整条记录命中任一
+  精确子串就丢，**不消耗 `seq`**（与闸门挡下同一条理由：取号不上报会让接收端报假丢失）。
+  丢弃数进自观测（`telemetry noise dropped …`，`info` 级、按签名去重）。
+- **两种记录边界读法（W4）**：
+  - `mysql_slow`：`# Time:` 起块（要求冒号后是时间戳，避开 SQL 的 `#` 行注释），
+    下一条 `# Time:` 或空闲超时封口；
+  - `postgres_csv`：引号状态跨行的 CSV 状态机，**引号外**的换行才切记录；
+    未封口的块跨读批时从 pending 正文重算引号状态（不另存一份会漂的状态）；
+    读取器截断的长行按 `Oversized` 挡下（不会把下一行粘进来）；
+    长空闲（60s）才按 `Oversized` 回收“写到一半”的记录（否则一条截断记录会永久吸收后续行）。
+- 配置校验的读法词表改为直接取契约 `MULTILINE_MODES`。
+- **真机验收脚本**：`dev/verify-log-acceptance.sh`（配合 CI 的 `log-acceptance` job）。
+  单测证明的是「给定行 → 给定记录」，证明不了轮转 / symlink / inode、checkpoint 跨进程
+  续读、噪音不取号这几类**只有真文件系统 + 真进程**才暴露的行为。脚本用临时目录自造
+  fixture（不需要 root），断言全是逐字比对与计数：记录集合、`[file_offset, file_offset_end)`
+  与来源字节一致、marker 恰好一次、`seq` 严格递增、自观测 `records=N` 对账。
+
+### 变更
+
+- `ProcessOutcome` 新增 `dropped_noise`：采集批次里被噪音过滤掉的条数。
+- `NoiseDropped` 不计入 `TelemetryTick::is_active()`：持续丢 cron 噪音的空闲机器不该永远显示 `Active`。
+- **事实采集跟上 `fact-v3`**：进程标识改取 `/proc/<pid>/exe` 的**完整路径**
+  （内核线程 / 僵尸整条跳过，读不到 `exe` 时退回 argv、再退回 `comm`）；监听端口只报稳定
+  服务端口。两者都是为了让内容摘要稳定 —— 15 字符短名会撞名、临时端口会随无关进程换号，
+  都会让幂等键失效。
+
+### 升级提示
+
+- **依赖 `wist-contracts` 0.9.5**（本版用到 `filters` / `drop_if_contains` 两个新能力轴）。
+  contracts 发布后再 `cargo update -p wist-contracts` 刷新 `Cargo.lock`。
+- 与本版配套的网关是 **0.20.1**：`WorkSpecSource` 是 `deny_unknown_fields` 的，低于它的网关
+  解析不了 `drop_if_contains`（整份目录加载失败），也不会把 `filters` 纳入能力裁剪。
+
 ## [0.9.0-alpha] - 2026-10-23
 
 ### 新增

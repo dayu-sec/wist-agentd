@@ -33,6 +33,8 @@ pub(super) struct CollectedReadBatch {
     pub(super) checkpoints: Vec<PendingCheckpoint>,
     pub(super) checkpoint_offset: u64,
     pub(super) truncated_lines: usize,
+    /// 本批按 `drop_if_contains` 丢掉的记录数（噪音行，进自观测）。
+    pub(super) dropped_noise: usize,
     /// 本次因**内容不全**被挡下（不转发）的记录。
     pub(super) withheld: Withheld,
     pub(super) resume: ResumeDecision,
@@ -46,6 +48,7 @@ impl CollectedReadBatch {
             checkpoints: Vec::new(),
             checkpoint_offset: 0,
             truncated_lines: 0,
+            dropped_noise: 0,
             withheld: Withheld::default(),
             resume,
         }

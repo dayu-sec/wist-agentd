@@ -20,8 +20,8 @@ mod support;
 
 use support::{
     build_file_input_config, build_record_sink, capacity_failure, invalid_output_failure,
-    missing_input_failure, processing_failure, replay_spool_only, spool_paused_reason,
-    unsupported_target, uplink_failure, withheld_failure,
+    missing_input_failure, noise_dropped_failure, processing_failure, replay_spool_only,
+    spool_paused_reason, unsupported_target, uplink_failure, withheld_failure,
 };
 
 // 生效输出解析要给主循环用（它在短路前算），所以在同一层再导出一次；
@@ -47,6 +47,11 @@ pub(super) enum TelemetryFailureKind {
     RecordWithheld,
     /// 文件族匹配数超过 `max_files`：新文件不再纳入跟踪（**没采全**，不是"没匹配"）。
     CapacityExceeded,
+    /// 按 `drop_if_contains` 丢掉噪音行：**配置的正常结果，不是故障**。
+    ///
+    /// 为什么走这条通道（并打 `info` 而不是 `error`）：它需要“同一问题只报一次”的去重，
+    /// 否则每分钟一条的 `pam_unix(cron:session)` 会让自观测也变成噪音。
+    NoiseDropped,
     /// **出口写失败**：记录已安全进 spool 等重发，但「写出口」这一步没成功。
     ///
     /// 单列一类是因为它与「读文件失败」的处置完全不同：输入没问题，是出口（数据面目标）
@@ -101,7 +106,11 @@ impl TelemetryTick {
     }
 
     pub(super) fn is_active(&self) -> bool {
-        !self.failures.is_empty()
+        // 噪音行丢弃是**配置的正常结果**，不算“这台机器在干活”：
+        // 一个持续丢 cron 噪音的空闲机器不该因此永远显示 `Active`。
+        self.failures
+            .iter()
+            .any(|failure| failure.kind != TelemetryFailureKind::NoiseDropped)
             || self.outcomes.iter().any(|outcome| {
                 outcome.records_processed > 0
                     || outcome.replayed_spool > 0
@@ -162,7 +171,11 @@ pub(super) fn len_framing_required<'a>(
         return None;
     }
     inputs
-        .find(|input| input.multiline_mode != "none")
+        .find(|input| {
+            // 读法词表与折叠器同源：新增长读法（`mysql_slow` / `postgres_csv`）自动升级分帧。
+            crate::telemetry::logs::multiline::MultilineMode::parse(&input.multiline_mode)
+                .is_some_and(|mode| mode.folds_records())
+        })
         .map(|input| input.input_id.as_str())
 }
 
@@ -537,6 +550,12 @@ async fn process_telemetry_input<S: RecordSink>(
             if let Some(capacity) = outcome.capacity.as_ref() {
                 tick.failures.push(capacity_failure(input, capacity));
             }
+            // 噪音行丢弃：配置的正常结果，但**必须可对账** ——
+            // 否则“这个面怎么少了一半”只能靠猜。走 failure 通道蹭它的按签名去重。
+            if outcome.dropped_noise > 0 {
+                tick.failures
+                    .push(noise_dropped_failure(input, outcome.dropped_noise));
+            }
             // 出口写失败：记录已安全进 spool，但**写出口**没成。必须说出来 ——
             // 旧行为里第一次失败是完全静默的（只有下一轮的回放失败才会报），
             // 而目标现在由控制面下发 —— 填错必须当场看得见，不能等 spool 涨到上限才 `pause`。
@@ -626,6 +645,7 @@ mod tests {
             multiline_mode: multiline.to_string(),
             exclude_globs: Vec::new(),
             filters: Default::default(),
+            drop_if_contains: Vec::new(),
         }
     }
 

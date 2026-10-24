@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 use wist_contracts::discovery::{DiscoveredResource, DiscoverySnapshot};
-use wist_contracts::fact_summary::FactContent;
+use wist_contracts::fact_summary::{EPHEMERAL_PORT_START, FactContent};
 
 /// `DiscoveredResource::kind`：进程（与 `ProcessDiscoveryProbe` 写入的值一致）。
 const PROCESS_KIND: &str = "process";
@@ -24,10 +24,12 @@ const IP_ADDRESS_KIND: &str = "ip_address";
 
 /// 进程可执行标识的属性名。
 ///
-/// 注意这个属性名与语义并不完全一致：macOS 侧 `ps -axo comm=` 实际给的是**完整路径**，
-/// Linux 侧读 `/proc/{pid}/comm` 只有 basename。所以规则表里 `process_path` 类规则
-/// 目前只在 macOS 上成立（显式化 `process.executable.path` 记在 B119）。
+/// 语义是「可执行实体的标识」，两端都是**绝对路径**（Linux 取 `/proc/<pid>/exe`，
+/// macOS 取 `ps -axo comm=`）。早先 Linux 侧只给 `comm` 的 basename（15 字符、会截断、
+/// 会撞名），`process_path` 类规则因此在 Linux 上不成立。
 const PROCESS_EXECUTABLE: &str = "process.executable.name";
+/// 监听端点：协议（`tcp` / `udp`）。与 `EndpointDiscoveryProbe` 写入的值一致。
+const ENDPOINT_PROTOCOL: &str = "endpoint.protocol";
 /// 监听端口的属性名。
 const ENDPOINT_PORT: &str = "endpoint.bind.port";
 /// 主机标识 / 主机名的属性名（`host` 方向）。
@@ -47,10 +49,12 @@ pub struct FactSummaryDraft {
     pub observed_at: String,
     pub os: String,
     pub arch: String,
-    /// 去重前的进程条数（去重会毁掉基数，留一个原始计数备查）。不进内容摘要。
+    /// 去重前的**用户态**进程条数（内核线程与僵尸不算 —— 它们没有可执行实体）。
+    /// 去重会毁掉基数，留一个原始计数备查。不进内容摘要。
     pub process_count: i64,
     pub process_executables: Vec<String>,
     pub packages: Vec<String>,
+    /// 稳定的服务端口，形如 `tcp:5432`（已滤掉内核临时端口区间）。
     pub listen_ports: Vec<String>,
     /// 网关下发、本机实际探测过的路径（白名单）。
     pub probed_paths: Vec<String>,
@@ -82,7 +86,7 @@ impl FactSummaryDraft {
         )
     }
 
-    /// 内容摘要（`fact-v2:sha256:<hex>`）。
+    /// 内容摘要（`fact-v3:sha256:<hex>`）。
     ///
     /// 实现只有一份 —— 在 `wist_contracts::fact_summary`，与网关共用。
     /// 这里只做转接：两侧各写一份规范化的话，一边改了另一边不知道，
@@ -116,9 +120,21 @@ pub fn build_summary(snapshot: &DiscoverySnapshot, probe_paths: &[String]) -> Fa
                 }
             }
             ENDPOINT_KIND => {
-                if let Some(value) = attribute(resource, ENDPOINT_PORT) {
-                    ports.insert(value.to_string());
+                let Some(port) =
+                    attribute(resource, ENDPOINT_PORT).and_then(|value| value.parse::<u16>().ok())
+                else {
+                    continue;
+                };
+                // 只按端口区间判：临时区间里的监听是客户端 socket / 端口池 / 端口转发的副产物。
+                // **不按回环地址判** —— `127.0.0.1:5432` 这类只绑本地的服务同样是有效判据。
+                if port >= EPHEMERAL_PORT_START {
+                    continue;
                 }
+                // 探针总是同时写协议与端口；缺一个说明快照不完整，不猜。
+                let Some(protocol) = attribute(resource, ENDPOINT_PROTOCOL) else {
+                    continue;
+                };
+                ports.insert((protocol.to_ascii_lowercase(), port));
             }
             HOST_KIND => {
                 if let Some(value) = attribute(resource, HOST_ID) {
@@ -163,7 +179,10 @@ pub fn build_summary(snapshot: &DiscoverySnapshot, probe_paths: &[String]) -> Fa
         // 包清单还没有探针（backlog B119）：如实留空，
         // 别让「没采」看起来像「没装」。
         packages: Vec::new(),
-        listen_ports: ports.into_iter().collect(),
+        listen_ports: ports
+            .into_iter()
+            .map(|(protocol, port)| format!("{protocol}:{port}"))
+            .collect(),
         probed_paths,
         present_paths,
         host_id,
@@ -239,6 +258,18 @@ mod tests {
         )
     }
 
+    /// 按探针真实写出的形状造端点（绑定地址不参与过滤，但真实快照里有）。
+    fn endpoint(protocol: &str, bind_ip: &str, port: &str) -> DiscoveredResource {
+        resource(
+            ENDPOINT_KIND,
+            &[
+                (ENDPOINT_PROTOCOL, protocol),
+                ("endpoint.bind.ip", bind_ip),
+                (ENDPOINT_PORT, port),
+            ],
+        )
+    }
+
     /// 多数用例不关心路径白名单：统一走空表。
     fn summary(snapshot: &DiscoverySnapshot) -> FactSummaryDraft {
         build_summary(snapshot, &[])
@@ -262,16 +293,50 @@ mod tests {
     #[test]
     fn collects_listen_ports_and_ignores_unrelated_kinds() {
         let summary = summary(&snapshot(vec![
-            resource(ENDPOINT_KIND, &[(ENDPOINT_PORT, "5432")]),
-            resource(ENDPOINT_KIND, &[(ENDPOINT_PORT, "5432")]),
-            resource(ENDPOINT_KIND, &[(ENDPOINT_PORT, "6379")]),
+            endpoint("tcp", "0.0.0.0", "5432"),
+            endpoint("tcp", "0.0.0.0", "5432"),
+            endpoint("udp", "::", "6379"),
             resource("host", &[("host.name", "demo")]),
             resource("container", &[("container.id", "abc")]),
         ]));
 
-        assert_eq!(summary.listen_ports, vec!["5432", "6379"]);
+        // 协议参与身份：同一端口在 tcp/udp 上是两件不同的事。
+        assert_eq!(summary.listen_ports, vec!["tcp:5432", "udp:6379"]);
         assert!(summary.process_executables.is_empty());
         assert_eq!(summary.process_count, 0);
+    }
+
+    #[test]
+    fn drops_ephemeral_socket_pool_ports() {
+        // 实测噪声的形状：一个 license 进程的临时端口池 + 编辑器的端口转发 —— 全在 ≥ 32768。
+        // 判据只看区间：回环上的**服务**端口（本地 postgres / 开发机的 dev server）
+        // 同样是「这台机器在跑什么」的信号，不能一刀切掉。
+        let summary = summary(&snapshot(vec![
+            endpoint("tcp", "0.0.0.0", "5432"),
+            endpoint("tcp", "127.0.0.1", "6379"),
+            // 编辑器端口转发：回环 + 临时端口。
+            endpoint("tcp", "127.0.0.1", "46671"),
+            // license 池 / docker 随机发布端口。
+            endpoint("tcp", "0.0.0.0", "35432"),
+            endpoint("tcp", "::", "33013"),
+            // 边界：32768 起算临时端口。
+            endpoint("udp", "0.0.0.0", "32768"),
+        ]));
+
+        assert_eq!(summary.listen_ports, vec!["tcp:5432", "tcp:6379"]);
+    }
+
+    #[test]
+    fn keeps_wildcard_service_ports_and_needs_a_protocol() {
+        // `0.0.0.0` / `::` 是真实的服务监听（对外可达），就是用途推断要的信号。
+        // 但只写端口、没写协议的端点不猜协议：宁可少一条，不要编一个 `tcp`。
+        let summary = summary(&snapshot(vec![
+            endpoint("tcp", "0.0.0.0", "8080"),
+            endpoint("tcp", "::", "443"),
+            resource(ENDPOINT_KIND, &[(ENDPOINT_PORT, "6379")]),
+        ]));
+
+        assert_eq!(summary.listen_ports, vec!["tcp:443", "tcp:8080"]);
     }
 
     #[test]
@@ -282,7 +347,8 @@ mod tests {
             resource(ENDPOINT_KIND, &[("endpoint.protocol", "tcp")]),
         ]));
 
-        // 内核线程等没有可执行名的进程只计入条数，不进推断信号。
+        // 没有可执行名的进程只计入条数，不进推断信号（Linux 侧的内核线程已在探针里滤掉，
+        // 这里保留的是「资源本身缺字段」的兼容行为）。
         assert_eq!(summary.process_count, 2);
         assert!(summary.process_executables.is_empty());
         assert!(summary.listen_ports.is_empty());
@@ -311,8 +377,8 @@ mod tests {
         assert_ne!(base.content_digest(), more.content_digest());
         // 版本前缀是契约的一部分：网关用同一实现重算，两侧算法/字段集必须对齐。
         let digest = base.content_digest();
-        assert!(digest.starts_with("fact-v2:sha256:"), "{digest}");
-        assert_eq!(digest.len(), "fact-v2:sha256:".len() + 64);
+        assert!(digest.starts_with("fact-v3:sha256:"), "{digest}");
+        assert_eq!(digest.len(), "fact-v3:sha256:".len() + 64);
     }
 
     #[test]

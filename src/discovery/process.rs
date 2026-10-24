@@ -151,10 +151,10 @@ fn list_processes() -> io::Result<Vec<ObservedProcess>> {
         let Ok(pid) = file_name.parse::<u32>() else {
             continue;
         };
-        let name = fs::read_to_string(format!("/proc/{pid}/comm"))
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+        // 内核线程与僵尸没有可执行实体：既推不出用途，名字还会随调度漂移。
+        let Some(name) = linux_process_name(pid) else {
+            continue;
+        };
         let (identity, identity_unavailable) = match process_identity(pid) {
             Ok(identity) => (identity, false),
             Err(err)
@@ -170,11 +170,56 @@ fn list_processes() -> io::Result<Vec<ObservedProcess>> {
         processes.push(ObservedProcess {
             pid,
             identity,
-            name,
+            name: Some(name),
             identity_unavailable,
         });
     }
     Ok(processes)
+}
+
+/// 取进程的可执行标识：优先 `/proc/<pid>/exe` 的**完整路径**。
+///
+/// 为什么不再用 `comm`：它是 15 字符截断的 basename（`victoria-logs-p` 这种），
+/// 既会撞名也会丢路径 —— 而 `process_path` 类规则（`/opt/homebrew`、`/Docker.app`…）
+/// 要的正是路径。
+///
+/// 返回 `None` = 这条 `/proc` 记录没有可执行实体（内核线程 / 僵尸），整条跳过：
+/// 内核线程的名字还会随工作队列绑定漂移（`kworker/0:1-cgroup_destroy`），
+/// 把它们放进事实只会让内容摘要永远不稳定。
+#[cfg(target_os = "linux")]
+fn linux_process_name(pid: u32) -> Option<String> {
+    match fs::read_link(format!("/proc/{pid}/exe")) {
+        Ok(path) => Some(path.to_string_lossy().into_owned()),
+        // 内核线程与僵尸都没有 `exe` 链接（ENOENT）。内核线程的 cmdline 也是空，
+        // 两者都会被 `first_cmdline_arg` 判成 None；真出现「无 exe 但有 argv」仍按 argv 保留。
+        Err(err) if err.kind() == io::ErrorKind::NotFound => read_cmdline_argv(pid),
+        // 读不到别人的 `exe`（权限）不等于不存在：退回 argv，再退回 comm。
+        Err(_) => read_cmdline_argv(pid).or_else(|| read_process_comm(pid)),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_cmdline_argv(pid: u32) -> Option<String> {
+    let content = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    first_cmdline_arg(&content)
+}
+
+/// 取 `argv[0]`：`/proc/<pid>/cmdline` 是 NUL 分隔的字节串，内核线程与僵尸是空文件。
+///
+/// `cfg` 带上 `test` 是为了在 macOS 上也能单测这个纯函数（生产构建里它只在 Linux 存在）。
+#[cfg(any(target_os = "linux", test))]
+fn first_cmdline_arg(content: &[u8]) -> Option<String> {
+    let first = content.split(|byte| *byte == 0).next()?;
+    let value = String::from_utf8_lossy(first).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_comm(pid: u32) -> Option<String> {
+    fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -238,8 +283,29 @@ fn list_processes() -> io::Result<Vec<ObservedProcess>> {
 #[cfg(test)]
 mod tests {
     use super::ObservedProcess;
+    #[cfg(any(target_os = "linux", test))]
+    use super::first_cmdline_arg;
     #[cfg(all(unix, not(target_os = "linux")))]
     use super::parse_unix_ps_process_line;
+
+    #[test]
+    fn first_cmdline_arg_stops_at_the_first_nul() {
+        assert_eq!(
+            first_cmdline_arg(b"/usr/sbin/nginx\0-g\0daemon off;\0"),
+            Some("/usr/sbin/nginx".to_string())
+        );
+        // 内核线程 / 僵尸：空文件，或第一个参数就是空串。
+        assert_eq!(first_cmdline_arg(b""), None);
+        assert_eq!(first_cmdline_arg(b"\0later-arg\0"), None);
+    }
+
+    /// Linux 侧的可执行标识必须是**路径**（`process_path` 规则与网关资产清单都靠它）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn own_process_has_an_absolute_executable_path() {
+        let name = super::linux_process_name(std::process::id()).expect("own process");
+        assert!(name.starts_with('/'), "not a path: {name}");
+    }
 
     #[test]
     fn process_identity_uses_identity_when_present() {

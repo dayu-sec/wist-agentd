@@ -68,6 +68,8 @@ pub struct FileInputConfig {
     pub exclude_globs: Vec<String>,
     /// 容器选源的结构化过滤器（默认空）；在**发现阶段**求值，只影响“哪些文件进工作集”。
     pub filters: wist_contracts::work::ContainerFilters,
+    /// 含这些**子串**的记录整条丢弃（默认空 = 不丢）；在**进闸门之前**求值。
+    pub drop_if_contains: Vec<String>,
     /// 每个 input 最多跟踪多少个文件。
     pub max_files: usize,
     /// 每 tick 最多接入多少个新文件。
@@ -110,6 +112,8 @@ pub struct ProcessOutcome {
     /// 本次因**内容不全**被挡下（不转发、不取号）的记录。
     /// 不是 0 就说明边界判据在这个文件上没起作用（例如某个块永不结束），必须说出来。
     pub withheld: Withheld,
+    /// 本次按 `drop_if_contains` 丢掉的噪音记录数（配置的正常结果，不是失败）。
+    pub dropped_noise: usize,
     pub rotated: bool,
     /// 是否因 spool 超限而暂停采集。
     pub paused: bool,
@@ -155,7 +159,14 @@ impl ProcessOutcome {
             paused: false,
             spool_bytes: 0,
             capacity: None,
+            dropped_noise: 0,
         }
+    }
+
+    /// 带上本批被 `drop_if_contains` 丢掉的条数（自观测用）。
+    fn with_dropped_noise(mut self, dropped_noise: usize) -> Self {
+        self.dropped_noise = dropped_noise;
+        self
     }
 
     pub(crate) fn spool_replay_only(replayed_spool: usize) -> Self {
@@ -170,6 +181,7 @@ impl ProcessOutcome {
             truncated: false,
             truncated_lines: 0,
             withheld: Withheld::default(),
+            dropped_noise: 0,
             rotated: false,
             paused: false,
             spool_bytes: 0,
@@ -193,6 +205,7 @@ impl ProcessOutcome {
             truncated: false,
             truncated_lines: 0,
             withheld: Withheld::default(),
+            dropped_noise: 0,
             rotated: false,
             paused: true,
             spool_bytes,
@@ -242,6 +255,7 @@ where
             checkpoints,
             checkpoint_offset,
             truncated_lines,
+            dropped_noise,
             withheld,
             resume,
         } = batch;
@@ -263,7 +277,8 @@ where
             truncated_lines,
             withheld,
             resume.rotated,
-        ))
+        )
+        .with_dropped_noise(dropped_noise))
     }
 
     #[cfg(test)]
@@ -325,18 +340,26 @@ where
             .await?;
 
         if batch.resume.rotated || batch.resume.truncated {
-            batch.records.extend(records_from_pending(
+            let admitted = records_from_pending(
+                self.config.multiline_mode,
                 &mut gate,
+                &self.config.drop_if_contains,
                 batch.pending_multiline.take(),
                 next_seq,
-            ));
+            );
+            batch.records.extend(admitted.records);
+            batch.dropped_noise += admitted.dropped_noise;
         } else {
-            batch.records.extend(flush_pending_if_source_changes(
+            let admitted = flush_pending_if_source_changes(
+                self.config.multiline_mode,
                 &mut gate,
+                &self.config.drop_if_contains,
                 &mut batch.pending_multiline,
                 &self.config.source_path,
                 next_seq,
-            ));
+            );
+            batch.records.extend(admitted.records);
+            batch.dropped_noise += admitted.dropped_noise;
         }
 
         let active_read = read_from_offset_async(
@@ -350,6 +373,7 @@ where
         let folded = records_from_read(
             &mut gate,
             self.config.multiline_mode,
+            &self.config.drop_if_contains,
             &observed_at,
             &self.config.source_path,
             active_read.lines,
@@ -357,6 +381,7 @@ where
             next_seq,
         );
         batch.records.extend(folded.records);
+        batch.dropped_noise += folded.dropped_noise;
         batch.pending_multiline = folded.pending;
         batch.checkpoint_offset = active_read.committed_end_offset;
         batch.checkpoints.push(PendingCheckpoint {
@@ -366,12 +391,22 @@ where
             rotated_from_path: batch.resume.rotated_from_path.clone(),
         });
 
-        if !saw_new_lines && pending_should_flush(batch.pending_multiline.as_ref(), &observed_at) {
-            batch.records.extend(records_from_pending(
+        if !saw_new_lines
+            && pending_should_flush(
+                self.config.multiline_mode,
+                batch.pending_multiline.as_ref(),
+                &observed_at,
+            )
+        {
+            let admitted = records_from_pending(
+                self.config.multiline_mode,
                 &mut gate,
+                &self.config.drop_if_contains,
                 batch.pending_multiline.take(),
                 next_seq,
-            ));
+            );
+            batch.records.extend(admitted.records);
+            batch.dropped_noise += admitted.dropped_noise;
         }
 
         batch.withheld = gate.withheld();
@@ -415,6 +450,7 @@ where
         let folded = records_from_read(
             gate,
             self.config.multiline_mode,
+            &self.config.drop_if_contains,
             &runtime.observed_at,
             &rotated_path,
             rotated_read.lines,
@@ -422,6 +458,7 @@ where
             next_seq,
         );
         batch.records.extend(folded.records);
+        batch.dropped_noise += folded.dropped_noise;
         batch.pending_multiline = folded.pending;
         batch.checkpoints.push(PendingCheckpoint {
             source_path: rotated_path,
@@ -597,6 +634,7 @@ where
             checkpoints,
             checkpoint_offset,
             truncated_lines,
+            dropped_noise,
             rotated,
             truncated,
             withheld,
@@ -618,6 +656,10 @@ where
             .await?;
         // 先交付/提交能读到的，再把单文件读失败报给上层：不交出去的话，
         // 同目录其它文件每轮都白读一遍（记录已上送，checkpoint 却没前进）。
+        //
+        // 取舍：`Err` 这一轮不会产出 `ProcessOutcome`，所以 `dropped_noise` / `withheld`
+        // 不会进这一轮的自观测（与既有 `withheld` 同一行为）。失败持续时它们每轮都被丢 ——
+        // 可接受：失败本身已经有一行 error，噪声计数不是排障的第一现场。
         if let Some(err) = failure {
             return Err(err);
         }
@@ -631,6 +673,7 @@ where
             rotated,
         );
         outcome.capacity = capacity;
+        outcome.dropped_noise = dropped_noise;
         Ok(outcome)
     }
 
@@ -649,9 +692,15 @@ where
         );
         let mut batch = FamilyBatch::new();
         // 迁移不上任何文件的旧块：没有文件可等，按到期封口直接交出去。
-        batch
-            .records
-            .extend(records_from_pending(&mut gate, orphan_pending, next_seq));
+        let orphan = records_from_pending(
+            self.config.multiline_mode,
+            &mut gate,
+            &self.config.drop_if_contains,
+            orphan_pending,
+            next_seq,
+        );
+        batch.records.extend(orphan.records);
+        batch.dropped_noise += orphan.dropped_noise;
         // 「首次扫描」= 这个 input **从未扫描过**（既没有跟踪任何文件，也没落过扫描时间）。
         //
         // 不能只看 `files.is_empty()`：跟踪过的文件全被删/轮转走之后也会是空，而那台机器上
@@ -813,9 +862,15 @@ where
                             .find(|entry| entry.path == display_path)
                         {
                             let pending = entry.pending_multiline.take();
-                            batch
-                                .records
-                                .extend(records_from_pending(gate, pending, next_seq));
+                            let admitted = records_from_pending(
+                                self.config.multiline_mode,
+                                gate,
+                                &self.config.drop_if_contains,
+                                pending,
+                                next_seq,
+                            );
+                            batch.records.extend(admitted.records);
+                            batch.dropped_noise += admitted.dropped_noise;
                         }
                     }
                 }
@@ -857,9 +912,15 @@ where
             .and_then(|entry| entry.pending_multiline.clone());
         if resume.truncated {
             // 截断：旧内容先封口，再从 0 读新内容。
-            batch
-                .records
-                .extend(records_from_pending(gate, pending.take(), next_seq));
+            let admitted = records_from_pending(
+                self.config.multiline_mode,
+                gate,
+                &self.config.drop_if_contains,
+                pending.take(),
+                next_seq,
+            );
+            batch.records.extend(admitted.records);
+            batch.dropped_noise += admitted.dropped_noise;
             batch.truncated = true;
         }
         if resume.rotated {
@@ -879,9 +940,15 @@ where
                     .log_state
                     .files
                     .retain(|entry| entry.path != display_path);
-                batch
-                    .records
-                    .extend(records_from_pending(gate, pending.take(), next_seq));
+                let admitted = records_from_pending(
+                    self.config.multiline_mode,
+                    gate,
+                    &self.config.drop_if_contains,
+                    pending.take(),
+                    next_seq,
+                );
+                batch.records.extend(admitted.records);
+                batch.dropped_noise += admitted.dropped_noise;
             }
             // 旧块已随轮转文件 rebind / 封口；当前文件重新开始。
             pending = None;
@@ -918,6 +985,7 @@ where
         let folded = records_from_read(
             gate,
             self.config.multiline_mode,
+            &self.config.drop_if_contains,
             &runtime.observed_at,
             display,
             read.lines,
@@ -925,11 +993,24 @@ where
             next_seq,
         );
         batch.records.extend(folded.records);
+        batch.dropped_noise += folded.dropped_noise;
         let mut pending = folded.pending;
-        if consumed_lines == 0 && pending_should_flush(pending.as_ref(), &runtime.observed_at) {
-            batch
-                .records
-                .extend(records_from_pending(gate, pending.take(), next_seq));
+        if consumed_lines == 0
+            && pending_should_flush(
+                self.config.multiline_mode,
+                pending.as_ref(),
+                &runtime.observed_at,
+            )
+        {
+            let admitted = records_from_pending(
+                self.config.multiline_mode,
+                gate,
+                &self.config.drop_if_contains,
+                pending.take(),
+                next_seq,
+            );
+            batch.records.extend(admitted.records);
+            batch.dropped_noise += admitted.dropped_noise;
         }
         batch.checkpoint_offset = batch.checkpoint_offset.max(read.committed_end_offset);
         // 只有**真变了**才写 checkpoint：未变化的位置每 15s 已经有一次全量状态写，
@@ -989,6 +1070,7 @@ where
         let folded = records_from_read(
             gate,
             self.config.multiline_mode,
+            &self.config.drop_if_contains,
             &runtime.observed_at,
             &rotated_path,
             read.lines,
@@ -996,11 +1078,24 @@ where
             next_seq,
         );
         batch.records.extend(folded.records);
+        batch.dropped_noise += folded.dropped_noise;
         let mut pending = folded.pending;
-        if consumed_lines == 0 && pending_should_flush(pending.as_ref(), &runtime.observed_at) {
-            batch
-                .records
-                .extend(records_from_pending(gate, pending.take(), next_seq));
+        if consumed_lines == 0
+            && pending_should_flush(
+                self.config.multiline_mode,
+                pending.as_ref(),
+                &runtime.observed_at,
+            )
+        {
+            let admitted = records_from_pending(
+                self.config.multiline_mode,
+                gate,
+                &self.config.drop_if_contains,
+                pending.take(),
+                next_seq,
+            );
+            batch.records.extend(admitted.records);
+            batch.dropped_noise += admitted.dropped_noise;
         }
         let rotated_real = tokio::fs::canonicalize(&rotated_path)
             .await
@@ -1065,6 +1160,8 @@ struct FamilyBatch {
     checkpoints: Vec<FamilyCheckpoint>,
     checkpoint_offset: u64,
     truncated_lines: usize,
+    /// 本批按 `drop_if_contains` 丢掉的记录数（噪音行，进自观测）。
+    dropped_noise: usize,
     rotated: bool,
     truncated: bool,
     withheld: Withheld,
@@ -1081,6 +1178,7 @@ impl FamilyBatch {
             checkpoints: Vec::new(),
             checkpoint_offset: 0,
             truncated_lines: 0,
+            dropped_noise: 0,
             rotated: false,
             truncated: false,
             withheld: Withheld::default(),

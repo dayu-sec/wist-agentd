@@ -21,6 +21,7 @@ mod missing;
 mod multiline;
 #[cfg(unix)]
 mod permissions;
+mod record_boundaries;
 mod rotation;
 mod spool_replay;
 
@@ -62,6 +63,7 @@ fn config(root: &Path, source_path: &Path) -> FileInputConfig {
         source_path: source_path.to_path_buf(),
         exclude_globs: Vec::new(),
         filters: Default::default(),
+        drop_if_contains: Vec::new(),
         max_files: super::DEFAULT_MAX_FILES_PER_INPUT,
         max_new_files: super::DEFAULT_MAX_NEW_FILES_PER_TICK,
         rescan_interval_ms: super::DEFAULT_RESCAN_INTERVAL_MS,

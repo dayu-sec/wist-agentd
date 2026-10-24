@@ -104,9 +104,9 @@ fn validate_logs_section(logs: &LogsSection) -> Result<(), ValidationError> {
             "head" | "tail" => {}
             _ => return Err(ValidationError::new("invalid_log_startup_position")),
         }
-        match input.multiline_mode.as_str() {
-            "none" | "indented" => {}
-            _ => return Err(ValidationError::new("invalid_log_multiline_mode")),
+        // 读法词表直接取契约（与网关装载期、目录同源）：新增一种读法不该在三处各加一次。
+        if !wist_contracts::work::MULTILINE_MODES.contains(&input.multiline_mode.as_str()) {
+            return Err(ValidationError::new("invalid_log_multiline_mode"));
         }
         // 排除项是绝对路径 glob：相对路径的结果取决于进程 cwd，同一台机器换一种启动方式
         // 就少采一个文件，那不是配置。
@@ -132,6 +132,9 @@ fn validate_logs_section(logs: &LogsSection) -> Result<(), ValidationError> {
                 return Err(ValidationError::new("invalid_log_input_container_filters"));
             }
         }
+        // 噪音行丢弃：与网关装载期共用同一份形状校验（精确子串、限条数 / 长度）。
+        wist_contracts::work::validate_drop_if_contains(&input.drop_if_contains)
+            .map_err(|_| ValidationError::new("invalid_log_input_drop_if_contains"))?;
     }
 
     Ok(())
@@ -185,6 +188,7 @@ mod tests {
                 multiline_mode: "none".to_string(),
                 exclude_globs: Vec::new(),
                 filters: Default::default(),
+                drop_if_contains: Vec::new(),
             }],
             file_inputs_file: None,
             in_memory_buffer_bytes: 1024,
@@ -437,6 +441,12 @@ mod tests {
             })),
             "invalid_log_input_exclude_glob",
         );
+        assert_code(
+            validate_config(&with_inputs(|input| {
+                input.drop_if_contains = vec![" padded ".to_string()]
+            })),
+            "invalid_log_input_drop_if_contains",
+        );
     }
 
     #[test]
@@ -452,14 +462,25 @@ mod tests {
     #[test]
     fn known_file_input_modes_are_accepted() {
         for startup_position in ["head", "tail"] {
-            for multiline_mode in ["none", "indented"] {
+            for multiline_mode in wist_contracts::work::MULTILINE_MODES {
                 let mut logs = valid_logs();
                 logs.file_inputs[0].startup_position = startup_position.to_string();
-                logs.file_inputs[0].multiline_mode = multiline_mode.to_string();
+                logs.file_inputs[0].multiline_mode = (*multiline_mode).to_string();
                 let config = base_config().with_telemetry(TelemetrySection { logs });
                 validate_config(&config).expect("known input modes");
             }
         }
+    }
+
+    #[test]
+    fn noise_needles_are_accepted_when_they_are_exact_substrings() {
+        let mut logs = valid_logs();
+        logs.file_inputs[0].drop_if_contains = vec![
+            "pam_unix(cron:session)".to_string(),
+            "systemd-logind".to_string(),
+        ];
+        let config = base_config().with_telemetry(TelemetrySection { logs });
+        validate_config(&config).expect("exact substrings");
     }
 
     #[test]

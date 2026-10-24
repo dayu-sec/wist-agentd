@@ -207,6 +207,7 @@ fn config_with_duplicate_log_input_ids_is_rejected() {
                     multiline_mode: "none".to_string(),
                     exclude_globs: Vec::new(),
                     filters: Default::default(),
+                    drop_if_contains: Vec::new(),
                 },
                 LogFileInputSection {
                     input_id: "app".to_string(),
@@ -215,6 +216,7 @@ fn config_with_duplicate_log_input_ids_is_rejected() {
                     multiline_mode: "none".to_string(),
                     exclude_globs: Vec::new(),
                     filters: Default::default(),
+                    drop_if_contains: Vec::new(),
                 },
             ],
             file_inputs_file: None,
@@ -280,6 +282,7 @@ fn config_with_invalid_log_startup_position_is_rejected() {
                 multiline_mode: "none".to_string(),
                 exclude_globs: Vec::new(),
                 filters: Default::default(),
+                drop_if_contains: Vec::new(),
             }],
             file_inputs_file: None,
             max_line_bytes: 1_048_576,
@@ -344,6 +347,7 @@ fn config_with_invalid_log_spool_over_limit_is_rejected() {
                 multiline_mode: "none".to_string(),
                 exclude_globs: Vec::new(),
                 filters: Default::default(),
+                drop_if_contains: Vec::new(),
             }],
             file_inputs_file: None,
             max_line_bytes: 1_048_576,
@@ -454,6 +458,7 @@ fn config_with_invalid_tcp_output_framing_is_rejected() {
                 multiline_mode: "none".to_string(),
                 exclude_globs: Vec::new(),
                 filters: Default::default(),
+                drop_if_contains: Vec::new(),
             }],
             file_inputs_file: None,
             max_line_bytes: 1_048_576,
@@ -494,6 +499,7 @@ fn container_input(
         multiline_mode: "none".to_string(),
         exclude_globs: Vec::new(),
         filters,
+        drop_if_contains: Vec::new(),
     }
 }
 

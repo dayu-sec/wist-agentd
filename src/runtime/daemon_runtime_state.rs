@@ -55,6 +55,17 @@ pub(super) fn emit_telemetry_failure(failure: &TelemetryFailure) {
                 failure.detail
             );
         }
+        // 噪音行丢弃：**正常态**，但要让运维能回答“为什么这个 input 少了很多行”。
+        // 打 `info`（不是 `error`）：它不对应任何故障。
+        TelemetryFailureKind::NoiseDropped => {
+            let magnitude = failure.magnitude.as_deref().unwrap_or("n/a");
+            log::info!(
+                "telemetry noise dropped input_id={} path={} detail={} magnitude={magnitude}",
+                failure.input_id,
+                failure.path,
+                failure.detail
+            );
+        }
         // 出口写失败：`magnitude` 里带目标地址与底层原因（`TcpRecordSink` 已挂 `host:port`）——
         // 运维看到这一行就该知道是哪个数据面目标连不上。
         TelemetryFailureKind::OutputWriteFailed => {

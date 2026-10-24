@@ -106,6 +106,7 @@ pub(super) fn build_file_input_config(
         source_path,
         exclude_globs: input.exclude_globs.clone(),
         filters: input.filters.clone(),
+        drop_if_contains: input.drop_if_contains.clone(),
         max_files: DEFAULT_MAX_FILES_PER_INPUT,
         max_new_files: DEFAULT_MAX_NEW_FILES_PER_TICK,
         rescan_interval_ms: DEFAULT_RESCAN_INTERVAL_MS,
@@ -256,15 +257,30 @@ pub(super) fn spool_paused_reason(spool_bytes: u64) -> String {
     format!("spool over limit ({spool_bytes} bytes); source read paused")
 }
 
+/// 按 `drop_if_contains` 丢掉噪音行的自观测记录。
+///
+/// `detail` 必须**稳定**（去重按 `kind|input_id|path|detail`）：同一份配置持续丢噪音只该报一次；
+/// 丢了多少放 `magnitude`（它会变）。
+pub(super) fn noise_dropped_failure(
+    input: &LogFileInputSection,
+    dropped: usize,
+) -> TelemetryFailure {
+    TelemetryFailure {
+        kind: TelemetryFailureKind::NoiseDropped,
+        input_id: input.input_id.clone(),
+        path: input.path.clone(),
+        detail: "drop_if_contains matched".to_string(),
+        magnitude: Some(format!("records={dropped}")),
+    }
+}
+
 fn spool_path_for(config: &AgentConfig, input: &LogFileInputSection) -> PathBuf {
     Path::new(&config.telemetry.logs.spool_dir).join(format!("{}.ndjson", input.input_id))
 }
 
 fn multiline_mode_for(input: &LogFileInputSection) -> MultilineMode {
-    match input.multiline_mode.as_str() {
-        "indented" => MultilineMode::IndentedContinuation,
-        _ => MultilineMode::None,
-    }
+    // 认不出的值按 `none`：配置校验（`validate`）已经拒过，这里只是不出错地兼底。
+    MultilineMode::parse(&input.multiline_mode).unwrap_or(MultilineMode::None)
 }
 
 /// 启动位：`tail`（默认，只采新增）| `head`（从文件头读一遍）。
@@ -281,8 +297,8 @@ fn startup_position_for(input: &LogFileInputSection) -> StartupPosition {
 mod tests {
     use super::{
         InputOrigin, TelemetryFailureKind, Withheld, build_file_input_config, capacity_failure,
-        effective_output, startup_position_for, unsupported_target, uplink_failure,
-        withheld_failure,
+        effective_output, multiline_mode_for, startup_position_for, unsupported_target,
+        uplink_failure, withheld_failure,
     };
     use crate::config::agent_config::{
         AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, LogFileInputSection,
@@ -313,6 +329,38 @@ mod tests {
             multiline_mode: "none".to_string(),
             exclude_globs: Vec::new(),
             filters: Default::default(),
+            drop_if_contains: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn known_multiline_names_map_to_the_reader_modes() {
+        // 目录 / 配置里的字符串 → 读法；认不出的兼底为 `none`（校验期已拒）。
+        for (name, expected) in [
+            (
+                "none",
+                crate::telemetry::logs::multiline::MultilineMode::None,
+            ),
+            (
+                "indented",
+                crate::telemetry::logs::multiline::MultilineMode::IndentedContinuation,
+            ),
+            (
+                "mysql_slow",
+                crate::telemetry::logs::multiline::MultilineMode::MysqlSlow,
+            ),
+            (
+                "postgres_csv",
+                crate::telemetry::logs::multiline::MultilineMode::PostgresCsv,
+            ),
+            (
+                "typo",
+                crate::telemetry::logs::multiline::MultilineMode::None,
+            ),
+        ] {
+            let mut entry = input();
+            entry.multiline_mode = name.to_string();
+            assert_eq!(multiline_mode_for(&entry), expected, "{name}");
         }
     }
 
