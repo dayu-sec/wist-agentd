@@ -98,6 +98,7 @@ pub(super) async fn resolve_family_paths(
 struct ContainerLogName<'a> {
     pod: &'a str,
     namespace: &'a str,
+    container: &'a str,
 }
 
 fn parse_container_log_name(path: &Path) -> Option<ContainerLogName<'_>> {
@@ -110,33 +111,68 @@ fn parse_container_log_name(path: &Path) -> Option<ContainerLogName<'_>> {
     let mut parts = head.splitn(3, '_');
     let pod = parts.next()?;
     let namespace = parts.next()?;
-    let _container = parts.next()?;
-    if pod.is_empty() || namespace.is_empty() {
+    let container = parts.next()?;
+    if pod.is_empty() || namespace.is_empty() || container.is_empty() {
         return None;
     }
-    Some(ContainerLogName { pod, namespace })
+    Some(ContainerLogName {
+        pod,
+        namespace,
+        container,
+    })
 }
 
-/// 过滤器求值：空过滤器 = 全收；非空时**名字不符约定的一律不收**。
+/// 过滤器求值：空过滤器 = 全收。
 ///
-/// “不符约定”不是故障：`filters` 只在容器选源（`/var/log/containers`）上合法，
-/// 网关装载期已经约束目标；这里只是不把解析不了的条目当作候选。
+/// 两道维度各有各的适用面：
+/// * `namespace_in` / `pod_not_in` 只对 **k8s 命名**（`<pod>_<ns>_<container>-<id>.log`）有意义；
+///   名字解析不出来 = 不是这个载体上的候选，直接不收（与旧行为一致）。
+/// * `name_in` / `name_not_in` 对两种载体都适用：k8s 取文件名第三段，Docker 取
+///   `config.v2.json` 里的 `Name`（见 [`crate::telemetry::container_ref`]）。
+///
+/// 取不到容器身份时的三态是**刻意不对称**的：
+/// * 包含式（`name_in`）要求“证明确实是它” —— 没有身份就不命中；
+/// * 排除式（`name_not_in`）不能因为读不到配置就把日志全丢了 —— 保留。
 fn container_filters_keep(filters: &ContainerFilters, path: &Path) -> bool {
     if filters.is_empty() {
         return true;
     }
-    let Some(name) = parse_container_log_name(path) else {
-        return false;
+    let k8s = parse_container_log_name(path);
+    if !filters.namespace_in.is_empty() || !filters.pod_not_in.is_empty() {
+        let Some(name) = k8s else {
+            return false;
+        };
+        if !filters.namespace_in.is_empty()
+            && !filters
+                .namespace_in
+                .iter()
+                .any(|namespace| namespace == name.namespace)
+        {
+            return false;
+        }
+        if filters.pod_not_in.iter().any(|pod| pod == name.pod) {
+            return false;
+        }
+    }
+    let want_name = !filters.name_in.is_empty();
+    let skip_name = !filters.name_not_in.is_empty();
+    if !want_name && !skip_name {
+        // 只用 k8s 维度时，非 k8s 命名的候选一律不收（旧行为）。
+        return k8s.is_some();
+    }
+    let container = k8s.map(|name| name.container.to_string()).or_else(|| {
+        crate::telemetry::container_ref::for_source_path(path.to_str()?).map(|found| found.name)
+    });
+    let Some(container) = container else {
+        return !want_name;
     };
-    if !filters.namespace_in.is_empty()
-        && !filters
-            .namespace_in
-            .iter()
-            .any(|namespace| namespace == name.namespace)
-    {
+    if want_name && !filters.name_in.iter().any(|wanted| wanted == &container) {
         return false;
     }
-    !filters.pod_not_in.iter().any(|pod| pod == name.pod)
+    !filters
+        .name_not_in
+        .iter()
+        .any(|skipped| skipped == &container)
 }
 
 /// 目标里有没有 glob 元字符。
@@ -326,6 +362,15 @@ mod tests {
         ContainerFilters {
             namespace_in: namespaces.iter().map(|v| v.to_string()).collect(),
             pod_not_in: pods.iter().map(|v| v.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn name_filters(name_in: &[&str], name_not_in: &[&str]) -> ContainerFilters {
+        ContainerFilters {
+            name_in: name_in.iter().map(|v| v.to_string()).collect(),
+            name_not_in: name_not_in.iter().map(|v| v.to_string()).collect(),
+            ..Default::default()
         }
     }
 
@@ -481,6 +526,8 @@ mod tests {
         let name = parse_container_log_name(path).expect("parse");
         assert_eq!(name.pod, "web-7d9f8c6b5-x2k4l");
         assert_eq!(name.namespace, "prod");
+        // 第三段是容器名：`name_in` / `name_not_in` 用的就是它。
+        assert_eq!(name.container, "nginx-sidecar");
 
         // 不像容器日志的一律解析不出来（不能靠猜）。
         assert!(parse_container_log_name(Path::new("/var/log/containers/README")).is_none());
@@ -681,5 +728,67 @@ mod tests {
             .expect("still parses");
         assert_eq!(odd.pod, "a");
         assert_eq!(odd.namespace, "b");
+    }
+
+    // ── M1.5：容器名过滤（k8s 文件名 / Docker config.v2.json）─────────────
+
+    #[tokio::test]
+    async fn container_name_filters_select_k8s_containers_by_the_third_segment() {
+        let dir = temp_dir("name-k8s");
+        for name in [
+            "web-1_prod_nginx-aaa.log",
+            "web-1_prod_sidecar-bbb.log",
+            "api-1_prod_nginx-ccc.log",
+        ] {
+            fs::write(dir.join(name), "x\n").unwrap();
+        }
+        let pattern = dir.join("*.log");
+
+        let selected = resolve_selected(&pattern, &[], &name_filters(&["nginx"], &[]), 512)
+            .await
+            .unwrap();
+        assert_eq!(
+            names(&selected),
+            vec!["api-1_prod_nginx-ccc.log", "web-1_prod_nginx-aaa.log"]
+        );
+
+        let selected = resolve_selected(&pattern, &[], &name_filters(&[], &["sidecar"]), 512)
+            .await
+            .unwrap();
+        assert_eq!(
+            names(&selected),
+            vec!["api-1_prod_nginx-ccc.log", "web-1_prod_nginx-aaa.log"]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Docker 载体：名字只在 `config.v2.json` 里；读不到时包含式不命中、排除式保留。
+    #[tokio::test]
+    async fn container_name_filters_read_docker_identity_and_treat_unknown_asymmetric() {
+        let root = temp_dir("name-docker");
+        let id_known = "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111";
+        let id_unknown = "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222";
+        for (id, config) in [(id_known, Some(r#"{"Name":"/mysql"}"#)), (id_unknown, None)] {
+            let dir = root.join("containers").join(id);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(format!("{id}-json.log")), "{}\n").unwrap();
+            if let Some(config) = config {
+                fs::write(dir.join("config.v2.json"), config).unwrap();
+            }
+        }
+        let pattern = root.join("containers").join("*").join("*-json.log");
+
+        let selected = resolve_selected(&pattern, &[], &name_filters(&["mysql"], &[]), 512)
+            .await
+            .unwrap();
+        assert_eq!(selected.len(), 1, "取不到身份的不能被当成 mysql");
+        assert!(selected[0].to_string_lossy().contains(id_known));
+
+        let selected = resolve_selected(&pattern, &[], &name_filters(&[], &["mysql"]), 512)
+            .await
+            .unwrap();
+        assert_eq!(selected.len(), 1, "排除式不能因读不到配置而丢日志");
+        assert!(selected[0].to_string_lossy().contains(id_unknown));
+        let _ = fs::remove_dir_all(&root);
     }
 }

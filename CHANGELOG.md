@@ -3,6 +3,24 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.5-alpha] - 2026-10-24
+
+### 新增（M1.5：容器名过滤）
+
+- **`filters.name_in` / `filters.name_not_in` 在采集端生效**：两种容器载体共用一个语义，
+  名字来源不同 —— k8s 取文件名第三段（`<pod>_<ns>_<container>-<id>.log`），Docker 读同目录
+  `config.v2.json` 的 `Name`（与帧字段 `container.name` 同源，因此不会出现“过滤用一个名字、
+  上报另一个名字”）。
+- **取不到身份时的三态刻意不对称**：包含式（`name_in`）要求“证明确实是它”，读不到就不命中；
+  排除式（`name_not_in`）不能因为读不到配置就把日志全丢了，保留。
+- `namespace_in` / `pod_not_in` 仍只对 k8s 命名有效；只用这两维时，非 k8s 命名的候选一律不收
+  （与旧行为一致）。
+
+### 依赖
+
+- `wist-contracts` 0.9.7（新增两个过滤维度与能力轴 `filter:name_in` / `filter:name_not_in`；
+  `CONTAINER_FILTERS` 扩到 4 维，能力上报自动带上）。
+
 ## [0.9.4-alpha] - 2026-10-24
 
 ### 新增（M1：容器身份）

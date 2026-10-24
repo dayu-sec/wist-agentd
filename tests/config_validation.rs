@@ -516,6 +516,7 @@ fn container_filters_are_accepted_under_the_container_root() {
         wist_contracts::work::ContainerFilters {
             namespace_in: vec!["prod".to_string()],
             pod_not_in: vec!["debug-pod".to_string()],
+            ..Default::default()
         },
     ));
     validate_config(&config).expect("container filters with a container source");
@@ -528,6 +529,7 @@ fn container_filters_are_rejected_off_the_container_root() {
         wist_contracts::work::ContainerFilters {
             namespace_in: vec!["prod".to_string()],
             pod_not_in: Vec::new(),
+            ..Default::default()
         },
     ));
     let err = validate_config(&config).expect_err("filters off the container root");
@@ -542,6 +544,7 @@ fn container_filters_reject_pattern_values() {
         wist_contracts::work::ContainerFilters {
             namespace_in: vec!["prod*".to_string()],
             pod_not_in: Vec::new(),
+            ..Default::default()
         },
     ));
     let err = validate_config(&config).expect_err("wildcard filter value");

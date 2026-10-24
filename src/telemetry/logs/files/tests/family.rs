@@ -987,6 +987,7 @@ fn tightening_filters_stops_reading_an_already_tracked_growing_file() {
     cfg.filters = wist_contracts::work::ContainerFilters {
         namespace_in: vec!["prod".to_string()],
         pod_not_in: vec!["debug-1".to_string()],
+        ..Default::default()
     };
     fs::write(&dropped, "d1\nd2\n").expect("append dropped");
     let mut second = FileFamilyProcessor::new(cfg.clone(), FileRecordSink::new(output.clone()));
@@ -1023,6 +1024,7 @@ fn a_deselected_file_that_comes_back_is_read_from_head_like_a_new_file() {
     cfg.filters = wist_contracts::work::ContainerFilters {
         namespace_in: vec!["prod".to_string()],
         pod_not_in: vec!["dbg-1".to_string()],
+        ..Default::default()
     };
     let mut excluded = FileFamilyProcessor::new(cfg.clone(), FileRecordSink::new(output.clone()));
     assert_eq!(
