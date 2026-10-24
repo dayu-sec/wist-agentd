@@ -23,6 +23,11 @@ use wist_contracts::telemetry_record::ContainerRef;
 /// 识别方式是**路径形状**（`<root>/containers/<id>/<file>`），不写死 `/var/lib/docker`：
 /// 改过 `data-root` 的现场照样能认。是否真是 Docker 目录，最终由 `config.v2.json` 是否存在决定。
 pub fn for_source_path(path: &str) -> Option<ContainerRef> {
+    // 采集端的来源路径是绝对路径（契约要求）。相对路径的基准是进程 cwd，换个启动方式
+    // 就翻面 —— 与 `path_exists` 同一个口径：不拿它猜身份。
+    if !path.starts_with('/') {
+        return None;
+    }
     let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
     // 从后往前找 `containers`：名字里带 containers 的目录不该被误认。
     let index = parts.iter().rposition(|part| *part == "containers")?;
@@ -96,18 +101,22 @@ fn resolve(config: &str, id: &str) -> Option<ContainerRef> {
         });
 
     if let Ok(mut guard) = cache().lock() {
-        // 上限只是防御：容器数量不可能无限增长（重建会换 id，旧键留着也无害）。
-        if guard.len() > 1024 {
-            guard.clear();
+        // **只缓存成功结果**：配置缺失 / 半写 / 坏 JSON 只存 (mtime, size) 也没用 ——
+        // 一旦那次的 mtime/size 恰好与后续一致，就会把“读不到”永久钉住。
+        // 失败的代价只是下一轮再读一个小文件。
+        if value.is_some() {
+            if guard.len() > 1024 {
+                guard.clear();
+            }
+            guard.insert(
+                path,
+                CacheEntry {
+                    modified,
+                    len,
+                    value: value.clone(),
+                },
+            );
         }
-        guard.insert(
-            path,
-            CacheEntry {
-                modified,
-                len,
-                value: value.clone(),
-            },
-        );
     }
     value
 }
@@ -157,6 +166,12 @@ mod tests {
         assert!(for_source_path("/srv/containers").is_none());
         assert!(for_source_path("/srv/containers/only-one-segment").is_none());
         assert!(for_source_path("/var/log/containers/x_probe_0/not-a-log").is_none());
+    }
+
+    #[test]
+    fn a_relative_path_is_ignored() {
+        // 采集端的来源路径是绝对路径；相对路径的结果取决于进程 cwd，不能当身份。
+        assert!(for_source_path("containers/abc/abc-json.log").is_none());
     }
 
     #[test]
