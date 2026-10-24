@@ -537,6 +537,50 @@ fn container_filters_are_rejected_off_the_container_root() {
 }
 
 #[test]
+fn container_name_filters_are_accepted_on_docker_sources() {
+    // name 维度不靠 k8s 文件名：纯 Docker 载体（名字在 `config.v2.json`）也必须能通过
+    // 本机配置校验。以前“有任一 filters 就必须在 /var/log/containers 下”会让同一份配置
+    // 在网关派活可用、搬到本机配置却被拒。
+    for path in [
+        "/var/lib/docker/containers/*/*-json.log*",
+        "/var/lib/docker/containers",
+        "/var/log/containers",
+    ] {
+        let config = config_with_input(container_input(
+            path,
+            wist_contracts::work::ContainerFilters {
+                name_in: vec!["mysql".to_string()],
+                name_not_in: vec!["fluent-bit".to_string()],
+                ..Default::default()
+            },
+        ));
+        validate_config(&config).unwrap_or_else(|err| panic!("{path}: {}", err.code));
+    }
+
+    // 非容器路径仍然拒（过滤器写在别处只会“一个都匹配不上”）。
+    let config = config_with_input(container_input(
+        "/var/log/mysql/slow.log",
+        wist_contracts::work::ContainerFilters {
+            name_in: vec!["mysql".to_string()],
+            ..Default::default()
+        },
+    ));
+    let err = validate_config(&config).expect_err("name filters off a container source");
+    assert_eq!(err.code, "invalid_log_input_container_filters");
+
+    // k8s 维度写在 Docker 根目录上仍然拒（那里没有 pod/namespace 语义）。
+    let config = config_with_input(container_input(
+        "/var/lib/docker/containers/*/*-json.log*",
+        wist_contracts::work::ContainerFilters {
+            namespace_in: vec!["prod".to_string()],
+            ..Default::default()
+        },
+    ));
+    let err = validate_config(&config).expect_err("k8s dimension on a docker source");
+    assert_eq!(err.code, "invalid_log_input_container_filters");
+}
+
+#[test]
 fn container_filters_reject_pattern_values() {
     // 过滤器存的是**精确名字**：`prod*` 永远匹配不上（那是 pattern 的写法）。
     let config = config_with_input(container_input(

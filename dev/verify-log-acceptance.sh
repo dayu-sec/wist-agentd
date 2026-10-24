@@ -309,6 +309,40 @@ def torn_recovery(phase):
     return ok
 
 
+def container_name_filters(phase, keep_unknown):
+    """M1.5：容器名过滤（`name_in` / `name_not_in`）。
+
+    fixture 里有三个容器目录：
+      * `mysql`：`config.v2.json` 有名字；
+      * `fluent-bit`：有名字，但应该被过滤掉；
+      * 没有 `config.v2.json` 的目录：身份读不到。
+
+    包含式（`name_in`）**不**收身份未知的；排除式（`name_not_in`）**保留**它 ——
+    这个不对称是刻意语义（“证明是它” vs “不能因读不到就丢”）。
+    """
+    recs = by_input(records(phase), "namefilters")
+    if not recs:
+        return fail("namefilters 没有任何记录")
+    names = []
+    for r in recs:
+        container = r.get("container") or {}
+        name = container.get("name") or "<unknown>"
+        names.append(name)
+        if name == "fluent-bit":
+            return fail("fluent-bit 不该被采：%r" % r["body"])
+        # 选了谁就只应该看到谁：身份与帧里的 container 一致。
+        if name == "mysql" and container.get("image") != "bitnami/mysql:8.0":
+            return fail("mysql 的 image = %r" % container.get("image"))
+    if "mysql" not in names:
+        return fail("缺少 mysql 的记录：%r" % names)
+    has_unknown = "<unknown>" in names
+    if keep_unknown and not has_unknown:
+        return fail("排除式应当保留身份未知的容器：%r" % names)
+    if not keep_unknown and has_unknown:
+        return fail("包含式不该收身份未知的容器：%r" % names)
+    return True
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1]
     if cmd == "static":
@@ -321,6 +355,8 @@ if __name__ == "__main__":
         ok = container_rotation(sys.argv[2])
     elif cmd == "docker-layout":
         ok = docker_layout(sys.argv[2])
+    elif cmd == "container-name-filters":
+        ok = container_name_filters(sys.argv[2], sys.argv[3] == "keep-unknown")
     elif cmd == "torn-resume":
         ok = torn_resume(sys.argv[2])
     elif cmd == "torn-recovery":
@@ -593,6 +629,58 @@ EOF
 )"
 if run_phase "${P7}"; then
   check "docker：多层 glob + 正文原样 + 轮转产物" docker-layout "${P7}"
+else
+  fail=1
+fi
+
+# ── phase 8/9：容器名过滤（M1.5：`name_in` / `name_not_in`）──────────────
+# 三份 fixture：mysql（有名字）、fluent-bit（有名字，应被剔）、无 config.v2.json（身份未知）。
+# 两个 phase 验的是同一个不对称语义：
+#   包含式 = “证明确实是它” → 身份未知的**不收**；
+#   排除式 = “不能因读不到就丢” → 身份未知的**保留**。
+NF_ROOT="${WORK}/nf/fixtures/dockerroot/containers"
+ID_MYSQL="1111111111111111111111111111111111111111111111111111111111111111"
+ID_FLUENT="2222222222222222222222222222222222222222222222222222222222222222"
+ID_UNKNOWN="3333333333333333333333333333333333333333333333333333333333333333"
+mkdir -p "${NF_ROOT}/${ID_MYSQL}" "${NF_ROOT}/${ID_FLUENT}" "${NF_ROOT}/${ID_UNKNOWN}"
+printf '{"log":"NF mysql\\n","stream":"stdout","time":"2026-10-24T00:00:00.000000000Z"}\n' > "${NF_ROOT}/${ID_MYSQL}/${ID_MYSQL}-json.log"
+printf '{"log":"NF fluent\\n","stream":"stdout","time":"2026-10-24T00:00:00.000000000Z"}\n' > "${NF_ROOT}/${ID_FLUENT}/${ID_FLUENT}-json.log"
+printf '{"log":"NF unknown\\n","stream":"stdout","time":"2026-10-24T00:00:00.000000000Z"}\n' > "${NF_ROOT}/${ID_UNKNOWN}/${ID_UNKNOWN}-json.log"
+cat > "${NF_ROOT}/${ID_MYSQL}/config.v2.json" <<EOF
+{"ID":"${ID_MYSQL}","Name":"/mysql","Config":{"Image":"bitnami/mysql:8.0"}}
+EOF
+cat > "${NF_ROOT}/${ID_FLUENT}/config.v2.json" <<EOF
+{"ID":"${ID_FLUENT}","Name":"/fluent-bit","Config":{"Image":"fluent/fluent-bit:4.0.3"}}
+EOF
+
+P8="${WORK}/p8"
+write_config "${P8}" "$(cat <<EOF
+[[telemetry.logs.file_inputs]]
+input_id = "namefilters"
+path = "${NF_ROOT}/*/*-json.log*"
+startup_position = "head"
+multiline_mode = "none"
+filters = { name_in = ["mysql"] }
+EOF
+)"
+if run_phase "${P8}"; then
+  check "容器名过滤：name_in 只采指定容器、身份未知的不收" container-name-filters "${P8}" drop-unknown
+else
+  fail=1
+fi
+
+P9="${WORK}/p9"
+write_config "${P9}" "$(cat <<EOF
+[[telemetry.logs.file_inputs]]
+input_id = "namefilters"
+path = "${NF_ROOT}/*/*-json.log*"
+startup_position = "head"
+multiline_mode = "none"
+filters = { name_not_in = ["fluent-bit"] }
+EOF
+)"
+if run_phase "${P9}"; then
+  check "容器名过滤：name_not_in 剔掉指定容器、身份未知的保留" container-name-filters "${P9}" keep-unknown
 else
   fail=1
 fi

@@ -123,12 +123,25 @@ fn validate_logs_section(logs: &LogsSection) -> Result<(), ValidationError> {
             .validate()
             .map_err(|_| ValidationError::new("invalid_log_input_container_filters"))?;
         if !input.filters.is_empty() {
-            // 过滤器靠文件名 `<pod>_<ns>_<container>-<id>.log` 求值：写在别的路径上
-            // 只会“一个都匹配不上”。与网关装载期同一条口径（这里也拦一道）：
-            // 本机直配的输入同样不该静默空载。
-            let root = wist_contracts::work::CONTAINER_LOG_ROOT;
-            let under_root = input.path == root || input.path.starts_with(&format!("{root}/"));
-            if !under_root {
+            // 维度决定目标形态（与网关装载期同一条口径，本机直配也拦一道）：
+            //   * `namespace_in` / `pod_not_in` 靠文件名 `<pod>_<ns>_<container>-<id>.log`
+            //     求值 → 只能在 k8s 的 `/var/log/containers` 下；
+            //   * `name_in` / `name_not_in` 也支持纯 Docker（名字来自同目录
+            //     `config.v2.json`）→ 只要求是容器日志来源的形状（不写死 data-root）。
+            // 两者分开判：以前“有任一 filters 就必须在 k8s 根下”会让同一份配置
+            // 在网关派活可用、搬到本机配置却被拒。
+            let k8s_shape =
+                !input.filters.namespace_in.is_empty() || !input.filters.pod_not_in.is_empty();
+            let name_shape =
+                !input.filters.name_in.is_empty() || !input.filters.name_not_in.is_empty();
+            if k8s_shape {
+                let root = wist_contracts::work::CONTAINER_LOG_ROOT;
+                let under_root = input.path == root || input.path.starts_with(&format!("{root}/"));
+                if !under_root {
+                    return Err(ValidationError::new("invalid_log_input_container_filters"));
+                }
+            }
+            if name_shape && !wist_contracts::work::is_container_log_target(&input.path) {
                 return Err(ValidationError::new("invalid_log_input_container_filters"));
             }
         }

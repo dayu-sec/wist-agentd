@@ -723,11 +723,14 @@ mod tests {
         // 段数不够 / 有空段。
         assert!(parse_container_log_name(Path::new("/var/log/containers/a_b-c.log")).is_none());
         assert!(parse_container_log_name(Path::new("/var/log/containers/_b_c-d.log")).is_none());
+        // 容器段为空同样是坏形状：`name_in` / `name_not_in` 靠的就是这一段。
+        assert!(parse_container_log_name(Path::new("/var/log/containers/a_b_-d.log")).is_none());
         // 四段以上：第三段把剩下的吃掉（容器名里不可能有 `_`，真出现就是格式变了）。
         let odd = parse_container_log_name(Path::new("/var/log/containers/a_b_c_d-e.log"))
             .expect("still parses");
         assert_eq!(odd.pod, "a");
         assert_eq!(odd.namespace, "b");
+        assert_eq!(odd.container, "c_d", "容器名段要完整吃掉剩余部分");
     }
 
     // ── M1.5：容器名过滤（k8s 文件名 / Docker config.v2.json）─────────────

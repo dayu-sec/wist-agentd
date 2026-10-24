@@ -3,6 +3,26 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.6-alpha] - 2026-10-24
+
+### 修复
+
+- **本机配置里的容器过滤器校验按维度拆分**。以前“有任一 `filters` 非空就必须在
+  `/var/log/containers` 下”，而 M1.5 的 `name_in` / `name_not_in` 也支持纯 Docker 载体：
+  同一份配置在网关派活里能用、写进 `[[telemetry.logs.file_inputs]]` 或任务清单却启动即拒。
+  现在与网关同一条口径：k8s 维限 `/var/log/containers`；name 维只要求是容器日志来源的形状
+  （共用 `wist_contracts::work::is_container_log_target`，接受目录形态）。
+
+### 测试
+
+- 验收脚本新增两个 phase：`name_in` 只采指定容器、身份读不到的不收；`name_not_in` 剔掉
+  指定容器、身份读不到的**保留**（共用同一份三容器 fixture，钉住这个不对称语义）。
+- 补形状断言：空容器段（`a_b_-d.log`）不算 k8s 命名；四段以上容器名完整吃掉剩余部分。
+
+### 依赖
+
+- `wist-contracts` 0.9.8。
+
 ## [0.9.5-alpha] - 2026-10-24
 
 ### 新增（M1.5：容器名过滤）
@@ -18,7 +38,7 @@
 
 ### 依赖
 
-- `wist-contracts` 0.9.7（新增两个过滤维度与能力轴 `filter:name_in` / `filter:name_not_in`；
+- `wist-contracts` 0.9.7（新增两个过滤维度与能力轴 `filters:name_in` / `filters:name_not_in`；
   `CONTAINER_FILTERS` 扩到 4 维，能力上报自动带上）。
 
 ## [0.9.4-alpha] - 2026-10-24
