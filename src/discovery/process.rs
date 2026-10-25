@@ -56,11 +56,7 @@ impl DiscoveryProbe for ProcessDiscoveryProbe {
         for process in processes {
             let resource_id = process.resource_id(&host_id);
             let target_id = process.target_id(&host_id);
-            let mut attributes = BTreeMap::new();
-            attributes.insert("process.pid".to_string(), process.pid.to_string());
-            if let Some(name) = &process.name {
-                attributes.insert("process.executable.name".to_string(), name.clone());
-            }
+            let attributes = process_attributes(&process);
             let mut execution_hints = BTreeMap::new();
             execution_hints.insert("process.pid".to_string(), process.pid.to_string());
             if let Some(identity) = &process.identity {
@@ -122,6 +118,8 @@ struct ObservedProcess {
     identity: Option<String>,
     name: Option<String>,
     identity_unavailable: bool,
+    /// `/proc/<pid>/cgroup` 推出来的容器 id。非 Linux / 不在容器里时是 `None`。
+    container_id: Option<String>,
 }
 
 impl ObservedProcess {
@@ -138,6 +136,26 @@ impl ObservedProcess {
             None => format!("{host_id}:pid:{}:process", self.pid),
         }
     }
+}
+
+/// 进程资源的属性。
+///
+/// 抽成纯函数有两个原因：一是能在非 Linux 上单测，二是中心侧依赖这些 key 的**准确拼写**
+/// （`container.id` 必须与 container 探针同名，否则进程永远挂不上容器）。
+fn process_attributes(process: &ObservedProcess) -> BTreeMap<String, String> {
+    let mut attributes = BTreeMap::new();
+    attributes.insert("process.pid".to_string(), process.pid.to_string());
+    if let Some(name) = &process.name {
+        attributes.insert("process.executable.name".to_string(), name.clone());
+    }
+    // 进程所属容器：中心侧靠它与 `containers[].id` 对齐，把进程挂到容器上 ——
+    // 不监听端口的容器化进程（批处理、sidecar）拿不到端口证据，只能靠这里。
+    if let Some(container_id) = &process.container_id {
+        attributes.insert("container.id".to_string(), container_id.clone());
+        // 与端点探针保持同一组 key：消费方习惯先找 `*.ref` 当引用字段。
+        attributes.insert("container.ref".to_string(), container_id.clone());
+    }
+    attributes
 }
 
 #[cfg(target_os = "linux")]
@@ -172,6 +190,7 @@ fn list_processes() -> io::Result<Vec<ObservedProcess>> {
             identity,
             name: Some(name),
             identity_unavailable,
+            container_id: crate::discovery::cgroup::process_container_id(pid),
         });
     }
     Ok(processes)
@@ -252,6 +271,8 @@ fn list_processes() -> io::Result<Vec<ObservedProcess>> {
             identity,
             name,
             identity_unavailable,
+            // macOS 的容器跑在虚拟机里，宿主 `ps` 看不到它们的归属。
+            container_id: None,
         });
     }
     Ok(processes)
@@ -282,11 +303,11 @@ fn list_processes() -> io::Result<Vec<ObservedProcess>> {
 
 #[cfg(test)]
 mod tests {
-    use super::ObservedProcess;
     #[cfg(any(target_os = "linux", test))]
     use super::first_cmdline_arg;
     #[cfg(all(unix, not(target_os = "linux")))]
     use super::parse_unix_ps_process_line;
+    use super::{ObservedProcess, process_attributes};
 
     #[test]
     fn first_cmdline_arg_stops_at_the_first_nul() {
@@ -308,12 +329,61 @@ mod tests {
     }
 
     #[test]
+    fn a_containerized_process_reports_the_container_attributes() {
+        let observed = ObservedProcess {
+            pid: 4100,
+            identity: Some("linux_proc_start:1".to_string()),
+            name: Some("/usr/bin/worker".to_string()),
+            identity_unavailable: false,
+            container_id: Some("3f2c9f3c1b8e".to_string()),
+        };
+
+        let attributes = process_attributes(&observed);
+        // 中心侧按这两个 key 把进程挂到容器上；改名必须在这里挂掉。
+        assert_eq!(
+            attributes.get("container.id").map(String::as_str),
+            Some("3f2c9f3c1b8e")
+        );
+        assert_eq!(
+            attributes.get("container.ref").map(String::as_str),
+            Some("3f2c9f3c1b8e")
+        );
+        assert_eq!(
+            attributes
+                .get("process.executable.name")
+                .map(String::as_str),
+            Some("/usr/bin/worker")
+        );
+    }
+
+    #[test]
+    fn a_host_process_has_no_container_attribute() {
+        let observed = ObservedProcess {
+            pid: 4200,
+            identity: None,
+            name: Some("/usr/sbin/sshd".to_string()),
+            identity_unavailable: false,
+            container_id: None,
+        };
+
+        let attributes = process_attributes(&observed);
+        // 宿主进程不能写出空的容器引用：中心侧会把空串当成「采到了但为空」。
+        assert!(!attributes.contains_key("container.id"));
+        assert!(!attributes.contains_key("container.ref"));
+        assert_eq!(
+            attributes.get("process.pid").map(String::as_str),
+            Some("4200")
+        );
+    }
+
+    #[test]
     fn process_identity_uses_identity_when_present() {
         let observed = ObservedProcess {
             pid: 42,
             identity: Some("linux_proc_start:123".to_string()),
             name: Some("demo".to_string()),
             identity_unavailable: false,
+            container_id: Some("3f2c9f3c1b8e".to_string()),
         };
 
         assert_eq!(
@@ -333,6 +403,7 @@ mod tests {
             identity: None,
             name: Some("demo".to_string()),
             identity_unavailable: false,
+            container_id: None,
         };
 
         assert_eq!(observed.resource_id("host-1"), "host-1:pid:42");

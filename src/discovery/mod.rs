@@ -1,6 +1,7 @@
 //! Discovery runtime skeleton.
 
 pub mod cache;
+pub mod cgroup;
 pub mod container;
 pub mod endpoint;
 pub mod host;

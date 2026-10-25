@@ -237,14 +237,14 @@ fn map_socket_inodes_to_processes(
 }
 
 fn process_owner(pid: u32) -> ProcessSocketOwner {
-    let cgroup_path = process_cgroup_path(pid);
+    let cgroup_path = crate::discovery::cgroup::process_cgroup_path(pid);
     ProcessSocketOwner {
         pid,
         process_identity: process_identity(pid).ok().flatten(),
         process_name: process_name(pid),
         container_id: cgroup_path
             .as_deref()
-            .and_then(container_id_from_cgroup_path),
+            .and_then(crate::discovery::cgroup::container_id_from_cgroup_path),
         cgroup_path,
     }
 }
@@ -285,49 +285,11 @@ fn process_name(pid: u32) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn process_cgroup_path(pid: u32) -> Option<String> {
-    let content = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-    let paths: Vec<_> = content
-        .lines()
-        .filter_map(|line| line.rsplit_once(':').map(|(_, path)| path.trim()))
-        .filter(|path| !path.is_empty() && *path != "/")
-        .collect();
-    paths
-        .iter()
-        .find(|path| container_id_from_cgroup_path(path).is_some())
-        .or_else(|| paths.first())
-        .map(|path| (*path).to_string())
-}
-
-fn container_id_from_cgroup_path(path: &str) -> Option<String> {
-    path.split(['/', ':'])
-        .rev()
-        .find_map(container_id_from_cgroup_segment)
-}
-
-fn container_id_from_cgroup_segment(segment: &str) -> Option<String> {
-    let trimmed = segment.trim().trim_end_matches(".scope");
-    for prefix in ["cri-containerd-", "docker-", "crio-"] {
-        if let Some(value) = trimmed.strip_prefix(prefix) {
-            return valid_container_id_prefix(value);
-        }
-    }
-    valid_container_id_prefix(trimmed)
-}
-
-fn valid_container_id_prefix(value: &str) -> Option<String> {
-    let hex: String = value
-        .chars()
-        .take_while(|ch| ch.is_ascii_hexdigit())
-        .collect();
-    if hex.len() >= 12 { Some(hex) } else { None }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        AddressFamily, SocketTableKind, container_id_from_cgroup_path, is_unspecified_proc_addr,
-        parse_linux_socket_line, parse_proc_ipv4, parse_proc_ipv6, socket_inode_from_link,
+        AddressFamily, SocketTableKind, is_unspecified_proc_addr, parse_linux_socket_line,
+        parse_proc_ipv4, parse_proc_ipv6, socket_inode_from_link,
     };
 
     #[test]
@@ -401,18 +363,5 @@ mod tests {
         assert!(!is_unspecified_proc_addr(
             "00000000000000000000000000000001"
         ));
-    }
-
-    #[test]
-    fn extracts_container_ids_from_cgroup_paths() {
-        assert_eq!(
-            container_id_from_cgroup_path("/kubepods.slice/cri-containerd-0123456789abcdef.scope"),
-            Some("0123456789abcdef".to_string())
-        );
-        assert_eq!(
-            container_id_from_cgroup_path("/docker/0123456789ab"),
-            Some("0123456789ab".to_string())
-        );
-        assert_eq!(container_id_from_cgroup_path("/user.slice"), None);
     }
 }
