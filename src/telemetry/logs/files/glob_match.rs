@@ -28,14 +28,23 @@ use wist_contracts::work::ContainerFilters;
 pub(super) struct FamilySelection {
     pub selected: Vec<PathBuf>,
     pub deselected: BTreeSet<String>,
+    /// 本轮被 `filters` 剔掉的现存路径数（`exclude_globs` 不计）。
+    pub filtered: usize,
+    /// 本轮因为**取不到容器身份**而作判定的候选数（包含式不命中 / 排除式保留都在内）。
+    ///
+    /// 为什么单独计数：身份来自 `config.v2.json`，权限 / 驱动 / 容器创建中都会让它读不到，
+    /// 而两种维度的降级方向相反 —— 不报出来就无从区分“配置真生效”与“静默 no-op”。
+    pub identity_unknown: usize,
 }
 
 impl FamilySelection {
-    /// 本轮没有扫描（不到重扫间隔）：两者都空。
+    /// 本轮没有扫描（不到重扫间隔）：全空。
     pub fn none() -> Self {
         Self {
             selected: Vec::new(),
             deselected: BTreeSet::new(),
+            filtered: 0,
+            identity_unknown: 0,
         }
     }
 }
@@ -67,25 +76,40 @@ pub(super) async fn resolve_family_paths(
         compile_excludes(exclude_globs)?
     };
     let rejected = std::sync::Mutex::new(BTreeSet::new());
+    let stats = std::sync::Mutex::new((0usize, 0usize));
     let keep = |path: &Path| {
-        let selected = !excludes.iter().any(|matcher| matcher.is_match(path))
-            && container_filters_keep(filters, path);
-        if !selected {
-            rejected
-                .lock()
-                .expect("deselected set")
-                .insert(path.display().to_string());
+        let excluded = excludes.iter().any(|matcher| matcher.is_match(path));
+        let verdict = if excluded {
+            FilterVerdict::Drop
+        } else {
+            container_filters_verdict(filters, path)
+        };
+        if verdict.identity_unknown() {
+            stats.lock().expect("selection stats").1 += 1;
         }
-        selected
+        if verdict.keeps() {
+            return true;
+        }
+        if !excluded {
+            stats.lock().expect("selection stats").0 += 1;
+        }
+        rejected
+            .lock()
+            .expect("deselected set")
+            .insert(path.display().to_string());
+        false
     };
     let selected = if !has_glob(&target_text) {
         resolve_explicit_or_dir(target, max_paths, &keep).await?
     } else {
         resolve_glob(&target_text, max_paths, &keep).await?
     };
+    let (filtered, identity_unknown) = stats.into_inner().expect("selection stats");
     Ok(FamilySelection {
         selected,
         deselected: rejected.into_inner().expect("deselected set"),
+        filtered,
+        identity_unknown,
     })
 }
 
@@ -122,6 +146,28 @@ fn parse_container_log_name(path: &Path) -> Option<ContainerLogName<'_>> {
     })
 }
 
+/// 选择层的判定结果。多出两个 `IdentityUnknown` 态，是为了让“身份读不到”可被计数：
+/// 它与“确实不匹配”在现场是两回事（前者是读 `config.v2.json` 失败）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterVerdict {
+    Keep,
+    Drop,
+    /// 排除式因取不到身份而**保留**（安全侧）。
+    KeepIdentityUnknown,
+    /// 包含式因取不到身份而**不命中**。
+    DropIdentityUnknown,
+}
+
+impl FilterVerdict {
+    fn keeps(self) -> bool {
+        matches!(self, Self::Keep | Self::KeepIdentityUnknown)
+    }
+
+    fn identity_unknown(self) -> bool {
+        matches!(self, Self::KeepIdentityUnknown | Self::DropIdentityUnknown)
+    }
+}
+
 /// 过滤器求值：空过滤器 = 全收。
 ///
 /// 两道维度各有各的适用面：
@@ -133,14 +179,14 @@ fn parse_container_log_name(path: &Path) -> Option<ContainerLogName<'_>> {
 /// 取不到容器身份时的三态是**刻意不对称**的：
 /// * 包含式（`name_in`）要求“证明确实是它” —— 没有身份就不命中；
 /// * 排除式（`name_not_in`）不能因为读不到配置就把日志全丢了 —— 保留。
-fn container_filters_keep(filters: &ContainerFilters, path: &Path) -> bool {
+fn container_filters_verdict(filters: &ContainerFilters, path: &Path) -> FilterVerdict {
     if filters.is_empty() {
-        return true;
+        return FilterVerdict::Keep;
     }
     let k8s = parse_container_log_name(path);
     if !filters.namespace_in.is_empty() || !filters.pod_not_in.is_empty() {
         let Some(name) = k8s else {
-            return false;
+            return FilterVerdict::Drop;
         };
         if !filters.namespace_in.is_empty()
             && !filters
@@ -148,31 +194,43 @@ fn container_filters_keep(filters: &ContainerFilters, path: &Path) -> bool {
                 .iter()
                 .any(|namespace| namespace == name.namespace)
         {
-            return false;
+            return FilterVerdict::Drop;
         }
         if filters.pod_not_in.iter().any(|pod| pod == name.pod) {
-            return false;
+            return FilterVerdict::Drop;
         }
     }
     let want_name = !filters.name_in.is_empty();
     let skip_name = !filters.name_not_in.is_empty();
     if !want_name && !skip_name {
         // 只用 k8s 维度时，非 k8s 命名的候选一律不收（旧行为）。
-        return k8s.is_some();
+        return if k8s.is_some() {
+            FilterVerdict::Keep
+        } else {
+            FilterVerdict::Drop
+        };
     }
     let container = k8s.map(|name| name.container.to_string()).or_else(|| {
         crate::telemetry::container_ref::for_source_path(path.to_str()?).map(|found| found.name)
     });
     let Some(container) = container else {
-        return !want_name;
+        return if want_name {
+            FilterVerdict::DropIdentityUnknown
+        } else {
+            FilterVerdict::KeepIdentityUnknown
+        };
     };
     if want_name && !filters.name_in.iter().any(|wanted| wanted == &container) {
-        return false;
+        return FilterVerdict::Drop;
     }
-    !filters
+    if filters
         .name_not_in
         .iter()
         .any(|skipped| skipped == &container)
+    {
+        return FilterVerdict::Drop;
+    }
+    FilterVerdict::Keep
 }
 
 /// 目标里有没有 glob 元字符。
@@ -792,6 +850,22 @@ mod tests {
             .unwrap();
         assert_eq!(selected.len(), 1, "排除式不能因读不到配置而丢日志");
         assert!(selected[0].to_string_lossy().contains(id_unknown));
+
+        // 选择层的自观测：剔了多少、其中多少是“身份读不到”要能分开报。
+        let selection = resolve_family_paths(&pattern, &[], &name_filters(&["mysql"], &[]), 512)
+            .await
+            .expect("selection");
+        assert_eq!(selection.filtered, 1, "身份未知的那个要被算作被剔");
+        assert_eq!(selection.identity_unknown, 1);
+
+        let selection = resolve_family_paths(&pattern, &[], &name_filters(&[], &["mysql"]), 512)
+            .await
+            .expect("selection");
+        assert_eq!(selection.filtered, 1, "mysql 被剔掉");
+        assert_eq!(
+            selection.identity_unknown, 1,
+            "排除式保留了它，但仍然要计入“身份读不到”"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }

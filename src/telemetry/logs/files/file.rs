@@ -114,6 +114,12 @@ pub struct ProcessOutcome {
     pub withheld: Withheld,
     /// 本次按 `drop_if_contains` 丢掉的噪音记录数（配置的正常结果，不是失败）。
     pub dropped_noise: usize,
+    /// 本轮被 `filters` 剔掉的现存路径数（`exclude_globs` 不算）。
+    /// 非 0 = 配置的选择层真的在起作用；用于回答“为什么这个 input 少了很多文件”。
+    pub selection_filtered: usize,
+    /// 其中因为**取不到容器身份**而作判定的条数（包含式不命中 / 排除式保留）。
+    /// 非 0 说明 `config.v2.json` 读不到（权限 / 非 json-file 驱动 / 容器创建中）。
+    pub identity_unknown: usize,
     pub rotated: bool,
     /// 是否因 spool 超限而暂停采集。
     pub paused: bool,
@@ -160,6 +166,8 @@ impl ProcessOutcome {
             spool_bytes: 0,
             capacity: None,
             dropped_noise: 0,
+            selection_filtered: 0,
+            identity_unknown: 0,
         }
     }
 
@@ -182,6 +190,8 @@ impl ProcessOutcome {
             truncated_lines: 0,
             withheld: Withheld::default(),
             dropped_noise: 0,
+            selection_filtered: 0,
+            identity_unknown: 0,
             rotated: false,
             paused: false,
             spool_bytes: 0,
@@ -206,6 +216,8 @@ impl ProcessOutcome {
             truncated_lines: 0,
             withheld: Withheld::default(),
             dropped_noise: 0,
+            selection_filtered: 0,
+            identity_unknown: 0,
             rotated: false,
             paused: true,
             spool_bytes,
@@ -635,6 +647,8 @@ where
             checkpoint_offset,
             truncated_lines,
             dropped_noise,
+            selection_filtered,
+            identity_unknown,
             rotated,
             truncated,
             withheld,
@@ -674,6 +688,8 @@ where
         );
         outcome.capacity = capacity;
         outcome.dropped_noise = dropped_noise;
+        outcome.selection_filtered = selection_filtered;
+        outcome.identity_unknown = identity_unknown;
         Ok(outcome)
     }
 
@@ -734,6 +750,10 @@ where
         };
         let matched = &selection.selected;
         let deselected = &selection.deselected;
+        // 选择层的自观测（只在真扫了的那一轮取值）：被 filters 剔了多少、
+        // 其中多少是因为容器身份读不到而作的判定。
+        batch.selection_filtered = selection.filtered;
+        batch.identity_unknown = selection.identity_unknown;
         let matched_keys: BTreeSet<String> = matched
             .iter()
             .map(|path| path.display().to_string())
@@ -1162,6 +1182,10 @@ struct FamilyBatch {
     truncated_lines: usize,
     /// 本批按 `drop_if_contains` 丢掉的记录数（噪音行，进自观测）。
     dropped_noise: usize,
+    /// 本轮被 `filters` 剔掉的现存路径数（不含 `exclude_globs`）。
+    selection_filtered: usize,
+    /// 其中因为“取不到容器身份”而作判定的条数（进自观测）。
+    identity_unknown: usize,
     rotated: bool,
     truncated: bool,
     withheld: Withheld,
@@ -1179,6 +1203,8 @@ impl FamilyBatch {
             checkpoint_offset: 0,
             truncated_lines: 0,
             dropped_noise: 0,
+            selection_filtered: 0,
+            identity_unknown: 0,
             rotated: false,
             truncated: false,
             withheld: Withheld::default(),

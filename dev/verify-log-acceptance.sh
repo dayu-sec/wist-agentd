@@ -340,6 +340,12 @@ def container_name_filters(phase, keep_unknown):
         return fail("排除式应当保留身份未知的容器：%r" % names)
     if not keep_unknown and has_unknown:
         return fail("包含式不该收身份未知的容器：%r" % names)
+    # 自观测：选源过滤要能对账，且“身份读不到”要单独计数（否则排除式静默 no-op 看不出来）。
+    text = log(phase)
+    if "telemetry selection filtered" not in text:
+        return fail("缺少选源过滤的自观测日志（telemetry selection filtered）")
+    if "identity_unknown=1" not in text:
+        return fail("自观测没有把身份读不到单独计数")
     return True
 
 

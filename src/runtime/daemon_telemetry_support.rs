@@ -274,6 +274,26 @@ pub(super) fn noise_dropped_failure(
     }
 }
 
+/// 按容器过滤器剔掉文件的记录（`filters` 真的生效了）。
+///
+/// `detail` 稳定（去重按 `kind|input_id|path|detail`）；量放 `magnitude`，且把
+/// “身份读不到”单独列出来 —— 它是排除式静默 no-op / 包含式一条不收的唯一线索。
+pub(super) fn selection_filtered_failure(
+    input: &LogFileInputSection,
+    filtered: usize,
+    identity_unknown: usize,
+) -> TelemetryFailure {
+    TelemetryFailure {
+        kind: TelemetryFailureKind::SelectionFiltered,
+        input_id: input.input_id.clone(),
+        path: input.path.clone(),
+        detail: "filters excluded files".to_string(),
+        magnitude: Some(format!(
+            "excluded={filtered} identity_unknown={identity_unknown}"
+        )),
+    }
+}
+
 fn spool_path_for(config: &AgentConfig, input: &LogFileInputSection) -> PathBuf {
     Path::new(&config.telemetry.logs.spool_dir).join(format!("{}.ndjson", input.input_id))
 }
@@ -297,8 +317,8 @@ fn startup_position_for(input: &LogFileInputSection) -> StartupPosition {
 mod tests {
     use super::{
         InputOrigin, TelemetryFailureKind, Withheld, build_file_input_config, capacity_failure,
-        effective_output, multiline_mode_for, startup_position_for, unsupported_target,
-        uplink_failure, withheld_failure,
+        effective_output, multiline_mode_for, selection_filtered_failure, startup_position_for,
+        unsupported_target, uplink_failure, withheld_failure,
     };
     use crate::config::agent_config::{
         AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, LogFileInputSection,
@@ -483,6 +503,26 @@ mod tests {
             )
             .multiline_mode,
             crate::telemetry::logs::multiline::MultilineMode::IndentedContinuation
+        );
+    }
+
+    #[test]
+    fn selection_filtered_magnitude_separates_identity_unknown() {
+        // 两个量必须分开：`excluded` 是配置生效，`identity_unknown` 是读 `config.v2.json` 失败 ——
+        // 混在一起就无法判断“排除式是不是静默 no-op”。
+        let input = input();
+        let failure = selection_filtered_failure(&input, 2, 1);
+        assert_eq!(failure.kind, TelemetryFailureKind::SelectionFiltered);
+        assert_eq!(failure.detail, "filters excluded files");
+        assert_eq!(
+            failure.magnitude.as_deref(),
+            Some("excluded=2 identity_unknown=1")
+        );
+        // 身份读不到、但没剔任何文件（排除式保留）也要报。
+        let kept = selection_filtered_failure(&input, 0, 1);
+        assert_eq!(
+            kept.magnitude.as_deref(),
+            Some("excluded=0 identity_unknown=1")
         );
     }
 

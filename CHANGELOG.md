@@ -3,6 +3,19 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.7-alpha] - 2026-10-25
+
+### 新增（选源过滤的自观测）
+
+- **`filters` 真的剔了哪些文件，现在看得见**：每轮通过已有的 failure 通道报一行
+  `telemetry selection filtered … magnitude=excluded=N identity_unknown=M`（打 `info`，
+  与 `noise dropped` 同一档：配置的正常结果、但必须可对账）。
+  - `excluded`：被 `filters` 剔掉的**现存文件数**（`exclude_globs` 不算）；
+  - `identity_unknown`：其中因为**读不到容器身份**（`config.v2.json` 缺失 / 坏 / 非 json-file）
+    而作判定的条数 —— 这是“排除式静默 no-op”“包含式一条不收”的唯一线索。
+  - 量进 `magnitude`、不进签名：持续生效的过滤器只报一次，不会每 tick 刷屏。
+- 验收脚本的两个 name 过滤 phase 同时断言这条日志（含 `identity_unknown=1`）。
+
 ## [0.9.6-alpha] - 2026-10-24
 
 ### 修复
