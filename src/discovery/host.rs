@@ -37,6 +37,12 @@ impl DiscoveryProbe for HostDiscoveryProbe {
         let source = self.source().as_str().to_string();
         let origin_id = format!("{}:{}:{}", source, self.name(), discovered_at);
 
+        let mut attributes = BTreeMap::from([
+            ("host.id".to_string(), host_id.clone()),
+            ("host.name".to_string(), host_name.clone()),
+        ]);
+        attributes.extend(platform_attributes());
+
         Ok(ProbeOutput {
             probe: self.name().to_string(),
             source: self.source(),
@@ -51,10 +57,7 @@ impl DiscoveryProbe for HostDiscoveryProbe {
                 resource_id: host_id.clone(),
                 kind: "host".to_string(),
                 origin_idx: 0,
-                attributes: BTreeMap::from([
-                    ("host.id".to_string(), host_id.clone()),
-                    ("host.name".to_string(), host_name.clone()),
-                ]),
+                attributes,
                 discovered_at: discovered_at.clone(),
                 last_seen_at: discovered_at.clone(),
                 health: "healthy".to_string(),
@@ -70,6 +73,49 @@ impl DiscoveryProbe for HostDiscoveryProbe {
             }],
         })
     }
+}
+
+/// 操作系统的身份属性。
+///
+/// 没有这几个键，中心侧的资产目录就只有「一台叫 xxx 的机器」—— 系统信息全空，
+/// 按发行版筛、按版本查漏洞都做不了。
+///
+/// 只发三个键，且每个都有消费方：
+///
+/// - `os.type`：机器可读（`macos` / `linux` / `windows`），编译期常量，用在过滤与分派上。
+/// - `os.name`：**产品名**（`macOS` / `Ubuntu`），直接给资产卡片显示。
+/// - `os.version`：系统版本号。注意 Linux 上这是**内核**版本（sysinfo 的语义）。
+///
+/// 为什么不用 `sysinfo::System::name()` 直接当 `os.name`：它在 macOS 上返回**内核名**
+/// `Darwin`（实测），而资产卡片要的是 `macOS`；在 Linux 上它本身就是发行版名，
+/// 所以只有 macOS 一个特例。原始内核名不另发 —— 没人消费的空属性只会让快照变大。
+///
+/// 取不到的值不写：缺一个键比写一个空串好，空串会被下游当成"已知为空"。
+fn platform_attributes() -> BTreeMap<String, String> {
+    let mut attributes = BTreeMap::new();
+
+    attributes.insert("os.type".to_string(), std::env::consts::OS.to_string());
+    if let Some(name) = os_product_name() {
+        attributes.insert("os.name".to_string(), name);
+    }
+    if let Some(version) = non_blank(sysinfo::System::os_version()) {
+        attributes.insert("os.version".to_string(), version);
+    }
+
+    attributes
+}
+
+fn os_product_name() -> Option<String> {
+    if cfg!(target_os = "macos") {
+        return Some("macOS".to_string());
+    }
+    non_blank(sysinfo::System::name())
+}
+
+fn non_blank(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// 机器名的**唯一**来源优先级：`HOSTNAME` → `COMPUTERNAME` → `/etc/hostname` → 系统主机名
@@ -151,7 +197,55 @@ fn machine_id_from_known_locations() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_host_name, host_name_from_sources};
+    use super::{default_host_name, host_name_from_sources, platform_attributes};
+
+    #[test]
+    fn platform_attributes_always_carry_a_machine_readable_os_type() {
+        // 编译期常量：拿不到任何系统信息时也得有它，否则下游无法分派。
+        let attributes = platform_attributes();
+        assert_eq!(
+            attributes.get("os.type").map(String::as_str),
+            Some(std::env::consts::OS)
+        );
+    }
+
+    #[test]
+    fn platform_attributes_never_contain_blank_values() {
+        // 缺键比空串好：空串会被下游当成「已知为空」。
+        for (key, value) in platform_attributes() {
+            assert!(!value.trim().is_empty(), "{key} must not be blank");
+        }
+    }
+
+    #[test]
+    fn platform_attributes_use_the_expected_keys() {
+        for key in platform_attributes().keys() {
+            assert!(
+                key.starts_with("os."),
+                "host 探针的平台上属性只用 os.* 命名空间，实际: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn os_name_is_a_product_name_not_a_kernel_name() {
+        // sysinfo 在 macOS 上返回 `Darwin`（内核名）。资产卡片要的是 `macOS`。
+        let attributes = platform_attributes();
+        let name = attributes.get("os.name").expect("os.name present");
+        assert_ne!(name, "Darwin", "内核名不能直接当产品名");
+        if cfg!(target_os = "macos") {
+            assert_eq!(name, "macOS");
+        }
+    }
+
+    #[test]
+    fn platform_attributes_do_not_leak_unconsumed_keys() {
+        // 只发有消费方的键：空属性只会让快照变大，还会让人以为已经采了。
+        let allowed = ["os.type", "os.name", "os.version"];
+        for key in platform_attributes().keys() {
+            assert!(allowed.contains(&key.as_str()), "未预期的属性: {key}");
+        }
+    }
 
     #[test]
     fn host_name_prefers_hostname_env() {
