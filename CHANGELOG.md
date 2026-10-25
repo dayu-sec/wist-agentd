@@ -1,7 +1,27 @@
 # 更新日志
 
-本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
+本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
+
+## [未发布]
+
+## [0.9.9-alpha] - 2026-10-25
+
+### 新增（macOS 监听端口采集）
+
+- **macOS 上也能知道「这台机器对谁开了什么口」了**。endpoint probe 之前只在 Linux 有实现，
+  macOS 一直报「一个端口都没开」，中心侧的服务列表因此为空。现在会列出本机所有监听中的
+  TCP / UDP 地址，并带上持有它的进程（pid + 可执行路径）。
+  - 每条记录包含协议、绑定地址、端口。`0.0.0.0`（对外）与 `127.0.0.1`（仅本机）
+    能区分开 —— 这两者是完全不同的暴露面。
+  - 只看正在监听的 socket，已建立的连接不计入。
+  - 同一进程重复绑同一端口只报一次。
+- 本机实测 60 个监听端点（`wparse` 1514、`wist-gateway` 3000、`wist-atlas` 8080、
+  Postgres 55437 …），端口 / 绑定地址 / 进程均正确。
+
+### 说明
+
+- 需要 `service install` 换二进制并重启守护进程后才生效。
 
 ## [0.9.8-alpha] - 2026-10-25
 

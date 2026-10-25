@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 
 #[cfg(target_os = "linux")]
 mod endpoint_linux;
+#[cfg(target_os = "macos")]
+mod endpoint_macos;
 
 use wist_contracts::discovery::{DiscoveredResource, DiscoveredTarget, DiscoveryOrigin};
 use wist_shared::time::now_rfc3339;
@@ -187,8 +189,14 @@ fn discover_service_endpoints() -> std::io::Result<Vec<ObservedServiceEndpoint>>
     endpoint_linux::discover_service_endpoints()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn discover_service_endpoints() -> std::io::Result<Vec<ObservedServiceEndpoint>> {
+    endpoint_macos::discover_service_endpoints()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn discover_service_endpoints() -> std::io::Result<Vec<ObservedServiceEndpoint>> {
+    // 其它平台既没有 `/proc` 也没有 libproc，暂时没有实现。
     Ok(Vec::new())
 }
 
