@@ -31,13 +31,13 @@ kind = "file"
 # path = "/var/lib/wist-agentd/data/wist-records.ndjson"
 
 [discovery]
-# 默认保留 host + network + endpoint + process discovery，便于本地 metrics / action target 建模。
-# container 属于更高基数发现，只有启用对应场景时再显式打开。
+# 默认保留 host + network + endpoint + process + container discovery。
+# container 默认开：Linux 上容器是最基本的资产层。确实不需要的部署显式写 false。
 host_enabled = true
 network_enabled = true
 endpoint_enabled = true
 process_enabled = true
-container_enabled = false
+container_enabled = true
 # 原文发现快照（DSNAP 帧）上送：默认关；打开后按周期把完整快照送到数据面。
 # 低于 60s 会被夹到 60s。
 # snapshot_uplink_enabled = false

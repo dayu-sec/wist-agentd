@@ -72,6 +72,7 @@ pub fn load_from_path(config_path: &Path) -> Result<AgentConfig, ConfigError> {
         ConfigReason::Io,
         format!("read config {}", config_path.display()),
     )?;
+    let text = migrate_legacy_container_flag(config_path, &text)?;
     let raw = toml::from_str::<toml::Value>(&text)
         .source_raw_err(ConfigReason::ParseToml, "parse config")?;
     let mut parsed = toml::from_str::<AgentConfig>(&text)
@@ -83,6 +84,84 @@ pub fn load_from_path(config_path: &Path) -> Result<AgentConfig, ConfigError> {
     validate_config(&path_resolved)
         .map_err(|err| ConfigReason::Validation.to_err().with_detail(err.code))?;
     Ok(path_resolved)
+}
+
+/// 0.9.10 及更早版本生成的配置模板把 `container_enabled` 写成了 `false`（当时定位是
+/// 「高基数发现，按需打开」）。现在默认改开，而那些配置文件已经落盘落地 ——
+/// 光改默认值对它们不生效，所以在这里做一次**一次性**改写。
+///
+/// 只动**仍然带着旧模板那行注释**的配置：说明没人动过这一块。
+/// 手写过 `container_enabled = false` 但没保留注释的配置一律不碰 —— 那是明确的选择。
+const LEGACY_CONTAINER_COMMENT: &str =
+    "# container 属于更高基数发现，只有启用对应场景时再显式打开。";
+const LEGACY_CONTAINER_LINE: &str = "container_enabled = false";
+const REPLACEMENT_CONTAINER_COMMENT: &str =
+    "# container 默认开：Linux 上容器是最基本的资产层。确实不需要的部署显式写 false。";
+const REPLACEMENT_CONTAINER_LINE: &str = "container_enabled = true";
+
+/// 把旧模板里的 `container_enabled = false` 改写为 `true`，返回新文本。
+///
+/// 不改就是 `None`（没有旧模板标记 / 已经被改过）。纯字符串操作，方便单测。
+fn rewritten_legacy_container_text(text: &str) -> Option<String> {
+    if !text.contains(LEGACY_CONTAINER_COMMENT) {
+        return None;
+    }
+    let mut replaced = false;
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| match line.trim_end() {
+            LEGACY_CONTAINER_COMMENT => REPLACEMENT_CONTAINER_COMMENT.to_string(),
+            LEGACY_CONTAINER_LINE if !replaced => {
+                replaced = true;
+                REPLACEMENT_CONTAINER_LINE.to_string()
+            }
+            _ => line.to_string(),
+        })
+        .collect();
+    if !replaced {
+        return None;
+    }
+    let mut rewritten = lines.join("\n");
+    if text.ends_with('\n') {
+        rewritten.push('\n');
+    }
+    Some(rewritten)
+}
+
+/// 加载时的一次性迁移：改写到磁盘，并打一行日志（配置文件被悄悄改掉很难排查）。
+fn migrate_legacy_container_flag(config_path: &Path, text: &str) -> Result<String, ConfigError> {
+    let Some(rewritten) = rewritten_legacy_container_text(text) else {
+        return Ok(text.to_string());
+    };
+    write_bytes_atomic(config_path, rewritten.as_bytes()).source_err(
+        ConfigReason::Io,
+        format!("rewrite config {}", config_path.display()),
+    )?;
+    log::warn!(
+        "config {}: container_enabled 已由旧模板的 false 改写为 true（容器采集默认开）；要关闭请显式改回 false",
+        config_path.display()
+    );
+    Ok(rewritten)
+}
+
+async fn migrate_legacy_container_flag_async(
+    config_path: &Path,
+    text: String,
+) -> Result<String, ConfigError> {
+    let Some(rewritten) = rewritten_legacy_container_text(&text) else {
+        return Ok(text);
+    };
+    write_bytes_atomic_async(config_path, rewritten.as_bytes())
+        .await
+        .source_err(
+            ConfigReason::Io,
+            format!("rewrite config {}", config_path.display()),
+        )?;
+    log::warn!(
+        "config {}: container_enabled 已由旧模板的 false 改写为 true（容器采集默认开）；要关闭请显式改回 false",
+        config_path.display()
+    );
+    Ok(rewritten)
 }
 
 /// 配置目录在 `/etc` 下时，数据默认根目录（供 `init-config` 提示使用）。
@@ -178,6 +257,7 @@ pub async fn load_from_path_async(config_path: &Path) -> Result<AgentConfig, Con
         ConfigReason::Io,
         format!("read config {}", config_path.display()),
     )?;
+    let text = migrate_legacy_container_flag_async(config_path, text).await?;
     let raw = toml::from_str::<toml::Value>(&text)
         .source_raw_err(ConfigReason::ParseToml, "parse config")?;
     let mut parsed = toml::from_str::<AgentConfig>(&text)

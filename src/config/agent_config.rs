@@ -66,7 +66,13 @@ pub struct DiscoverySection {
     pub endpoint_enabled: bool,
     #[serde(default)]
     pub process_enabled: bool,
-    #[serde(default)]
+    /// 是否采集容器（运行时 task 目录 + `/proc/<pid>/cgroup` 归属）。
+    ///
+    /// 默认**开**：Linux 上容器是最基本的资产层，「默认关」等于能力藏着。
+    /// 0.9.10 及以前默认关，升级后会打开（旧模板生成且未动过的配置会被一次改写，
+    /// 见 `config_runtime::migrate_legacy_container_flag`）。
+    /// 确实不需要的部署显式写 `container_enabled = false`。
+    #[serde(default = "default_discovery_container_enabled")]
     pub container_enabled: bool,
     /// 是否把完整发现快照作为 `DSNAP:` 帧上送数据面。
     ///
@@ -85,7 +91,7 @@ impl Default for DiscoverySection {
             network_enabled: default_discovery_network_enabled(),
             endpoint_enabled: default_discovery_endpoint_enabled(),
             process_enabled: true,
-            container_enabled: false,
+            container_enabled: default_discovery_container_enabled(),
             snapshot_uplink_enabled: default_discovery_snapshot_uplink_enabled(),
             snapshot_uplink_interval_seconds: default_discovery_snapshot_uplink_interval_seconds(),
         }
@@ -475,6 +481,10 @@ fn default_discovery_endpoint_enabled() -> bool {
     true
 }
 
+fn default_discovery_container_enabled() -> bool {
+    true
+}
+
 fn default_discovery_snapshot_uplink_enabled() -> bool {
     false
 }
@@ -562,6 +572,28 @@ mod tests {
         let empty_section: AgentConfig =
             serde_json::from_str(r#"{"schema_version":"v1","discovery":{}}"#).expect("decode");
         assert!(!empty_section.discovery.process_enabled);
+    }
+
+    #[test]
+    fn discovery_container_defaults_on_at_both_levels() {
+        // 整段缺省（走 Default）与「段在、字段缺省」两档都必须默认开：
+        // 升级后没有写这一行的配置要能自动开始采集容器。
+        assert!(DiscoverySection::default().container_enabled);
+
+        let inline: DiscoverySection = serde_json::from_str("{}").expect("decode");
+        assert!(inline.container_enabled);
+
+        let whole_missing: AgentConfig =
+            serde_json::from_str(r#"{"schema_version":"v1"}"#).expect("decode");
+        assert!(whole_missing.discovery.container_enabled);
+    }
+
+    #[test]
+    fn an_explicit_container_flag_still_wins() {
+        // 默认开了，但显式写 false 的部署不能被悄悄改回来（迁移只改旧模板那一行）。
+        let inline: DiscoverySection =
+            serde_json::from_str(r#"{"container_enabled":false}"#).expect("decode");
+        assert!(!inline.container_enabled);
     }
 
     #[test]

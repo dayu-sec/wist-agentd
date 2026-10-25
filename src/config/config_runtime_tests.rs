@@ -304,7 +304,10 @@ path = "log/out.ndjson"
     assert!(config.discovery.network_enabled);
     assert!(config.discovery.endpoint_enabled);
     assert!(config.discovery.process_enabled);
-    assert!(!config.discovery.container_enabled);
+    assert!(
+        config.discovery.container_enabled,
+        "容器采集默认开；要关必须显式写 false"
+    );
 }
 
 #[test]
@@ -604,4 +607,63 @@ file_inputs_file = "tasks/missing.toml"
         err.to_string().contains("read file_inputs_file"),
         "unexpected error: {err}"
     );
+}
+
+// ── 旧模板的 container_enabled 一次性迁移 ──────────────────
+
+fn legacy_template_config(root: &Path) -> PathBuf {
+    let path = root.join("agentd.toml");
+    let text = r#"schema_version = "v1"
+
+[discovery]
+# 默认保留 host + network + endpoint + process discovery，便于本地 metrics / action target 建模。
+# container 属于更高基数发现，只有启用对应场景时再显式打开。
+host_enabled = true
+network_enabled = true
+endpoint_enabled = true
+process_enabled = true
+container_enabled = false
+"#;
+    fs::write(&path, text).expect("write config");
+    path
+}
+
+#[test]
+fn a_legacy_template_config_gets_containers_enabled_on_load() {
+    // 旧版本生成的配置把 container_enabled 写死成 false；只改 serde 默认值对它不生效，
+    // 所以加载时要做一次改写 —— 这是「升级自动打开」的实际落点。
+    let root = temp_dir("legacy-container-migrate");
+    let path = legacy_template_config(&root);
+
+    let config = load_from_path(&path).expect("load config");
+    assert!(config.discovery.container_enabled);
+
+    // 文件要真的被改写：否则每次启动都会重复迁移，管理员也看不到实际生效的配置。
+    let rewritten = fs::read_to_string(&path).expect("read config");
+    assert!(rewritten.contains("container_enabled = true"));
+    assert!(!rewritten.contains("container_enabled = false"));
+    assert!(!rewritten.contains("只有启用对应场景时再显式打开"));
+
+    // 再加载一次不应该再改（幂等）。
+    let again = load_from_path(&path).expect("reload config");
+    assert!(again.discovery.container_enabled);
+    assert_eq!(fs::read_to_string(&path).expect("read config"), rewritten);
+}
+
+#[test]
+fn a_hand_written_false_is_left_alone() {
+    // 没有旧模板那行注释 = 人写的。显式关掉容器是明确的选择，迁移不能覆盖它。
+    let root = temp_dir("legacy-container-explicit");
+    let path = root.join("agentd.toml");
+    let text = r#"schema_version = "v1"
+
+[discovery]
+host_enabled = true
+container_enabled = false
+"#;
+    fs::write(&path, text).expect("write config");
+
+    let config = load_from_path(&path).expect("load config");
+    assert!(!config.discovery.container_enabled);
+    assert_eq!(fs::read_to_string(&path).expect("read config"), text);
 }

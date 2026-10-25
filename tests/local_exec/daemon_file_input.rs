@@ -240,12 +240,15 @@ fn daemon_run_once_processes_configured_file_input() {
             .iter()
             .any(|probe| probe.probe == "process")
     );
+    // 容器探针自 0.9.11 起默认注册。宿主上没有可读的 runtime root 时它返回空，
+    // 但状态仍应是 ok —— 「看不见容器」不是故障（非 root 读不到 /run/containerd 也一样）。
     assert!(
         snapshot
             .discovery
             .probes
             .iter()
-            .all(|probe| probe.probe != "container")
+            .any(|probe| probe.probe == "container" && probe.status == "ok"),
+        "容器探针默认开启且不应因权限/根目录不存在而失败"
     );
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].body, "first\n");

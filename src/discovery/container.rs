@@ -225,11 +225,18 @@ fn read_runtime_root(root: &ContainerRuntimeRoot) -> io::Result<Vec<ObservedCont
     let entries = match fs::read_dir(&root.path) {
         Ok(entries) => entries,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(containers),
+        // 非 root 运行的 agent 读不到 `/run/containerd`（0700）。这不是故障，
+        // 只是「看不见容器」；整轮探针失败会把健康度永久标红。
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => return Ok(containers),
         Err(err) => return Err(err),
     };
 
     for entry in entries {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => continue,
+            Err(err) => return Err(err),
+        };
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
             Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
@@ -350,6 +357,40 @@ mod tests {
         }])
         .expect("discover containers");
 
+        assert!(containers.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_runtime_root_is_not_a_probe_failure() {
+        // 非 root 运行的 agent 读不到 /run/containerd（0700）。那只是「看不见容器」，
+        // 不该让整轮探测失败 —— 否则探针健康度会永久标红。
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir("unreadable-root");
+        let task_root = root.join("k8s.io");
+        fs::create_dir_all(task_root.join("container-a")).expect("container a");
+        let mut perms = fs::metadata(&task_root).expect("metadata").permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&task_root, perms).expect("chmod");
+        // root（CI 容器里常见）绕过权限位：这时断言「空」不成立，直接跳过。
+        let readable = fs::read_dir(&task_root).is_ok();
+
+        let result = discover_containers_in_roots(&[ContainerRuntimeRoot {
+            runtime: "containerd",
+            runtime_namespace: Some("k8s.io"),
+            path: task_root.clone(),
+        }]);
+
+        // 恢复权限，免得临时目录删不掉。
+        let mut perms = fs::metadata(&task_root).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&task_root, perms).expect("chmod back");
+
+        if readable {
+            return;
+        }
+        let containers = result.expect("permission denied must not fail the probe");
         assert!(containers.is_empty());
     }
 

@@ -315,9 +315,13 @@ DiscoverySection {
 - `network_enabled`：network 发现，段内省略时默认 `true`
 - `endpoint_enabled`：endpoint 发现，段内省略时默认 `true`
 - `process_enabled`：process 发现，段内省略时默认 `false`
-- `container_enabled`：container 发现（高基数），段内省略时默认 `false`
+- `container_enabled`：container 发现（运行时 task 目录 + `/proc/<pid>/cgroup` 归属），段内省略时默认 `true`
 
-整段 `[discovery]` 不写时走 `DiscoverySection::default()`：host / network / endpoint / process 为 `true`、container 为 `false`。
+整段 `[discovery]` 不写时走 `DiscoverySection::default()`：host / network / endpoint / process / container 均为 `true`。
+
+> `container_enabled` 自 0.9.11 起默认开。早期版本生成的配置里它被写死为 `false`：
+> 只要那份配置还带着旧模板的单行注释（说明没人动过这一段），加载时会**一次性**改写为
+> `true` 并落盘；手写 `false`（无那行注释）的配置不动 —— 那是明确的选择。
 默认模板把五个键都显式写出（`src/config/config_runtime_support.rs:33-40`）。
 五个开关不能全为 `false`，否则报 `missing_discovery_probe`（`wist-validate-0.1.2/src/config.rs:43-51`）。
 
