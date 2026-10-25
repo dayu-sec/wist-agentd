@@ -68,6 +68,14 @@ pub struct DiscoverySection {
     pub process_enabled: bool,
     #[serde(default)]
     pub container_enabled: bool,
+    /// 是否把完整发现快照作为 `DSNAP:` 帧上送数据面。
+    ///
+    /// 默认关：原文快照一台几百 KB，属于 P1 的显式开关，不应因升级默认打开。
+    #[serde(default = "default_discovery_snapshot_uplink_enabled")]
+    pub snapshot_uplink_enabled: bool,
+    /// 快照上送周期（秒）。低于 60s 会被夹到 60s，避免误配把机器打满。
+    #[serde(default = "default_discovery_snapshot_uplink_interval_seconds")]
+    pub snapshot_uplink_interval_seconds: u64,
 }
 
 impl Default for DiscoverySection {
@@ -78,6 +86,8 @@ impl Default for DiscoverySection {
             endpoint_enabled: default_discovery_endpoint_enabled(),
             process_enabled: true,
             container_enabled: false,
+            snapshot_uplink_enabled: default_discovery_snapshot_uplink_enabled(),
+            snapshot_uplink_interval_seconds: default_discovery_snapshot_uplink_interval_seconds(),
         }
     }
 }
@@ -465,6 +475,14 @@ fn default_discovery_endpoint_enabled() -> bool {
     true
 }
 
+fn default_discovery_snapshot_uplink_enabled() -> bool {
+    false
+}
+
+fn default_discovery_snapshot_uplink_interval_seconds() -> u64 {
+    300
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,6 +562,20 @@ mod tests {
         let empty_section: AgentConfig =
             serde_json::from_str(r#"{"schema_version":"v1","discovery":{}}"#).expect("decode");
         assert!(!empty_section.discovery.process_enabled);
+    }
+
+    #[test]
+    fn discovery_snapshot_uplink_defaults_off_and_five_minutes() {
+        // 原文快照体积大，默认不能因升级自动打开；周期默认 5 分钟。
+        assert!(!DiscoverySection::default().snapshot_uplink_enabled);
+        assert_eq!(
+            DiscoverySection::default().snapshot_uplink_interval_seconds,
+            300
+        );
+
+        let inline: DiscoverySection = serde_json::from_str("{}").expect("decode");
+        assert!(!inline.snapshot_uplink_enabled);
+        assert_eq!(inline.snapshot_uplink_interval_seconds, 300);
     }
 
     #[test]

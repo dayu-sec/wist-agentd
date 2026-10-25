@@ -438,6 +438,8 @@ fn daemon_run_once_can_enable_high_cardinality_discovery_explicitly() {
         endpoint_enabled: true,
         process_enabled: true,
         container_enabled: true,
+        snapshot_uplink_enabled: false,
+        snapshot_uplink_interval_seconds: 300,
     };
 
     let snapshot = daemon::run_once(&daemon::DaemonLoop {

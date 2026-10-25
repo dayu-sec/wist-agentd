@@ -3,6 +3,28 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.8-alpha] - 2026-10-25
+
+### 新增（发现快照原文上送）
+
+- **完整发现快照可以作为 `DSNAP:` 帧周期上送到数据面**，消费者是中心侧资产目录（`wist-atlas`），
+  不是网关。与事实摘要**分开标记、分开周期**：摘要走网关（10~30 KB），原文快照走 atlas
+  （一台几百 KB），互不挤占。
+  - 默认**关**（`[discovery] snapshot_uplink_enabled`）—— 几百 KB 的上送不该因升级自动打开。
+  - 周期 `snapshot_uplink_interval_seconds` 默认 300s；**低于 60s 会被夹到 60s**，一块全量
+    快照不能因手滑配置打到秒级。
+  - 只在 `[telemetry.logs.output] kind = "tcp"` 且输出启用时生效。开了开关但输出不是 tcp 时，
+    启动后打一行 `event=DiscoverySnapshotUplinkInactive` 说明原因 —— 这个组合以前是**完全静默**的。
+  - 与日志 / 指标 / 事实共用一条连接与同一个 `seq` 号源。号先落盘再发送：发送失败会留一个
+    **可见的空洞**，因为退号会让同一个号被两帧复用，下游按 `(agent, seq)` 去重时会误删。
+
+### 说明
+
+- 配置模板里的新增键是**注释掉的**：旧版本 agentd 的配置是 `deny_unknown_fields`，
+  把新键写进旧 agent 读的模板会启动即拒。
+- 快照里目前只有 `host.id` / `host.name`，没有 `os.*` / `host.arch`；中心侧主机资产卡片的
+  系统信息暂时为空，属于下一步的采集项。
+
 ## [0.9.7-alpha] - 2026-10-25
 
 ### 新增（选源过滤的自观测）

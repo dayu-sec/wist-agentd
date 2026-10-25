@@ -14,7 +14,9 @@ use wist_api::facts::ReportAgentFactSummary;
 use wist_api::status::{AgentStatusReport, AgentWorkState, AgentWorkStateChange};
 use wist_contracts::agent_uplink::AgentUplinkState;
 use wist_contracts::capability_report::LogsCapabilities;
+use wist_contracts::discovery::DiscoverySnapshot;
 use wist_contracts::discovery_policy::DiscoveryAspectPolicySet;
+use wist_contracts::ingest::{DiscoveryReport, DiscoveryReportMode};
 use wist_contracts::local_work::{
     AgentLocalOneShotWork, AgentLocalStandingWork, AgentLocalTask, AgentLocalWork,
 };
@@ -126,6 +128,12 @@ const FACT_REPORT_MIN_INTERVAL_MS: i64 = 300_000;
 /// 否则网关宕机时会每 tick（3s）重试一次。策略表是**慢变量**（平台按版本策展发布），
 /// 5 分钟一次足够及时；而 agentd 的内建默认周期与表同值，所以拿不到也不影响采集。
 const DISCOVERY_POLICY_FETCH_MIN_INTERVAL_MS: i64 = 300_000;
+
+/// 原文发现快照（`DSNAP:` 帧）上送周期的**下限**（秒）。
+///
+/// 一帧是一台机器的全量快照（实测 macOS ~800 KB）。配成 1s 不是「更快拿到资产」，
+/// 而是把数据面按 Gbps 打满；这里直接夹住而不是让配置校验失败 —— 现场改小是手滑。
+const DISCOVERY_SNAPSHOT_MIN_INTERVAL_SECS: u64 = 60;
 
 /// 策略表拉取的到期判定用 `Duration`；值只有一个来源（上面的毫秒常量）。
 const DISCOVERY_POLICY_FETCH_MIN_INTERVAL: Duration =
@@ -851,6 +859,88 @@ async fn send_fact_summary(
     }
 }
 
+/// 发一帧原文发现快照并打一行结果（成功/失败各一行；没有快照或缺 agent_id 时静默）。
+///
+/// 注意调用方**已经**把本轮记为一次尝试（与事实摘要同一取舍：失败也要被周期节流，
+/// 否则数据面坏掉时会每 tick（3s）重试一帧几百 KB）。所以这里的两种静默返回都会占用
+/// 一个完整周期：`None` 快照 = 首轮探针全挂 / 缓存为空，`None` 的 `agent_id` = 未入网。
+/// 两者都是慢变量（发现刷新在秒级、入网是一次性动作），等一个周期比每 tick 空转划算。
+async fn send_discovery_snapshot_report(
+    sink: &mut TelemetryRecordSink,
+    config: &AgentConfig,
+    snapshot: Option<&DiscoverySnapshot>,
+    next_seq: &mut u64,
+    global_seq_path: &Path,
+) {
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    let Some(agent_id) = config.agent.agent_id.as_deref() else {
+        return;
+    };
+    match report_discovery_snapshot(sink, config, snapshot, next_seq, global_seq_path).await {
+        Ok(()) => log::info!(
+            "event=DiscoverySnapshotSent agent_id={agent_id} snapshot_id={} revision={} resources={} targets={}",
+            snapshot.snapshot_id,
+            snapshot.revision,
+            snapshot.resources.len(),
+            snapshot.targets.len()
+        ),
+        Err(err) => log::warn!("wist-agentd discovery snapshot uplink failed: {err}"),
+    }
+}
+
+/// 把最新发现快照包成 `ReportDiscoverySnapshot`，以 ` DSNAP: ` 帧发到数据面。
+///
+/// 与事实摘要共用同一条连接与全局 `seq`，只是帧标记不同。快照体积大，调用方负责
+/// 按独立周期节流（见 `send_discovery_snapshot` 的计算）。
+async fn report_discovery_snapshot(
+    sink: &mut TelemetryRecordSink,
+    config: &AgentConfig,
+    snapshot: &DiscoverySnapshot,
+    next_seq: &mut u64,
+    global_seq_path: &Path,
+) -> RuntimeResult<()> {
+    let agent_id = config.agent.agent_id.as_deref().unwrap_or("unknown");
+    let instance_id = config.agent.instance_name.as_deref().unwrap_or_default();
+    let reported_at = now_rfc3339();
+    let report = DiscoveryReport::new(
+        format!("disc_{agent_id}_{}", now_ts_ms()),
+        agent_id.to_string(),
+        instance_id.to_string(),
+        1,
+        DiscoveryReportMode::FullSnapshot,
+        reported_at.clone(),
+        snapshot.clone(),
+    );
+    let body = serde_json::to_vec(&report)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    // 取号 → 先持久化高水位 → 再发送（与日志/指标/事实同一个 seq 空间）。
+    let seq = *next_seq;
+    *next_seq += 1;
+    log_seq_state::store_async(global_seq_path, *next_seq).await?;
+    let envelope = DataFrame::new(agent_id, reported_at, seq);
+    sink.write_discovery(&envelope, &body).await?;
+    Ok(())
+}
+
+/// 配置里的周期（秒）→ 实际使用的周期，夹到不低于 [`DISCOVERY_SNAPSHOT_MIN_INTERVAL_SECS`]。
+fn discovery_snapshot_interval(configured_secs: u64) -> Duration {
+    Duration::from_secs(configured_secs.max(DISCOVERY_SNAPSHOT_MIN_INTERVAL_SECS))
+}
+
+/// 本轮是否该发一帧原文快照。
+///
+/// `None`（进程刚起来 / 从没发过）立即放行：重启后的第一件事就该是补一份当前快照，
+/// 而不是先等满一个周期。代价是节流是**进程内**的（`Instant`），重启即清零 ——
+/// 对 5 分钟级的慢变量，这个取舍比「重启后五分钟没有资产」划算。
+fn discovery_snapshot_due(last: Option<Instant>, interval: Duration) -> bool {
+    match last {
+        None => true,
+        Some(at) => at.elapsed() >= interval,
+    }
+}
+
 /// 是否还在事实摘要上送的最小间隔内（即应当跳过）。
 ///
 /// 节流必须 **fail-open**：宁可多发一次，不可因为时钟问题永远不发。
@@ -1019,6 +1109,11 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     // 出口健康的跨 tick 记忆（只在「失败 → 恢复」时补一行）。
     let mut uplink_health = UplinkHealth::default();
     let mut last_metrics_uplink: Option<Instant> = None;
+    let mut last_discovery_uplink: Option<Instant> = None;
+    // 只提醒一次：`snapshot_uplink_enabled = true` 搭配非 tcp 输出时，行为是
+    // 「不发、不报错」—— 完全静默。现场只会问「为什么没有数据」，所以启动后第一次
+    // 判定不生效时就把原因打出来，不每 tick 刷屏。
+    let mut warned_discovery_uplink_ineffective = false;
     let mut previous_telemetry_failures = BTreeSet::new();
     let mut previous_metrics_failures = BTreeSet::new();
     let mut previous_telemetry_paused = BTreeSet::new();
@@ -1187,6 +1282,34 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
             // 否则输出端坏掉时会每 tick（3s）重试并刷满日志。
             last_metrics_uplink = Some(Instant::now());
         }
+        // 原文快照体积大，按独立周期发送（默认 5 分钟），不跟 3s tick。
+        // 只在「上送确实生效且是 tcp」时记尝试：待命/file 输出下不应消耗周期，
+        // 否则重新启用后要等满一个周期才发第一帧。
+        let discovery_output = effective_output(loop_ctx.config, uplink_runtime.grant());
+        let discovery_uplink_active = loop_ctx.config.discovery.snapshot_uplink_enabled
+            && discovery_output.enabled
+            && discovery_output.kind == "tcp";
+        if loop_ctx.config.discovery.snapshot_uplink_enabled
+            && !discovery_uplink_active
+            && !warned_discovery_uplink_ineffective
+        {
+            warned_discovery_uplink_ineffective = true;
+            log::warn!(
+                "event=DiscoverySnapshotUplinkInactive snapshot_uplink_enabled=true but the output is not an enabled tcp sink (enabled={} kind={}); full snapshots will not be sent",
+                discovery_output.enabled,
+                discovery_output.kind
+            );
+        }
+        let send_discovery_snapshot = discovery_uplink_active
+            && discovery_snapshot_due(
+                last_discovery_uplink,
+                discovery_snapshot_interval(
+                    loop_ctx.config.discovery.snapshot_uplink_interval_seconds,
+                ),
+            );
+        if send_discovery_snapshot {
+            last_discovery_uplink = Some(Instant::now());
+        }
         let (snapshot, changes) = run_once_with_failure_cache(
             &loop_ctx,
             Some(&mut previous_telemetry_failures),
@@ -1197,6 +1320,7 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
             &uplink_runtime,
             Some(&mut uplink_health),
             send_metrics,
+            send_discovery_snapshot,
         )
         .await?;
         pending_work_state_changes.extend(changes);
@@ -1276,6 +1400,8 @@ async fn run_once_with_failure_cache(
     uplink_health: Option<&mut UplinkHealth>,
     // 本轮要不要上送指标（由调用方按授权与周期定；一次性路径按授权定）。
     send_metrics: bool,
+    // 本轮要不要上送原文发现快照（由调用方按配置与周期定；一次性路径不发）。
+    send_discovery_snapshot: bool,
 ) -> RuntimeResult<(RuntimeHealthSnapshot, Vec<TelemetryWorkState>)> {
     let run_dir = Path::new(&loop_ctx.config.paths.run_dir);
     let state_dir = Path::new(&loop_ctx.config.paths.state_dir);
@@ -1362,6 +1488,16 @@ async fn run_once_with_failure_cache(
                         loop_ctx.config,
                         state_dir,
                         &fact_summary,
+                        &mut next_seq,
+                        &global_seq_path,
+                    )
+                    .await;
+                }
+                if send_discovery_snapshot && sink.carries_discovery_frames() {
+                    send_discovery_snapshot_report(
+                        &mut sink,
+                        loop_ctx.config,
+                        discovery_runtime.latest_snapshot(),
                         &mut next_seq,
                         &global_seq_path,
                     )
@@ -2138,6 +2274,7 @@ async fn run_once_with_work_async(
         &uplink,
         None,
         send_metrics,
+        false,
     )
     .await
     .map(|(snapshot, _)| snapshot)
@@ -2347,6 +2484,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             None,
+            false,
             false,
         )
         .await
@@ -2902,6 +3040,7 @@ mod tests {
             &AppliedUplink::default(),
             None,
             false,
+            false,
         )
         .await
         .expect("standby tick");
@@ -2946,6 +3085,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             None,
+            false,
             false,
         )
         .await
@@ -3103,6 +3243,221 @@ mod tests {
                 .expect("load state")
                 .is_none(),
             "缺少 agent_id 时不应记录尝试"
+        );
+    }
+
+    // ── 原文发现快照（DSNAP）上送 ──────────────────────────
+
+    /// 一份最小但真实的快照：一个 host 资源，足够验证信封与正文契约。
+    fn draft_snapshot(revision: i64) -> DiscoverySnapshot {
+        let mut snapshot = DiscoverySnapshot::new(
+            format!("discovery:{revision}:2026-10-25T00:00:00Z"),
+            revision,
+            "2026-10-25T00:00:00Z".to_string(),
+        );
+        snapshot
+            .resources
+            .push(wist_contracts::discovery::DiscoveredResource {
+                resource_id: "hostname:node-1".to_string(),
+                kind: "host".to_string(),
+                origin_idx: 0,
+                attributes: std::collections::BTreeMap::from([(
+                    "host.name".to_string(),
+                    "node-1".to_string(),
+                )]),
+                discovered_at: "2026-10-25T00:00:00Z".to_string(),
+                last_seen_at: "2026-10-25T00:00:00Z".to_string(),
+                health: "healthy".to_string(),
+                source: "host".to_string(),
+            });
+        snapshot
+    }
+
+    #[test]
+    fn discovery_snapshot_interval_clamps_to_the_floor() {
+        // 配 0 / 1 / 59 都按 60s 走：一块 800 KB 的帧不能因手滑配置打到秒级。
+        for configured in [0u64, 1, 59] {
+            assert_eq!(
+                discovery_snapshot_interval(configured),
+                Duration::from_secs(60),
+                "configured={configured}"
+            );
+        }
+        assert_eq!(discovery_snapshot_interval(60), Duration::from_secs(60));
+        assert_eq!(discovery_snapshot_interval(300), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn discovery_snapshot_is_due_on_the_first_tick() {
+        // 进程刚起来：先补一份当前快照，不让首帧白等一个周期。
+        assert!(discovery_snapshot_due(None, Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn discovery_snapshot_is_not_due_inside_the_interval() {
+        let interval = Duration::from_secs(300);
+        assert!(!discovery_snapshot_due(Some(Instant::now()), interval));
+        // 机器刚启动 / 沙箱里单调时钟很年轻时 `checked_sub` 会是 `None`：跳过而不是 panic。
+        let Some(recent) = Instant::now().checked_sub(Duration::from_secs(10)) else {
+            return;
+        };
+        assert!(!discovery_snapshot_due(Some(recent), interval));
+    }
+
+    #[test]
+    fn discovery_snapshot_is_due_once_the_interval_elapses() {
+        let interval = Duration::from_secs(300);
+        let Some(boundary) = Instant::now().checked_sub(interval) else {
+            return;
+        };
+        // 边界本身放行：`>=` 而不是 `>`。
+        assert!(discovery_snapshot_due(Some(boundary), interval));
+        let Some(past) = Instant::now().checked_sub(interval + Duration::from_secs(1)) else {
+            return;
+        };
+        assert!(discovery_snapshot_due(Some(past), interval));
+    }
+
+    #[tokio::test]
+    async fn discovery_snapshot_report_sends_a_dsnap_frame_parsable_as_the_contract() {
+        // 这一帧的消费者是 wist-atlas 适配器，它按 `wist-contracts` 解析正文而不猜形状。
+        // 所以断言必须回放到 `DiscoveryReport` 本体上，而不是只看有没有 `kind` 字段。
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let state_dir = fact_summary_state_dir("dsnap-frame");
+        let seq_path = log_seq_state::path_for(&state_dir);
+        let mut next_seq = 3u64;
+        let mut sink = tcp_sink(port);
+        let config = test_config();
+        let snapshot = draft_snapshot(9);
+
+        let (result, frame) = tokio::join!(
+            report_discovery_snapshot(&mut sink, &config, &snapshot, &mut next_seq, &seq_path),
+            frame_server(listener)
+        );
+        result.expect("report ok");
+
+        let frame = frame.expect("server task");
+        assert!(frame.ends_with('\n'), "line framing must terminate once");
+        assert_eq!(frame.matches(" DSNAP: ").count(), 1);
+        let (envelope, body) = frame.split_once(" DSNAP: ").expect("DSNAP marker");
+        let envelope: serde_json::Value = serde_json::from_str(envelope).expect("envelope json");
+        assert_eq!(envelope["agent"], "agent-x");
+        assert_eq!(envelope["seq"], 3);
+        assert_eq!(envelope["schema"], "v1");
+
+        let report: DiscoveryReport =
+            serde_json::from_str(body.trim_end()).expect("body must be the contract object");
+        assert_eq!(report.api_version, "v1");
+        assert_eq!(report.kind, "report_discovery_snapshot");
+        assert_eq!(report.report_mode, DiscoveryReportMode::FullSnapshot);
+        assert!(report.report_id.starts_with("disc_agent-x_"));
+        assert_eq!(report.agent_id, "agent-x");
+        assert_eq!(report.instance_id, "instance-x");
+        assert_eq!(report.snapshot_id, "discovery:9:2026-10-25T00:00:00Z");
+        assert_eq!(report.revision, 9);
+        assert_eq!(report.generated_at, "2026-10-25T00:00:00Z");
+        assert_eq!(report.snapshot.resources.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn discovery_snapshot_report_consumes_one_seq_and_persists_the_high_water() {
+        // 原文快照与日志/指标/事实共用同一个 `seq` 空间：取号、先落盘高水位、再发送。
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let state_dir = fact_summary_state_dir("dsnap-seq");
+        let seq_path = log_seq_state::path_for(&state_dir);
+        let mut next_seq = 7u64;
+        let mut sink = tcp_sink(port);
+        let config = test_config();
+        let snapshot = draft_snapshot(1);
+
+        let (result, _frame) = tokio::join!(
+            report_discovery_snapshot(&mut sink, &config, &snapshot, &mut next_seq, &seq_path),
+            frame_server(listener)
+        );
+        result.expect("report ok");
+
+        assert_eq!(next_seq, 8, "一帧只吃一个号");
+        assert_eq!(
+            log_seq_state::load_or_default_async(&seq_path)
+                .await
+                .expect("load seq"),
+            8,
+            "高水位必须先于发送落盘"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_snapshot_report_is_skipped_without_an_agent_id() {
+        // 信封里的身份是自称的，但它仍然必需：没有 agent_id 就无从表达「这是谁的快照」。
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let state_dir = fact_summary_state_dir("dsnap-unenrolled");
+        let seq_path = log_seq_state::path_for(&state_dir);
+        let mut next_seq = 0u64;
+        let mut config = test_config();
+        config.agent.agent_id = None;
+        let mut sink = tcp_sink(port);
+        let snapshot = draft_snapshot(1);
+
+        send_discovery_snapshot_report(
+            &mut sink,
+            &config,
+            Some(&snapshot),
+            &mut next_seq,
+            &seq_path,
+        )
+        .await;
+
+        assert_eq!(next_seq, 0, "缺 agent_id 时不应消耗 seq");
+        assert!(!seq_path.exists(), "缺 agent_id 时不应写 seq 高水位");
+        assert_no_request(&listener).await;
+    }
+
+    #[tokio::test]
+    async fn discovery_snapshot_report_is_skipped_without_a_snapshot() {
+        // 首个 tick 可能还没跑出发现结果（探针全挂 / 缓存为空）：静默跳过，且不消耗号。
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let state_dir = fact_summary_state_dir("dsnap-no-snapshot");
+        let seq_path = log_seq_state::path_for(&state_dir);
+        let mut next_seq = 0u64;
+        let mut sink = tcp_sink(port);
+
+        send_discovery_snapshot_report(&mut sink, &test_config(), None, &mut next_seq, &seq_path)
+            .await;
+
+        assert_eq!(next_seq, 0);
+        assert!(!seq_path.exists());
+        assert_no_request(&listener).await;
+    }
+
+    #[tokio::test]
+    async fn discovery_snapshot_report_failure_still_burns_the_seq() {
+        // 与事实摘要同一取舍：号先落盘再发，失败了留一个**可见的空洞**。
+        // 反过来（失败就退号）会让同一个号被两帧复用，下游按 (agent, seq) 去重时会误删。
+        let state_dir = fact_summary_state_dir("dsnap-dead-plane");
+        let seq_path = log_seq_state::path_for(&state_dir);
+        let mut next_seq = 0u64;
+        let mut sink = tcp_sink(closed_port().await);
+
+        let result = report_discovery_snapshot(
+            &mut sink,
+            &test_config(),
+            &draft_snapshot(1),
+            &mut next_seq,
+            &seq_path,
+        )
+        .await;
+
+        assert!(result.is_err(), "发到关闭的端口必须表现为错误");
+        assert_eq!(next_seq, 1);
+        assert_eq!(
+            log_seq_state::load_or_default_async(&seq_path)
+                .await
+                .expect("load seq"),
+            1
         );
     }
 

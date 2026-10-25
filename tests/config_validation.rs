@@ -159,6 +159,8 @@ fn config_with_all_discovery_probes_disabled_is_rejected() {
         endpoint_enabled: false,
         process_enabled: false,
         container_enabled: false,
+        snapshot_uplink_enabled: false,
+        snapshot_uplink_interval_seconds: 300,
     };
 
     let err = validate_config(&fixture).expect_err("config should be rejected");

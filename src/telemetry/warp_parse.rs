@@ -141,6 +141,26 @@ impl TelemetryRecordSink {
     pub(crate) fn carries_fact_frames(&self) -> bool {
         matches!(self, Self::Tcp(_))
     }
+
+    /// 上送一帧原文发现快照（` DSNAP:` 标记 + `ReportDiscoverySnapshot` JSON）。
+    ///
+    /// 与事实帧分开标记：原文快照体积大、消费者是 atlas 而非网关，不能让网关的
+    /// `agent-facts` 通道误收。file sink 只承载日志，这里静默跳过（由调用方的
+    /// `carries_discovery_frames()` 在发送前判断）。
+    pub(crate) async fn write_discovery(
+        &mut self,
+        envelope: &DataFrame,
+        body: &[u8],
+    ) -> io::Result<()> {
+        match self {
+            Self::File(_) => Ok(()),
+            Self::Tcp(sink) => sink.write_discovery(envelope, body).await,
+        }
+    }
+
+    pub(crate) fn carries_discovery_frames(&self) -> bool {
+        matches!(self, Self::Tcp(_))
+    }
 }
 
 #[derive(Debug, Clone, ::jumo_derive::Jumo)]
@@ -331,6 +351,17 @@ impl TcpRecordSink {
             .await
     }
 
+    /// 写入一帧原文发现快照（` DSNAP: ` 标记 + 契约对象 JSON 正文）。
+    pub(crate) async fn write_discovery(
+        &mut self,
+        envelope: &DataFrame,
+        body: &[u8],
+    ) -> io::Result<()> {
+        let frame = build_discovery_frame(envelope, body)?;
+        self.write_payload(&build_payload_bytes(&frame, self.framing))
+            .await
+    }
+
     /// 测试用：缩短退避窗口，避免真实等待默认的 1s。
     #[cfg(test)]
     fn with_backoff(mut self, initial: Duration) -> Self {
@@ -394,6 +425,16 @@ fn build_fact_frame(envelope: &DataFrame, body: &[u8]) -> io::Result<Vec<u8>> {
     let mut frame = serde_json::to_vec(envelope)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     frame.extend_from_slice(b" OBSFACT: ");
+    frame.extend_from_slice(body);
+    Ok(frame)
+}
+
+/// TCP 原文发现快照帧：与事实帧同构，但帧标记为 ` DSNAP: `，正文是
+/// `ReportDiscoverySnapshot`（`kind = report_discovery_snapshot`）的 JSON。
+fn build_discovery_frame(envelope: &DataFrame, body: &[u8]) -> io::Result<Vec<u8>> {
+    let mut frame = serde_json::to_vec(envelope)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    frame.extend_from_slice(b" DSNAP: ");
     frame.extend_from_slice(body);
     Ok(frame)
 }
@@ -654,6 +695,155 @@ mod tests {
         assert_eq!(parsed_body["metric"]["kind"], "host_metrics");
         assert_eq!(parsed_body["values"][0], 0.25);
         assert_eq!(parsed_body["timestamps"][0], 1_234_567_890_000_i64);
+    }
+
+    #[test]
+    fn discovery_frame_uses_dsnap_marker_and_keeps_body() {
+        let envelope = DataFrame::new("agent-001", "2026-04-14T00:00:00Z", 43);
+        let body = br#"{"api_version":"v1","kind":"report_discovery_snapshot"}"#;
+
+        let frame = super::build_discovery_frame(&envelope, body).expect("build frame");
+        let text = String::from_utf8_lossy(&frame);
+        let (env, parsed_body) = text.split_once(" DSNAP: ").expect("DSNAP marker");
+
+        let parsed_env: serde_json::Value = serde_json::from_str(env).expect("valid envelope");
+        assert_eq!(parsed_env["agent"], "agent-001");
+        assert_eq!(parsed_env["seq"], 43);
+        assert_eq!(parsed_body, String::from_utf8_lossy(body));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tcp_record_sink_writes_discovery_frame() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind listener: {err}"),
+        };
+        let port = listener.local_addr().expect("listener addr").port();
+        // 收满一帧即返回：sink 会把连接留着复用，读 EOF 会挂到测试结束。
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut body = Vec::new();
+            let mut buf = vec![0u8; 8192];
+            loop {
+                let n = socket.read(&mut buf).await.expect("read");
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&buf[..n]);
+                if body.contains(&b'\n') {
+                    break;
+                }
+            }
+            body
+        });
+        let mut sink = TcpRecordSink::new("127.0.0.1".to_string(), port, TcpFraming::Line);
+
+        // 正文故意超过单次读缓冲：分帧只能依赖标记与结尾换行，不能假设「一次 write 一个包」。
+        let payload = format!(
+            r#"{{"kind":"report_discovery_snapshot","pad":"{}"}}"#,
+            "x".repeat(20_000)
+        );
+        let envelope = DataFrame::new("agent-001", "2026-04-14T00:00:00Z", 11);
+        sink.write_discovery(&envelope, payload.as_bytes())
+            .await
+            .expect("write discovery");
+
+        let body = server.await.expect("join");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.ends_with('\n'),
+            "line framing must terminate the frame"
+        );
+        assert!(
+            !text.ends_with("\n\n"),
+            "only one trailing newline (a second one would be an empty record)"
+        );
+        assert_eq!(text.matches(" DSNAP: ").count(), 1, "exactly one marker");
+
+        let (env, parsed) = text
+            .trim_end_matches('\n')
+            .split_once(" DSNAP: ")
+            .expect("DSNAP marker");
+        let parsed_env: serde_json::Value = serde_json::from_str(env).expect("valid envelope");
+        assert_eq!(parsed_env["agent"], "agent-001");
+        assert_eq!(parsed_env["seq"], 11);
+        // 正文必须字节级不变：适配器按契约解，中间任何重编码都是隐患。
+        assert_eq!(parsed, payload);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tcp_record_sink_len_framing_prefixes_the_discovery_frame_length() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind listener: {err}"),
+        };
+        let port = listener.local_addr().expect("listener addr").port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut body = Vec::new();
+            let mut buf = vec![0u8; 8192];
+            loop {
+                let n = socket.read(&mut buf).await.expect("read");
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&buf[..n]);
+                // 头是「<len> <frame>」；这里只等到拿全头 + 长度足够。
+                let text = String::from_utf8_lossy(&body);
+                if let Some((len, rest)) = text.split_once(' ')
+                    && let Ok(len) = len.parse::<usize>()
+                    && rest.len() >= len
+                {
+                    break;
+                }
+            }
+            body
+        });
+        let mut sink = TcpRecordSink::new("127.0.0.1".to_string(), port, TcpFraming::Len);
+        let envelope = DataFrame::new("agent-001", "2026-04-14T00:00:00Z", 12);
+
+        sink.write_discovery(&envelope, br#"{"kind":"report_discovery_snapshot"}"#)
+            .await
+            .expect("write discovery");
+
+        let body = server.await.expect("join");
+        let text = String::from_utf8_lossy(&body);
+        let (len, frame) = text.split_once(' ').expect("length prefix");
+        let len: usize = len.parse().expect("numeric length");
+        assert_eq!(len, frame.len(), "length must describe the frame bytes");
+        assert!(frame.contains(" DSNAP: "), "frame: {frame}");
+        assert!(
+            !frame.ends_with('\n'),
+            "len framing carries the frame verbatim, no trailing newline"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn file_sink_swallows_discovery_frames() {
+        // file sink 只承载日志记录。发现快照必须显式不可用，否则它会被静默写进
+        // 日志文件（到那时没人会去那里找资产，体积还白担）。
+        let path = temp_file("discovery-file-sink");
+        let envelope = DataFrame::new("agent-001", "2026-04-14T00:00:00Z", 3);
+        let body = br#"{"kind":"report_discovery_snapshot"}"#;
+
+        let mut sink = super::TelemetryRecordSink::File(FileRecordSink::new(path.clone()));
+        assert!(
+            !sink.carries_discovery_frames(),
+            "file sink only carries logs"
+        );
+        sink.write_discovery(&envelope, body)
+            .await
+            .expect("file sink must swallow the frame");
+        assert!(
+            !path.exists(),
+            "file sink must not create a file for a discovery frame"
+        );
+
+        let tcp_sink = TcpRecordSink::new("127.0.0.1".to_string(), 9, TcpFraming::Line);
+        let tcp = super::TelemetryRecordSink::Tcp(tcp_sink);
+        assert!(tcp.carries_discovery_frames());
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -38,6 +38,10 @@ network_enabled = true
 endpoint_enabled = true
 process_enabled = true
 container_enabled = false
+# 原文发现快照（DSNAP 帧）上送：默认关；打开后按周期把完整快照送到数据面。
+# 低于 60s 会被夹到 60s。
+# snapshot_uplink_enabled = false
+# snapshot_uplink_interval_seconds = 300
 
 # 可选：
 # [agent]
