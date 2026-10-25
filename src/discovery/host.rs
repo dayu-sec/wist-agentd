@@ -80,11 +80,13 @@ impl DiscoveryProbe for HostDiscoveryProbe {
 /// 没有这几个键，中心侧的资产目录就只有「一台叫 xxx 的机器」—— 系统信息全空，
 /// 按发行版筛、按版本查漏洞都做不了。
 ///
-/// 只发三个键，且每个都有消费方：
+/// 四个键，每个都有消费方：
 ///
 /// - `os.type`：机器可读（`macos` / `linux` / `windows`），编译期常量，用在过滤与分派上。
 /// - `os.name`：**产品名**（`macOS` / `Ubuntu`），直接给资产卡片显示。
 /// - `os.version`：系统版本号。注意 Linux 上这是**内核**版本（sysinfo 的语义）。
+/// - `host.arch`：CPU 架构（`aarch64` / `x86_64`）。与事实摘要的 `arch` 同一取值
+///   （`std::env::consts::ARCH`），两个载荷不能各说一套。
 ///
 /// 为什么不用 `sysinfo::System::name()` 直接当 `os.name`：它在 macOS 上返回**内核名**
 /// `Darwin`（实测），而资产卡片要的是 `macOS`；在 Linux 上它本身就是发行版名，
@@ -101,6 +103,9 @@ fn platform_attributes() -> BTreeMap<String, String> {
     if let Some(version) = non_blank(sysinfo::System::os_version()) {
         attributes.insert("os.version".to_string(), version);
     }
+    // 编译期常量，恒有值：不用 `sysinfo::System::cpu_arch()` —— 那个在多架构进程
+    // （如 Rosetta）下报的是**运行进程**的架构，而资产目录问的是这台机器是什么。
+    attributes.insert("host.arch".to_string(), std::env::consts::ARCH.to_string());
 
     attributes
 }
@@ -221,10 +226,19 @@ mod tests {
     fn platform_attributes_use_the_expected_keys() {
         for key in platform_attributes().keys() {
             assert!(
-                key.starts_with("os."),
-                "host 探针的平台上属性只用 os.* 命名空间，实际: {key}"
+                key.starts_with("os.") || key == "host.arch",
+                "host 探针的平台上属性只用 os.* 与 host.arch，实际: {key}"
             );
         }
+    }
+
+    #[test]
+    fn arch_is_the_compile_time_constant() {
+        // 与事实摘要同源，避免两个载荷对同一台机器报不同架构。
+        assert_eq!(
+            platform_attributes().get("host.arch").map(String::as_str),
+            Some(std::env::consts::ARCH)
+        );
     }
 
     #[test]
@@ -241,7 +255,7 @@ mod tests {
     #[test]
     fn platform_attributes_do_not_leak_unconsumed_keys() {
         // 只发有消费方的键：空属性只会让快照变大，还会让人以为已经采了。
-        let allowed = ["os.type", "os.name", "os.version"];
+        let allowed = ["os.type", "os.name", "os.version", "host.arch"];
         for key in platform_attributes().keys() {
             assert!(allowed.contains(&key.as_str()), "未预期的属性: {key}");
         }
