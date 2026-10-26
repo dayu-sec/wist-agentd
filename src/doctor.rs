@@ -305,11 +305,19 @@ async fn diagnose(config_root: &Path, offline: bool) -> Report {
             "控制面与数据面是否可达**未验证**",
         ));
         // 网络相关的跳过，但**本地就能得出的结论不该跟着丢**：生效输出 / spool 积压 / 本地工作。
-        checks.extend(uplink_local_checks(&config, None, true).await);
+        checks.extend(uplink_local_checks(&config, None, true, None).await);
     } else {
         let (network_checks, grant) = network_checks(&config).await;
         checks.extend(network_checks);
-        checks.extend(uplink_local_checks(&config, grant.as_ref(), false).await);
+        // 快照周期的主来源是控制面（按机器设）。诊断要多问一次，否则页面显示“已关闭”时
+        // 分不清是网关下发的还是本机配置的（而处置完全相反）。
+        let snapshot_grant =
+            crate::control::discovery_snapshot::fetch_discovery_snapshot(&config, None)
+                .await
+                .grant();
+        checks.extend(
+            uplink_local_checks(&config, grant.as_ref(), false, snapshot_grant.as_ref()).await,
+        );
         checks.extend(uplink_target_check(&config, grant.as_ref()).await);
     }
 
@@ -1072,6 +1080,7 @@ async fn uplink_local_checks(
     config: &AgentConfig,
     grant: Option<&AgentUplinkGrant>,
     offline: bool,
+    snapshot_grant: Option<&wist_api::discovery_snapshot::DiscoverySnapshotGrant>,
 ) -> Vec<Check> {
     let mut checks = Vec::new();
     let effective = effective_output(config, grant);
@@ -1124,9 +1133,61 @@ async fn uplink_local_checks(
         )),
     }
 
+    checks.push(snapshot_uplink_check(config, grant, snapshot_grant));
     checks.push(spool_check(config).await);
     checks.push(local_work_check(config).await);
     checks
+}
+
+/// 原文快照（DSNAP）上送：开关 + 实际周期 + 来源 + 生效输出。
+///
+/// 不探网络（`--offline` 也要报）：四项都是本机可得的结论。
+///
+/// 为什么专门有一项：0.9.11 现场「发布后一帧 DSNAP 都没回来」时，diagnose 报「20 项正常」——
+/// 因为诊断里**根本没有发现/快照相关的项**，而根因只是配置里没有 `snapshot_uplink_enabled`
+/// （旧配置没这个键，默认关），进程日志也一行都不提。
+///
+/// 现在多一个来源维度：周期可能由**控制面下发**（gateway-web 按机器设）。
+/// 这种情况改本机 `agentd.toml` 是无效的，提示里必须说出来 —— 否则运维会反复改一份不生效的文件。
+fn snapshot_uplink_check(
+    config: &AgentConfig,
+    grant: Option<&AgentUplinkGrant>,
+    snapshot_grant: Option<&wist_api::discovery_snapshot::DiscoverySnapshotGrant>,
+) -> Check {
+    let policy = crate::control::discovery_snapshot::effective_policy(config, snapshot_grant);
+    let output = effective_output(config, grant);
+    let detail = format!(
+        "enabled={} interval_seconds={} source={} output.enabled={} output.kind={}",
+        policy.enabled, policy.interval_seconds, policy.source, output.enabled, output.kind
+    );
+
+    if !policy.enabled {
+        return Check::warn(
+            "discovery.snapshot_uplink",
+            "原文快照上送已关闭",
+            format!("{detail}；关掉后中心拿不到资产清单（进程 / 端口 / 容器明细），只剩事实摘要"),
+        )
+        .hint(if policy.source == "control_plane" {
+            "这是**控制面下发**的设置：到管理面（gateway-web）的「原文快照上送」里改；\
+             改本机 agentd.toml 不会生效"
+        } else {
+            "需要资产清单就在 [discovery] 里写 `snapshot_uplink_enabled = true`\
+             （默认 3600s 一帧，约 100 KB/帧），改完重启守护进程"
+        });
+    }
+
+    if output.enabled && output.kind == "tcp" {
+        return Check::ok("discovery.snapshot_uplink", "原文快照上送已生效", detail);
+    }
+    Check::warn(
+        "discovery.snapshot_uplink",
+        "原文快照上送已开启，但输出不是已启用的 tcp",
+        format!("{detail}；此状态下不发快照（开关开了也没用）"),
+    )
+    .hint(
+        "输出由控制面 `uplink:poll` 授权决定：确认网关侧「数据面上送」开关与目标地址；\
+         待命（enabled=false）或 kind=file 都不会发 DSNAP",
+    )
 }
 
 /// 数据面目标可达性（需要网络）：只有「生效输出是 tcp 且给了目标」时才探。
@@ -2480,7 +2541,7 @@ mod tests {
         let config = template_config();
         let grant = AgentUplinkGrant::standby("2026-10-01T00:00:00Z".to_string());
 
-        let checks = uplink_local_checks(&config, Some(&grant), false).await;
+        let checks = uplink_local_checks(&config, Some(&grant), false, None).await;
         let standby = checks
             .iter()
             .find(|check| check.id == "uplink.effective")
@@ -2506,6 +2567,85 @@ mod tests {
             !standby.detail.contains("网关侧没有可用的数据面上送地址"),
             "{}",
             standby.detail
+        );
+    }
+
+    /// 0.9.11 现场：旧配置里没有这个键 → 默认关 → 一帧不发，而 diagnose 报了「20 项正常」。
+    /// 现在三种状态都必须**显式**报出来，不得静默。
+    #[test]
+    fn snapshot_uplink_reports_disabled_instead_of_staying_silent() {
+        let mut config = template_config();
+        config.discovery.snapshot_uplink_enabled = false;
+
+        let check = snapshot_uplink_check(&config, None, None);
+        assert_eq!(check.id, "discovery.snapshot_uplink");
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.title.contains("已关闭"), "{check:?}");
+        assert!(check.detail.contains("enabled=false"), "{check:?}");
+        assert!(
+            check
+                .hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("snapshot_uplink_enabled = true"),
+            "要告诉运维怎么打开"
+        );
+    }
+
+    #[test]
+    fn snapshot_uplink_reports_enabled_but_non_tcp_output() {
+        let mut config = template_config();
+        config.discovery.snapshot_uplink_enabled = true;
+        config.telemetry.logs.output.enabled = true;
+        config.telemetry.logs.output.kind = "file".to_string();
+
+        let check = snapshot_uplink_check(&config, None, None);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.title.contains("tcp"), "{check:?}");
+        assert!(check.detail.contains("kind=file"), "{check:?}");
+    }
+
+    #[test]
+    fn snapshot_uplink_is_ok_when_output_is_tcp_and_granted() {
+        let mut config = template_config();
+        config.discovery.snapshot_uplink_enabled = true;
+        // 低于下限的配置要按**实际生效值**报出来（60s），否则现场会以为仍是 30s。
+        config.discovery.snapshot_uplink_interval_seconds = 30;
+        let grant = AgentUplinkGrant::enabled_at(
+            "c-001.example".to_string(),
+            9000,
+            "2026-10-26T00:00:00Z".to_string(),
+        );
+
+        let check = snapshot_uplink_check(&config, Some(&grant), None);
+        assert_eq!(check.status, Status::Ok);
+        assert!(check.detail.contains("interval_seconds=60"), "{check:?}");
+        assert!(check.detail.contains("source=local_config"), "{check:?}");
+    }
+
+    /// 控制面下发优先级高于本机配置；此时提示必须指向管理面（改本机文件无效）。
+    #[test]
+    fn snapshot_uplink_prefers_the_control_plane_setting() {
+        let mut config = template_config();
+        config.discovery.snapshot_uplink_enabled = true;
+        config.discovery.snapshot_uplink_interval_seconds = 3600;
+        config.telemetry.logs.output.enabled = true;
+        config.telemetry.logs.output.kind = "tcp".to_string();
+        let grant = wist_api::discovery_snapshot::DiscoverySnapshotGrant {
+            enabled: false,
+            interval_seconds: 300,
+            source: "agent".to_string(),
+            granted_at: "2026-10-26T00:00:00Z".to_string(),
+        };
+
+        let check = snapshot_uplink_check(&config, None, Some(&grant));
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("source=control_plane"), "{check:?}");
+        assert!(check.detail.contains("interval_seconds=300"), "{check:?}");
+        let hint = check.hint.as_deref().expect("hint");
+        assert!(
+            hint.contains("管理面"),
+            "控制面下发时改本机无效，提示必须指对地方：{hint}"
         );
     }
 

@@ -13,8 +13,14 @@ use crate::service::{
     self, ServiceCommand, ServiceCommandOutcome, ServiceLayout, ServicePlatform, ServiceSpec,
 };
 use crate::state_store;
+use wist_shared::time::now_ts_ms;
 
 const CONFIG_DIR: &str = "wist-agentd";
+/// `refresh-facts` 默认等多久（秒）。一个 tick 是 3s，加上强拉策略（最坏 5s）与全量探针；
+/// 15s 能盖住正常路径，等不到就如实说「守护进程可能没在跑」。
+const REFRESH_FACTS_DEFAULT_WAIT_SECS: u64 = 15;
+/// `--wait` 的上限（秒）：全量重采本身可能很慢，不要让人写出一个卡一整天的等待。
+const REFRESH_FACTS_MAX_WAIT_SECS: u64 = 120;
 
 pub(crate) async fn run() -> AgentdResult<i32> {
     let root =
@@ -36,6 +42,12 @@ enum Command {
     Doctor {
         json: bool,
         offline: bool,
+    },
+    /// 手动「重采 + 重报」：写请求文件，守护进程下一个 tick 全量重采并立即上报事实。
+    ///
+    /// `wait_secs = 0` 不等待结果（只入队）；否则轮询结果文件最多这么久。
+    RefreshFacts {
+        wait_secs: u64,
     },
 }
 
@@ -133,6 +145,9 @@ where
                 None => default_config_root(),
             };
             crate::doctor::run(&config_root, json, offline).await
+        }
+        Command::RefreshFacts { wait_secs } => {
+            run_refresh_facts(root, parsed.config_dir.as_deref(), wait_secs).await
         }
     }
 }
@@ -263,6 +278,58 @@ where
             index += 1;
             continue;
         }
+        if arg == "refresh-facts" {
+            if command_explicit {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "multiple commands are not supported",
+                ));
+            }
+            command = Command::RefreshFacts {
+                wait_secs: REFRESH_FACTS_DEFAULT_WAIT_SECS,
+            };
+            command_explicit = true;
+            index += 1;
+            continue;
+        }
+        if arg == "--no-wait" {
+            match &mut command {
+                Command::RefreshFacts { wait_secs } => {
+                    *wait_secs = 0;
+                    index += 1;
+                    continue;
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--no-wait is only supported with refresh-facts",
+                    ));
+                }
+            }
+        }
+        if arg == "--wait" {
+            match &mut command {
+                Command::RefreshFacts { wait_secs } => {
+                    let value = option_value(&args, index + 1, "--wait")?;
+                    let parsed = value.to_str().and_then(|text| text.parse::<u64>().ok());
+                    let Some(seconds) = parsed else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "--wait needs a non-negative integer number of seconds",
+                        ));
+                    };
+                    *wait_secs = seconds.min(REFRESH_FACTS_MAX_WAIT_SECS);
+                    index += 2;
+                    continue;
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--wait is only supported with refresh-facts",
+                    ));
+                }
+            }
+        }
         if arg == "--json" {
             match &mut command {
                 Command::Doctor { json, .. } => {
@@ -304,7 +371,7 @@ where
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "unknown argument or command: {display}{suggestion} (supported: help | version | init-config [--stdout] | service <print|install|uninstall|status> | enroll | diagnose [--json] [--offline] | --config-dir <path>)",
+                "unknown argument or command: {display}{suggestion} (supported: help | version | init-config [--stdout] | service <print|install|uninstall|status> | enroll | diagnose [--json] [--offline] | refresh-facts [--wait <secs> | --no-wait] | --config-dir <path>)",
             ),
         ));
     }
@@ -327,6 +394,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "service",
     "enroll",
     "diagnose",
+    "refresh-facts",
 ];
 
 /// 拼错的子命令 → 最接近的那个（简单的编辑距离，够用且不引新依赖）。
@@ -407,6 +475,8 @@ fn looks_like_option(value: &OsString) -> bool {
                 | "--no-activate"
                 | "--json"
                 | "--offline"
+                | "--wait"
+                | "--no-wait"
         )
     })
 }
@@ -688,6 +758,131 @@ async fn run_daemon(root: PathBuf, config_dir: Option<&Path>) -> AgentdResult<()
 
     daemon::run_forever_async(loop_ctx).await?;
     Ok(())
+}
+
+/// 执行 `refresh-facts`：投递一次「重采 + 重报」请求，并按需等守护进程给出结果。
+///
+/// 为什么用请求文件而不是直接跑一次扫描：
+///   * 单实例锁（`flock`）保证同一数据 home 只有一个守护进程，另起一个进程拿不到锁；
+///   * 探针/策略的「上次运行时刻」在守护进程内存里，外部进程发不出真实的「全量重采」；
+///   * 守护进程没有入站监听面，写文件是唯一不需要动控制面契约的通道。
+async fn run_refresh_facts(
+    root: PathBuf,
+    config_dir: Option<&Path>,
+    wait_secs: u64,
+) -> AgentdResult<i32> {
+    let config_root = match config_dir {
+        Some(path) => resolve_config_dir_arg(&root, path),
+        None => default_config_root(),
+    };
+    // 与守护进程读同一份配置：state 目录必须一致，否则请求落在一个没人看的目录里。
+    // 这里**不**顺手初始化配置：一个「投递请求」的命令不该在 /etc 下凭空建文件。
+    let config_path = crate::config_runtime::resolve_config_path(&config_root);
+    if tokio::fs::metadata(&config_path).await.is_err() {
+        return Err(AgentdReason::InvalidArgs.to_err().with_detail(format!(
+            "no agentd config at {} (run `wist-agentd init-config --config-dir <path>` first)",
+            config_path.display()
+        )));
+    }
+    let config = crate::config_runtime::load_from_path_async(&config_path)
+        .await
+        .conv_err()?;
+    let state_dir = PathBuf::from(&config.paths.state_dir);
+
+    let now_ms = now_ts_ms();
+    let command = wist_api::status::AgentCommand {
+        command_id: format!("local_refresh_{now_ms}"),
+        requested_at_ms: now_ms,
+        kind: wist_api::status::command_kind::REFRESH_FACTS.to_string(),
+        params: String::new(),
+    };
+    let command = match state_store::commands::submit_request_async(&state_dir, &command)
+        .await
+        .source_err(AgentdReason::system_error(), "queue command")?
+    {
+        state_store::commands::SubmitOutcome::Queued => {
+            println!(
+                "command queued: command_id={} file={}",
+                command.command_id,
+                state_store::commands::request_path(&state_dir).display()
+            );
+            command
+        }
+        // 请求文件是单槽：已有一条还没被守护进程取走。覆盖它会让那条命令的 id
+        // 永远不会出现在台账里（正在等它的人要白等 15s），所以等**先到的那条**。
+        state_store::commands::SubmitOutcome::AlreadyPending(pending) => {
+            println!(
+                "a refresh request is already queued: command_id={} (not queueing another)",
+                pending.command_id
+            );
+            pending
+        }
+    };
+
+    if wait_secs == 0 {
+        println!("not waiting: the daemon applies it on its next tick (<=3s)");
+        return Ok(0);
+    }
+    println!("waiting up to {wait_secs}s for the daemon to apply it...");
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+    loop {
+        match state_store::commands::load_history_async(&state_dir).await {
+            Ok(history) => {
+                if let Some(record) = history.find(&command.command_id) {
+                    print_command_result(record);
+                    return Ok(command_exit_code(&record.outcome));
+                }
+            }
+            Err(err) => eprintln!("warning: failed to read the command ledger: {err}"),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            println!(
+                "timed out after {wait_secs}s: the daemon may not be running, or the tick is blocked; \
+                 the request stays queued and will run if the daemon starts within 10 minutes"
+            );
+            return Ok(1);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+fn print_command_result(result: &state_store::commands::CommandRecord) {
+    let detail = if result.detail.is_empty() {
+        String::new()
+    } else {
+        format!(" detail={}", result.detail)
+    };
+    match result.outcome.as_str() {
+        wist_api::status::command_outcome::SUCCEEDED => {
+            println!("fact refresh done: fact summary reported to the data plane{detail}")
+        }
+        wist_api::status::command_outcome::FAILED => {
+            println!("fact refresh done, but the fact summary was NOT reported{detail}")
+        }
+        wist_api::status::command_outcome::NO_UPLINK => println!(
+            "fact refresh done, but facts cannot be sent: no TCP data-plane uplink \
+             (check [telemetry.logs.output] / the uplink address){detail}"
+        ),
+        wist_api::status::command_outcome::THROTTLED => {
+            println!("ignored: a manual refresh ran too recently{detail}")
+        }
+        wist_api::status::command_outcome::STALE => {
+            println!("not executed: the command was too old{detail}")
+        }
+        wist_api::status::command_outcome::UNSUPPORTED => {
+            println!("not executed: this agentd does not implement the command kind{detail}")
+        }
+        other => println!("unknown outcome {other}{detail}"),
+    }
+}
+
+fn command_exit_code(outcome: &str) -> i32 {
+    if outcome == wist_api::status::command_outcome::SUCCEEDED {
+        0
+    } else {
+        1
+    }
 }
 
 /// 执行 `enroll` 子命令：用一次性 token 注册，token 不落盘。
@@ -1113,6 +1308,7 @@ fn usage_message() -> &'static str {
         "  wist-agentd service print --for <systemd|launchd>   (render for another platform)\n",
         "  wist-agentd enroll [--token <token> | --token-stdin] [--config-dir <path>]\n",
         "  wist-agentd diagnose [--json] [--offline] [--config-dir <path>]\n",
+        "  wist-agentd refresh-facts [--wait <secs> | --no-wait] [--config-dir <path>]\n",
         "\n",
         "Commands:\n",
         "  help                 Show this help message.\n",
@@ -1126,6 +1322,12 @@ fn usage_message() -> &'static str {
         "  enroll               Enroll with a one-time token; the token is never written to disk.\n",
         "  diagnose             Diagnose this host: config / identity / service / connectivity / uplink.\n",
         "                       Exits nonzero when anything FAILs, so scripts can gate on it.\n",
+        "  refresh-facts        Force a full discovery refresh and report the fact summary now\n",
+        "                       (the daemon normally reports it at most once per 5 minutes).\n",
+        "\n",
+        "Refresh-facts options:\n",
+        "  --wait <secs>        Wait up to <secs> for the daemon to finish (default 15, max 120).\n",
+        "  --no-wait            Only queue the request; print where it was written and exit.\n",
         "\n",
         "Service options (Linux uses systemd, macOS uses launchd):\n",
         "  --bin <path>         Installed path of the wist-agentd binary (default: current executable).\n",

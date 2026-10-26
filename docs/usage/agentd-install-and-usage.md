@@ -500,6 +500,77 @@ sudo wist-agentd service uninstall    # 停止 + 删定义
 
 `uninstall` 只删服务定义，**不会**删除配置、state、日志，这是有意的。
 
+### 7.5 手动重采 + 重报（现场加速授权）
+
+事实摘要默认**最多 5 分钟一次**（`FACT_REPORT_MIN_INTERVAL_MS`），发现本身又是 300s/900s 的慢变量；
+所以网关侧「用途判定 / 端口 / 路径」这几类事实可能比现场变化晚几分钟。要立刻刷新一次：
+
+```bash
+sudo wist-agentd refresh-facts            # 等最多 15s，打印结果
+sudo wist-agentd refresh-facts --wait 30  # 重采较慢时多等一会（上限 120s）
+sudo wist-agentd refresh-facts --no-wait  # 只入队，不等结果
+```
+
+也可以由**网关主动发起**（管理面 / 脚本）：
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  https://<gateway>/api/v1/admin/agents/<agent_id>/fact-refresh
+curl -H "Authorization: Bearer $ADMIN_TOKEN" \
+  https://<gateway>/api/v1/admin/agents/<agent_id>/fact-refresh   # 看结果
+```
+
+命令搭在 agentd 每 3s 的**状态上报回执**里（≤3s 到达），不需要给 agent 加入站监听；
+执行完后 agentd 在下次上报里用 `command_acks` 回传结果。未确认前网关会重发同一条，
+agentd 按 `command_id`（本地台账）去重，不会重复跑。本机命令适合现场排障，网关命令适合管理面 / 批量操作。
+
+网关侧的两个额外结果（只在管理面 `GET` 里看得到，agent 不会回这两个值）：
+
+- `superseded` —— 又点了一次，旧命令被同 kind 的新命令覆盖，**没执行**；
+- `expired` —— 命令超过 **1 小时**仍没被确认（旧 agentd 不解析回执 / 机器长期离线），
+  网关不再下发。`expired` 与 agent 的 `stale`（10 分钟）是两件事：前者是网关放弃，
+  后者是 agent 拿到时已经太旧。
+
+本机 `refresh-facts` 与网关命令走的是**同一个通用命令通道**：`kind = refresh_facts`，
+请求/结果落 `state/command.request.json` / `state/command_history.json`（台账保留最近 64 条）。
+以后新增命令只需加一个 kind 分支。
+
+注意：网关命令**同样受 60s 最小间隔**。如果本地刚跑过（或点了两次），命令会被节流 —— 它照样
+会回传 `throttled`，过一分钟再发一次即可；网关侧不会一直重发（1 小时后标 `expired`）。
+
+本机入口的请求文件是**单槽**的：已经有一条还没被守护进程取走时，再跑一次不会覆盖它，
+而是打印 `a refresh request is already queued: command_id=...` 并（带 `--wait` 时）等**先到的那条**的结果。
+覆盖会丢掉前一条的 `command_id`，正在等它的人将永远等不到台账结果。
+
+它做三件事（不是只把旧快照重发一遍）：
+
+1. **强制拉一次发现策略**（绕过 5 分钟间隔）—— 目录里新加的 `path_exists:` 路径只有随策略表下发后才会被探测；
+2. **全量重采**所有发现探针（进程 / 端口 / 容器 / k8s / host / network）；
+3. **绕过事实摘要的 5 分钟节流**，本轮立刻上报。
+
+结果与退出码：
+
+| outcome | 含义 | 退出码 |
+| --- | --- | --- |
+| `succeeded` | 重采完成，事实帧已发到数据面 | 0 |
+| `failed` | 重采完成，但事实上报失败 / 守护循环失败（`detail` 是原因） | 1 |
+| `no_uplink` | 本机输出不是 TCP（`file`），事实无处可去 | 1 |
+| `throttled` | 距上一次重采不足 60s，或本 tick 已接受一条 | 1 |
+| `stale` | 命令超过 10 分钟没被处理（守护进程当时没在跑） | 1 |
+| `unsupported` | 本机 agentd 不认识这种命令（旧版本遇到新命令） | 1 |
+
+几个边界：
+
+- 单台最小间隔 **60s**（`WIST_AGENTD_FACT_REFRESH_SECS` 可覆盖）：全量重采比常驻节拍贵，防止连点。
+- 单个探针失败时**沿用本进程上一次成功输出**并在结果里列出失败项（不会把「没采到」说成「采到了空的」；
+  刚重启、探针还没成功跑过一轮时没有这个兜底）。
+- 它**不**归档用途判定，也**不**能让「未就绪」的采集面变成可授权；它只解决「事实已经变了、还没送出去」。
+- 事实帧只有数据面 TCP 一条通道；`no_uplink` 时先查 `[telemetry.logs.output]` / 上送地址。
+
+日志：`event=CommandAccepted` / `event=CommandHandled` / `event=CommandDuplicate` /
+`event=FactRefreshCompleted`。请求与结果落在 `state/command.request.json` /
+`state/command_history.json`（台账保留最近 64 条，网关重发靠它去重）。
+
 ## 8. 验收清单
 
 一键验收（需要 root 的**一次性验收机**，会自动安装→断言→清理）：

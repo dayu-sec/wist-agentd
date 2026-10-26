@@ -5,6 +5,8 @@ pub mod enrollment;
 mod runtime_entry;
 // 数据面上送启用的拉取与应用（网关授予，agentd 侧生效）。
 pub mod uplink;
+// 原文快照上送周期（网关下发，可按机器不同；没下发时用本机 [discovery]）。
+pub mod discovery_snapshot;
 pub mod work;
 
 pub(crate) use runtime_entry::run;

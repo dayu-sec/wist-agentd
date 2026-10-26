@@ -262,15 +262,29 @@ impl DiscoveryRuntime {
                     }
                 },
             };
+            // 失败但沿用了上次成功输出：资源要留，但**不能**记成这一轮的成功。
+            let mut used_fallback = false;
             let output = if due {
-                self.last_run_at[index] = due_at;
+                // 记**真实**的运行时刻：`due_at = None`（按需全量重采）以前被写成 `None`，
+                // 下一轮的到期判定会把它当成「从没跑过」再全刷一遍 —— 手动重采就变成连续两次全量。
+                self.last_run_at[index] = Some(due_at.unwrap_or_else(Instant::now));
                 match self.probes[index].refresh(now) {
                     Ok(output) => {
                         // 只记**成功**的输出：失败的那一轮不该让旧结果被“刷新”了。
                         self.last_outputs[index] = Some(output.clone());
                         Ok(output)
                     }
-                    Err(err) => Err(err),
+                    // 按需全量重采：单个探针失败不能把这一类的资源从快照里抹掉 —— 否则紧接着
+                    // 强制重报时，网关会把「没采到」读成「采到了空的」。沿用本进程上次成功输出，
+                    // 并把这次失败照样记进 `errors`（页面上仍是 failed，只是资源是旧的）。
+                    Err(err) => match (due_at, self.last_outputs[index].clone()) {
+                        (None, Some(cached)) => {
+                            used_fallback = true;
+                            errors.push(err);
+                            Ok(cached)
+                        }
+                        _ => Err(err),
+                    },
                 }
             } else {
                 match self.last_outputs[index].clone() {
@@ -296,12 +310,14 @@ impl DiscoveryRuntime {
                     for target in &mut output.targets {
                         target.origin_idx = origin_idx;
                     }
-                    successful_probes.push(SuccessfulProbeRefresh {
-                        probe: output.probe.clone(),
-                        source: output.source,
-                        resource_count: output.resources.len(),
-                        target_count: output.targets.len(),
-                    });
+                    if !used_fallback {
+                        successful_probes.push(SuccessfulProbeRefresh {
+                            probe: output.probe.clone(),
+                            source: output.source,
+                            resource_count: output.resources.len(),
+                            target_count: output.targets.len(),
+                        });
+                    }
                     origins.push(output.origin);
                     resources.extend(output.resources);
                     targets.extend(output.targets);
@@ -416,7 +432,7 @@ impl DiscoveryRefreshResult {
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant, SystemTime};
     use std::{fs, path::PathBuf};
 
@@ -695,6 +711,60 @@ mod tests {
         )
     }
 
+    /// 可以通过外部开关变成失败的探针：用来验「按需重采时失败项沿用上次成功输出」。
+    struct FlakyProbe {
+        name: &'static str,
+        calls: Arc<AtomicUsize>,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl crate::discovery::DiscoveryProbe for FlakyProbe {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn source(&self) -> DiscoverySourceKind {
+            DiscoverySourceKind::LocalRuntime
+        }
+
+        fn refresh_interval(&self) -> Duration {
+            Duration::from_secs(3600)
+        }
+
+        fn refresh(&self, _now: SystemTime) -> Result<ProbeOutput, DiscoveryError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(crate::discovery::probe_failed(
+                    self.name,
+                    DiscoverySourceKind::LocalRuntime,
+                    "probe unavailable",
+                ));
+            }
+            Ok(ProbeOutput {
+                probe: self.name.to_string(),
+                source: DiscoverySourceKind::LocalRuntime,
+                refreshed_at: "2026-09-22T00:00:00Z".to_string(),
+                origin: DiscoveryOrigin {
+                    origin_id: format!("origin-{}", self.name),
+                    probe: self.name.to_string(),
+                    source: "local_runtime".to_string(),
+                    observed_at: "2026-09-22T00:00:00Z".to_string(),
+                },
+                resources: vec![DiscoveredResource {
+                    resource_id: format!("{}-1", self.name),
+                    kind: self.name.to_string(),
+                    origin_idx: 0,
+                    attributes: BTreeMap::new(),
+                    discovered_at: "2026-09-22T00:00:00Z".to_string(),
+                    last_seen_at: "2026-09-22T00:00:00Z".to_string(),
+                    health: "healthy".to_string(),
+                    source: self.name.to_string(),
+                }],
+                targets: Vec::new(),
+            })
+        }
+    }
+
     /// 构造一份只带周期的最小策略表（其余字段不是调度用的，填占位值即可）。
     fn policy_set(version: i64, intervals: &[(&str, i64)]) -> DiscoveryAspectPolicySet {
         bounded_policy_set(
@@ -872,6 +942,49 @@ mod tests {
 
         assert_eq!(fast_calls.load(Ordering::SeqCst), 2);
         assert_eq!(slow_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn refresh_all_records_run_times_so_the_next_due_tick_does_not_repeat_it() {
+        // 手动「重采」在常驻循环里跑：全量刷新之后，下一轮的周期调度不该再全刷一遍。
+        let (probe, calls) = interval_probe("fast", Duration::from_secs(3600));
+        let mut runtime = DiscoveryRuntime::new(vec![probe]);
+
+        runtime.refresh_all();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        runtime.refresh_due(Instant::now());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "全量刷新要记真实运行时刻，不能把 last_run_at 写成 None"
+        );
+    }
+
+    #[test]
+    fn full_refresh_keeps_the_last_successful_output_when_a_probe_fails() {
+        // 按需全量重采：失败的那一项沿用上次成功输出，不能让它那一类资源从快照里消失。
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fail = Arc::new(AtomicBool::new(false));
+        let mut runtime = DiscoveryRuntime::new(vec![Box::new(FlakyProbe {
+            name: "flaky",
+            calls: Arc::clone(&calls),
+            fail: Arc::clone(&fail),
+        })]);
+
+        let first = runtime.refresh_all();
+        assert!(first.errors.is_empty());
+        assert_eq!(resource_ids(&runtime), vec!["flaky-1"]);
+
+        fail.store(true, Ordering::SeqCst);
+        let second = runtime.refresh_all();
+        assert_eq!(second.errors.len(), 1);
+        assert_eq!(
+            resource_ids(&runtime),
+            vec!["flaky-1"],
+            "失败项要沿用上次成功输出，否则紧接着的重报会把「没采到」说成「空的」"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

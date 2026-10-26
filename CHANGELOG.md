@@ -3,7 +3,67 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布]
+## [0.9.12-alpha] - 2026-10-26
+
+### 新增（通用的一次性命令通道）
+
+- **统一入口**：网关下发的命令（状态回执 `AgentStatusAck.commands`）与本机 `refresh-facts` CLI
+  共用一份**命令台账**（`state/command_history.json`）和一条执行路径。新增一种命令只需加一个
+  `kind` 分支，不再新增通道 / 去重 / 结果格式。
+- 每条命令带 `command_id`：已处理过的（网关重发、重启后重发）只补结果，不再执行；结果在下一次
+  状态上报的 `command_acks` 里回传（`succeeded` / `failed` / `no_uplink` / `throttled` / `stale` /
+  `unsupported`），上报成功才清。
+- 首个命令 `refresh_facts`：强制拉一次发现策略 → **全量重采**所有探针 → **绕过事实摘要的 5 分钟
+  节流**立即上报。本机入口 `wist-agentd refresh-facts`（`--wait <secs>` / `--no-wait`）。
+- 单台最小间隔 60s（`WIST_AGENTD_FACT_REFRESH_SECS` 可覆盖）；命令超过 10 分钟才拿到则判 `stale`。
+- 本机请求文件是**单槽**的：已有一条未被拾取的请求时，新的 `refresh-facts` 不覆盖它，
+  而是等**先到的那条**的台账结果（覆盖会丢掉前一条的 `command_id`，等它的人会白白超时）。
+- 按需全量重采时，**单个探针失败沿用上次成功输出**（并在 detail 里列出失败项），避免紧接着的重报把
+  「没采到」写成「采到了空的」；同时修正全量刷新后 `last_run_at` 被写成 `None`、导致下一轮又全刷一遍的问题。
+- 日志：`CommandAccepted` / `CommandHandled` / `CommandDuplicate` / `FactRefreshCompleted`；
+  请求/台账读不出或写不回时另有 `CommandRequestUnreadable` / `CommandHistoryUnreadable` /
+  `CommandHistoryStoreFailed`（都是 warn，不影响下一轮）。
+
+### 升级提示（命令通道）
+
+- 依赖 `wist-api` 的 `AgentCommand` / `AgentCommandAck`（`AgentStatusAck.commands` /
+  `AgentStatusReport.command_acks`）。**网关必须先升级**：旧网关的 `AgentStatusReport` 是
+  `deny_unknown_fields`，收到带 `command_acks` 的报文会整份 400。没有结果时 agentd 不发该字段，
+  所以本机 `refresh-facts` 这条路径可以先上。
+
+### 变更（原文快照默认开启，默认 1 小时一帧）
+
+- `[discovery] snapshot_uplink_enabled` 默认从 **关** 改为 **开**：资产清单（进程 / 端口 / 容器明细）
+  只有原文快照里有，默认关等于中心看不到资产。**升级后旧配置（没有这个键）会开始上报**；
+  显式写了 `false` 的保持不变。
+- `snapshot_uplink_interval_seconds` 默认从 `300` 改为 `3600`（1 小时）。实测一台 117 资源的机器
+  一帧约 114 KB：1 小时一帧 ≈ 2.7 MB/天，5 分钟一帧 ≈ 33 MB/天。
+  周期是**本机配置**，不同机器可以不同（关键主机 300~900，容器密集的 1800~3600）；低于 60s 仍夹到 60s。
+- 新建配置模板直接写出这两项（而不是注释掉），让「发不发、多久发」一眼可见。
+
+### 新增（可观测性：不再「静默不发」）
+
+- **周期改由控制面下发**（`agent/discovery-snapshot:poll`，管理面 web 按机器设）：
+  优先级 **单机覆盖 > 全局设置 > 本机 `[discovery]`**。网关没有设置时回 `204`，继续用本机配置 ——
+  本机配置仍是离线 / 旧网关 / 未入网时唯一的来源。旧网关没有这个端点（404）同样静默回落，
+  不会每 30s 刷一行 failed。
+- 网关**撤销**设置时会把已下发的值清掉并回落本机配置（否则会一直沿用旧周期）。
+- 启动行 `event=DiscoverySnapshotUplinkConfigured ... source=local_config` 说明本机值；
+  控制面值到达/变化时另打 `event=DiscoverySnapshotPolicyApplied/ Cleared`。
+
+- 启动时打一行 `event=DiscoverySnapshotUplinkConfigured enabled=... interval_seconds=...`：
+  关闭时明说关闭及后果。此前「配置里没有这个键 → 默认关」在日志里**一行都没有**，
+  现场表现为「采集一切正常、数据面一帧都没有」。
+- `diagnose` 新增 `discovery.snapshot_uplink` 检查，四种状态都报：
+  已关闭（warn，附开启方法）/ 已开启但输出不是已启用的 tcp（warn，说明开关开了也不发）/ 已生效（ok，
+  报实际周期与 `source`）。来源是 `control_plane` 时提示会**明确说改本机 toml 无效**。
+  此前诊断里**没有任何发现/快照项**，所以故障时它报「全部正常」。
+
+### 备注
+
+- 失败语义不变：到点就发，失败只 warn 一行，等下一个整周期（不做秒级重试，也不堆积 spool）。
+- 数据面 `agent-dsnap.jsonl` 仍无内置轮转：默认 1 小时后写入量降为原来的 1/12，
+  但长期运行仍需按大小/天轮转（数据面侧配置，不在本仓）。
 
 ## [0.9.11-alpha] - 2026-10-25
 

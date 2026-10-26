@@ -1,6 +1,6 @@
 [package]
 name = "wist-agentd"
-version = "0.9.11" #@gxl:set(version)
+version = "0.9.12" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -75,3 +75,4 @@ sha2 = "0.10"
 # `[patch]` 放在这里（而不是逐条改依赖行），是为了让 api/metrics/validate 也解析到本地版本。
 # [patch.crates-io]
 # wist-contracts = { path = "../wist-contracts" }
+

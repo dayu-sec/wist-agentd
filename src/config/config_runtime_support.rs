@@ -38,10 +38,12 @@ network_enabled = true
 endpoint_enabled = true
 process_enabled = true
 container_enabled = true
-# 原文发现快照（DSNAP 帧）上送：默认关；打开后按周期把完整快照送到数据面。
-# 低于 60s 会被夹到 60s。
-# snapshot_uplink_enabled = false
-# snapshot_uplink_interval_seconds = 300
+# 原文发现快照（DSNAP 帧）上送：送到数据面，由中心侧资产目录（wist-atlas）消费。
+# 默认开、1 小时一帧（一台 100 资源的机器约 100 KB/帧 ≈ 2.7 MB/天）。
+# 按机器调整：资产变化快的关键主机 300~900，容器/进程密集的机器 1800~3600。
+# 低于 60s 会被夹到 60s；不需要资产清单就写 false。
+snapshot_uplink_enabled = true
+snapshot_uplink_interval_seconds = 3600
 
 # 可选：
 # [agent]

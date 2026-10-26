@@ -11,7 +11,10 @@ use wist_api::discovery_policies::{
     DiscoveryPoliciesReturned, POLL_DISCOVERY_POLICIES_KIND, PollDiscoveryPolicies,
 };
 use wist_api::facts::ReportAgentFactSummary;
-use wist_api::status::{AgentStatusReport, AgentWorkState, AgentWorkStateChange};
+use wist_api::status::{
+    AgentCommand, AgentCommandAck, AgentStatusAck, AgentStatusReport, AgentWorkState,
+    AgentWorkStateChange, command_kind, command_outcome,
+};
 use wist_contracts::agent_uplink::AgentUplinkState;
 use wist_contracts::capability_report::LogsCapabilities;
 use wist_contracts::discovery::DiscoverySnapshot;
@@ -31,6 +34,9 @@ use crate::enrollment::enrollment_http_client;
 
 use crate::error::RuntimeResult;
 
+use crate::control::discovery_snapshot::{
+    AppliedSnapshotPolicy, SnapshotEvent, effective_policy, fetch_discovery_snapshot,
+};
 use crate::control::enrollment::terminal_auth_advice;
 use crate::control::uplink::{AppliedUplink, UplinkFetch, fetch_uplink_grant};
 use crate::control::work::{AppliedWorkGrant, ack_work, fetch_work_grant, report_work_result};
@@ -52,8 +58,8 @@ use crate::self_observability::{
     RuntimeHealthSnapshot, emit,
 };
 use crate::state_store::{
-    agent_runtime, auth_terminal, execution_queue, fact_report, log_seq_state, planner_candidates,
-    work,
+    agent_runtime, auth_terminal, commands, execution_queue, fact_report, log_seq_state,
+    planner_candidates, work,
 };
 use crate::telemetry::metrics::target_view;
 
@@ -143,6 +149,56 @@ const DISCOVERY_POLICY_FETCH_MIN_INTERVAL: Duration =
 ///
 /// 与事实摘要同理：它在主循环里排在采集之前，必须自己封顶，不能吃掉 tick。
 const DISCOVERY_POLICY_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 「重采 + 重报」命令的最小间隔。
+///
+/// 触发会跑一遍**全量**发现（进程枚举 / 端口 / 容器 / k8s），比常驻节拍（逐项 300~900s）贵得多。
+/// 60s 足够挡住手滑连点，又不至于让运维觉得「点了没反应」。
+const REFRESH_FACTS_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// 重采命令最小间隔的环境覆盖（秒）。
+///
+/// 与 `TERMINAL_RETRY_ENV` 同一模式：生产值是 60s，而「连点被节流」这类路径要能测。
+pub const FACT_REFRESH_ENV: &str = "WIST_AGENTD_FACT_REFRESH_SECS";
+
+/// 命令的**过期**窗口（毫秒）：网关下发后很久才被拿到（守护进程没跑 / 被阻塞）就不执行。
+///
+/// 对所有 kind 生效：命令是“立刻做一次”的，隔了 10 分钟再做已经没意义了。
+const COMMAND_STALE_MS: i64 = 10 * 60 * 1000;
+
+/// 生效的重采最小间隔：未设置 / 非法值 → 默认 `REFRESH_FACTS_MIN_INTERVAL`。
+pub(crate) fn refresh_facts_min_interval() -> Duration {
+    match std::env::var(FACT_REFRESH_ENV)
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        None | Some("") => REFRESH_FACTS_MIN_INTERVAL,
+        Some(text) => text
+            .parse::<u64>()
+            .map(Duration::from_secs)
+            .unwrap_or(REFRESH_FACTS_MIN_INTERVAL),
+    }
+}
+
+/// 一次强制事实上报的落地结果（只在手动「重采 + 重报」时产出）。
+#[derive(Debug, Default)]
+pub(crate) struct FactReportAttempt {
+    /// 事实帧有没有被**尝试**发出（本机是 `file` 输出时为 `false`）。
+    attempted: bool,
+    /// 真正写进数据面成功。
+    reported: bool,
+    /// 尝试过但失败了。
+    error: Option<String>,
+}
+
+/// 一次事实摘要发送的结果。
+enum FactSendOutcome {
+    /// 没发：`file` 输出承载不了事实帧，或还在节流窗口内。
+    Skipped,
+    Reported,
+    Failed(String),
+}
 
 /// 拉取**工作授权快照**的最小间隔。
 ///
@@ -419,6 +475,8 @@ struct StatusReportOutcome {
     latency_ms: Option<u64>,
     /// 需要运维介入时网关给的稳定 code（`unknown_credential` / `certificate_revoked` …）。
     terminal: Option<&'static str>,
+    /// 网关在回执里下发的一次性命令（没有则为空）。
+    commands: Vec<AgentCommand>,
 }
 
 impl StatusReportOutcome {
@@ -427,6 +485,7 @@ impl StatusReportOutcome {
         Self {
             latency_ms: None,
             terminal: None,
+            commands: Vec::new(),
         }
     }
 
@@ -434,6 +493,7 @@ impl StatusReportOutcome {
         Self {
             latency_ms: None,
             terminal: Some(code),
+            commands: Vec::new(),
         }
     }
 }
@@ -495,6 +555,8 @@ async fn report_status_to_control_plane(
     work: &AppliedWorkGrant,
     uplink: &AppliedUplink,
     uplink_health: &UplinkHealth,
+    // 本次要回传的一次性命令结果（空 = 没有要确认的命令）。
+    command_acks: &[AgentCommandAck],
     // 终态下的低频重试传 `true`：那次调用只为问一句「还认我吗」，失败**不打印**
     // （§4.2 的「失败静默」）——否则一台被拒的机器在网关宕机期间会每 5 分钟刷一行，
     // 而终态的初衷之一就是「不刷日志」。
@@ -536,6 +598,7 @@ async fn report_status_to_control_plane(
         // `EXPORTER_IDS` 与 `telemetry::exporters::EXPORTERS` 的一致性由单测钉住）。
         // 硬写一份名单会漂；从这里取，新增一种能力时自动跟上。
         logs_capabilities: Some(declared_logs_capabilities()),
+        command_acks: command_acks.to_vec(),
     };
     let client = match enrollment_http_client(config) {
         Ok(client) => client,
@@ -549,10 +612,22 @@ async fn report_status_to_control_plane(
     let url = format!("{}/api/v1/agent/status", endpoint.trim_end_matches('/'));
     let started = Instant::now();
     match client.post(&url).json(&report).send().await {
-        Ok(response) if response.status().is_success() => StatusReportOutcome {
-            latency_ms: Some(started.elapsed().as_millis() as u64),
-            terminal: None,
-        },
+        Ok(response) if response.status().is_success() => {
+            let latency_ms = Some(started.elapsed().as_millis() as u64);
+            // 回执里可能带一条「重采 + 重报」命令。解析失败不算上报失败（延迟已采到）：
+            // 下一轮还会重新下发同一条（网关只在 agent 确认后才清）。
+            let commands = response
+                .json::<AgentStatusAck>()
+                .await
+                .ok()
+                .map(|ack| ack.commands)
+                .unwrap_or_default();
+            StatusReportOutcome {
+                latency_ms,
+                terminal: None,
+                commands,
+            }
+        }
         Ok(response) => {
             let status = response.status();
             // 读正文才能把「需要停下的终态」从其它 401 里认出来（§5.4）。
@@ -646,6 +721,8 @@ async fn retry_terminal_probe(
         work,
         uplink,
         uplink_health,
+        // 终态重试只为问「还认我吗」，不回传任何命令结果。
+        &[],
         // 终态的「失败静默」：这条路径上所有非成功结果都不打日志。
         true,
     )
@@ -745,6 +822,9 @@ async fn enter_terminal_if_absent(
 /// **不做本地判重**：判重归网关（它从收到的内容自己重算摘要，判定 `accepted`/`duplicate`）。
 /// 这里只按最小间隔节流 —— agentd 必须**无条件周期全量**上送，否则本地算法或状态一退化
 /// 就会静默停报，而且没有任何一层能发现。多发一次的代价是流量，停报的代价是视图停滞。
+///
+/// 这个包装仅供测试（生产路径走 [`report_fact_summary_with`]）。
+#[cfg(test)]
 async fn report_fact_summary(
     sink: &mut TelemetryRecordSink,
     config: &AgentConfig,
@@ -752,6 +832,29 @@ async fn report_fact_summary(
     summary: &fact_summary::FactSummaryDraft,
     next_seq: &mut u64,
     global_seq_path: &Path,
+) -> RuntimeResult<bool> {
+    report_fact_summary_with(
+        sink,
+        config,
+        state_dir,
+        summary,
+        next_seq,
+        global_seq_path,
+        false,
+    )
+    .await
+}
+
+/// `force = true` 用于手动「重采 + 重报」：只绕过节流，**仍然照常记录本次尝试** —— 下一次
+/// 周期上报依旧从此刻起算 5 分钟，不会因为按了一次按钮就退化成每 tick 重发。
+async fn report_fact_summary_with(
+    sink: &mut TelemetryRecordSink,
+    config: &AgentConfig,
+    state_dir: &Path,
+    summary: &fact_summary::FactSummaryDraft,
+    next_seq: &mut u64,
+    global_seq_path: &Path,
+    force: bool,
 ) -> RuntimeResult<bool> {
     // 这里**不**再检查控制面端点与凭据：帧走的是数据面，身份校验尚未落地
     // （见计划 §9 风险行）。缺 agent_id 时仍然跳过 —— 它是信封里的自称。
@@ -774,9 +877,10 @@ async fn report_fact_summary(
         }
     };
     let now_ms = now_ts_ms();
-    if previous
-        .as_ref()
-        .is_some_and(|state| within_fact_report_min_interval(state.last_attempt_at_ms, now_ms))
+    if !force
+        && previous
+            .as_ref()
+            .is_some_and(|state| within_fact_report_min_interval(state.last_attempt_at_ms, now_ms))
     {
         return Ok(false);
     }
@@ -838,6 +942,7 @@ async fn report_fact_summary(
 ///
 /// 抽出来是因为两条路都要发它：**启用**时（与指标/日志同一轮）和**待命**时（只有它）——
 /// 「这台机器是什么」不需要授权就能决定该派什么活，见 `run_once_with_failure_cache`。
+#[allow(clippy::too_many_arguments)]
 async fn send_fact_summary(
     sink: &mut TelemetryRecordSink,
     config: &AgentConfig,
@@ -845,17 +950,194 @@ async fn send_fact_summary(
     summary: &fact_summary::FactSummaryDraft,
     next_seq: &mut u64,
     global_seq_path: &Path,
+    force: bool,
+) -> FactSendOutcome {
+    match report_fact_summary_with(
+        sink,
+        config,
+        state_dir,
+        summary,
+        next_seq,
+        global_seq_path,
+        force,
+    )
+    .await
+    {
+        Ok(true) => {
+            log::info!(
+                "event=FactSummaryReported digest={} processes={} executables={} ports={}",
+                summary.content_digest(),
+                summary.process_count,
+                summary.process_executables.len(),
+                summary.listen_ports.len()
+            );
+            FactSendOutcome::Reported
+        }
+        Ok(false) => FactSendOutcome::Skipped,
+        Err(err) => {
+            log::warn!("wist-agentd fact summary uplink failed: {err}");
+            FactSendOutcome::Failed(err.to_string())
+        }
+    }
+}
+
+/// 取一次**本机**命令（`refresh-facts` CLI 写的）；不存在返回 `None`。
+///
+/// 先删请求再处理：慢 tick、坏文件都不该让同一个请求被反复拾取。
+async fn take_local_command(state_dir: &Path) -> Option<AgentCommand> {
+    let command = match commands::read_request_async(state_dir).await {
+        Ok(Some(command)) => command,
+        Ok(None) => return None,
+        Err(err) => {
+            log::warn!("event=CommandRequestUnreadable detail=\"{err}\"");
+            if let Err(err) = commands::remove_request_async(state_dir).await {
+                log::warn!("event=CommandRequestCleanupFailed detail=\"{err}\"");
+            }
+            return None;
+        }
+    };
+    if let Err(err) = commands::remove_request_async(state_dir).await {
+        log::warn!("event=CommandRequestCleanupFailed detail=\"{err}\"");
+    }
+    Some(command)
+}
+
+/// 命令的来源：决定结果要不要回传给网关。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandSource {
+    Local,
+    Remote,
+}
+
+/// 一条命令的判定：执行，或直接回一个结果（不执行）。
+enum CommandVerdict {
+    /// 未知 kind：立刻回 `unsupported`（旧 agent 收到新命令不能把回执解析失败）。
+    Unsupported,
+    /// 过了 10 分钟窗口。
+    Stale,
+    /// 本 tick 已接受过一条重采，或距上次重采不足最小间隔。
+    Throttled,
+    /// 执行一次重采。
+    AcceptRefresh,
+}
+
+fn evaluate_command(
+    command: &AgentCommand,
+    refresh_accepted_this_tick: bool,
+    last_refresh: Option<Instant>,
+    min_interval: Duration,
+    now_ms: i64,
+) -> CommandVerdict {
+    if command.kind != command_kind::REFRESH_FACTS {
+        return CommandVerdict::Unsupported;
+    }
+    if now_ms.saturating_sub(command.requested_at_ms) > COMMAND_STALE_MS {
+        return CommandVerdict::Stale;
+    }
+    if refresh_accepted_this_tick || last_refresh.is_some_and(|at| at.elapsed() < min_interval) {
+        return CommandVerdict::Throttled;
+    }
+    CommandVerdict::AcceptRefresh
+}
+
+fn ack_from_record(record: &commands::CommandRecord) -> AgentCommandAck {
+    AgentCommandAck {
+        command_id: record.command_id.clone(),
+        outcome: record.outcome.clone(),
+        detail: record.detail.clone(),
+    }
+}
+
+/// 记录一条命令结果，并返回要回传给网关的 ack。
+fn record_command(
+    history: &mut commands::CommandHistory,
+    command: &AgentCommand,
+    outcome: &str,
+    detail: String,
+    now_ms: i64,
+) -> AgentCommandAck {
+    let record = commands::CommandRecord {
+        command_id: command.command_id.clone(),
+        kind: command.kind.clone(),
+        outcome: outcome.to_string(),
+        detail,
+        completed_at_ms: now_ms,
+    };
+    history.record(record.clone());
+    log::info!(
+        "event=CommandHandled command_id={} kind={} outcome={} detail=\"{}\"",
+        record.command_id,
+        record.kind,
+        record.outcome,
+        record.detail
+    );
+    ack_from_record(&record)
+}
+
+/// 一次重采的结果（`refresh_facts` 的判定细节，不属于命令队列本身）。
+fn refresh_facts_outcome(
+    snapshot: &RuntimeHealthSnapshot,
+    attempt: &FactReportAttempt,
+) -> (&'static str, String) {
+    let probe_failures: Vec<String> = snapshot
+        .discovery
+        .probes
+        .iter()
+        .filter(|probe| probe.status == "failed")
+        .map(|probe| match probe.error.as_deref() {
+            Some(detail) if !detail.is_empty() => format!("{}: {detail}", probe.probe),
+            _ => probe.probe.clone(),
+        })
+        .collect();
+    let outcome = if attempt.reported {
+        command_outcome::SUCCEEDED
+    } else if attempt.attempted || attempt.error.is_some() {
+        command_outcome::FAILED
+    } else {
+        // 重采做了，但本机输出承载不了事实帧（`file`）。这不是“重报成功”。
+        command_outcome::NO_UPLINK
+    };
+    let detail = if let Some(error) = attempt.error.as_ref() {
+        error.clone()
+    } else if probe_failures.is_empty() {
+        format!(
+            "probes={} failed={}",
+            snapshot.discovery.probes.len(),
+            snapshot.discovery.failure_count
+        )
+    } else {
+        format!(
+            "{} 个探针失败（沿用上次成功输出）：{}",
+            probe_failures.len(),
+            probe_failures.join("; ")
+        )
+    };
+    log::info!(
+        "event=FactRefreshCompleted outcome={outcome} probes={} failed={} detail=\"{detail}\"",
+        snapshot.discovery.probes.len(),
+        snapshot.discovery.failure_count
+    );
+    (outcome, detail)
+}
+
+/// 把强制上报的落地记录到调用方的槽位（常规 tick 传 `None`）。
+fn record_forced_fact_report(
+    target: &mut Option<&mut FactReportAttempt>,
+    outcome: FactSendOutcome,
 ) {
-    match report_fact_summary(sink, config, state_dir, summary, next_seq, global_seq_path).await {
-        Ok(true) => log::info!(
-            "event=FactSummaryReported digest={} processes={} executables={} ports={}",
-            summary.content_digest(),
-            summary.process_count,
-            summary.process_executables.len(),
-            summary.listen_ports.len()
-        ),
-        Ok(false) => {}
-        Err(err) => log::warn!("wist-agentd fact summary uplink failed: {err}"),
+    let Some(slot) = target.as_mut() else {
+        return;
+    };
+    match outcome {
+        FactSendOutcome::Skipped => {}
+        FactSendOutcome::Reported => {
+            slot.attempted = true;
+            slot.reported = true;
+        }
+        FactSendOutcome::Failed(detail) => {
+            slot.attempted = true;
+            slot.error = Some(detail);
+        }
     }
 }
 
@@ -924,8 +1206,30 @@ async fn report_discovery_snapshot(
     Ok(())
 }
 
+/// 启动时打一行「原文快照上送」的本机配置（开关 + 生效周期）。
+///
+/// 为什么必须有：这个能力默认开，而 `snapshot_uplink_enabled = false` 时**完全不发也不告警** ——
+/// 0.9.11 现场就是「日志里一切正常、数据面一帧都没有」，因为日志里连这个键的存在都看不到。
+/// 这里只报本机事实；输出是否生效取决于控制面 grant，留给循环里的 `Inactive` 告警。
+fn log_discovery_snapshot_config(config: &AgentConfig) {
+    let configured = config.discovery.snapshot_uplink_interval_seconds;
+    let effective = discovery_snapshot_interval(configured);
+    if config.discovery.snapshot_uplink_enabled {
+        log::info!(
+            "event=DiscoverySnapshotUplinkConfigured enabled=true interval_seconds={} configured_seconds={} clamped={} source=local_config detail=\"控制面有下发时以下发为准\"",
+            effective.as_secs(),
+            configured,
+            effective.as_secs() != configured
+        );
+    } else {
+        log::info!(
+            "event=DiscoverySnapshotUplinkConfigured enabled=false reason=\"snapshot_uplink_enabled = false\" detail=\"不发原文快照：中心拿不到资产清单（进程 / 端口 / 容器明细）\""
+        );
+    }
+}
+
 /// 配置里的周期（秒）→ 实际使用的周期，夹到不低于 [`DISCOVERY_SNAPSHOT_MIN_INTERVAL_SECS`]。
-fn discovery_snapshot_interval(configured_secs: u64) -> Duration {
+pub(crate) fn discovery_snapshot_interval(configured_secs: u64) -> Duration {
     Duration::from_secs(configured_secs.max(DISCOVERY_SNAPSHOT_MIN_INTERVAL_SECS))
 }
 
@@ -1073,6 +1377,10 @@ pub struct DaemonLoop<'a> {
 pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     // 运行时**跨 tick 活着**：观测频率的调度记忆就在它里面（内存态，不落盘）。
     let mut discovery_runtime = DiscoveryRuntime::new(discovery_probes(loop_ctx.config));
+    // 「原文快照上送」是默认开、1 小时一帧的隐性行为：关掉时不发、输出不是 tcp 时也不发，
+    // 两种情况**都很安静**。启动时先把本机配置这一半说清（另一半取决于控制面 grant，
+    // 见循环里的 `DiscoverySnapshotUplinkInactive`）。
+    log_discovery_snapshot_config(loop_ctx.config);
     // 工作授权跨 tick 活着：`acked_plan_version` 就在里面，它决定
     // “这一版我确认过了，不用每 30s 重复确认”。
     //
@@ -1106,6 +1414,25 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     // 数据面上送启用同样跨 tick 活着：上一次已应用的 grant 就在里面（拉取失败保留它）。
     let mut uplink_runtime = AppliedUplink::default();
     let mut last_uplink_fetch: Option<Instant> = None;
+    // 原文快照上送周期同理：网关下发优先，没下发用本机 `[discovery]`。
+    let mut snapshot_policy = AppliedSnapshotPolicy::default();
+    let mut last_snapshot_fetch: Option<Instant> = None;
+    // 一次性命令：本机 `refresh-facts` 与网关回执里的命令共用同一份台账与同一条执行路径。
+    // `last_refresh_facts` 只是重采这一种 kind 的节流计时（重启即清零是刻意的）。
+    let command_state_dir = PathBuf::from(&loop_ctx.config.paths.state_dir);
+    let refresh_facts_interval = refresh_facts_min_interval();
+    let mut last_refresh_facts: Option<Instant> = None;
+    let mut command_history = commands::load_history_async(&command_state_dir)
+        .await
+        .unwrap_or_else(|err| {
+            log::warn!(
+                "event=CommandHistoryUnreadable detail=\"{err}\"（当作空台账，下一条命令会重建）"
+            );
+            commands::CommandHistory::default()
+        });
+    // 下一个 tick 要处理的（来自网关回执）与待回传的结果（下一次上报带上）。
+    let mut pending_commands: Vec<AgentCommand> = Vec::new();
+    let mut pending_command_acks: Vec<AgentCommandAck> = Vec::new();
     // 出口健康的跨 tick 记忆（只在「失败 → 恢复」时补一行）。
     let mut uplink_health = UplinkHealth::default();
     let mut last_metrics_uplink: Option<Instant> = None;
@@ -1253,12 +1580,93 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
             upgrader_bin,
             config_dir,
         };
+        // 一次性命令：先把本机请求并入队列，再统一判定。
+        // 放在策略拉取之前：重采命令要连**探测白名单**一起刷新，否则新路径根本不在列表里。
+        let mut queue: Vec<(AgentCommand, CommandSource)> = pending_commands
+            .drain(..)
+            .map(|command| (command, CommandSource::Remote))
+            .collect();
+        if let Some(local) = take_local_command(&command_state_dir).await {
+            queue.push((local, CommandSource::Local));
+        }
+        let now_ms = now_ts_ms();
+        let mut accepted_refresh: Option<(AgentCommand, CommandSource)> = None;
+        let mut history_dirty = false;
+        for (command, source) in queue {
+            // 已处理过（网关重发 / 重启后重发）：只补结果，不再执行。
+            if let Some(record) = command_history.find(&command.command_id) {
+                log::info!(
+                    "event=CommandDuplicate command_id={} outcome={} detail=\"已处理过，只补结果\"",
+                    record.command_id,
+                    record.outcome
+                );
+                if source == CommandSource::Remote {
+                    pending_command_acks.push(ack_from_record(record));
+                }
+                continue;
+            }
+            let verdict = evaluate_command(
+                &command,
+                accepted_refresh.is_some(),
+                last_refresh_facts,
+                refresh_facts_interval,
+                now_ms,
+            );
+            let (outcome, detail) = match verdict {
+                CommandVerdict::AcceptRefresh => {
+                    last_refresh_facts = Some(Instant::now());
+                    log::info!(
+                        "event=CommandAccepted command_id={} kind={} source={}",
+                        command.command_id,
+                        command.kind,
+                        if source == CommandSource::Remote {
+                            "gateway"
+                        } else {
+                            "local"
+                        }
+                    );
+                    accepted_refresh = Some((command, source));
+                    continue;
+                }
+                CommandVerdict::Unsupported => (
+                    command_outcome::UNSUPPORTED,
+                    format!("agentd 尚未实现命令 kind={}", command.kind),
+                ),
+                CommandVerdict::Stale => (
+                    command_outcome::STALE,
+                    format!(
+                        "命令超过 {} 分钟未被处理（守护进程当时没在跑 / 被阻塞）",
+                        COMMAND_STALE_MS / 60_000
+                    ),
+                ),
+                CommandVerdict::Throttled => (
+                    command_outcome::THROTTLED,
+                    format!(
+                        "距上一次重采不足最小间隔（{}s）或本 tick 已接受一条",
+                        refresh_facts_interval.as_secs()
+                    ),
+                ),
+            };
+            let ack = record_command(&mut command_history, &command, outcome, detail, now_ms);
+            history_dirty = true;
+            if source == CommandSource::Remote {
+                pending_command_acks.push(ack);
+            }
+        }
+        let force_refresh = accepted_refresh.is_some();
         // 到达拉取间隔就拉一次策略表并应用（启动首轮即拉）。必须在 refresh_due 之前，
         // 这样本轮采集就用上新周期。
-        refresh_discovery_policy(loop_ctx.config, &mut discovery_runtime).await;
+        refresh_discovery_policy(loop_ctx.config, &mut discovery_runtime, force_refresh).await;
         // 上送启用要**先于**工作授权与采集：否则会出现「工作已应用、上送还关着」的一个 tick
         // —— 派活后第一轮采到了却发不出去。上送开关是采集的前置条件。
         refresh_uplink_grant(loop_ctx.config, &mut uplink_runtime, &mut last_uplink_fetch).await;
+        // 快照周期紧跟在上送授权之后（它比采集更"慢"，排在任何采集与计算之前）。
+        refresh_discovery_snapshot_policy(
+            loop_ctx.config,
+            &mut snapshot_policy,
+            &mut last_snapshot_fetch,
+        )
+        .await;
         // 工作授权同样在采集之前应用：本轮就按新的授权采（或停）。
         refresh_work_grant(
             &loop_ctx,
@@ -1282,20 +1690,23 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
             // 否则输出端坏掉时会每 tick（3s）重试并刷满日志。
             last_metrics_uplink = Some(Instant::now());
         }
-        // 原文快照体积大，按独立周期发送（默认 5 分钟），不跟 3s tick。
+        // 原文快照体积大，按独立周期发送（默认 1 小时），不跟 3s tick。
+        // 周期与开关取**生效值**：控制面下发优先，没下发用本机 `[discovery]`。
         // 只在「上送确实生效且是 tcp」时记尝试：待命/file 输出下不应消耗周期，
         // 否则重新启用后要等满一个周期才发第一帧。
+        let snapshot_policy_now = effective_policy(loop_ctx.config, snapshot_policy.grant());
         let discovery_output = effective_output(loop_ctx.config, uplink_runtime.grant());
-        let discovery_uplink_active = loop_ctx.config.discovery.snapshot_uplink_enabled
+        let discovery_uplink_active = snapshot_policy_now.enabled
             && discovery_output.enabled
             && discovery_output.kind == "tcp";
-        if loop_ctx.config.discovery.snapshot_uplink_enabled
+        if snapshot_policy_now.enabled
             && !discovery_uplink_active
             && !warned_discovery_uplink_ineffective
         {
             warned_discovery_uplink_ineffective = true;
             log::warn!(
-                "event=DiscoverySnapshotUplinkInactive snapshot_uplink_enabled=true but the output is not an enabled tcp sink (enabled={} kind={}); full snapshots will not be sent",
+                "event=DiscoverySnapshotUplinkInactive snapshot_uplink_enabled=true (source={}) but the output is not an enabled tcp sink (enabled={} kind={}); full snapshots will not be sent",
+                snapshot_policy_now.source,
                 discovery_output.enabled,
                 discovery_output.kind
             );
@@ -1303,14 +1714,18 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
         let send_discovery_snapshot = discovery_uplink_active
             && discovery_snapshot_due(
                 last_discovery_uplink,
-                discovery_snapshot_interval(
-                    loop_ctx.config.discovery.snapshot_uplink_interval_seconds,
-                ),
+                discovery_snapshot_interval(snapshot_policy_now.interval_seconds),
             );
         if send_discovery_snapshot {
             last_discovery_uplink = Some(Instant::now());
         }
-        let (snapshot, changes) = run_once_with_failure_cache(
+        let mut fact_attempt = FactReportAttempt::default();
+        let forced_fact_report = if force_refresh {
+            Some(&mut fact_attempt)
+        } else {
+            None
+        };
+        let tick = run_once_with_failure_cache(
             &loop_ctx,
             Some(&mut previous_telemetry_failures),
             Some(&mut previous_metrics_failures),
@@ -1321,8 +1736,51 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
             Some(&mut uplink_health),
             send_metrics,
             send_discovery_snapshot,
+            force_refresh,
+            forced_fact_report,
         )
-        .await?;
+        .await;
+        let (snapshot, changes) = match tick {
+            Ok(pair) => pair,
+            Err(err) => {
+                // 命令已经被取走：给台账一个明确结果（若已接受执行），再返回。
+                if let Some((command, source)) = accepted_refresh.as_ref() {
+                    let ack = record_command(
+                        &mut command_history,
+                        command,
+                        command_outcome::FAILED,
+                        format!("守护循环失败：{err}"),
+                        now_ts_ms(),
+                    );
+                    if *source == CommandSource::Remote {
+                        pending_command_acks.push(ack);
+                    }
+                    history_dirty = true;
+                }
+                if history_dirty
+                    && let Err(err) =
+                        commands::store_history_async(&command_state_dir, &command_history).await
+                {
+                    log::warn!("event=CommandHistoryStoreFailed detail=\"{err}\"");
+                }
+                return Err(err);
+            }
+        };
+        if let Some((command, source)) = accepted_refresh.take() {
+            let (outcome, detail) = refresh_facts_outcome(&snapshot, &fact_attempt);
+            let ack = record_command(&mut command_history, &command, outcome, detail, now_ts_ms());
+            history_dirty = true;
+            // 只有网关下发的命令需要回传；本机命令从台账读结果。
+            if source == CommandSource::Remote {
+                pending_command_acks.push(ack);
+            }
+        }
+        if history_dirty
+            && let Err(err) =
+                commands::store_history_async(&command_state_dir, &command_history).await
+        {
+            log::warn!("event=CommandHistoryStoreFailed detail=\"{err}\"");
+        }
         pending_work_state_changes.extend(changes);
         emit(&snapshot);
         if last_report_at.elapsed() >= STATUS_REPORT_INTERVAL {
@@ -1354,10 +1812,16 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                 // 到这里那次可变借用早已结束，所以这里用 `&` 不会冲突。
                 &uplink_runtime,
                 &uplink_health,
+                &pending_command_acks,
                 // 常规上报：失败要看得见（只有终态下的低频重试才静默）。
                 false,
             )
             .await;
+            if report.latency_ms.is_some() {
+                // 上报成功：结果已送达；同时接住网关可能新下发的命令（下一个 tick 处理）。
+                pending_command_acks.clear();
+                pending_commands = report.commands;
+            }
             if let Some(code) = report.terminal {
                 // 一行日志、一次落盘，**首个认出终态者为准**（续期那条已经进过的话这里不再重复）。
                 if terminal.is_none() {
@@ -1402,6 +1866,10 @@ async fn run_once_with_failure_cache(
     send_metrics: bool,
     // 本轮要不要上送原文发现快照（由调用方按配置与周期定；一次性路径不发）。
     send_discovery_snapshot: bool,
+    // 手动「重采 + 重报」：强制全量重采，并绕过事实摘要的一次节流。
+    force_refresh: bool,
+    // 强制上报的落地结果（`None` = 常规 tick 不产出）。
+    mut forced_fact_report: Option<&mut FactReportAttempt>,
 ) -> RuntimeResult<(RuntimeHealthSnapshot, Vec<TelemetryWorkState>)> {
     let run_dir = Path::new(&loop_ctx.config.paths.run_dir);
     let state_dir = Path::new(&loop_ctx.config.paths.state_dir);
@@ -1412,7 +1880,8 @@ async fn run_once_with_failure_cache(
         .agent_id
         .as_deref()
         .unwrap_or("unknown");
-    let (discovery, fact_summary) = refresh_discovery_snapshot(state_dir, discovery_runtime).await;
+    let (discovery, fact_summary) =
+        refresh_discovery_snapshot(state_dir, discovery_runtime, force_refresh).await;
     let metrics_tick = process_metrics_tick(state_dir);
     emit_metrics_tick(&metrics_tick);
     if let Some(previous) = previous_metrics_failures {
@@ -1444,15 +1913,17 @@ async fn run_once_with_failure_cache(
                 // 静默跳过 —— 否则会走 `write_fact` 的 `Err` 分支，把正常状态报成故障
                 // （旧实现每 5 分钟一行 `fact summary uplink failed` 的毛病，别再引回）。
                 if sink.carries_fact_frames() {
-                    send_fact_summary(
+                    let outcome = send_fact_summary(
                         &mut sink,
                         loop_ctx.config,
                         state_dir,
                         &fact_summary,
                         &mut next_seq,
                         &global_seq_path,
+                        force_refresh,
                     )
                     .await;
+                    record_forced_fact_report(&mut forced_fact_report, outcome);
                 }
                 TelemetryTick::silent()
             } else {
@@ -1483,15 +1954,17 @@ async fn run_once_with_failure_cache(
                 }
                 // 事实摘要在**指标之后**发：同样共用这条连接与全局 `seq`，只是帧标记不同。
                 if sink.carries_fact_frames() {
-                    send_fact_summary(
+                    let outcome = send_fact_summary(
                         &mut sink,
                         loop_ctx.config,
                         state_dir,
                         &fact_summary,
                         &mut next_seq,
                         &global_seq_path,
+                        force_refresh,
                     )
                     .await;
+                    record_forced_fact_report(&mut forced_fact_report, outcome);
                 }
                 if send_discovery_snapshot && sink.carries_discovery_frames() {
                     send_discovery_snapshot_report(
@@ -1519,6 +1992,10 @@ async fn run_once_with_failure_cache(
             }
         }
         Err(err) => {
+            // 手动重采时要把「输出配置坏掉」写进结果：否则 CLI 只会看到一个笼统的超时/失败。
+            if let Some(slot) = forced_fact_report.as_mut() {
+                slot.error = Some(format!("构建遥测输出失败：{err}"));
+            }
             // 待命时 sink 建不起来（例如本机 `kind` 非法）也只是“没有可发的目标”，静默即可 ——
             // 不能报成故障（待命本就是正常态）。只有启用后才把输出配置错误报出来。
             if effective.enabled {
@@ -1642,9 +2119,16 @@ struct DiscoveryHealth {
 /// 而一次性路径是 `refresh_all`（全量、**忽略周期**），策略表对它没有意义 —— 在那儿拉
 /// 等于白付一次网络往返（最坏 `DISCOVERY_POLICY_FETCH_TIMEOUT`）。常驻循环才有「下一 tick」，
 /// 策略也才有落点。计时状态随 `DiscoveryRuntime` 跨 tick（见该字段的注释）。
-async fn refresh_discovery_policy(config: &AgentConfig, runtime: &mut DiscoveryRuntime) {
+///
+/// `force = true`（手动重采）时**忽略**最小间隔：新加进目录的 `path_exists:` 路径只有随策略表
+/// 下发后才会被探测，等 5 分钟正是手动触发要绕开的那一段。
+async fn refresh_discovery_policy(
+    config: &AgentConfig,
+    runtime: &mut DiscoveryRuntime,
+    force: bool,
+) {
     let now = Instant::now();
-    if !runtime.policy_fetch_due(now, DISCOVERY_POLICY_FETCH_MIN_INTERVAL) {
+    if !force && !runtime.policy_fetch_due(now, DISCOVERY_POLICY_FETCH_MIN_INTERVAL) {
         return;
     }
     // 先记「尝试」再发：失败也要被最小间隔节流，否则网关宕机时会每 tick（3s）重试。
@@ -1695,6 +2179,33 @@ async fn refresh_uplink_grant(
     // 「该不该打日志」交给 `observe`：预期内（未入网 / 404）静默，异常按签名去重。
     if let Some(line) = runtime.observe(fetch_uplink_grant(config).await) {
         log::warn!("{line}");
+    }
+}
+
+/// 拉取并应用原文快照上送设置（启动首轮即拉，之后按与工作授权相同的 30s 节流）。
+///
+/// 请求里带上**当前实际生效**的值：网关据此在管理面显示「配置 vs 生效」的分叉
+/// （典型现场：页面配了 1 小时，机器实际还在 300s)。
+///
+/// 与 uplink 同一取舍：先记「尝试」再发（失败也节流），失败**保留**已应用的设置；
+/// 而「网关没有设置 / 旧网关 404」由 `observe` 负责清掉已应用的设置并回落本机配置。
+async fn refresh_discovery_snapshot_policy(
+    config: &AgentConfig,
+    runtime: &mut AppliedSnapshotPolicy,
+    last_fetch: &mut Option<Instant>,
+) {
+    let now = Instant::now();
+    if let Some(at) = *last_fetch
+        && at.elapsed() < Duration::from_millis(WORK_FETCH_MIN_INTERVAL_MS as u64)
+    {
+        return;
+    }
+    *last_fetch = Some(now);
+    let applied = effective_policy(config, runtime.grant()).applied();
+    match runtime.observe(fetch_discovery_snapshot(config, Some(applied)).await) {
+        Some(SnapshotEvent::Applied(line)) => log::info!("{line}"),
+        Some(SnapshotEvent::Failed(line)) => log::warn!("{line}"),
+        None => {}
     }
 }
 
@@ -1987,18 +2498,26 @@ fn work_result_of(record: &crate::upgrade::UpgradeRecord) -> Option<(&'static st
     }
 }
 
+/// `force = true`（手动「重采」）时走**全量刷新**并落盘：各探针的周期在这里不参与调度。
+/// 全量刷新会保留失败项的上次成功输出（见 `DiscoveryRuntime::refresh_inner`），
+/// 所以紧接着的重报不会把「没采到」写成「采到了空的」。
 async fn refresh_discovery_snapshot(
     state_dir: &Path,
     runtime: &mut DiscoveryRuntime,
+    force: bool,
 ) -> (DiscoveryHealth, fact_summary::FactSummaryDraft) {
     let (cached, cache_load_failure) = runtime.load_from_state_dir_async(state_dir).await;
     let (cached_meta, meta_load_failure) = runtime.load_meta_from_state_dir_async(state_dir).await;
     // 按各探针的 `refresh_interval()` 调度：只刷到期的，未到期的沿用上次输出。
     // 这是“基础观测频率”真的生效的地方 —— 在此之前各探针声明的周期是死代码，
     // 运行时每 tick（3s）把所有探针全刷一遍（含 906 个进程的枚举）。
-    let mut result = runtime
-        .refresh_due_and_store_async(state_dir, Instant::now())
-        .await;
+    let mut result = if force {
+        runtime.refresh_and_store_async(state_dir).await
+    } else {
+        runtime
+            .refresh_due_and_store_async(state_dir, Instant::now())
+            .await
+    };
     let candidates = planner_bridge::build_collection_candidates(&result.persisted_snapshot);
     let host_candidates: Vec<_> = candidates
         .iter()
@@ -2275,6 +2794,8 @@ async fn run_once_with_work_async(
         None,
         send_metrics,
         false,
+        false,
+        None,
     )
     .await
     .map(|(snapshot, _)| snapshot)
@@ -2486,6 +3007,8 @@ mod tests {
             None,
             false,
             false,
+            false,
+            None,
         )
         .await
         .expect("gated tick");
@@ -2595,6 +3118,130 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             &UplinkHealth::default(),
+            &[],
+            false,
+        )
+        .await;
+        server.await.expect("server task");
+        assert!(outcome.latency_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn report_status_ack_carries_commands() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let _ = read_http_request(&mut socket).await;
+            let body = r#"{"agent_id":"agent-x","instance_id":"instance-x","acknowledged_at":"t","commands":[{"command_id":"c-1","requested_at_ms":1700000000000,"kind":"refresh_facts"}]}"#;
+            let response = format!(
+                "HTTP/1.1 202 Accepted\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let mut config = test_config();
+        config.control_plane.endpoint = Some(endpoint);
+        let outcome = report_status_to_control_plane(
+            &config,
+            None,
+            None,
+            None,
+            None,
+            &AppliedWorkGrant::default(),
+            &AppliedUplink::default(),
+            &UplinkHealth::default(),
+            &[],
+            false,
+        )
+        .await;
+        server.await.expect("server task");
+
+        assert!(outcome.latency_ms.is_some());
+        assert_eq!(
+            outcome.commands,
+            vec![AgentCommand {
+                command_id: "c-1".to_string(),
+                requested_at_ms: 1_700_000_000_000,
+                kind: command_kind::REFRESH_FACTS.to_string(),
+                params: String::new(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn report_status_sends_command_acks() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let request = read_http_request(&mut socket).await;
+            assert!(
+                request.contains("\"command_acks\":[")
+                    && request.contains("\"command_id\":\"c-1\"")
+                    && request.contains("\"outcome\":\"succeeded\""),
+                "{request}"
+            );
+            let response =
+                "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let mut config = test_config();
+        config.control_plane.endpoint = Some(endpoint);
+        let acks = [AgentCommandAck {
+            command_id: "c-1".to_string(),
+            outcome: command_outcome::SUCCEEDED.to_string(),
+            detail: String::new(),
+        }];
+        let outcome = report_status_to_control_plane(
+            &config,
+            None,
+            None,
+            None,
+            None,
+            &AppliedWorkGrant::default(),
+            &AppliedUplink::default(),
+            &UplinkHealth::default(),
+            &acks,
+            false,
+        )
+        .await;
+        server.await.expect("server task");
+        assert!(outcome.latency_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn report_status_omits_command_acks_when_empty() {
+        // 兼容旧网关（`deny_unknown_fields`）：没有结果时字段必须不出现。
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let request = read_http_request(&mut socket).await;
+            assert!(
+                !request.contains("command_acks"),
+                "没有结果时必须省略该字段（旧网关会整份拒收）: {request}"
+            );
+            let response =
+                "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let mut config = test_config();
+        config.control_plane.endpoint = Some(endpoint);
+        let outcome = report_status_to_control_plane(
+            &config,
+            None,
+            None,
+            None,
+            None,
+            &AppliedWorkGrant::default(),
+            &AppliedUplink::default(),
+            &UplinkHealth::default(),
+            &[],
             false,
         )
         .await;
@@ -2631,6 +3278,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             &UplinkHealth::default(),
+            &[],
             false,
         )
         .await;
@@ -2744,6 +3392,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &uplink,
             &UplinkHealth::default(),
+            &[],
             false,
         )
         .await;
@@ -2812,6 +3461,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &uplink,
             &UplinkHealth::default(),
+            &[],
             false,
         )
         .await;
@@ -3041,6 +3691,8 @@ mod tests {
             None,
             false,
             false,
+            false,
+            None,
         )
         .await
         .expect("standby tick");
@@ -3087,6 +3739,8 @@ mod tests {
             None,
             false,
             false,
+            false,
+            None,
         )
         .await
         .expect("standby tick");
@@ -3592,6 +4246,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             &UplinkHealth::default(),
+            &[],
             false,
         )
         .await;
@@ -3687,6 +4342,7 @@ mod tests {
             &grant,
             &AppliedUplink::default(),
             &UplinkHealth::default(),
+            &[],
             false,
         )
         .await;
@@ -3708,6 +4364,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             &UplinkHealth::default(),
+            &[],
             false,
         )
         .await;
@@ -3742,6 +4399,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             &UplinkHealth::default(),
+            &[],
             false,
         )
         .await;
@@ -3782,6 +4440,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             &UplinkHealth::default(),
+            &[],
             false,
         )
         .await;
@@ -4464,5 +5123,188 @@ mod tests {
 
         assert!(!recovered);
         assert_eq!(state.attempts, i64::MAX, "不能绕回负数");
+    }
+
+    // ── 手动「重采 + 重报」 ────────────────────────────────────
+
+    /// 强制重采必须**绕过** 5 分钟事实节流，并把落地结果写回调用方。
+    #[tokio::test]
+    async fn a_forced_tick_reports_facts_inside_the_throttle_window() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = frame_server(listener);
+
+        let root = local_state_dir("forced-fact");
+        let mut config = test_config();
+        config.paths.root_dir = root.display().to_string();
+        config.paths.run_dir = root.join("run").display().to_string();
+        config.paths.state_dir = root.join("state").display().to_string();
+        config.paths.log_dir = root.join("log").display().to_string();
+        config.telemetry.logs.output.enabled = false;
+        config.telemetry.logs.output.kind = "tcp".to_string();
+        config.telemetry.logs.output.tcp.addr = "127.0.0.1".to_string();
+        config.telemetry.logs.output.tcp.port = port;
+
+        // 刚报过：普通 tick 会被最小间隔挡住。
+        let state_dir = Path::new(&config.paths.state_dir);
+        seeded_attempt(state_dir, now_ts_ms()).await;
+
+        let loop_ctx = DaemonLoop {
+            config: &config,
+            exec_bin: ::std::path::Path::new(""),
+            upgrader_bin: ::std::path::Path::new(""),
+            config_dir: ::std::path::Path::new(""),
+        };
+        let mut discovery_runtime = DiscoveryRuntime::new(discovery_probes(&config));
+        let mut attempt = FactReportAttempt::default();
+        run_once_with_failure_cache(
+            &loop_ctx,
+            None,
+            None,
+            None,
+            &mut discovery_runtime,
+            &AppliedWorkGrant::default(),
+            &AppliedUplink::default(),
+            None,
+            false,
+            false,
+            true,
+            Some(&mut attempt),
+        )
+        .await
+        .expect("forced tick");
+
+        let frame = server.await.expect("server task");
+        assert!(frame.contains(" OBSFACT: "), "强制重报必须发帧: {frame}");
+        assert!(
+            attempt.attempted && attempt.reported,
+            "落地结果要写回调用方"
+        );
+        assert!(attempt.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_local_command_is_taken_once() {
+        let state_dir = fact_summary_state_dir("command-local");
+        let command = sample_command("local-1", command_kind::REFRESH_FACTS, now_ts_ms());
+        commands::submit_request_async(&state_dir, &command)
+            .await
+            .expect("submit");
+
+        assert_eq!(take_local_command(&state_dir).await, Some(command));
+        assert!(
+            commands::read_request_async(&state_dir)
+                .await
+                .expect("read")
+                .is_none()
+        );
+        assert!(take_local_command(&state_dir).await.is_none());
+    }
+
+    fn sample_command(id: &str, kind: &str, requested_at_ms: i64) -> AgentCommand {
+        AgentCommand {
+            command_id: id.to_string(),
+            requested_at_ms,
+            kind: kind.to_string(),
+            params: String::new(),
+        }
+    }
+
+    #[test]
+    fn evaluate_command_covers_accept_unsupported_stale_and_throttled() {
+        let now = now_ts_ms();
+        let interval = Duration::from_secs(60);
+
+        assert!(matches!(
+            evaluate_command(
+                &sample_command("c-future", "future_command", now),
+                false,
+                None,
+                interval,
+                now
+            ),
+            CommandVerdict::Unsupported
+        ));
+        assert!(matches!(
+            evaluate_command(
+                &sample_command(
+                    "c-stale",
+                    command_kind::REFRESH_FACTS,
+                    now - COMMAND_STALE_MS - 1
+                ),
+                false,
+                None,
+                interval,
+                now
+            ),
+            CommandVerdict::Stale
+        ));
+        assert!(matches!(
+            evaluate_command(
+                &sample_command("c-throttled", command_kind::REFRESH_FACTS, now),
+                false,
+                Some(Instant::now()),
+                interval,
+                now
+            ),
+            CommandVerdict::Throttled
+        ));
+        // 本 tick 已经接受过一条：同批第二条走节流，不在一轮里跑两次全量。
+        assert!(matches!(
+            evaluate_command(
+                &sample_command("c-second", command_kind::REFRESH_FACTS, now),
+                true,
+                None,
+                interval,
+                now
+            ),
+            CommandVerdict::Throttled
+        ));
+        assert!(matches!(
+            evaluate_command(
+                &sample_command("c-ok", command_kind::REFRESH_FACTS, now),
+                false,
+                None,
+                interval,
+                now
+            ),
+            CommandVerdict::AcceptRefresh
+        ));
+    }
+
+    #[test]
+    fn record_command_writes_the_ledger_and_returns_an_ack() {
+        let mut history = commands::CommandHistory::default();
+        let command = sample_command("c-1", command_kind::REFRESH_FACTS, 1);
+
+        let ack = record_command(
+            &mut history,
+            &command,
+            command_outcome::SUCCEEDED,
+            "probes=6 failed=0".to_string(),
+            2,
+        );
+        assert_eq!(ack.command_id, "c-1");
+        assert_eq!(ack.outcome, command_outcome::SUCCEEDED);
+        assert_eq!(ack.detail, "probes=6 failed=0");
+        assert_eq!(
+            history.find("c-1").map(|record| record.detail.as_str()),
+            Some("probes=6 failed=0")
+        );
+
+        // 同一 id 再记一次覆盖，不新增 —— 这是“网关重发只补结果”的去重依据。
+        let ack = record_command(
+            &mut history,
+            &command,
+            command_outcome::FAILED,
+            "retry".to_string(),
+            3,
+        );
+        assert_eq!(ack.outcome, command_outcome::FAILED);
+        assert_eq!(history.entries.len(), 1);
+        assert_eq!(
+            history.find("c-1").map(|record| record.outcome.as_str()),
+            Some(command_outcome::FAILED)
+        );
     }
 }

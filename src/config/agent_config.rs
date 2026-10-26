@@ -74,12 +74,17 @@ pub struct DiscoverySection {
     /// 确实不需要的部署显式写 `container_enabled = false`。
     #[serde(default = "default_discovery_container_enabled")]
     pub container_enabled: bool,
-    /// 是否把完整发现快照作为 `DSNAP:` 帧上送数据面。
+    /// 是否把完整发现快照作为 `DSNAP:` 帧上送数据面（消费者是中心侧资产目录）。
     ///
-    /// 默认关：原文快照一台几百 KB，属于 P1 的显式开关，不应因升级默认打开。
+    /// 默认**开**：资产清单（进程 / 端口 / 容器明细）只有原文快照里有，关掉等于中心看不到资产。
+    /// 成本按周期线性：一台 100 资源的机器一帧约 100 KB，1 小时一帧 ≈ 2.7 MB/天。
+    /// 确实不需要的部署显式写 `snapshot_uplink_enabled = false`。
     #[serde(default = "default_discovery_snapshot_uplink_enabled")]
     pub snapshot_uplink_enabled: bool,
-    /// 快照上送周期（秒）。低于 60s 会被夹到 60s，避免误配把机器打满。
+    /// 快照上送周期（秒）。默认 **1 小时**；低于 60s 会被夹到 60s，避免误配把机器打满。
+    ///
+    /// 不同机器可以不同（本机配置即生效域）：资产变化快的关键主机 300~900，
+    /// 容器/进程密集的机器 1800~3600。改完重启守护进程生效。
     #[serde(default = "default_discovery_snapshot_uplink_interval_seconds")]
     pub snapshot_uplink_interval_seconds: u64,
 }
@@ -486,11 +491,11 @@ fn default_discovery_container_enabled() -> bool {
 }
 
 fn default_discovery_snapshot_uplink_enabled() -> bool {
-    false
+    true
 }
 
 fn default_discovery_snapshot_uplink_interval_seconds() -> u64 {
-    300
+    3600
 }
 
 #[cfg(test)]
@@ -597,17 +602,22 @@ mod tests {
     }
 
     #[test]
-    fn discovery_snapshot_uplink_defaults_off_and_five_minutes() {
-        // 原文快照体积大，默认不能因升级自动打开；周期默认 5 分钟。
-        assert!(!DiscoverySection::default().snapshot_uplink_enabled);
+    fn discovery_snapshot_uplink_defaults_on_and_hourly() {
+        // 资产清单只有原文快照里有 → 默认开；周期默认 1 小时（约 100 KB/帧）。
+        assert!(DiscoverySection::default().snapshot_uplink_enabled);
         assert_eq!(
             DiscoverySection::default().snapshot_uplink_interval_seconds,
-            300
+            3600
         );
 
         let inline: DiscoverySection = serde_json::from_str("{}").expect("decode");
-        assert!(!inline.snapshot_uplink_enabled);
-        assert_eq!(inline.snapshot_uplink_interval_seconds, 300);
+        assert!(inline.snapshot_uplink_enabled);
+        assert_eq!(inline.snapshot_uplink_interval_seconds, 3600);
+
+        // 显式关闭仍是显式关闭：默认值变化不得翻转用户的明确选择。
+        let off: DiscoverySection =
+            serde_json::from_str(r#"{"snapshot_uplink_enabled": false}"#).expect("decode");
+        assert!(!off.snapshot_uplink_enabled);
     }
 
     #[test]

@@ -8,6 +8,7 @@
 pub mod agent_runtime;
 pub mod auth_terminal;
 pub mod client_identity;
+pub mod commands;
 pub mod execution_queue;
 pub mod fact_report;
 pub mod history;

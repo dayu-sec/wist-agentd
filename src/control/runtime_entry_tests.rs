@@ -1,7 +1,7 @@
 use super::{
     enrollment_report_lines, init_config_message, initialize_runtime_state_async, parse_command,
     refresh_runtime_version, resolve_config_dir_arg, resolve_exec_bin_from, run_from_args,
-    sync_runtime_identity, usage_message,
+    run_refresh_facts, sync_runtime_identity, usage_message,
 };
 use crate::config::agent_config::{
     AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, PathsSection,
@@ -309,6 +309,7 @@ fn usage_message_lists_supported_commands() {
     assert!(message.contains("wist-agentd version"));
     assert!(message.contains("wist-agentd service <print|install|uninstall|status>"));
     assert!(message.contains("wist-agentd diagnose [--json] [--offline]"));
+    assert!(message.contains("wist-agentd refresh-facts [--wait <secs> | --no-wait]"));
     assert!(message.contains("Show this help message"));
     assert!(message.contains("--config-dir <path>"));
 }
@@ -1134,6 +1135,118 @@ fn enrollment_report_without_config_reports_outcome_only() {
             "already enrolled (state identity, no request sent)".to_string(),
             "token_persisted=false".to_string(),
         ]
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn parse_command_accepts_refresh_facts() {
+    assert_eq!(
+        parse_command(["refresh-facts"]).expect("parse"),
+        super::ParsedArgs {
+            command: super::Command::RefreshFacts {
+                wait_secs: super::REFRESH_FACTS_DEFAULT_WAIT_SECS,
+            },
+            config_dir: None,
+        }
+    );
+}
+
+#[test]
+fn parse_command_accepts_refresh_facts_wait_flags_in_any_order() {
+    let expected = super::ParsedArgs {
+        command: super::Command::RefreshFacts { wait_secs: 5 },
+        config_dir: Some(PathBuf::from("conf")),
+    };
+    assert_eq!(
+        parse_command(["refresh-facts", "--wait", "5", "--config-dir", "conf"]).expect("parse"),
+        expected
+    );
+    assert_eq!(
+        parse_command(["--config-dir", "conf", "refresh-facts", "--wait", "5"]).expect("parse"),
+        expected
+    );
+
+    assert_eq!(
+        parse_command(["refresh-facts", "--no-wait"]).expect("parse"),
+        super::ParsedArgs {
+            command: super::Command::RefreshFacts { wait_secs: 0 },
+            config_dir: None,
+        }
+    );
+}
+
+#[test]
+fn parse_command_clamps_refresh_facts_wait() {
+    let parsed = parse_command(["refresh-facts", "--wait", "9999"]).expect("parse");
+    assert_eq!(
+        parsed.command,
+        super::Command::RefreshFacts {
+            wait_secs: super::REFRESH_FACTS_MAX_WAIT_SECS,
+        }
+    );
+}
+
+#[test]
+fn parse_command_rejects_invalid_refresh_facts_arguments() {
+    let err = parse_command(["refresh-facts", "--wait", "soon"]).expect_err("not a number");
+    assert!(err.to_string().contains("non-negative integer"), "{err}");
+
+    let err = parse_command(["refresh-facts", "--wait"]).expect_err("missing value");
+    assert!(
+        err.to_string().contains("missing value for --wait"),
+        "{err}"
+    );
+
+    for flag in ["--wait", "--no-wait"] {
+        let err = parse_command([flag]).expect_err("flag without refresh-facts");
+        assert!(
+            err.to_string()
+                .contains("only supported with refresh-facts"),
+            "{flag}: {err}"
+        );
+    }
+}
+
+#[test]
+fn refresh_facts_queues_a_request_under_the_configured_state_dir() {
+    let root = temp_dir("refresh-facts-queue");
+    let state = root.join("state");
+    fs::write(
+        root.join("agentd.toml"),
+        format!(
+            "schema_version = \"v1\"\n\n[paths]\nroot_dir = \"{}\"\nrun_dir = \"{}\"\nstate_dir = \"{}\"\nlog_dir = \"{}\"\n",
+            root.display(),
+            root.join("run").display(),
+            state.display(),
+            root.join("log").display()
+        ),
+    )
+    .expect("write config");
+
+    let code = block_on(run_refresh_facts(root.clone(), Some(&root), 0)).expect("queue request");
+    assert_eq!(code, 0);
+
+    let command = block_on(crate::state_store::commands::read_request_async(&state))
+        .expect("read")
+        .expect("command queued");
+    assert!(command.command_id.starts_with("local_refresh_"));
+    assert_eq!(command.kind, wist_api::status::command_kind::REFRESH_FACTS);
+    assert!(command.requested_at_ms > 0);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn refresh_facts_does_not_create_a_config() {
+    let root = temp_dir("refresh-facts-no-config");
+
+    let err = block_on(run_refresh_facts(root.clone(), Some(&root), 0))
+        .expect_err("must not silently init a config");
+    let detail = err.display_chain().to_string();
+    assert!(detail.contains("no agentd config"), "{detail}");
+    assert!(
+        !root.join("agentd.toml").exists(),
+        "a read-ish command must not create the config it needs"
     );
     let _ = fs::remove_dir_all(root);
 }
