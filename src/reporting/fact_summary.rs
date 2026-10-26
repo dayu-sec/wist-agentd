@@ -166,7 +166,7 @@ pub fn build_summary(snapshot: &DiscoverySnapshot, probe_paths: &[String]) -> Fa
         }
     }
 
-    let (probed_paths, present_paths) = probe_path_existence(probe_paths);
+    let probe = self::probe_paths(probe_paths);
 
     FactSummaryDraft {
         // 与契约同一口径：`snapshot.revision` 现为 `Int`（i64），不再需要收窄。
@@ -183,30 +183,71 @@ pub fn build_summary(snapshot: &DiscoverySnapshot, probe_paths: &[String]) -> Fa
             .into_iter()
             .map(|(protocol, port)| format!("{protocol}:{port}"))
             .collect(),
-        probed_paths,
-        present_paths,
+        probed_paths: probe.probed,
+        present_paths: probe.present,
         host_id,
         host_name,
         network_addresses: addresses.into_iter().collect(),
     }
 }
 
+/// 一次路径探测的结果。
+///
+/// 为什么把 `unreadable` 单独拿出来：以前只看「存在 / 不存在」两态，而 `Path::exists()`
+/// 把所有错误都压成 `false` —— 「没权限」于是伪装成「没有这个目录」，网关据此报
+/// `match_unsatisfied`（确认没有），处置方向（去查采集配置）和真因（去查权限）正好相反。
+///
+/// `unreadable` 里的路径**不在** `probed` 里：网关的三态求值会因此得到
+/// `fact_not_collected`（无法判定），而不是「确认不存在」。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PathProbeReport {
+    pub probed: Vec<String>,
+    pub present: Vec<String>,
+    pub unreadable: Vec<UnreadablePath>,
+}
+
+/// 探不了的一条路径（原始错误照原样带出，供人直接看出是权限还是别的）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UnreadablePath {
+    pub path: String,
+    pub error: String,
+}
+
 /// 探路径存在性。只接受**绝对路径**：相对路径的结果取决于进程 cwd，
 /// 同一台机器换一个启动方式就会翻面，不能当事实。
-fn probe_path_existence(probe_paths: &[String]) -> (Vec<String>, Vec<String>) {
+///
+/// 三态：存在 / 确认不存在（`NotFound`）/ 探不了（其余错误）。只有前两者进 `probed`。
+pub fn probe_paths(paths: &[String]) -> PathProbeReport {
+    let mut report = PathProbeReport::default();
     let mut probed = BTreeSet::new();
     let mut present = BTreeSet::new();
-    for path in probe_paths {
+    for path in paths {
         let path = path.trim();
         if path.is_empty() || !path.starts_with('/') {
             continue;
         }
-        probed.insert(path.to_string());
-        if std::path::Path::new(path).exists() {
-            present.insert(path.to_string());
+        match std::fs::metadata(path) {
+            Ok(_) => {
+                probed.insert(path.to_string());
+                present.insert(path.to_string());
+            }
+            // 确认不存在：这是一条**可用的事实**（`path_exists` 为假）。
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                probed.insert(path.to_string());
+            }
+            // 看不到 ≠ 不存在：不记“探过”，让求值落成「无法判定」。
+            Err(err) => {
+                log::warn!("fact summary: probe path unreadable: {path}: {err}");
+                report.unreadable.push(UnreadablePath {
+                    path: path.to_string(),
+                    error: err.to_string(),
+                });
+            }
         }
     }
-    (probed.into_iter().collect(), present.into_iter().collect())
+    report.probed = probed.into_iter().collect();
+    report.present = present.into_iter().collect();
+    report
 }
 
 fn attribute<'a>(resource: &'a DiscoveredResource, key: &str) -> Option<&'a str> {
@@ -406,6 +447,25 @@ mod tests {
                 .iter()
                 .any(|path| path == "relative/path"),
             "相对路径不能当作事实"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_paths_are_not_reported_as_probed() {
+        // 「看不到 ≠ 不存在」：用一条**不可能读到**的路径（父级是设备文件，`ENOTDIR`）。
+        // 这类路径既不能报 `match_unsatisfied`（确认没有），因为那会把「查权限」的人
+        // 引去改采集配置。
+        let existing = env!("CARGO_MANIFEST_DIR").to_string();
+        let report = probe_paths(&[existing.clone(), "/dev/null/child".to_string()]);
+
+        assert_eq!(report.probed, vec![existing.clone()]);
+        assert_eq!(report.present, vec![existing]);
+        assert_eq!(report.unreadable.len(), 1, "{report:?}");
+        assert_eq!(report.unreadable[0].path, "/dev/null/child");
+        assert!(
+            !report.unreadable[0].error.is_empty(),
+            "原始错误要带出来，否则人还是不知道是权限还是别的"
         );
     }
 

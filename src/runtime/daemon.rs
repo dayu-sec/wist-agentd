@@ -1010,6 +1010,7 @@ enum CommandSource {
 }
 
 /// 一条命令的判定：执行，或直接回一个结果（不执行）。
+#[derive(Debug)]
 enum CommandVerdict {
     /// 未知 kind：立刻回 `unsupported`（旧 agent 收到新命令不能把回执解析失败）。
     Unsupported,
@@ -1019,6 +1020,11 @@ enum CommandVerdict {
     Throttled,
     /// 执行一次重采。
     AcceptRefresh,
+    /// 只探这几条路径并回传（采集预检）。
+    ///
+    /// **不受重采节流**：探十几条路径是纯读、毫秒级，卡它与卡整轮采集不是一回事；
+    /// 重复点击在网关侧已经被「同 kind 覆盖」拦住了。
+    AcceptProbe(Vec<String>),
 }
 
 fn evaluate_command(
@@ -1033,6 +1039,10 @@ fn evaluate_command(
     }
     if now_ms.saturating_sub(command.requested_at_ms) > COMMAND_STALE_MS {
         return CommandVerdict::Stale;
+    }
+    // 路径探测请求优先于“整轮重采”：它便宜、幂等，而且正是网关在等的那件事。
+    if let Some(request) = crate::control::preflight::parse_probe_request(&command.params) {
+        return CommandVerdict::AcceptProbe(request.paths);
     }
     if refresh_accepted_this_tick || last_refresh.is_some_and(|at| at.elapsed() < min_interval) {
         return CommandVerdict::Throttled;
@@ -1626,6 +1636,25 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                         }
                     );
                     accepted_refresh = Some((command, source));
+                    continue;
+                }
+                CommandVerdict::AcceptProbe(paths) => {
+                    // 只探路径并把实测回传网关 —— 不跑整轮采集。
+                    // 这一步失败不该阻塞后续 tick：结果记进台账，网关那一侧会看到一个
+                    // `failed` 并保持 `probe.pending`，页面重试即可。
+                    let (outcome, detail) =
+                        crate::control::preflight::report_path_probe(loop_ctx.config, &paths).await;
+                    let ack = record_command(
+                        &mut command_history,
+                        &command,
+                        outcome,
+                        detail,
+                        now_ts_ms(),
+                    );
+                    history_dirty = true;
+                    if source == CommandSource::Remote {
+                        pending_command_acks.push(ack);
+                    }
                     continue;
                 }
                 CommandVerdict::Unsupported => (
@@ -5270,6 +5299,30 @@ mod tests {
             ),
             CommandVerdict::AcceptRefresh
         ));
+    }
+
+    #[test]
+    fn a_path_scoped_refresh_facts_becomes_a_probe_and_skips_the_throttle() {
+        // 采集预检复用 `refresh_facts`：带 `scope=paths` 时只探路径。
+        // **不受重采节流** —— 探十几条路径是纯读、毫秒级，卡它与卡整轮采集不是一回事；
+        // 同一 tick 里已经跑过一次全量，也不影响再探一次路径（网关正等着这个结果）。
+        let now = now_ts_ms();
+        let interval = Duration::from_secs(60);
+        let mut command = sample_command("c-probe", command_kind::REFRESH_FACTS, now);
+        command.params =
+            r#"{"scope":"paths","paths":["/var/log/containers","/var/lib/docker/containers"]}"#
+                .to_string();
+
+        match evaluate_command(&command, true, Some(Instant::now()), interval, now) {
+            CommandVerdict::AcceptProbe(paths) => assert_eq!(
+                paths,
+                vec![
+                    "/var/log/containers".to_string(),
+                    "/var/lib/docker/containers".to_string()
+                ]
+            ),
+            other => panic!("expected AcceptProbe, got {other:?}"),
+        }
     }
 
     #[test]
