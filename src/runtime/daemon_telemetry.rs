@@ -410,6 +410,7 @@ pub(super) async fn process_exporters(
                     agent_id,
                     &run.input_id,
                     &run.target,
+                    exporters::emits_journald_json(&run.exporter_id),
                     &run.family,
                     &run.unit_id,
                     &output,

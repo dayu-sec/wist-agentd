@@ -13,7 +13,13 @@
 //! 它把上一次读到的游标落盘（`state/exporters/<id>.cursor`），下一轮用 `--after-cursor`
 //! 接着读。游标取自 `-o json` 基本输出的 `__CURSOR` 字段（**只取这一个传输层字段**，
 //! 记录 body 仍是原行，见 `linux-server-log-coverage-plan.md` D1 / W3）。
+//!
+//! 唯一一处**发出前改写**：journald `-o json` 会把含控制字符/非法 UTF-8 的字段编成
+//! 字节数组（`"MESSAGE":[67,108,...]`），而 WPL 的 `chars@...` 只认字符串，数组会让
+//! 字段整条缺失。本模块在成帧前把它们解码回字符串（见 [`normalize_exporter_line`]），
+//! 其余导出器与其余字段仍原样透传。
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -251,14 +257,121 @@ pub fn is_due(period_secs: u64, last_run_ms: Option<i64>, now_ms: i64) -> bool {
     }
 }
 
+/// stdout 是 journald `-o json` 的导出器：只有这些需要把字节数组字段解码回字符串。
+///
+/// 用**显式白名单**而不是 `starts_with("journalctl")`：以后真出现一个输出纯文本的
+/// `journalctl-*` 导出器时，不会被误当 JSON 改写（方括号是正文的一部分）。
+const JOURNALD_JSON_EXPORTERS: &[&str] = &[
+    "journalctl-unit",
+    "journalctl-shutdown",
+    KERNEL_LOG_EXPORTER,
+];
+
+/// 这个导出器的 stdout 是不是 journald `-o json`（决定成帧前要不要解码字节数组字段）。
+///
+/// 判据用**归一后的 `exporter_id`**，不是目录里的原始 `target`：前者是决定 argv 的那个真值
+/// （`dmesg:panic` 归一成 `dmesg`），后者只用于记录与审计展示。
+pub fn emits_journald_json(exporter_id: &str) -> bool {
+    JOURNALD_JSON_EXPORTERS.contains(&exporter_id)
+}
+
+/// journald `-o json` 会把**含控制字符或非法 UTF-8** 的字段序列化成「字节数组」
+/// （`"MESSAGE":[67,108,...]`：彩色输出的 ESC、`\r`、二进制片段都会触发）。
+/// 下游 WPL 的 `chars@MESSAGE` 只认字符串 —— 数组会让该字段整条缺失，网关侧表现为
+/// `400 not a data-plane log record: missing field raw`（2026-10-26 现场 clash 日志即此）。
+///
+/// 所以在**发出前**把「元素全是 0..=255 的数组」按 UTF-8 解码回字符串：
+///   - 调用方先用 [`emits_journald_json`] 判定（其余导出器输出纯文本，正文里的方括号
+///     不能按 JSON 改写）；
+///   - 非法字节**直接丢弃**（不插入 U+FFFD）：`raw` 是给检索/展示用的，替换符只会污染
+///     字段值，而原始字节在 journald 里仍可查；整行丢弃才是不可接受的；
+///   - ESC / CR 等控制字符**保留**（`raw` 仍是原文；JSON 序列化会转义成 `\u001b` / `\r`）；
+///   - 改写过的那行会**按键名排序**重序列化（`serde_json` 未开 `preserve_order`）：
+///     下游 WPL 按名取字段，无影响；`wp_event_md5` 也是确定性的，重读同一窗口仍能去重；
+///   - 解析失败 / 不是对象 / 数组元素不全是字节 → 原样返回，绝不因一行坏数据打断整轮采集。
+///
+/// 启发式 `contains("\":[")` 依赖 journalctl 的**紧凑单行** JSON（`"KEY":[...]`，冒号后无空格）；
+/// 命中不了就原样透传，不会误改。
+fn normalize_journald_json_line<'a>(line: &'a str) -> Cow<'a, str> {
+    if !line.contains("\":[") {
+        return Cow::Borrowed(line);
+    }
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return Cow::Borrowed(line);
+    };
+    let Some(map) = value.as_object_mut() else {
+        return Cow::Borrowed(line);
+    };
+    let mut changed = false;
+    for field in map.values_mut() {
+        let serde_json::Value::Array(items) = field else {
+            continue;
+        };
+        let Some(bytes) = items
+            .iter()
+            .map(|item| {
+                item.as_u64()
+                    .filter(|byte| *byte <= u8::MAX as u64)
+                    .map(|byte| byte as u8)
+            })
+            .collect::<Option<Vec<u8>>>()
+        else {
+            continue;
+        };
+        *field = serde_json::Value::String(decode_dropping_invalid(&bytes));
+        changed = true;
+    }
+    if !changed {
+        return Cow::Borrowed(line);
+    }
+    match serde_json::to_string(&value) {
+        Ok(encoded) => Cow::Owned(encoded),
+        Err(_) => Cow::Borrowed(line),
+    }
+}
+
+/// 按 UTF-8 解码；**非法字节直接丢弃**（不插入 U+FFFD）。
+///
+/// 为什么丢弃而不是替换：`raw` 是给检索/展示用的，`�` 只会污染字段值；而原始字节在
+/// journald 里仍可查（本模块只搬这一份副本）。尾部被截断的多字节序列也一并丢掉，
+/// 不会把半个字符留在字段里。
+fn decode_dropping_invalid(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(text) => {
+                out.push_str(text);
+                return out;
+            }
+            Err(err) => {
+                let valid = err.valid_up_to();
+                if let Ok(text) = std::str::from_utf8(&rest[..valid]) {
+                    out.push_str(text);
+                }
+                match err.error_len() {
+                    Some(len) => rest = &rest[valid + len..],
+                    // 尾部是被截断的多字节序列：后面没有可保留的内容了。
+                    None => return out,
+                }
+            }
+        }
+    }
+}
+
 /// 一次导出运行的一行输出 → 一条记录（`seq` 全局递增）。
 ///
 /// `source_path` 用 `exporter:<target>` 明确标注「这不是一个真实文件路径」——让下游
 /// 不会去 `state/logs/file_inputs/<input_id>/` 里找它。
+///
+/// `journald_json` 为真时，成帧前把 journald 的字节数组字段解码成字符串（见
+/// [`normalize_journald_json_line`]）；调用方用 [`emits_journald_json`] 判定。
+#[allow(clippy::too_many_arguments)] // 参数都是「一条记录的组成部分」，拆成结构体只会多一层包装
 pub fn records_from_output(
     agent_id: &str,
     input_id: &str,
     target: &str,
+    journald_json: bool,
     family: &str,
     unit: &str,
     output: &str,
@@ -269,6 +382,13 @@ pub fn records_from_output(
     let mut records = Vec::new();
     let mut offset = 0u64;
     for line in output.lines() {
+        // journald 的字节数组字段在发出前解码成字符串（见 normalize_journald_json_line）；
+        // 其余导出器原样透传。
+        let line = if journald_json {
+            normalize_journald_json_line(line)
+        } else {
+            Cow::Borrowed(line)
+        };
         let seq = *next_seq;
         *next_seq += 1;
         let body_len = line.len() as u64;
@@ -648,6 +768,7 @@ mod tests {
             "agent-a",
             "work-NetworkFirewall-nft-ruleset",
             "nft-ruleset",
+            false,
             "NetworkFirewall",
             "linux-network-firewall",
             "table inet filter {\n\tchain input {\n}\n",
@@ -689,6 +810,7 @@ mod tests {
             "agent-a",
             "work-KernelSystem-linux-kernel-system-exporter",
             KERNEL_LOG_EXPORTER,
+            true,
             "KernelSystem",
             "linux-kernel-system",
             output,
@@ -705,6 +827,93 @@ mod tests {
                 "s=a0eb73fc6e164bd9bbb9b97c8abfa77c;i=a8f4;b=3c5bc0d5d86848348f18d525c917a112;m=290dc93bed;t=65e79f9d2cad0;x=9791448d01876c03"
             )
         );
+    }
+
+    #[test]
+    fn journald_byte_array_fields_are_decoded_before_uplink() {
+        // journald 把含 ESC 的 MESSAGE 编成字节数组；不转成字符串的话，
+        // WPL 的 `chars@MESSAGE` 取不到值 → 网关 400 `missing field raw`。
+        let line = r#"{"_COMM":"start.sh","_SYSTEMD_UNIT":"clash.service","MESSAGE":[67,108,97,115,104,232,174,162,233,152,133,229,156,176,229,157,128,228,184,141,229,143,175,232,174,191,233,151,174,239,188,129,32,27,91,51,49,109,82,69,68,27,91,48,109],"PRIORITY":"6"}"#;
+        let normalized = normalize_journald_json_line(line);
+        let value: serde_json::Value = serde_json::from_str(&normalized).expect("json");
+        let message = value["MESSAGE"].as_str().expect("MESSAGE 应被解码成字符串");
+        assert_eq!(message, "Clash订阅地址不可访问！ \u{1b}[31mRED\u{1b}[0m");
+        // 其它字段保持原样
+        assert_eq!(value["_COMM"].as_str(), Some("start.sh"));
+        assert_eq!(value["PRIORITY"].as_str(), Some("6"));
+    }
+
+    #[test]
+    fn only_journald_json_exporters_opt_into_the_rewrite() {
+        assert!(emits_journald_json("journalctl-unit"));
+        assert!(emits_journald_json("journalctl-shutdown"));
+        assert!(emits_journald_json(KERNEL_LOG_EXPORTER));
+        // 纯文本导出器（nft 规则里就有方括号）不能按 JSON 改写。
+        assert!(!emits_journald_json("nft-ruleset"));
+        assert!(!emits_journald_json("dmesg"));
+        // 未来若出现输出纯文本的 journalctl-* 导出器，也不能被白名单误收。
+        assert!(!emits_journald_json("journalctl-foo"));
+    }
+
+    #[test]
+    fn json_rewriting_leaves_non_byte_arrays_and_bad_lines_alone() {
+        // 真正的字符串数组（不是字节数组）不能改。
+        assert!(matches!(
+            normalize_journald_json_line(r#"{"tags":["a","b"]}"#),
+            Cow::Borrowed(_)
+        ));
+        // 坏行原样发，不打断整轮采集。
+        assert!(matches!(
+            normalize_journald_json_line("not json"),
+            Cow::Borrowed(_)
+        ));
+        // 没有数组时走快路径。
+        assert!(matches!(
+            normalize_journald_json_line(r#"{"MESSAGE":"ok"}"#),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn empty_and_undecodable_byte_arrays_stay_as_strings() {
+        // 空数组 → 空字符串（这类 journald 条目本来就没有正文；字段仍在）。
+        let empty = normalize_journald_json_line(r#"{"MESSAGE":[]}"#);
+        let value: serde_json::Value = serde_json::from_str(&empty).expect("json");
+        assert_eq!(value["MESSAGE"].as_str(), Some(""));
+    }
+
+    #[test]
+    fn invalid_utf8_bytes_are_dropped_not_replaced() {
+        // 非法字节直接丢弃（不插入 U+FFFD）：raw 是给检索/展示用的，替换符只会污染字段值。
+        let lossy = normalize_journald_json_line(r#"{"MESSAGE":[65,255,66]}"#);
+        let value: serde_json::Value = serde_json::from_str(&lossy).expect("json");
+        assert_eq!(value["MESSAGE"].as_str(), Some("AB"));
+        // 尾部被截断的多字节序列也整段丢弃，不留半个字符。
+        assert_eq!(decode_dropping_invalid(&[65, 0xe4, 0xb8]), "A");
+        // 合法 UTF-8（中文 + ESC）原样保留。
+        assert_eq!(
+            decode_dropping_invalid("中文\u{1b}[0m".as_bytes()),
+            "中文\u{1b}[0m"
+        );
+    }
+
+    #[test]
+    fn exported_journald_records_carry_decoded_message() {
+        let line = r#"{"MESSAGE":[65,66,67]}"#;
+        let mut seq = 0;
+        let records = records_from_output(
+            "agent-a",
+            "work-ServiceLifecycle-linux-service-lifecycle",
+            "journalctl-unit",
+            true,
+            "ServiceLifecycle",
+            "linux-service-lifecycle",
+            line,
+            &mut seq,
+        );
+        assert_eq!(records.len(), 1);
+        let value: serde_json::Value = serde_json::from_str(&records[0].body).expect("json");
+        assert_eq!(value["MESSAGE"].as_str(), Some("ABC"));
     }
 
     #[tokio::test]
