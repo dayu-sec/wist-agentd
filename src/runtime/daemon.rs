@@ -1387,6 +1387,19 @@ pub struct DaemonLoop<'a> {
 pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     // 运行时**跨 tick 活着**：观测频率的调度记忆就在它里面（内存态，不落盘）。
     let mut discovery_runtime = DiscoveryRuntime::new(discovery_probes(loop_ctx.config));
+    // L3 搜索范围：启动时先用**上次落盘**的那份（重启后不必等一次拉取才能搜），
+    // 之后在循环里按最小间隔刷新。空 = 不搜（默认，也是旧网关下的唯一状态）。
+    let mut last_source_search_fetch: Option<Instant> = None;
+    {
+        let policy = crate::control::source_search_policy::load(std::path::Path::new(
+            &loop_ctx.config.paths.state_dir,
+        ));
+        log::info!(
+            "event=SourceSearchPolicyRestored catalog_version={} roots=\"{}\"",
+            policy.catalog_version,
+            policy.describe()
+        );
+    }
     // 「原文快照上送」是默认开、1 小时一帧的隐性行为：关掉时不发、输出不是 tcp 时也不发，
     // 两种情况**都很安静**。启动时先把本机配置这一半说清（另一半取决于控制面 grant，
     // 见循环里的 `DiscoverySnapshotUplinkInactive`）。
@@ -1686,6 +1699,14 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
         // 到达拉取间隔就拉一次策略表并应用（启动首轮即拉）。必须在 refresh_due 之前，
         // 这样本轮采集就用上新周期。
         refresh_discovery_policy(loop_ctx.config, &mut discovery_runtime, force_refresh).await;
+        // L3 搜索范围：与发现策略同一节奏拉（知识库 ∩ 网关 roots 的交集，本机无配置）。
+        // 拿不到就沿用落盘那份 —— 断网不该让已定位的日志突然消失。
+        refresh_source_search_policy(
+            loop_ctx.config,
+            &mut last_source_search_fetch,
+            force_refresh,
+        )
+        .await;
         // 上送启用要**先于**工作授权与采集：否则会出现「工作已应用、上送还关着」的一个 tick
         // —— 派活后第一轮采到了却发不出去。上送开关是采集的前置条件。
         refresh_uplink_grant(loop_ctx.config, &mut uplink_runtime, &mut last_uplink_fetch).await;
@@ -1926,6 +1947,9 @@ async fn run_once_with_failure_cache(
         .await
         .unwrap_or(0);
     let effective = effective_output(loop_ctx.config, uplink.grant());
+    // 日志源候选跟着**事实摘要**上送（同一拍、同一份快照，见 `control::log_sources`）：
+    // 摘要真发出去了才跟着发，不另造一套节流。
+    let mut facts_reported = false;
     let telemetry_tick = match build_telemetry_sink(loop_ctx.config, work, &effective) {
         Ok(mut sink) => {
             if !effective.enabled {
@@ -1952,6 +1976,7 @@ async fn run_once_with_failure_cache(
                         force_refresh,
                     )
                     .await;
+                    facts_reported = matches!(outcome, FactSendOutcome::Reported);
                     record_forced_fact_report(&mut forced_fact_report, outcome);
                 }
                 TelemetryTick::silent()
@@ -1993,6 +2018,7 @@ async fn run_once_with_failure_cache(
                         force_refresh,
                     )
                     .await;
+                    facts_reported = matches!(outcome, FactSendOutcome::Reported);
                     record_forced_fact_report(&mut forced_fact_report, outcome);
                 }
                 if send_discovery_snapshot && sink.carries_discovery_frames() {
@@ -2034,6 +2060,25 @@ async fn run_once_with_failure_cache(
             }
         }
     };
+    // 日志源候选：与事实摘要同拍。失败只进日志 —— 它是一条辅助信息，
+    // 不该把发现 tick 变成故障（也不该让 `RuntimeHealthSnapshot` 多出一种失败）。
+    if facts_reported {
+        match crate::control::log_sources::report_log_sources(
+            loop_ctx.config,
+            discovery_runtime.latest_snapshot(),
+            &instance_id,
+        )
+        .await
+        {
+            Ok(0) => {}
+            Ok(accepted) => {
+                log::info!("event=LogSourcesReported agent_id={agent_id} accepted={accepted}")
+            }
+            Err(err) => {
+                log::warn!("event=LogSourcesReportFailed agent_id={agent_id} detail=\"{err}\"")
+            }
+        }
+    }
     // 出口恢复：上一轮报过出口写失败、这一轮真的发出去了 → 补一行（见 `UplinkHealth`）。
     // 位置在失败行之后：先报错、再报好，读日志时顺序与因果一致。
     if let Some(health) = uplink_health {
@@ -2151,6 +2196,28 @@ struct DiscoveryHealth {
 ///
 /// `force = true`（手动重采）时**忽略**最小间隔：新加进目录的 `path_exists:` 路径只有随策略表
 /// 下发后才会被探测，等 5 分钟正是手动触发要绕开的那一段。
+/// 拉一次 L3 搜索范围（知识库 ∩ 网关 roots 的交集）。
+///
+/// 失败什么都不改（沿用落盘那份）：搜索范围是“允许去哪儿找”，不是数据 ——
+/// 断网期间清空会让本已定位到的日志突然消失，而它并没有变。与发现策略表同一姿态。
+async fn refresh_source_search_policy(
+    config: &AgentConfig,
+    last_fetch: &mut Option<Instant>,
+    force: bool,
+) {
+    let now = Instant::now();
+    if !force
+        && let Some(at) = *last_fetch
+        && at.elapsed() < DISCOVERY_POLICY_FETCH_MIN_INTERVAL
+    {
+        return;
+    }
+    *last_fetch = Some(now);
+    // 成功时 `refresh` 自己落盘并打一行 `SourceSearchPolicyApplied`；失败只留日志。
+    let state_dir = std::path::Path::new(&config.paths.state_dir);
+    let _ = crate::control::source_search_policy::refresh(config, state_dir).await;
+}
+
 async fn refresh_discovery_policy(
     config: &AgentConfig,
     runtime: &mut DiscoveryRuntime,

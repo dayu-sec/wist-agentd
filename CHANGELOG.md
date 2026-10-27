@@ -3,6 +3,34 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.10.0-alpha] - 2026-10-27
+
+### 新增（日志源动态定位：库装在 `/data/db/...` 也能采到）
+
+- **本机推导数据库日志目录**：从进程证据（`-D` / `PGDATA` / `--log-error` / `my.cnf` /
+  `redis.conf` / `mongod.conf` / 正在打开的日志文件）推出 PostgreSQL、MySQL、Redis、MongoDB
+  的日志目录，作为**候选**随事实摘要同拍上报（`POST /api/v1/agent/log-sources`）。
+  采不采仍由网关判定，agent 不自作主张。
+- **容器里的实例**：容器视角的路径经 `/proc/<pid>/root` + `realpath` 变成**宿主可见**路径；
+  命名卷、可写层、bind mount 三种形态都能定位。
+- **多实例**：同一机器上 5432 / 5433 两个实例各自一条（按端口作身份，重启不丢）。
+- **受限搜索（L3，默认关）**：前几层证据都落不了地时，在**控制面下发**的 roots 下有界查找
+  （标记：`PG_VERSION` / `ibdata1` / `dump.rdb` / `WiredTiger` 或日志文件名）。
+  上限：roots ≤ 8、深度 ≤ 4、2000 条目、总时长 2s；不跟随符号链接；只读目录名，不读文件内容。
+- **`agentd diagnose` 新增 `discovery.log_sources`**：现场跑一次解析（与守护进程同一条路），
+  直接报「看到了几个实例、定位到几个、当前搜索范围」，专治「我配了 `-D`，为什么页面上没变」。
+
+### 变更（配置）
+
+- `[discovery]` 新增 `source_resolve`（默认开：只读 `/proc`，常数成本）。
+- **搜索范围不在本机配置里**：由网关下发（知识库 `search_roots` ∩ `allowed_source_roots`），
+  落 `state/source_search_policy.json`（重启后仍生效）；拿不到就不搜索。主机侧改不了范围。
+
+### 升级注意
+
+- 需要的网关端点（`/api/v1/agent/log-sources`、`/source-search-policy:poll`）需要
+  **网关 ≥ 0.23.0-alpha**；旧网关下这两个能力静默不可用，**其它行为不变**（404 不告警）。
+
 ## [0.9.13-alpha] - 2026-10-26
 
 ### 修复（探针：看不到 ≠ 不存在）

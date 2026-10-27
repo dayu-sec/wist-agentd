@@ -9,6 +9,12 @@ pub mod uplink;
 pub mod discovery_snapshot;
 // 采集预检：网关让机器**自己**探一次路径（远程维护时不用人登录客户机）。
 pub mod preflight;
+// 日志源候选上报（agentd 解析 → 网关判定）。与预检同一姿态：**尽力而为**，
+// 送不出去只进日志，不把发现 tick 弄成故障。
+pub mod log_sources;
+// L3 搜索范围（知识库 ∩ 网关 roots 的**交集**，由网关下发；本机无配置）。
+// 拿不到 = 不搜索，行为与 L2b 一致。
+pub mod source_search_policy;
 pub mod work;
 
 pub(crate) use runtime_entry::run;

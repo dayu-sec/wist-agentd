@@ -321,6 +321,7 @@ mod tests {
             container_enabled: false,
             snapshot_uplink_enabled: false,
             snapshot_uplink_interval_seconds: 300,
+            source_resolve: true,
         };
         assert_code(validate_config(&config), "missing_discovery_probe");
     }
@@ -343,6 +344,7 @@ mod tests {
                 container_enabled: false,
                 snapshot_uplink_enabled: false,
                 snapshot_uplink_interval_seconds: 300,
+                source_resolve: true,
             };
             set_enabled(&mut discovery);
             let mut config = base_config();

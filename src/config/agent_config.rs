@@ -87,6 +87,12 @@ pub struct DiscoverySection {
     /// 容器/进程密集的机器 1800~3600。改完重启守护进程生效。
     #[serde(default = "default_discovery_snapshot_uplink_interval_seconds")]
     pub snapshot_uplink_interval_seconds: u64,
+    /// 是否在**本机解析服务的日志目录**（PostgreSQL / MySQL / Redis / MongoDB），作为候选上报给网关。
+    ///
+    /// 默认**开**：只读发现快照 + `/proc/<pid>/{cmdline,environ,fd}`（有上限），
+    /// 常数成本、不遍历文件系统。关掉只是不报，不影响其它采集。
+    #[serde(default = "default_discovery_source_resolve_enabled")]
+    pub source_resolve: bool,
 }
 
 impl Default for DiscoverySection {
@@ -99,6 +105,7 @@ impl Default for DiscoverySection {
             container_enabled: default_discovery_container_enabled(),
             snapshot_uplink_enabled: default_discovery_snapshot_uplink_enabled(),
             snapshot_uplink_interval_seconds: default_discovery_snapshot_uplink_interval_seconds(),
+            source_resolve: default_discovery_source_resolve_enabled(),
         }
     }
 }
@@ -496,6 +503,10 @@ fn default_discovery_snapshot_uplink_enabled() -> bool {
 
 fn default_discovery_snapshot_uplink_interval_seconds() -> u64 {
     3600
+}
+
+fn default_discovery_source_resolve_enabled() -> bool {
+    true
 }
 
 #[cfg(test)]

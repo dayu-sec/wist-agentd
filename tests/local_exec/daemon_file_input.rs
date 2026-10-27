@@ -443,6 +443,8 @@ fn daemon_run_once_can_enable_high_cardinality_discovery_explicitly() {
         container_enabled: true,
         snapshot_uplink_enabled: false,
         snapshot_uplink_interval_seconds: 300,
+        // 这些用例不该往外发 HTTP：日志源解析与上报一并关掉。
+        source_resolve: false,
     };
 
     let snapshot = daemon::run_once(&daemon::DaemonLoop {

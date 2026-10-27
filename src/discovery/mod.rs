@@ -6,6 +6,9 @@ pub mod container;
 pub mod endpoint;
 pub mod host;
 pub mod k8s;
+// 日志源定位（v1 只做 PostgreSQL）：从发现快照的进程证据推出日志目录，作为候选上报。
+// 采不采、采哪个仍由网关判定（见 `wist-design/doc/design/edge/log-source-resolution.md`）。
+pub mod log_source;
 pub mod network;
 pub mod policy;
 pub mod process;

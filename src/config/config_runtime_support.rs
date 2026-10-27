@@ -44,6 +44,13 @@ container_enabled = true
 # 低于 60s 会被夹到 60s；不需要资产清单就写 false。
 snapshot_uplink_enabled = true
 snapshot_uplink_interval_seconds = 3600
+# 本机解析服务的日志目录（PostgreSQL / MySQL / Redis / MongoDB）。
+# 解析结果作为**候选**上报网关，采不采仍由网关判定（roots + 人工覆盖优先）。
+# 只读 `/proc/<pid>/{cmdline,environ,fd}`（有上限），不遍历文件系统。
+source_resolve = true
+# 注：L3（在非标准目录下“找”日志目录）**不在本文件配**。它的搜索范围由
+# 知识库 `[[units]] search_roots` ∩ 网关 `[collection] allowed_source_roots` 决定，
+# 经控制面下发；拿不到就不搜索。改这里不会放宽它。
 
 # 可选：
 # [agent]

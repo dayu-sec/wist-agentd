@@ -297,6 +297,7 @@ async fn diagnose(config_root: &Path, offline: bool) -> Report {
     checks.extend(identity_checks(&config).await);
     checks.extend(service_checks(config_root, &config));
     checks.extend(exporter_tool_checks(&config));
+    checks.push(log_source_check(&config));
 
     if offline {
         checks.push(Check::warn(
@@ -904,6 +905,96 @@ fn binary_checks() -> Vec<Check> {
 ///
 /// 为什么读状态而不是自己 `stat`：需求是「缺件被记录」，而记录点就在采集路径上
 /// （`process_exporters` 跑前预检）；diagnose 只做**呈现**，不另造一份判据。
+/// 日志目录解析：开关 + **现场跑一次**（与守护进程同一个 `resolve`）。
+///
+/// 为什么要在诊断里现场跑：现场问的第一个问题就是「我明明配了 `-D`，为什么页面上没变」。
+/// 只靠事后翻日志要等人登录主机；这里直接把「看到了几个实例、定位到几个」摆出来 ——
+/// 而且它与守护进程走同一条解析路径，不存在「工具说找到了、进程没上报」。
+fn log_source_check(config: &AgentConfig) -> Check {
+    if !config.discovery.source_resolve {
+        return Check::warn(
+            "discovery.log_sources",
+            "日志目录解析已关闭",
+            "source_resolve = false；网关收不到任何解析出来的目录",
+        )
+        .hint(
+            "要自动定位数据库（PostgreSQL / MySQL / Redis / MongoDB）的日志目录就在 [discovery] 写 `source_resolve = true`（默认开）",
+        );
+    }
+    if !config.discovery.process_enabled {
+        return Check::warn(
+            "discovery.log_sources",
+            "解析开着，但进程发现是关的",
+            "process_enabled = false；解析靠进程证据（argv / environ），关着时必然什么也找不到",
+        )
+        .hint("把 [discovery] 的 `process_enabled` 打开，或直接依赖采集目录里的标准路径");
+    }
+
+    let policy =
+        crate::control::source_search_policy::load(std::path::Path::new(&config.paths.state_dir));
+    let sources = crate::discovery::log_source::resolve_live(&policy);
+    let resolved = sources
+        .iter()
+        .filter(|source| !source.dir.is_empty())
+        .count();
+    let unresolved = sources.len() - resolved;
+    let services: Vec<&str> = {
+        let mut names: Vec<&str> = sources
+            .iter()
+            .map(|source| source.service.as_str())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    };
+    let detail = format!(
+        "resolved={resolved} unresolved={unresolved} services=[{}] search={}",
+        services.join(", "),
+        // 搜索范围不在本机配置里，而是知识库 ∩ 网关下发的交集（见设计 §5.4/§6.1.1）——
+        // 现场排查“为什么没去搜”时，这两项就是答案。
+        if policy.is_empty() {
+            "off".to_string()
+        } else {
+            format!(
+                "catalog_version={} {}",
+                policy.catalog_version,
+                policy.describe()
+            )
+        }
+    );
+
+    if resolved > 0 {
+        return Check::ok(
+            "discovery.log_sources",
+            "已定位到日志目录",
+            format!("{detail}；会随事实摘要一起上报给网关（含容器里的实例）"),
+        );
+    }
+    if unresolved > 0 {
+        let mut hint = "常见原因：① `logging_collector = off`（日志进 stderr/journald）；\
+             ② 目录在容器里、但落在网关 `[collection] allowed_source_roots` 之外（named volume）；\
+             ③ 是人工覆盖的活（管理面 API 指定目录）"
+            .to_string();
+        if policy.is_empty() {
+            hint.push_str(
+                "；④ L3 搜索是关的 —— 它由知识库 `[[units]] search_roots` ∩ 网关 \
+                 `[collection] allowed_source_roots` 决定（本机无配置），两份都包含数据目录时才会去搜",
+            );
+        }
+        return Check::warn(
+            "discovery.log_sources",
+            "看到了实例，但没找到日志目录",
+            detail,
+        )
+        .hint(hint);
+    }
+    Check::ok(
+        "discovery.log_sources",
+        "没有可解析的实例",
+        format!("{detail}；服务词表：postgresql / mysql / redis / mongodb"),
+    )
+}
+
 fn exporter_tool_checks(config: &AgentConfig) -> Vec<Check> {
     let state_dir = PathBuf::from(&config.paths.state_dir);
     let missing = crate::telemetry::exporters::load_state(&state_dir).missing;
@@ -2589,6 +2680,51 @@ mod tests {
                 .unwrap_or_default()
                 .contains("snapshot_uplink_enabled = true"),
             "要告诉运维怎么打开"
+        );
+    }
+
+    #[test]
+    fn log_source_check_reports_a_disabled_switch() {
+        let mut config = template_config();
+        config.discovery.source_resolve = false;
+
+        let check = log_source_check(&config);
+        assert_eq!(check.id, "discovery.log_sources");
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check
+                .hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("source_resolve = true"),
+            "要告诉运维怎么打开：{check:?}"
+        );
+    }
+
+    #[test]
+    fn log_source_check_says_it_needs_process_discovery() {
+        // 解析靠进程证据：进程发现关着时，开关开着也什么都不会发生。
+        let mut config = template_config();
+        config.discovery.source_resolve = true;
+        config.discovery.process_enabled = false;
+
+        let check = log_source_check(&config);
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check.detail.contains("process_enabled = false"),
+            "{check:?}"
+        );
+    }
+
+    #[test]
+    fn log_source_check_survives_a_live_scan() {
+        // 真跑一次进程 + 端点探针：不等于某个具体结论（依主机而异），
+        // 但必须能给出一个结论，且 id 稳定。
+        let check = log_source_check(&template_config());
+        assert_eq!(check.id, "discovery.log_sources");
+        assert!(
+            matches!(check.status, Status::Ok | Status::Warn),
+            "{check:?}"
         );
     }
 
