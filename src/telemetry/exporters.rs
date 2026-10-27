@@ -157,8 +157,19 @@ pub fn argv_for(id: &str, arg: Option<&str>) -> io::Result<Vec<String>> {
         ("last-reboot", _) => Ok(v(&["/usr/bin/last", "-x", "reboot", "shutdown"])),
         ("nft-ruleset", _) => Ok(v(&["/usr/sbin/nft", "list", "ruleset"])),
         ("iptables-save", _) => Ok(v(&["/usr/sbin/iptables-save"])),
-        // 首版只给「有哪些盘」；逐盘 `-a` 的详情留待后续（见本模块头部的能力边界）。
-        ("smartctl", _) => Ok(v(&["/usr/sbin/smartctl", "--scan-open"])),
+        // 首版只给「哪些盘」；逐盘 `-a` 的详情留待后续（见本模块头部的能力边界）。
+        //
+        // 安装位置随平台/包管理器不同：Linux 发行版在 `/usr/sbin`，macOS 的 Homebrew 在
+        // `/opt/homebrew/sbin`（Apple Silicon）或 `/usr/local/sbin`（Intel）。
+        // 逐个探测取**第一个可执行的**；都不在时保留第一个候选，让缺件预检如实报 missing。
+        ("smartctl", _) => Ok(vec![
+            first_present(&[
+                "/usr/sbin/smartctl",
+                "/opt/homebrew/sbin/smartctl",
+                "/usr/local/sbin/smartctl",
+            ]),
+            "--scan-open".to_string(),
+        ]),
         ("dmesg", None) => Ok(v(&["/usr/bin/dmesg"])),
         ("dmesg", Some("panic")) => Ok(v(&["/usr/bin/dmesg", "--level", "emerg,alert,crit"])),
         ("dmesg", Some("nvidia-xid")) => Ok(v(&["/usr/bin/dmesg"])),
@@ -582,6 +593,16 @@ pub fn tool_present(tool: &str) -> bool {
 /// argv 里的二进制路径（argv[0]）。
 pub fn tool_path(argv: &[String]) -> Option<&str> {
     argv.first().map(String::as_str)
+}
+
+/// 候选路径里第一个**可执行**的那个；一个都没有时返回第一个（让缺件预检如实报缺失）。
+fn first_present(candidates: &[&str]) -> String {
+    candidates
+        .iter()
+        .find(|path| tool_present(path))
+        .copied()
+        .unwrap_or(candidates[0])
+        .to_string()
 }
 
 /// 当前时刻（毫秒），供调度用。
@@ -1018,5 +1039,27 @@ mod tests {
             tool_path(&["/usr/sbin/smartctl".to_string(), "--scan-open".to_string()]),
             Some("/usr/sbin/smartctl")
         );
+    }
+
+    #[test]
+    fn smartctl_is_resolved_across_linux_and_homebrew_locations() {
+        // 不能把路径写死：Linux 在 `/usr/sbin`，macOS 的 Homebrew 在 `/opt/homebrew/sbin`。
+        // 这里是纯逻辑层面的断言（本机是否存在 smartctl 不影响结论）。
+        let argv = argv_for("smartctl", None).expect("已知导出器");
+        assert_eq!(argv[1], "--scan-open");
+        let candidates = [
+            "/usr/sbin/smartctl",
+            "/opt/homebrew/sbin/smartctl",
+            "/usr/local/sbin/smartctl",
+        ];
+        assert!(
+            candidates.contains(&argv[0].as_str()),
+            "可选位置之一：{}",
+            argv[0]
+        );
+        // 取到的那个一定存在，除非三个都没装（那种情况保留第一个，由缺件预检报缺失）。
+        if candidates.iter().any(|path| tool_present(path)) {
+            assert!(tool_present(&argv[0]), "应当选到可执行的那个：{}", argv[0]);
+        }
     }
 }

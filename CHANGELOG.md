@@ -3,6 +3,15 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.10.1-alpha] - 2026-10-27
+
+### 修复（macOS 上的存储健康）
+
+- `smartctl` 导出器不再写死 `/usr/sbin/smartctl`：按顺序探测
+  `/usr/sbin` → `/opt/homebrew/sbin`（Apple Silicon）→ `/usr/local/sbin`（Intel），取第一个**可执行**的。
+  三个都没有时仍保留第一个候选，由既有的「工具缺失」预检如实上报（不静默）。
+- 与知识库 0.7.0 配套：macOS 开发机（MacDev）的 StorageHealth 面现在能真的跑起来。
+
 ## [0.10.0-alpha] - 2026-10-27
 
 ### 新增（日志源动态定位：库装在 `/data/db/...` 也能采到）
