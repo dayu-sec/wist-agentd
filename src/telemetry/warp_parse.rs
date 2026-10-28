@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::config::agent_config::LogsOutputSection;
 use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout};
 use wist_contracts::telemetry_record::{DataFrame, TelemetryRecord};
@@ -225,8 +225,24 @@ impl TcpFraming {
 
 /// TCP 连接超时：避免死网卡/黑洞地址让 tick 永久挂起。
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// TCP 写超时：避免对端不读导致的写永久挂起。
-const TCP_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// TCP 写超时窗口：判的是**没有进展**，不是整次写的时长。
+///
+/// 为什么必须是「无进展」而不是 `timeout(_, write_all)`：后者会把一个**慢但一直在推进**的
+/// 连接当场取消，取消点落在任意字节上，于是线上留下半帧。接收端（wparse 的 `line`/`auto`）
+/// 在 EOF 上会把最后一条**没有换行**的残行当成一条完整记录交付 —— 数据面因此看到一条被截断
+/// 的 JSON 帧（解析失败 + miss 脏数据）。见 [`finish_in_background`]。
+const TCP_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// 单次 payload 写（一条连接上的一次写单元）的**总时长**上限。
+///
+/// 只判「无进展」还不够：对端每 4.9 秒滴 1 字节也能让无进展窗口永不触发，而主循环是
+/// **串行**的 —— 卡住等于不采集、不上报、不看控制面。3 秒一拍，一次写超过这个上限本身
+/// 就是故障现场：交给后台收尾，本轮按失败落 spool（数据不会丢，重放会补上）。
+const TCP_WRITE_TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
+/// 写停住后，「把剩下的半帧写完」的上限。
+///
+/// 只保「不留半帧」，不保「很快」：这一轮已经失败、调用方会把整批落 spool 重放，
+/// 收尾慢一点没有代价；把连接直接关掉才是有代价的（接收端会把半帧当记录）。
+const TCP_WRITE_FINISH_TIMEOUT: Duration = Duration::from_secs(60);
 /// 退避初始时长与上限（失败翻倍、成功重置）。
 const TCP_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const TCP_BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -309,25 +325,41 @@ impl TcpRecordSink {
     }
 
     /// 写一段已分帧的字节到连接；失败时重置连接并进入指数退避，以便下次重连。
+    ///
+    /// 关键不变量：**这条连接上最后一条数据必须是完整帧**。写停住时不能直接关连接，
+    /// 否则线上剩下的半帧会在接收端 EOF 时被当成一条记录（见 [`finish_in_background`]）。
+    ///
+    /// 例外只有一种：链路真的断了（`PayloadWrite::Failed`）或进程被直接杀掉 —— 那时本端
+    /// 已经无法再写，残尾只能由接收端看到；数据本身由 spool 兜住。
     async fn write_payload(&mut self, payload: &[u8]) -> io::Result<()> {
         self.ensure_connected().await?;
-        let write = {
-            let stream = self.stream.as_mut().expect("connected");
-            timeout(TCP_WRITE_TIMEOUT, stream.write_all(payload)).await
-        };
-        match write {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(err)) => {
-                self.stream = None;
+        let mut stream = self.stream.take().expect("connected");
+        match write_payload_bytes(
+            &mut stream,
+            payload,
+            TCP_WRITE_STALL_TIMEOUT,
+            TCP_WRITE_TOTAL_TIMEOUT,
+        )
+        .await
+        {
+            PayloadWrite::Complete => {
+                self.stream = Some(stream);
+                Ok(())
+            }
+            PayloadWrite::Failed(err) => {
                 self.schedule_backoff();
                 Err(self.tag_target(err))
             }
-            Err(_) => {
-                self.stream = None;
+            PayloadWrite::Stalled { written } => {
                 self.schedule_backoff();
+                if written < payload.len() {
+                    // 线上已经有半帧：交给后台把剩余字节写完再关。绝不在这里直接关。
+                    finish_in_background(stream, payload[written..].to_vec());
+                }
+                // `written == 0`：一个字节都没出去，直接关是干净的（走 drop）。
                 Err(self.tag_target(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "tcp write timed out",
+                    "tcp write stalled (no progress)",
                 )))
             }
         }
@@ -386,6 +418,101 @@ impl RecordSink for TcpRecordSink {
             .await
             .map_err(uplink_write_error)
     }
+}
+
+/// 一次 payload 写的结局。
+#[derive(Debug)]
+enum PayloadWrite {
+    /// 全部写入（含下层的 flush）。
+    Complete,
+    /// 我们不再等了（`stall` 窗口内无进展，或总时长用尽）；`written` 字节已经在线上。
+    Stalled { written: usize },
+    /// 连接出错；出错前可能已有部分字节在线上，而错误后的连接已不可再写。
+    ///
+    /// 这种残尾**没法在本端收尾**（socket 已经坏了），接收端仍可能在 EOF 上把它当一条记录。
+    /// 数据本身由 spool 兜住，这里只是如实区分「我们主动不等了」与「链路断了」。
+    Failed(io::Error),
+}
+
+/// 把 `payload` 写进 `stream`：`stall` 管「多久没进展就算停住」，`total` 管「这次写最多占多久」。
+///
+/// 两个上限都要：只有 `stall` 时，对端慢慢滴数据可以无限拖住串行的主循环；
+/// 只有 `total` 时，慢但对端一直在推进的连接会被误杀（就是本 issue 的半帧来源）。
+///
+/// 逐次 `write`（而不是 `write_all`）是为了在停住时**知道已经出去了多少字节** ——
+/// 收尾只需要写剩下的部分，不必重发、也不会把重复的字节拼进帧里。
+async fn write_payload_bytes<S>(
+    stream: &mut S,
+    payload: &[u8],
+    stall: Duration,
+    total: Duration,
+) -> PayloadWrite
+where
+    S: AsyncWrite + Unpin,
+{
+    let deadline = Instant::now() + total;
+    let mut written = 0usize;
+    while written < payload.len() {
+        let now = Instant::now();
+        if now >= deadline {
+            return PayloadWrite::Stalled { written };
+        }
+        let window = stall.min(deadline - now);
+        match timeout(window, stream.write(&payload[written..])).await {
+            Ok(Ok(0)) => {
+                return PayloadWrite::Failed(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "tcp write accepted zero bytes",
+                ));
+            }
+            Ok(Ok(written_now)) => written += written_now,
+            Ok(Err(err)) => return PayloadWrite::Failed(err),
+            Err(_) => return PayloadWrite::Stalled { written },
+        }
+    }
+    match stream.flush().await {
+        Ok(()) => PayloadWrite::Complete,
+        Err(err) => PayloadWrite::Failed(err),
+    }
+}
+
+/// 把「已经写了半截」的剩余字节写完再关连接。
+///
+/// 为什么必须有：接收端在 EOF 上会把最后一条**没有换行**的残行交付成一条记录
+/// （wparse `line` / `auto` 的 tail-line 语义）。所以这条连接的最后一条数据必须是完整帧；
+/// 写停住时若直接关闭，数据面就会收到一条**截断的 JSON 帧**，现象就是 miss 里出现半条报文
+/// （`{"schema":"v1","agent":"..."` 这类截在信封中间的脏数据）。
+///
+/// 为什么放后台而不是这里 await：这一轮已经失败（调用方会把整批落 spool，下一轮重放），
+/// 但半帧不能就这么留在线上；进度等不起，收尾可以慢慢来。
+///
+/// 剩余字节写不完（对端真的死了）时只能如实告警：那种情况下没有数据面侧能做的事，
+/// 数据本身也已经由 spool 兜住。
+fn finish_in_background<S>(mut stream: S, rest: Vec<u8>)
+where
+    S: AsyncWrite + Send + Unpin + 'static,
+{
+    // 拿不到 runtime（进程正在退出）时不 spawn：`tokio::spawn` 在无上下文时会 panic，
+    // 而这条路径本身就是「尽力而为」，宁可留下半帧也不能让收尾把进程带崩。
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        log::warn!("uplink: no runtime available to finish a stalled frame");
+        return;
+    };
+    handle.spawn(async move {
+        match timeout(TCP_WRITE_FINISH_TIMEOUT, stream.write_all(&rest)).await {
+            Ok(Ok(())) => {
+                let _ = stream.flush().await;
+                let _ = stream.shutdown().await;
+            }
+            Ok(Err(err)) => log::warn!(
+                "uplink: failed to finish a stalled frame; the peer may see a truncated tail: {err}"
+            ),
+            Err(_) => log::warn!(
+                "uplink: gave up finishing a stalled frame after {}s; the peer may see a truncated tail",
+                TCP_WRITE_FINISH_TIMEOUT.as_secs()
+            ),
+        }
+    });
 }
 
 /// TCP 上送帧：结构化信封（不含原文）与 `LOGRAW:` 原始行分离，避免把 raw 塞进 JSON。
@@ -629,6 +756,100 @@ mod tests {
         assert_eq!(sink.backoff, TCP_BACKOFF_INITIAL);
         assert!(sink.next_attempt_at.is_none());
         server.await.expect("server");
+    }
+
+    /// 写停住时，报告的是**真正到过对端的字节数**（不是「全写了」也不是「一点没写」）。
+    ///
+    /// 这个数字是收尾的唯一依据：多算会把重复字节拼进帧，少算会丢字节。
+    #[tokio::test(flavor = "current_thread")]
+    async fn stalled_write_reports_the_bytes_that_reached_the_peer() {
+        // `duplex(64)`：写满 64 字节后不再有进展，可确定性地触发「停住」。
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let payload = vec![b'a'; 1024];
+
+        let outcome = super::write_payload_bytes(
+            &mut writer,
+            &payload,
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let written = match outcome {
+            super::PayloadWrite::Stalled { written } => written,
+            other => panic!("expected a stall, got {other:?}"),
+        };
+        assert!(
+            written > 0 && written < payload.len(),
+            "must report a partial write, got {written}"
+        );
+
+        let mut got = vec![0u8; written];
+        reader.read_exact(&mut got).await.expect("read prefix");
+        assert_eq!(
+            got,
+            payload[..written],
+            "reported bytes must match what the peer got"
+        );
+    }
+
+    /// 停住之后必须把剩余字节写完再关：对端最终拿到的是**完整帧**，而不是半条。
+    ///
+    /// 这就是 issue #34 的要害：wparse 在 EOF 上会把最后一条无换行的残行当记录交付，
+    /// 半帧会变成 miss 里的一条截断 JSON。
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stalled_frame_is_finished_before_the_stream_closes() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let payload = vec![b'f'; 4096];
+
+        let stalled = super::write_payload_bytes(
+            &mut writer,
+            &payload,
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+        )
+        .await;
+        let written = match stalled {
+            super::PayloadWrite::Stalled { written } => written,
+            other => panic!("expected a stall, got {other:?}"),
+        };
+
+        super::finish_in_background(writer, payload[written..].to_vec());
+
+        let mut got = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_to_end(&mut got))
+            .await
+            .expect("background finish must not hang")
+            .expect("read to end");
+        assert_eq!(
+            got, payload,
+            "the peer must end up with the whole frame, not a truncated tail"
+        );
+    }
+
+    /// 总时长上限必须能单独生效：否则「对端每 4.9 秒收 1 字节」能把串行的主循环无限拖住
+    /// （无进展窗口永远不触发）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_total_budget_caps_a_write_before_the_stall_window_would() {
+        // `duplex(1)`：只能收下 1 字节，之后无进展；无进展窗口故意设成 30s，只有总预算能做主。
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let payload = vec![b'z'; 1024];
+
+        let outcome = super::write_payload_bytes(
+            &mut writer,
+            &payload,
+            Duration::from_secs(30),
+            Duration::from_millis(50),
+        )
+        .await;
+
+        match outcome {
+            super::PayloadWrite::Stalled { written } => assert_eq!(
+                written, 1,
+                "the total budget must cut the write and keep the progress count"
+            ),
+            other => panic!("expected the total budget to cut the write, got {other:?}"),
+        }
     }
 
     #[test]
