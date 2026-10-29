@@ -80,6 +80,12 @@ stage() {
     cp -f "${BIN_DIR}/${bin}" "${STAGE_DIR}/${bin}"
     chmod 0755 "${STAGE_DIR}/${bin}"
   done
+  # 可选的兼容性声明：网关入库时会读它（`requires` / `supports` / `compat_mode`）。
+  # 没有它也能发包，只是网关按“兼容性未知”告警；有它才能在下发前拦住不兼容组合。
+  if [ -f "${CRATE_ROOT}/compat.json" ]; then
+    cp -f "${CRATE_ROOT}/compat.json" "${STAGE_DIR}/compat.json"
+    info "compat.json ✓"
+  fi
 }
 
 pack() {

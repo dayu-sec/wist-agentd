@@ -3,6 +3,15 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.10.3-alpha] - 2026-10-29
+
+### 变更（发版带上升级兼容声明）
+
+- 新增仓根 `compat.json`：`requires: { "wist-gateway": ">=0.26.0" }`，**故意不给**
+  `compat_mode` / `coexists_with` —— 旧网关的 `deny_unknown_fields` 会拒收新 agentd 的上报，
+  混合态真的不行，就该硬拦，把“先升网关”这个顺序钉住。
+- `dev/package-agentd.sh` 与发布流水线都会把它打进包内（仓根缺件则拒绝发布）。
+
 ## [0.10.2-alpha] - 2026-10-28
 
 ### 修复（上送不再产生截断帧）
