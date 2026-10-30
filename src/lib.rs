@@ -8,6 +8,8 @@ pub(crate) mod doctor;
 pub mod error;
 pub mod exec;
 pub(crate) mod fs_async;
+pub(crate) mod investigate;
+pub(crate) mod investigate_disk;
 pub mod reporting;
 pub mod runtime;
 pub mod service;

@@ -598,6 +598,9 @@ async fn report_status_to_control_plane(
         // `EXPORTER_IDS` 与 `telemetry::exporters::EXPORTERS` 的一致性由单测钉住）。
         // 硬写一份名单会漂；从这里取，新增一种能力时自动跟上。
         logs_capabilities: Some(declared_logs_capabilities()),
+        // 调查能力：网关据此在**入队前**判断“这台机器会不会这道题”（`None` = 旧 agentd）。
+        // 与采集能力同源：从 `investigate::TOPICS` 取，不另写一份名单。
+        investigation_capabilities: Some(crate::investigate::capabilities()),
         command_acks: command_acks.to_vec(),
     };
     let client = match enrollment_http_client(config) {
@@ -1025,6 +1028,12 @@ enum CommandVerdict {
     /// **不受重采节流**：探十几条路径是纯读、毫秒级，卡它与卡整轮采集不是一回事；
     /// 重复点击在网关侧已经被「同 kind 覆盖」拦住了。
     AcceptProbe(Vec<String>),
+    /// 执行一次一次性调查（见 [`crate::investigate`]）。
+    ///
+    /// 与重采同样**不受节流**：它只读、有界（默认 5s），而且网关侧同 kind 的命令会被覆盖。
+    AcceptInvestigate(crate::investigate::InvestigateRequest),
+    /// 调查参数读不懂：立刻回 `failed`，而不是猜一个题目去扫盘。
+    BadInvestigateParams(String),
 }
 
 fn evaluate_command(
@@ -1034,6 +1043,16 @@ fn evaluate_command(
     min_interval: Duration,
     now_ms: i64,
 ) -> CommandVerdict {
+    // 调查是另一条 kind（不是 `refresh_facts` 的参数）：旧 agentd 会如实回 `unsupported`。
+    if command.kind == crate::investigate::COMMAND_KIND {
+        if now_ms.saturating_sub(command.requested_at_ms) > COMMAND_STALE_MS {
+            return CommandVerdict::Stale;
+        }
+        return match crate::investigate::InvestigateRequest::from_params(&command.params) {
+            Ok(request) => CommandVerdict::AcceptInvestigate(request),
+            Err(detail) => CommandVerdict::BadInvestigateParams(detail),
+        };
+    }
     if command.kind != command_kind::REFRESH_FACTS {
         return CommandVerdict::Unsupported;
     }
@@ -1082,6 +1101,101 @@ fn record_command(
         record.detail
     );
     ack_from_record(&record)
+}
+
+/// 跑一次调查并把证据送到它能去的地方，返回要回传的 `(outcome, detail)`。
+///
+/// 三件事，都在这里收口：
+///
+/// 1. **执行**（[`crate::investigate::run_for_command`]）：跑完并把完整报告落本机
+///    `state/investigations/<topic>.json`；落盘失败不算失败（盘满正是要查的时候）。
+/// 2. **回传**：走**数据面通用通道**，帧标记 ` IVSREP: `（与 `OBSFACT` / `DSNAP` 同协议、同 `seq` 空间；
+///    连接是本次临时建的 —— 一次性命令不值得为它养一条常连接）。
+///    闸跟事实帧一致：**只有 tcp 能承载控制类帧**；待命（`enabled = false`）也发 ——
+///    调查是诊断元数据，不是主机内容（见 `wist-agentd/docs/design/agentd-investigation.md` §4）。
+/// 3. **ack**：`outcome` 只表达「调查做成了没有」；报告去了哪里写在 `detail` 里
+///    （回传失败也是 `succeeded`：查清了就是查清了，通道问题单独说）。
+async fn run_investigation(
+    config: &AgentConfig,
+    command: &AgentCommand,
+    request: &crate::investigate::InvestigateRequest,
+    work: &AppliedWorkGrant,
+    uplink: &AppliedUplink,
+    state_dir: &Path,
+) -> (&'static str, String) {
+    let (report, path) = match crate::investigate::run_for_command(config, request).await {
+        Ok(done) => done,
+        Err(detail) => return (command_outcome::FAILED, detail),
+    };
+    let mut detail = report.summary();
+    let stored = format!("；完整报告：{}", path.display());
+
+    let output = effective_output(config, uplink.grant());
+    let delivery = match build_telemetry_sink(config, work, &output) {
+        Ok(mut sink) if sink.carries_investigation_frames() => {
+            let seq_path = log_seq_state::path_for(state_dir);
+            // 与日志/指标/事实共用同一个 seq 空间（`(agent, seq)` 是数据面的去重键）。
+            let mut next_seq = log_seq_state::load_or_default_async(&seq_path)
+                .await
+                .unwrap_or(0);
+            match send_investigation_frame(
+                &mut sink,
+                config,
+                &command.command_id,
+                &report,
+                &mut next_seq,
+                &seq_path,
+            )
+            .await
+            {
+                Ok(()) => format!("；报告已回传（IVSREP，seq={}）", next_seq.saturating_sub(1)),
+                Err(err) => {
+                    log::warn!(
+                        "event=InvestigationReportUplinkFailed command_id={} detail=\"{err}\"",
+                        command.command_id
+                    );
+                    format!("；报告回传失败：{err}")
+                }
+            }
+        }
+        Ok(_) => "；无数据面上送通道（output kind ≠ tcp），报告只在本机".to_string(),
+        Err(err) => format!("；出口配置不可用（{err}），报告只在本机"),
+    };
+
+    detail.push_str(&delivery);
+    detail.push_str(&stored);
+    // ack 是 3s 一次的状态上报里的一段文本：给它一个硬上限，不靠“各段都自觉”。
+    (
+        (command_outcome::SUCCEEDED),
+        crate::investigate::truncate_chars(detail, 900),
+    )
+}
+
+/// 发一帧调查报告（` IVSREP: `）。
+///
+async fn send_investigation_frame(
+    sink: &mut TelemetryRecordSink,
+    config: &AgentConfig,
+    command_id: &str,
+    report: &crate::investigate::Report,
+    next_seq: &mut u64,
+    seq_path: &Path,
+) -> Result<(), String> {
+    // 信封的 `agent` 是自称：没有注册身份就不发（与事实帧同一条理由）。
+    let Some(agent_id) = config.agent.agent_id.as_deref() else {
+        return Err("not enrolled (agent.agent_id is empty)".to_string());
+    };
+    let body = report.to_uplink_body(command_id);
+    let seq = *next_seq;
+    *next_seq += 1;
+    // 先持久化高水位再发：跳号可以，撞号不行。
+    log_seq_state::store_async(seq_path, *next_seq)
+        .await
+        .map_err(|err| err.to_string())?;
+    let envelope = DataFrame::new(agent_id, report.observed_at.clone(), seq);
+    sink.write_investigation(&envelope, &body)
+        .await
+        .map_err(|err| err.to_string())
 }
 
 /// 一次重采的结果（`refresh_facts` 的判定细节，不属于命令队列本身）。
@@ -1670,6 +1784,33 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                     }
                     continue;
                 }
+                CommandVerdict::AcceptInvestigate(request) => {
+                    // 调查本身（目录遍历）在 `execute` 里已丢到 blocking 池；这里只负责
+                    // 「跑完了没有」与「证据送到哪里」。回传失败**不**改变 outcome：
+                    // 磁盘紧张是结论、回传失败是通道问题，两者都不等于“命令没执行”。
+                    let (outcome, detail) = run_investigation(
+                        loop_ctx.config,
+                        &command,
+                        &request,
+                        &work_runtime,
+                        &uplink_runtime,
+                        &command_state_dir,
+                    )
+                    .await;
+                    let ack = record_command(
+                        &mut command_history,
+                        &command,
+                        outcome,
+                        detail,
+                        now_ts_ms(),
+                    );
+                    history_dirty = true;
+                    if source == CommandSource::Remote {
+                        pending_command_acks.push(ack);
+                    }
+                    continue;
+                }
+                CommandVerdict::BadInvestigateParams(detail) => (command_outcome::FAILED, detail),
                 CommandVerdict::Unsupported => (
                     command_outcome::UNSUPPORTED,
                     format!("agentd 尚未实现命令 kind={}", command.kind),
@@ -3536,6 +3677,17 @@ mod tests {
             );
             // 本版真没有的能力不报（多报比漏报更糟：网关会据此派活）。
             assert!(logs.parsers.is_empty() && logs.watcher_modes.is_empty());
+            // 调查能力同一份报文里带上：网关必须在**入队前**就知道这台机器会不会这道题。
+            let capabilities = report
+                .investigation_capabilities
+                .expect("investigation_capabilities present");
+            assert_eq!(
+                capabilities.surfaces,
+                crate::investigate::TOPICS
+                    .iter()
+                    .map(|topic| topic.to_string())
+                    .collect::<Vec<_>>()
+            );
             let response =
                 "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
             socket.write_all(response.as_bytes()).await.expect("write");
@@ -5390,6 +5542,205 @@ mod tests {
             ),
             other => panic!("expected AcceptProbe, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_investigate_command_is_accepted_and_parses_its_params() {
+        let now = now_ts_ms();
+        let interval = Duration::from_secs(60);
+        let mut command = sample_command("c-investigate", crate::investigate::COMMAND_KIND, now);
+        command.params = r#"{"topic":"disk","path":"/var","top":3}"#.to_string();
+
+        // 调查**不受重采节流**（同一 tick 已经跑过重采也能做）。
+        match evaluate_command(&command, true, Some(Instant::now()), interval, now) {
+            CommandVerdict::AcceptInvestigate(request) => {
+                assert_eq!(request.path, Some(std::path::PathBuf::from("/var")));
+                assert_eq!(request.top, 3);
+            }
+            other => panic!("expected AcceptInvestigate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_investigate_command_with_bad_params_fails_instead_of_guessing() {
+        let now = now_ts_ms();
+        let interval = Duration::from_secs(60);
+        let mut command = sample_command("c-bad", crate::investigate::COMMAND_KIND, now);
+        command.params = r#"{"topic":"memory"}"#.to_string();
+
+        match evaluate_command(&command, false, None, interval, now) {
+            CommandVerdict::BadInvestigateParams(detail) => {
+                assert!(detail.contains("memory"), "{detail}")
+            }
+            other => panic!("expected BadInvestigateParams, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_investigate_command_goes_stale_like_any_other_command() {
+        let now = now_ts_ms();
+        let interval = Duration::from_secs(60);
+        let command = sample_command(
+            "c-stale-investigate",
+            crate::investigate::COMMAND_KIND,
+            now - COMMAND_STALE_MS - 1,
+        );
+
+        assert!(matches!(
+            evaluate_command(&command, false, None, interval, now),
+            CommandVerdict::Stale
+        ));
+    }
+
+    /// 调查报告走**数据面通用通道**（` IVSREP: ` 帧），ack 只带结论与落点。
+    ///
+    /// 为什么钉住端到端：报告与 ack 走两条路（数据面 / 控制面），`command_id` 是唯一关联键；
+    /// 任何一侧改了形状，网关就再也拼不回「这是哪次调查的结果」。
+    #[tokio::test]
+    async fn an_investigate_command_returns_the_report_over_the_data_plane() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = frame_server(listener);
+
+        let root = local_state_dir("investigate-uplink");
+        let mut config = test_config();
+        config.paths.root_dir = root.display().to_string();
+        config.paths.run_dir = root.join("run").display().to_string();
+        config.paths.state_dir = root.join("state").display().to_string();
+        config.paths.log_dir = root.join("log").display().to_string();
+        config.telemetry.logs.output.kind = "tcp".to_string();
+        config.telemetry.logs.output.tcp.addr = "127.0.0.1".to_string();
+        config.telemetry.logs.output.tcp.port = port;
+
+        let command = sample_command("cmd-inv", crate::investigate::COMMAND_KIND, now_ts_ms());
+        let request = crate::investigate::InvestigateRequest {
+            // 扫仓库自己：目录小、不依赖现场，但走的是同一条代码路径。
+            path: Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+            top: 2,
+            max_seconds: 2,
+            ..crate::investigate::InvestigateRequest::default()
+        };
+        let (outcome, detail) = run_investigation(
+            &config,
+            &command,
+            &request,
+            &AppliedWorkGrant::default(),
+            &AppliedUplink::default(),
+            std::path::Path::new(&config.paths.state_dir),
+        )
+        .await;
+
+        // 调查做成了 = succeeded；结论与回传去向都在 detail 里。
+        assert_eq!(outcome, command_outcome::SUCCEEDED);
+        assert!(detail.starts_with("disk 调查："), "{detail}");
+        assert!(detail.contains("IVSREP"), "{detail}");
+        assert!(detail.contains("完整报告"), "{detail}");
+
+        let frame = server.await.expect("server task");
+        assert_eq!(frame.matches(" IVSREP: ").count(), 1, "{frame}");
+        let (envelope, body) = frame
+            .trim_end_matches('\n')
+            .split_once(" IVSREP: ")
+            .expect("IVSREP marker");
+        let envelope: serde_json::Value = serde_json::from_str(envelope).expect("envelope");
+        assert_eq!(envelope["agent"], "agent-x");
+        let body: serde_json::Value = serde_json::from_str(body).expect("report body");
+        // `command_id` 是把数据面报告接回控制面 ack 的唯一关联键。
+        assert_eq!(body["command_id"], "cmd-inv");
+        assert_eq!(body["report_schema"], "wist.investigation.disk/v1");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 无数据面上送通道（`kind = file`）：调查报告只在本机，但**仍算查成了**。
+    ///
+    /// 为什么必须钉住：本机调试 / standalone 就是这个形态 —— 把“没通道”当成调查失败，
+    /// 会让人以为调查本身坏了。
+    #[tokio::test]
+    async fn an_investigate_command_without_a_tcp_uplink_keeps_the_report_local() {
+        let root = local_state_dir("investigate-file-output");
+        let mut config = test_config();
+        config.paths.root_dir = root.display().to_string();
+        config.paths.state_dir = root.join("state").display().to_string();
+        config.paths.log_dir = root.join("log").display().to_string();
+        // 默认就是 file；显式写一遍，免得将来默认值改了这条测试白过。
+        config.telemetry.logs.output.kind = "file".to_string();
+
+        let command = sample_command(
+            "cmd-inv-local",
+            crate::investigate::COMMAND_KIND,
+            now_ts_ms(),
+        );
+        let request = crate::investigate::InvestigateRequest {
+            path: Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+            top: 2,
+            max_seconds: 2,
+            ..crate::investigate::InvestigateRequest::default()
+        };
+        let (outcome, detail) = run_investigation(
+            &config,
+            &command,
+            &request,
+            &AppliedWorkGrant::default(),
+            &AppliedUplink::default(),
+            std::path::Path::new(&config.paths.state_dir),
+        )
+        .await;
+
+        assert_eq!(outcome, command_outcome::SUCCEEDED);
+        assert!(detail.contains("无数据面上送通道"), "{detail}");
+        assert!(detail.contains("完整报告"), "{detail}");
+        assert!(
+            std::path::Path::new(&config.paths.state_dir)
+                .join("investigations")
+                .join("disk.json")
+                .exists(),
+            "报告仍要落本机"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 未注册（没有 `agent.agent_id`）：回传失败写在 detail 里，但调查仍是 `succeeded`。
+    #[tokio::test]
+    async fn an_investigate_command_without_an_identity_reports_the_delivery_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        // 不接连接：发送会在“取信封身份”这一步就失败，不需要服务端。
+        drop(listener);
+
+        let root = local_state_dir("investigate-no-agent");
+        let mut config = test_config();
+        config.agent.agent_id = None;
+        config.paths.state_dir = root.join("state").display().to_string();
+        config.telemetry.logs.output.kind = "tcp".to_string();
+        config.telemetry.logs.output.tcp.addr = "127.0.0.1".to_string();
+        config.telemetry.logs.output.tcp.port = port;
+
+        let command = sample_command(
+            "cmd-inv-anon",
+            crate::investigate::COMMAND_KIND,
+            now_ts_ms(),
+        );
+        let request = crate::investigate::InvestigateRequest {
+            path: Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+            top: 1,
+            max_seconds: 2,
+            ..crate::investigate::InvestigateRequest::default()
+        };
+        let (outcome, detail) = run_investigation(
+            &config,
+            &command,
+            &request,
+            &AppliedWorkGrant::default(),
+            &AppliedUplink::default(),
+            std::path::Path::new(&config.paths.state_dir),
+        )
+        .await;
+
+        assert_eq!(outcome, command_outcome::SUCCEEDED, "调查本身做完了");
+        assert!(detail.contains("报告回传失败"), "{detail}");
+        assert!(detail.contains("not enrolled"), "{detail}");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -49,6 +49,11 @@ enum Command {
     RefreshFacts {
         wait_secs: u64,
     },
+    /// 一次性调查（只读）：当场查一个问题并给证据表（见 [`crate::investigate`]）。
+    Investigate {
+        request: crate::investigate::InvestigateRequest,
+        json: bool,
+    },
 }
 
 /// `service` 子命令的动作。
@@ -148,6 +153,14 @@ where
         }
         Command::RefreshFacts { wait_secs } => {
             run_refresh_facts(root, parsed.config_dir.as_deref(), wait_secs).await
+        }
+        Command::Investigate { request, json } => {
+            // 配置是可选的：磁盘调查不依赖 agentd 配置（读不到只是少了一节「agent 自己占多少」）。
+            let config_root = match parsed.config_dir.as_deref() {
+                Some(path) => Some(resolve_config_dir_arg(&root, path)),
+                None => Some(default_config_root()),
+            };
+            crate::investigate::run(config_root.as_deref(), request, json).await
         }
     }
 }
@@ -292,6 +305,31 @@ where
             index += 1;
             continue;
         }
+        if arg == "investigate" {
+            if command_explicit {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "multiple commands are not supported",
+                ));
+            }
+            index += 1;
+            // 可选的题目紧跟其后（`investigate disk`）；不写题目就是默认的磁盘调查。
+            let mut request = crate::investigate::InvestigateRequest::default();
+            if let Some(candidate) = args.get(index)
+                && !looks_like_option(candidate)
+            {
+                let topic = candidate.to_string_lossy().into_owned();
+                request = crate::investigate::InvestigateRequest::for_topic(&topic)
+                    .map_err(|detail| io::Error::new(io::ErrorKind::InvalidInput, detail))?;
+                index += 1;
+            }
+            command = Command::Investigate {
+                request,
+                json: false,
+            };
+            command_explicit = true;
+            continue;
+        }
         if arg == "--no-wait" {
             match &mut command {
                 Command::RefreshFacts { wait_secs } => {
@@ -330,6 +368,21 @@ where
                 }
             }
         }
+        if let Some(flag) = arg
+            .to_str()
+            .filter(|text| INVESTIGATE_VALUE_FLAGS.contains(text))
+        {
+            let value = option_value(&args, index + 1, flag)?;
+            let Command::Investigate { request, .. } = &mut command else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{flag} is only supported with investigate"),
+                ));
+            };
+            apply_investigate_option(request, flag, value)?;
+            index += 2;
+            continue;
+        }
         if arg == "--json" {
             match &mut command {
                 Command::Doctor { json, .. } => {
@@ -337,10 +390,15 @@ where
                     index += 1;
                     continue;
                 }
+                Command::Investigate { json, .. } => {
+                    *json = true;
+                    index += 1;
+                    continue;
+                }
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "--json is only supported with diagnose",
+                        "--json is only supported with diagnose / investigate",
                     ));
                 }
             }
@@ -371,7 +429,7 @@ where
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "unknown argument or command: {display}{suggestion} (supported: help | version | init-config [--stdout] | service <print|install|uninstall|status> | enroll | diagnose [--json] [--offline] | refresh-facts [--wait <secs> | --no-wait] | --config-dir <path>)",
+                "unknown argument or command: {display}{suggestion} (supported: help | version | init-config [--stdout] | service <print|install|uninstall|status> | enroll | diagnose [--json] [--offline] | refresh-facts [--wait <secs> | --no-wait] | investigate [topic] [--path <dir>] [--top <n>] [--min-size <size>] [--depth <n>] [--max-seconds <n>] [--json] | --config-dir <path>)",
             ),
         ));
     }
@@ -395,7 +453,63 @@ const KNOWN_COMMANDS: &[&str] = &[
     "enroll",
     "diagnose",
     "refresh-facts",
+    "investigate",
 ];
+
+/// `investigate` 的取值参数（题目本身的选项）。
+const INVESTIGATE_VALUE_FLAGS: &[&str] =
+    &["--path", "--top", "--min-size", "--depth", "--max-seconds"];
+
+/// 把一个 `investigate` 选项写到请求上（并且**当场夹紧**，与 `--wait` 同一做法）。
+fn apply_investigate_option(
+    request: &mut crate::investigate::InvestigateRequest,
+    flag: &str,
+    value: &OsString,
+) -> io::Result<()> {
+    let text = value.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{flag} needs a text value"),
+        )
+    })?;
+    match flag {
+        "--path" => {
+            // 只认绝对路径：相对路径取决于进程 cwd，同一台机器换一种启动方式就翻面。
+            if !text.starts_with('/') {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("--path needs an absolute directory, got `{text}`"),
+                ));
+            }
+            request.path = Some(PathBuf::from(text));
+        }
+        "--top" => request.top = parse_investigate_number(flag, text)? as usize,
+        "--depth" => request.depth = parse_investigate_number(flag, text)? as usize,
+        "--max-seconds" => request.max_seconds = parse_investigate_number(flag, text)?,
+        "--min-size" => {
+            request.min_size = crate::investigate::parse_size(text).map_err(|detail| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("--min-size: {detail}"))
+            })?
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported investigate option {flag}"),
+            ));
+        }
+    }
+    request.normalize();
+    Ok(())
+}
+
+fn parse_investigate_number(flag: &str, text: &str) -> io::Result<u64> {
+    text.parse::<u64>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{flag} needs a non-negative integer, got `{text}`"),
+        )
+    })
+}
 
 /// 拼错的子命令 → 最接近的那个（简单的编辑距离，够用且不引新依赖）。
 ///
@@ -477,6 +591,11 @@ fn looks_like_option(value: &OsString) -> bool {
                 | "--offline"
                 | "--wait"
                 | "--no-wait"
+                | "--path"
+                | "--top"
+                | "--min-size"
+                | "--depth"
+                | "--max-seconds"
         )
     })
 }
@@ -1309,6 +1428,8 @@ fn usage_message() -> &'static str {
         "  wist-agentd enroll [--token <token> | --token-stdin] [--config-dir <path>]\n",
         "  wist-agentd diagnose [--json] [--offline] [--config-dir <path>]\n",
         "  wist-agentd refresh-facts [--wait <secs> | --no-wait] [--config-dir <path>]\n",
+        "  wist-agentd investigate [disk] [--path <dir>] [--top <n>] [--min-size <size>]\n",
+        "                                 [--depth <n>] [--max-seconds <n>] [--json] [--config-dir <path>]\n",
         "\n",
         "Commands:\n",
         "  help                 Show this help message.\n",
@@ -1324,10 +1445,20 @@ fn usage_message() -> &'static str {
         "                       Exits nonzero when anything FAILs, so scripts can gate on it.\n",
         "  refresh-facts        Force a full discovery refresh and report the fact summary now\n",
         "                       (the daemon normally reports it at most once per 5 minutes).\n",
+        "  investigate [topic]  One-shot, read-only investigation of this host; prints evidence\n",
+        "                       (paths + sizes), not just a verdict. Topics: disk (default).\n",
+        "                       Exits nonzero when anything FAILs.\n",
         "\n",
         "Refresh-facts options:\n",
         "  --wait <secs>        Wait up to <secs> for the daemon to finish (default 15, max 120).\n",
         "  --no-wait            Only queue the request; print where it was written and exit.\n",
+        "\n",
+        "Investigate options (topic `disk`: which files are big, and how big):\n",
+        "  --path <dir>         Scan this absolute directory instead of the tightest filesystem.\n",
+        "  --top <n>            List the N biggest files / directories (default 10, max 50).\n",
+        "  --min-size <size>    Only list files at least this big (e.g. 8MiB; default 0).\n",
+        "  --depth <n>          Descend at most N levels (default 16, max 64).\n",
+        "  --max-seconds <n>    Time budget for the scan (default 5, max 30).\n",
         "\n",
         "Service options (Linux uses systemd, macOS uses launchd):\n",
         "  --bin <path>         Installed path of the wist-agentd binary (default: current executable).\n",
@@ -1343,7 +1474,7 @@ fn usage_message() -> &'static str {
         "Options:\n",
         "  --config-dir <path>  Use the specified config directory. Relative paths are resolved from the current working directory.\n",
         "                       Default: /etc/wist-agentd.\n",
-        "  --json               Only with `diagnose`: print machine-readable JSON instead of text.\n",
+        "  --json               Only with `diagnose` / `investigate`: print machine-readable JSON instead of text.\n",
         "  --offline            Only with `diagnose`: skip network probes (control plane / data plane).\n",
     )
 }

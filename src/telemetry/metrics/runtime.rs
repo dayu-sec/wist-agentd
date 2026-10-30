@@ -549,65 +549,88 @@ fn push_disk_capacity_facts(
 /// 这是 `system.filesystem.*` 的来源；过渡版的 `host.disk.*` 汇总仍由
 /// [`collect_host_disk_usage`] 产出，两者并存。
 fn collect_host_filesystem_usage(disks: &Disks, facts: &mut Vec<MetricsLabeledFact>) {
-    if cfg!(target_os = "linux") {
-        collect_linux_filesystems(disks, facts);
-    } else if cfg!(target_os = "macos") {
-        collect_macos_filesystems(disks, facts);
+    for filesystem in local_filesystems(disks) {
+        facts.extend(filesystem_facts(
+            &filesystem.mount,
+            &filesystem.file_system,
+            filesystem.total_space,
+            filesystem.available_space,
+        ));
     }
 }
 
-fn collect_linux_filesystems(disks: &Disks, facts: &mut Vec<MetricsLabeledFact>) {
-    let mut seen_devices = HashSet::new();
-    // 先固定根文件系统为规范挂载点，避免它的 bind mount 先出现时把 `/` 顶掉。
-    if let Some(root) = disks
-        .list()
-        .iter()
-        .find(|disk| disk.mount_point() == Path::new("/"))
-        && is_linux_filesystem_mount(root)
-    {
-        let device = root.name().to_string_lossy();
-        seen_devices.insert(filesystem_dedupe_key(&device, "/"));
-        push_filesystem_facts(facts, root);
-    }
-    for disk in disks.list() {
-        if !is_linux_filesystem_mount(disk) {
-            continue;
-        }
-        let device = disk.name().to_string_lossy();
-        let key = filesystem_dedupe_key(&device, &disk.mount_point().to_string_lossy());
-        // 同一文件系统被 bind mount 到多个路径时只报一次（取最先出现的挂载点）。
-        if !seen_devices.insert(key) {
-            continue;
-        }
-        push_filesystem_facts(facts, disk);
-    }
+/// 本机一个「真实文件系统」的容量快照。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalFilesystem {
+    pub mount: String,
+    pub device: String,
+    pub file_system: String,
+    pub total_space: u64,
+    pub available_space: u64,
 }
 
-fn collect_macos_filesystems(disks: &Disks, facts: &mut Vec<MetricsLabeledFact>) {
-    let mut seen_devices = HashSet::new();
-    // Data 卷优先作为内部容量的规范挂载点；`/` 只读，排在它后面。
-    for preferred in ["/System/Volumes/Data", "/"] {
-        if let Some(disk) = disks
+/// 本机真实文件系统清单（指标与 `investigate disk` **共用同一套过滤与去重规则**）。
+///
+/// 顺序是刻意的：**规范挂载点优先**（Linux `/`、macOS 的 Data 卷），其余按系统给出的顺序补齐。
+/// 同一设备被 bind mount / btrfs 子卷挂到多处时只保留第一条 —— 逐条上报会把容量重复计数。
+pub(crate) fn local_filesystems(disks: &Disks) -> Vec<LocalFilesystem> {
+    if !(cfg!(target_os = "linux") || cfg!(target_os = "macos")) {
+        return Vec::new();
+    }
+    let preferred: &[&str] = if cfg!(target_os = "macos") {
+        &["/System/Volumes/Data", "/"]
+    } else {
+        &["/"]
+    };
+
+    let mut seen = HashSet::new();
+    let mut filesystems = Vec::new();
+    for mount in preferred {
+        let Some(disk) = disks
             .list()
             .iter()
-            .find(|disk| disk.mount_point() == Path::new(preferred))
-            && is_macos_filesystem_mount(disk)
-        {
-            let device = disk.name().to_string_lossy();
-            seen_devices.insert(filesystem_dedupe_key(&device, preferred));
-            push_filesystem_facts(facts, disk);
+            .find(|disk| disk.mount_point() == Path::new(mount))
+        else {
+            continue;
+        };
+        if !is_local_filesystem_mount(disk) {
+            continue;
         }
+        let device = disk.name().to_string_lossy().to_string();
+        if !seen.insert(filesystem_dedupe_key(&device, mount)) {
+            continue;
+        }
+        filesystems.push(local_filesystem(disk));
     }
     for disk in disks.list() {
-        if !is_macos_filesystem_mount(disk) {
+        if !is_local_filesystem_mount(disk) {
             continue;
         }
-        let device = disk.name().to_string_lossy();
-        let key = filesystem_dedupe_key(&device, &disk.mount_point().to_string_lossy());
-        if !seen_devices.insert(key) {
+        let device = disk.name().to_string_lossy().to_string();
+        let mount = disk.mount_point().to_string_lossy();
+        if !seen.insert(filesystem_dedupe_key(&device, &mount)) {
             continue;
         }
-        push_filesystem_facts(facts, disk);
+        filesystems.push(local_filesystem(disk));
+    }
+    filesystems
+}
+
+fn local_filesystem(disk: &sysinfo::Disk) -> LocalFilesystem {
+    LocalFilesystem {
+        mount: disk.mount_point().to_string_lossy().to_string(),
+        device: disk.name().to_string_lossy().to_string(),
+        file_system: disk.file_system().to_string_lossy().to_string(),
+        total_space: disk.total_space(),
+        available_space: disk.available_space(),
+    }
+}
+
+fn is_local_filesystem_mount(disk: &sysinfo::Disk) -> bool {
+    if cfg!(target_os = "macos") {
+        is_macos_filesystem_mount(disk)
+    } else {
+        is_linux_filesystem_mount(disk)
     }
 }
 
@@ -728,15 +751,6 @@ fn is_excluded_filesystem(file_system: &str) -> bool {
             | "webdav"
             | "afpfs"
     ) || file_system.starts_with("fuse")
-}
-
-fn push_filesystem_facts(facts: &mut Vec<MetricsLabeledFact>, disk: &sysinfo::Disk) {
-    facts.extend(filesystem_facts(
-        &disk.mount_point().to_string_lossy(),
-        &disk.file_system().to_string_lossy(),
-        disk.total_space(),
-        disk.available_space(),
-    ));
 }
 
 fn filesystem_facts(

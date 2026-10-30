@@ -428,6 +428,7 @@ check=launchctl print system/com.dayu-sec.wist-agentd
 wist-agentd version                       # 已部署版本
 wist-agentd service status       # 只读自检（含真实数据/日志落点）
 sudo wist-agentd diagnose                   # 一屏诊断（配置/身份/服务/连通/上送）；退出码非零 = 有 FAIL
+wist-agentd investigate disk                # 一次性调查（磁盘满：哪几大文件、多大了）；只读、有界
 ```
 
 | 平台 | 服务状态 | 日志 |
@@ -570,6 +571,50 @@ agentd 按 `command_id`（本地台账）去重，不会重复跑。本机命令
 日志：`event=CommandAccepted` / `event=CommandHandled` / `event=CommandDuplicate` /
 `event=FactRefreshCompleted`。请求与结果落在 `state/command.request.json` /
 `state/command_history.json`（台账保留最近 64 条，网关重发靠它去重）。
+
+### 7.6 一次性调查（`investigate`）
+
+**先查清楚是谁占了盘，再决定删什么。**
+
+```bash
+wist-agentd investigate disk                             # 查最紧张的那个文件系统的挂载点
+wist-agentd investigate disk --path /var --top 20        # 查 /var，列前 20
+wist-agentd investigate disk --min-size 8MiB             # 只列 ≥8MiB 的文件
+wist-agentd investigate disk --json                      # 机器可读（脚本 / AI）
+```
+
+| 选项 | 说明 |
+| --- | --- |
+| `--path <dir>` | 扫描根（**绝对路径**）；不写 = 占用率最高的文件系统挂载点 |
+| `--top <n>` | 文件 / 目录各列前 N（默认 10，上限 50） |
+| `--min-size <size>` | 只列 ≥ 该体量的文件（`512k` / `8MiB` / `2G`，默认 0） |
+| `--depth <n>` | 最多下钻 N 层（默认 16，上限 64） |
+| `--max-seconds <n>` | 扫描时长预算（默认 5，上限 30） |
+| `--json` | 机器可读输出（与落盘报告同一份） |
+
+它给五节：
+
+| 节 | 内容 | 何时变红 |
+| --- | --- | --- |
+| `disk.filesystems` | 每个本地文件系统的已用/总量/可用 + **inode** 占比 | 空间或 inode ≥85% WARN、≥95% FAIL |
+| `disk.top_dirs` | 扫描根下**一级目录**的合计与占比 | — |
+| `disk.top_files` | 最大的 N 个文件 | — |
+| `disk.agent_dirs` | agent 自己的落点（root/state/log/run）各多大 | ≥1 GiB WARN、≥10 GiB FAIL |
+| `disk.scan` | 扫了多少 / 是否被预算截断 / 哪些目录读不了 | 截断或不可读 → WARN |
+
+退出码：**有 FAIL = 1**（与 `diagnose` 同一条门禁语义）。`disk.scan` 显示 `truncated=true`
+时，「最大的文件」只是**已扫到的部分** —— 提高 `--max-seconds` / `--depth`，或把 `--path` 指到更窄的目录。
+以 root 跑才能看到 `root` 专属目录（如 `/var/lib/docker`）。
+
+它**只读**、不需要守护进程在跑、读不到配置也能用（只是少一节 `disk.agent_dirs`）。
+扫描不跟随符号链接、不跨文件系统、有三重上限（条目 200k / 时长 / 深度），不会把一台已经在
+扛业务的机器再压一遍。
+
+网关也可以以**一次性命令**触发（`kind = investigate`）：执行完 ack 回结论摘要，**完整报告走数据面**
+（` IVSREP: ` 帧，正文带 `command_id`，网关靠它把报告接回那次命令），本机另留一份
+`state/investigations/disk.json`。`outcome` 只表示「调查做成了没有」，磁盘紧张是 `detail` 里的结论；
+回传失败也不改 `outcome`（查清了就是查清了，通道问题单独说）。需要数据面认识 `IVSREP` 才能入库。
+设计取舍见 [`../design/agentd-investigation.md`](../design/agentd-investigation.md)。
 
 ## 8. 验收清单
 

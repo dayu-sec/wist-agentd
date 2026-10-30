@@ -161,6 +161,28 @@ impl TelemetryRecordSink {
     pub(crate) fn carries_discovery_frames(&self) -> bool {
         matches!(self, Self::Tcp(_))
     }
+
+    /// 上送一帧**调查报告**（` IVSREP: ` 标记 + `Report` JSON）。
+    ///
+    /// 为什么与事实/快照同一条闸：它是**控制类帧**（小、结构化、消费者是网关自己），
+    /// 不是主机日志内容。file sink 只承载日志（本机调试），这里静默跳过 —— 由调用方的
+    /// [`Self::carries_investigation_frames`] 在发送前判断（与事实帧同一套写法，
+    /// 不让正常状态走 `Err` 被报成故障）。
+    pub(crate) async fn write_investigation(
+        &mut self,
+        envelope: &DataFrame,
+        body: &[u8],
+    ) -> io::Result<()> {
+        match self {
+            Self::File(_) => Ok(()),
+            Self::Tcp(sink) => sink.write_investigation(envelope, body).await,
+        }
+    }
+
+    /// 这条 sink 能不能承载调查帧（只有数据面 TCP 能）。
+    pub(crate) fn carries_investigation_frames(&self) -> bool {
+        matches!(self, Self::Tcp(_))
+    }
 }
 
 #[derive(Debug, Clone, ::jumo_derive::Jumo)]
@@ -394,6 +416,17 @@ impl TcpRecordSink {
             .await
     }
 
+    /// 写入一帧调查报告（` IVSREP: ` 标记 + `Report` JSON 正文）。
+    pub(crate) async fn write_investigation(
+        &mut self,
+        envelope: &DataFrame,
+        body: &[u8],
+    ) -> io::Result<()> {
+        let frame = build_investigation_frame(envelope, body)?;
+        self.write_payload(&build_payload_bytes(&frame, self.framing))
+            .await
+    }
+
     /// 测试用：缩短退避窗口，避免真实等待默认的 1s。
     #[cfg(test)]
     fn with_backoff(mut self, initial: Duration) -> Self {
@@ -562,6 +595,20 @@ fn build_discovery_frame(envelope: &DataFrame, body: &[u8]) -> io::Result<Vec<u8
     let mut frame = serde_json::to_vec(envelope)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     frame.extend_from_slice(b" DSNAP: ");
+    frame.extend_from_slice(body);
+    Ok(frame)
+}
+
+/// TCP 调查报告帧：与事实/快照帧同构，但帧标记为 ` IVSREP: `（investigation report），
+/// 正文是 `wist-agentd investigate` 的 `Report` JSON（含 `command_id`，与控制面 ack 关联）。
+///
+/// 为什么单开一个标记而不是复用 `OBSFACT`：两者的**消费者与保留策略不同** —— 事实是资产
+/// 清单的原料（可长期留），调查是某次提问的证据（含路径/文件名，通常短期保留）。
+/// 混在一个标记里，数据面只能用同一条 sink 规则，等于把两者的保留期与可见性绑死。
+fn build_investigation_frame(envelope: &DataFrame, body: &[u8]) -> io::Result<Vec<u8>> {
+    let mut frame = serde_json::to_vec(envelope)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    frame.extend_from_slice(b" IVSREP: ");
     frame.extend_from_slice(body);
     Ok(frame)
 }
@@ -931,6 +978,38 @@ mod tests {
         assert_eq!(parsed_env["agent"], "agent-001");
         assert_eq!(parsed_env["seq"], 43);
         assert_eq!(parsed_body, String::from_utf8_lossy(body));
+    }
+
+    #[test]
+    fn investigation_frame_uses_ivsrep_marker_and_keeps_body() {
+        let envelope = DataFrame::new("agent-001", "2026-10-30T00:00:00Z", 44);
+        let body = br#"{"command":"investigate","topic":"disk","command_id":"cmd_1"}"#;
+
+        let frame = super::build_investigation_frame(&envelope, body).expect("build frame");
+        let text = String::from_utf8_lossy(&frame);
+        let (env, parsed_body) = text.split_once(" IVSREP: ").expect("IVSREP marker");
+
+        let parsed_env: serde_json::Value = serde_json::from_str(env).expect("valid envelope");
+        assert_eq!(parsed_env["agent"], "agent-001");
+        assert_eq!(parsed_env["seq"], 44);
+        assert_eq!(parsed_body, String::from_utf8_lossy(body));
+        // 不许蹭别的帧标记：数据面按标记分 sink，串台会把报告写进日志/事实的保留策略里。
+        for other in [" LOGRAW: ", " METRICS: ", " OBSFACT: ", " DSNAP: "] {
+            assert!(!text.contains(other), "must not carry {other}: {text}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn only_the_tcp_sink_carries_investigation_frames() {
+        let file = super::TelemetryRecordSink::File(super::FileRecordSink::new(
+            std::path::PathBuf::from("/tmp/wist-agentd-investigation-sink.ndjson"),
+        ));
+        assert!(!file.carries_investigation_frames());
+        // 与事实帧同一道闸：两者都是控制类帧，只走 TCP。
+        assert_eq!(
+            file.carries_fact_frames(),
+            file.carries_investigation_frames()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

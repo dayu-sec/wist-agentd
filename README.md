@@ -61,6 +61,10 @@ wist-agentd service status
 
 # 一屏诊断「这台机器现在有什么问题」（配置/身份/服务/连通/上送）；退出码非零 = 有 FAIL
 sudo wist-agentd diagnose
+
+# 一次性调查「磁盘满了是哪几大文件」（只读、有界）；退出码非零 = 有 FAIL
+wist-agentd investigate disk
+wist-agentd investigate disk --path /var --top 20 --json
 ```
 
 开发机联调：[`dev/start.sh`](dev/start.sh)（`&` + `disown`，非生产）。
@@ -91,6 +95,27 @@ TTY 下 `[OK]/[WARN]/[FAIL]` 带颜色（绿/黄/红），一眼扫到 FAIL；�
    而网关可能发布在别的端口（如 3000），`network.tcp` 会因此 FAIL 并直接指出这个原因；
    `network.tls_cert` 则把**网关叶证书的 SAN 与 endpoint 主机名**对一遍，证书签给了别的主机名时
    直接 FAIL（换域名、共享 `identity/` 被另一条部署路径重签、反代 SNI 不对都会命中）。
+
+### 一次性调查（`investigate`）
+
+`diagnose` 回答「**它自己**为什么不对」，`investigate` 回答「**这台机器**现在怎么了」：
+一次性、按题目、给**证据表**（路径 + 体量 + 占比），而不是红绿检查。第一道题是磁盘：
+
+```bash
+wist-agentd investigate disk                          # 查最紧张的那个文件系统的挂载点
+wist-agentd investigate disk --path /var --top 20     # 查 /var，列前 20
+wist-agentd investigate disk --min-size 8MiB --json   # 只要 ≥8MiB 的，机器可读输出
+```
+
+它给五节：文件系统占用（含 **inode**）→ 一级目录合计 → 最大的文件 → **agent 自己占多少** →
+扫描完成度（扫了多少、有没有被预算截断、哪些目录读不了）。默认预算 200k 条目 / 5s / 16 层，
+超了如实标「扫描未完成」—— 调查不会为了答案把一台已经在扛业务的机器再压一遍。
+**只读**、不需要守护进程在跑、读不到配置也能用（只是少一节 agent 自占）。详见
+[`docs/design/agentd-investigation.md`](docs/design/agentd-investigation.md)。
+
+同一份实现也能由网关以**一次性命令**触发（`kind = investigate`，`params` 见设计文档）：
+执行完 ack 回结论摘要，**完整报告走数据面**（` IVSREP: ` 帧，带 `command_id`），
+本机另留一份 `state/investigations/<topic>.json`。
 
 ### 快速开始
 
@@ -128,6 +153,12 @@ wist-agentd --config-dir /etc/wist-agentd
 - **Run modes** — `standalone` (no control plane: no collection, buffering, or uplink; local execution and state machine only) and `managed`.
 - **Self-diagnosis** — `wist-agentd diagnose` probes config / identity / service /
   connectivity / uplink, prints per-check hints, and exits nonzero when anything FAILs.
+- **One-shot investigation** — `wist-agentd investigate disk` answers “disk is full — which
+  files are big, and how big”: filesystem usage incl. **inodes**, top-level directories, the
+  biggest files, the agent's own footprint, and how complete the scan was. Read-only, bounded
+  (entries / seconds / depth), and also available as a gateway one-shot command (`kind =
+  investigate`) whose full report comes back over the data plane as an `IVSREP:` frame
+  (correlated by `command_id`); the daemon also keeps a copy under `state/investigations/`.
 
 ## How the pieces fit
 
@@ -183,6 +214,7 @@ Usage:
   wist-agentd service print --for <systemd|launchd>   (render for another platform)
   wist-agentd enroll [--token <token> | --token-stdin] [--config-dir <path>]
   wist-agentd diagnose [--json] [--offline] [--config-dir <path>]
+  wist-agentd investigate [disk] [--path <dir>] [--top <n>] [--min-size <size>] [--depth <n>] [--max-seconds <n>] [--json] [--config-dir <path>]
 
 Commands:
   help                 Show this help message.
@@ -196,6 +228,8 @@ Commands:
   enroll               Enroll with a one-time token; the token is never written to disk.
   diagnose             Diagnose this host: config / identity / service / connectivity / uplink.
                        Exits nonzero when anything FAILs, so scripts can gate on it.
+  investigate          One-shot, read-only investigation of this host (topic: disk).
+                       Prints evidence (paths + sizes), not just a verdict; exits nonzero on FAIL.
 
 Service options (Linux uses systemd, macOS uses launchd):
   --bin <path>         Installed path of the wist-agentd binary (default: current executable).
@@ -208,10 +242,17 @@ Enroll options:
   --token <token>      One-time enrollment token (visible in argv/ps for the run).
   --token-stdin        Read the token from stdin instead (recommended on shared hosts).
 
+Investigate options (topic `disk`: which files are big, and how big):
+  --path <dir>         Scan this absolute directory instead of the tightest filesystem.
+  --top <n>            List the N biggest files / directories (default 10, max 50).
+  --min-size <size>    Only list files at least this big (e.g. 8MiB; default 0).
+  --depth <n>          Descend at most N levels (default 16, max 64).
+  --max-seconds <n>    Time budget for the scan (default 5, max 30).
+
 Options:
   --config-dir <path>  Use the specified config directory. Relative paths are resolved from the current working directory.
                        Default: /etc/wist-agentd.
-  --json               Only with `diagnose`: print machine-readable JSON instead of text.
+  --json               Only with `diagnose` / `investigate`: print machine-readable JSON instead of text.
   --offline            Only with `diagnose`: skip network probes (control plane / data plane).
 ```
 
@@ -271,6 +312,7 @@ src/
   control/          # daemon entry and enrollment
   discovery/        # host / network / endpoint / process / container probes
   exec/             # execution controller, process control, quarantine, recovery
+  investigate*      # one-shot investigation (model + `disk` topic)
   reporting/        # result aggregation and upstream reporting
   runtime/          # daemon loop, scheduler, self-observability
   service/          # systemd / launchd definitions, install & status
@@ -289,6 +331,8 @@ docs/usage/         # install & operations manual + usage/troubleshooting help
   manual (how to install, configure, run, upgrade, troubleshoot).
 - [`docs/design/agentd-service-deployment.md`](docs/design/agentd-service-deployment.md) — long-running
   service design rationale (systemd / launchd).
+- [`docs/design/agentd-investigation.md`](docs/design/agentd-investigation.md) — one-shot
+  investigation (`investigate`) design: topics, evidence model, scan bounds, wire contract.
 - [`docs/design/agentd-architecture.md`](docs/design/agentd-architecture.md) — module boundaries and state model.
 - [`docs/design/agentd-exec-protocol.md`](docs/design/agentd-exec-protocol.md) — the `wist-exec` local protocol.
 - [`docs/design/agent-config-schema.md`](docs/design/agent-config-schema.md) — the `agentd.toml` schema.

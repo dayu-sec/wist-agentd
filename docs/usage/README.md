@@ -190,11 +190,28 @@ mv -f /usr/local/bin/wist-agentd.new /usr/local/bin/wist-agentd
 
 ### 2.7 日志吃满磁盘
 
+先查清楚「是谁占的」，再决定删什么 —— 不要凭感觉删日志：
+
+```bash
+wist-agentd investigate disk            # 盘最紧张的那个文件系统：目录/文件/agent 自占
+wist-agentd investigate disk --path /var --top 20
+wist-agentd investigate disk --json     # 机器可读
+```
+
+它给五节：文件系统占用（含 inode）→ 一级目录合计 → 最大的文件 → agent 自己占多少 → 扫描完成度。
+只看**第一条 FAIL** 与「一级目录占用 / 最大的文件」两节就能定因；`disk.agent_dirs` 那一节
+是「是不是我们自己」—— 它到 1 GiB 就会 WARN。详见
+[../design/agentd-investigation.md](../design/agentd-investigation.md)。
+
+已经确认是 agentd 的日志：
+
 - macOS：launchd 不轮转文件，配 `/etc/newsyslog.d/wist-agentd.conf`；Linux：journald，额度看
   `/etc/systemd/journald.conf` 的 `SystemMaxUse`，或 `sudo journalctl --vacuum-size=500M`。
 - 稳态输出已收敛（变化才打印 + 默认 5 分钟心跳）；调大 `WIST_AGENTD_LOG_HEARTBEAT_SECS`
   （默认 `300`，`0` = 逐轮打印，仅联调）。
 - 采集输出 `wist-records.ndjson` 是数据，不受收敛影响，由下游或 logrotate 管。
+- 正在写的日志文件**不要手工删**（轮转由 `wist-log` 管，删了进程会继续往已删除的 inode 写，
+  空间不会释放）。
 
 ### 2.8 采集与落点
 

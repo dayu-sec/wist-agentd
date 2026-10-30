@@ -1209,6 +1209,139 @@ fn parse_command_rejects_invalid_refresh_facts_arguments() {
 }
 
 #[test]
+fn parse_command_accepts_investigate_with_its_defaults() {
+    let parsed = parse_command(["investigate"]).expect("parse");
+    assert_eq!(
+        parsed.command,
+        super::Command::Investigate {
+            request: crate::investigate::InvestigateRequest::default(),
+            json: false,
+        }
+    );
+    assert_eq!(parsed.config_dir, None);
+
+    // 显式写出题目与默认题目等价。
+    assert_eq!(
+        parse_command(["investigate", "disk"]).expect("parse"),
+        parsed
+    );
+}
+
+#[test]
+fn parse_command_accepts_investigate_options_in_any_order() {
+    let expected = super::ParsedArgs {
+        command: super::Command::Investigate {
+            request: crate::investigate::InvestigateRequest {
+                topic: crate::investigate::TOPIC_DISK.to_string(),
+                path: Some(PathBuf::from("/var")),
+                top: 5,
+                min_size: 8 * 1024 * 1024,
+                depth: 4,
+                max_seconds: 2,
+            },
+            json: true,
+        },
+        config_dir: Some(PathBuf::from("conf")),
+    };
+    assert_eq!(
+        parse_command([
+            "investigate",
+            "disk",
+            "--path",
+            "/var",
+            "--top",
+            "5",
+            "--min-size",
+            "8MiB",
+            "--depth",
+            "4",
+            "--max-seconds",
+            "2",
+            "--json",
+            "--config-dir",
+            "conf",
+        ])
+        .expect("parse"),
+        expected
+    );
+    assert_eq!(
+        parse_command([
+            "--config-dir",
+            "conf",
+            "investigate",
+            "disk",
+            "--json",
+            "--max-seconds",
+            "2",
+            "--depth",
+            "4",
+            "--min-size",
+            "8MiB",
+            "--top",
+            "5",
+            "--path",
+            "/var",
+        ])
+        .expect("parse"),
+        expected
+    );
+}
+
+#[test]
+fn parse_command_clamps_investigate_ranges() {
+    let parsed = parse_command([
+        "investigate",
+        "--top",
+        "9999",
+        "--depth",
+        "0",
+        "--max-seconds",
+        "9999",
+    ])
+    .expect("parse");
+    let super::Command::Investigate { request, .. } = parsed.command else {
+        panic!("expected investigate");
+    };
+    assert_eq!(request.top, crate::investigate::MAX_TOP);
+    assert_eq!(request.depth, 1);
+    assert_eq!(request.max_seconds, crate::investigate::MAX_SCAN_SECONDS);
+}
+
+#[test]
+fn parse_command_rejects_invalid_investigate_arguments() {
+    let err = parse_command(["investigate", "memory"]).expect_err("unknown topic");
+    assert!(
+        err.to_string().contains("unknown investigation topic"),
+        "{err}"
+    );
+    assert!(err.to_string().contains("disk"), "{err}");
+
+    let err = parse_command(["investigate", "--top", "many"]).expect_err("not a number");
+    assert!(err.to_string().contains("--top"), "{err}");
+
+    let err = parse_command(["investigate", "--min-size", "12x"]).expect_err("bad unit");
+    assert!(err.to_string().contains("--min-size"), "{err}");
+
+    let err = parse_command(["investigate", "--path", "relative"]).expect_err("relative path");
+    assert!(err.to_string().contains("absolute"), "{err}");
+
+    let err = parse_command(["investigate", "--path"]).expect_err("missing value");
+    assert!(
+        err.to_string().contains("missing value for --path"),
+        "{err}"
+    );
+
+    // 选项不能脱离 investigate 使用（与 --wait / --no-wait 同一道门）。
+    for flag in ["--path", "--top", "--min-size", "--depth", "--max-seconds"] {
+        let err = parse_command([flag, "1"]).expect_err("flag without investigate");
+        assert!(
+            err.to_string().contains("only supported with investigate"),
+            "{flag}: {err}"
+        );
+    }
+}
+
+#[test]
 fn refresh_facts_queues_a_request_under_the_configured_state_dir() {
     let root = temp_dir("refresh-facts-queue");
     let state = root.join("state");

@@ -15,6 +15,7 @@ wist-agentd（edge daemon）实现时最重要的设计文档。
 6. [agent-config-schema.md](./agent-config-schema.md) — 配置 schema（配合 `src/config/`）
 7. [self-observability.md](./self-observability.md) — 自观测（配合 `src/runtime/self_observability.rs`）
 8. [agentd-service-deployment.md](./agentd-service-deployment.md) — 后台长期运行方案（设计说明；配合 `src/service/`）
+9. [agentd-investigation.md](./agentd-investigation.md) — 一次性调查 `investigate`（题目模型 / 磁盘证据 / 扫描边界 / 命令 seam；配合 `src/investigate*.rs`）
 
 > 面向运维的安装/使用/排障手册不在本目录，在 [`../usage/`](../usage/README.md)：
 > [agentd-install-and-usage.md](../usage/agentd-install-and-usage.md)（安装与使用手册）、
@@ -25,6 +26,7 @@ wist-agentd（edge daemon）实现时最重要的设计文档。
 - [log-file-input-spec.md](./log-file-input-spec.md) — 文件日志输入规格（checkpoint/tail/rotate）
 - [log-source-exporters.md](./log-source-exporters.md) — 定时导出器（`Exporter` 采集来源）设计（journald/smartctl/nft/dmesg…）
 - [log-file-state-schema.md](./log-file-state-schema.md) — 文件日志 checkpoint 状态 schema
+- [suricata-eve-collection.md](./suricata-eve-collection.md) — 流量镜像与 Suricata `eve.json` 采集（形态/吞吐/容量/控制面落点）
 - [macos-agent-uplink-to-warp-parse.md](./macos-agent-uplink-to-warp-parse.md) — macOS P0 采集端到端方案
 - [macos-security-audit-log-sources.md](./macos-security-audit-log-sources.md) — macOS 安全/审计日志源清单
 - [linux-security-audit-log-sources.md](./linux-security-audit-log-sources.md) — Linux 采集源清单（计算/数据服务器；**未核对**，规则/样本为零）
@@ -36,6 +38,7 @@ wist-agentd（edge daemon）实现时最重要的设计文档。
 | `src/bootstrap` | agentd-state-and-boundaries |
 | `src/config` | agent-config-schema |
 | `src/exec` | agentd-exec-protocol、agentd-failure-handling |
+| `src/investigate*` | agentd-investigation |
 | `src/runtime` | agentd-architecture、self-observability |
 | `src/service` | agentd-service-deployment（设计）＋ `../usage/agentd-install-and-usage`（安装/运维） |
 | `src/telemetry` | log-file-input-spec、log-file-state-schema、macos-*、linux-* |

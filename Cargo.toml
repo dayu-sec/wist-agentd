@@ -1,6 +1,6 @@
 [package]
 name = "wist-agentd"
-version = "0.10.3" #@gxl:set(version)
+version = "0.11.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -33,11 +33,9 @@ tokio-rustls = "0.26"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 toml = "1.1"
 tokio = { version = "1.48", features = ["full"] }
-wist-contracts = { version = "0.9" }
-#wist-contracts = { version = "0.8", path = "../wist-contracts" }
-# 跨进程 seam 报文（enrollment / agent_status / gateway / work / agent_uplink）。CI/发布走 registry；本地联调可改用下面注释的 path 行。
-wist-api = { version = "0.9" }
-#wist-api = { version = "0.8", path = "../wist-api" }
+wist-contracts = "0.9.9"
+# 跨进程 seam 报文（enrollment / agent_status / gateway / work / agent_uplink）。CI/发布走 registry；本地联调可临时切 path。
+wist-api = "0.9.4"
 wist-metrics = { version = "0.5" }
 #wist-metrics = { version = "0.5", path = "../wist-metrics" }
 wist-shared = { version = "0.2" }
@@ -71,8 +69,12 @@ path = "src/bin/wist-upgrader.rs"
 # 预期值，否则「两边用同一个错实现」会让测试白过。生产代码不用它。
 sha2 = "0.10"
 
-# 本地联调：与 `wist-contracts` 同期改动时，取消下面两行的注释 ——
-# `[patch]` 放在这里（而不是逐条改依赖行），是为了让 api/metrics/validate 也解析到本地版本。
+# 本地联调：与 `wist-contracts` / `wist-api` 同期改动时启用 —— `[patch]` 放在这里（而不是逐条改
+# 依赖行），是为了让 api/metrics/validate 也解析到本地版本（否则会同时存在两份 contracts，
+# 类型互不认识）。**发布态不要留**：
 # [patch.crates-io]
 # wist-contracts = { path = "../wist-contracts" }
+# wist-api = { path = "../wist-api" }
+# wist-validate = { path = "../wist-validate" }
+# wist-metrics = { path = "../wist-metrics" }
 
