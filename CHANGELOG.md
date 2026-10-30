@@ -3,6 +3,82 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.11.0-alpha] - 2026-10-30
+
+### 新增（一次性调查：磁盘满了，到底是哪几大文件）
+
+- **`wist-agentd investigate [disk]`**：只读、有界的一次性调查，给**证据表**而不是红绿检查。
+  磁盘题固定五节：文件系统占用（含 **inode**）→ 一级目录合计 → 最大的文件 → **agent 自己占多少**
+  → 扫描完成度。有 FAIL 退出码非零（与 `diagnose` 同一条门禁语义）。
+  - 默认扫描根 = 占用率最高的文件系统挂载点（数据盘先报警时不用手写 `--path`）；
+  - 选项：`--path` / `--top` / `--min-size` / `--depth` / `--max-seconds` / `--json`；
+  - 扫描**不跟随符号链接、不跨文件系统**，条目 200k / 时长 5s / 深度 16 三重上限；
+    触顶如实标 `truncated`，「最大的文件」不会被当成本机全部真相；
+  - 不需要守护进程在跑、读不到配置也能用（只少一节 `disk.agent_dirs`）。
+- **网关一次性命令 `kind = investigate`**：搭在既有的命令通道上（`AgentStatusAck.commands` →
+  `command_acks`）。执行完 ack 回结论摘要；**完整报告走数据面回传**：新增 ` IVSREP: ` 帧
+  （与 `LOGREC`/`METRICS`/`OBSFACT`/`DSNAP` 同一套信封与 `seq` 空间），正文带 `command_id`
+  （数据面报告与控制面 ack 的唯一关联键）与 `report_schema`（`wist.investigation.<topic>/v1`）。
+  `outcome` 只表达「调查做成了没有」（磁盘紧张是结论，不是命令失败）；回传失败不改 outcome，
+  只写在 `detail` 里。`params` 为 JSON：`{topic, path, top, min_size, depth, max_seconds}`，
+  宽容解析、夹紧区间；**题目不认识就回 `failed`**，不猜一个题目去扫盘。
+- 回传的几条规矩：只有 `kind = tcp` 能承载（待命也发 —— 调查是诊断元数据，不是主机内容）；
+  单帧上限 64 KiB，超了**逐级退化**（去 `rows` → 去 `hint` + 截 `detail`，结论始终保留），
+  **不发半条 JSON**；不重试、不进 spool（证据迟到就没意义）；本地另留一份 `state/investigations/<topic>.json`。
+- ack 的 `detail` 摘要**不绑定题目**：优先取 `*.top_files`，其次 `*.top_dirs`，再退到第一个带证据表的节。
+  写死 `disk.top_files` 会让新增第二道题时摘要静默只剩结论、没有任何证据（而且不会报错）。
+- 设计取舍见 [`docs/design/agentd-investigation.md`](docs/design/agentd-investigation.md)；
+  调查面的词表与网关授权见跨仓
+  [`investigation-surfaces.md`](../wist-design/doc/design/center/investigation-surfaces.md)。
+- ⚠ **升级顺序：网关先于 agentd**。`AgentStatusReport` 是 `deny_unknown_fields` 的，0.11.0 起每次
+  状态上报都带 `investigation_capabilities` —— 发给 0.26.x 网关会被整条拒掉（agent 看上去会“掉线”）。
+  `compat.json` 的 `requires.wist-gateway` 因此从 `>=0.26.0` 提到 **`>=0.27.0`**；
+  旧 agentd 在 0.27 网关上照常工作，只是调查菜单一直置灰。
+
+### 新增（采集追平：让 agentd 跟得上高吞吐日志源）
+
+- **`[telemetry.logs] catchup_slice_ms`（默认 400）/ `catchup_budget_ms`（默认 1800）**：
+  一轮 tick 里对同一条输入**反复读多批**，直到追平或时间片用完；任一为 `0` = 关闭（回到
+  「每 tick 一批」）。
+  - 为什么：`max_lines_per_tick` / `max_read_bytes_per_tick` 只是**一批**的上限，而主循环 3s 一拍 ——
+    单输入上限就是 `4096 行 / 3s ≈ 1365 行/秒`。Suricata 的 `eve.json`、高频应用日志会因此
+    永远滞后：checkpoint 追不上文件尾，spool 涨满后 `pause`（「采了但一直在滞后」比采不到更难查）。
+  - 每条输入一个**让位粒度**（片），整轮另有一个**硬预算**（3s 拍的 60%）= 采集段不能吃掉整拍。
+  - 追的判据是「本批**读到了行**」而不是「产出记录」：多行折叠 / `drop_if_contains` /
+    未封口块都会让记录数为 0，但文件确实在前进。
+- **超长行截断进自观测**：`telemetry line truncated input_id=… path=… detail=… magnitude=lines=N`
+  （`warn`，按签名去重）。对 JSON Lines（如 `eve.json`）截断 = 产出一条下游永远解析不了的记录，
+  必须能在源头看见，否则「下游为什么有坏 JSON」查不到。
+
+### 新增（诊断：采集输入能不能读）
+
+- **`diagnose` 新增 `telemetry.inputs`**：逐个检查本机配置 + 已生效工作折算出的日志目标，
+  只读不采：显式单文件真开一次（不读内容），glob / 目录只看**固定前缀目录**；
+  匹配为空**不算失败**（运行时也不把“没匹配”当错误）。采集未运行（待命 / standalone）
+  时报「待启用」，不制造假失败。
+  为什么：路径写错 / 权限不足 / 被采程序没启动，现象全是「平台上看不到数据」，
+  而以前的 diagnose **完全不看输入**，现场只能猜。
+
+### 变更（内部）
+
+- `ProcessOutcome.read_lines`：本批真正读进来的行数，追平循环的唯一进度信号
+  （不能用 `records_processed`：多行折叠 / 噪音丢弃 / 未封口块下它会是 0）。
+- tick 内的失败/计数改为**每条输入聚合后拍末只报一次**：追平会让同一输入一拍跑多批，
+  每批各推一条会让同一个问题一拍打 N 次，毁掉既有的按签名去重。
+
+- 文件系统枚举收敛到 `telemetry::metrics::runtime::local_filesystems`：指标 `host.filesystem.*`
+  与 `investigate disk` **共用同一套过滤与去重规则**（bind mount / APFS 辅助卷不会两处口径不一）。
+- `doctor::Status` 增加 `Ord`（`Ok < Warn < Fail`），调查复用同一套状态词表，不再另起一套。
+
+### 升级注意
+
+- 新增的 `investigate` 命令 kind 对旧 agentd **不兼容是有意的**：本机 CLI 新能力需要升级二进制；
+  网关下发调查要求 agentd ≥ 0.11.0（旧版本会回 `unsupported`，不会静默）。其余行为不变。
+- 数据面（warp-parse）需要新增 `IVSREP:` 的 WPL/OML 与 sink 分组（`business.d/agent_ivsrep.toml`）
+  才能把报告入库；在那之前记录会落兑底 sink `gateway-logs`（可见但错位，不会丢）。
+  **顺序建议：先发数据面规则包，再开网关侧调查入口**（agentd 先升也不会有副作用：没下发过
+  `investigate` 命令就不会发帧）。
+
 ## [0.10.3-alpha] - 2026-10-29
 
 ### 变更（发版带上升级兼容声明）
