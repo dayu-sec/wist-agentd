@@ -169,6 +169,8 @@ LogsSection {
   max_line_bytes
   max_read_bytes_per_tick
   max_lines_per_tick
+  catchup_slice_ms
+  catchup_budget_ms
   spool_max_bytes
   spool_over_limit
   spool_dir
@@ -191,9 +193,22 @@ LogsSection {
 - `max_line_bytes`
   单行最大字节数：超过即截断提交并计数，默认 `1048576`（1 MiB）
 - `max_read_bytes_per_tick`
-  单次 tick 最多读取的字节数（大文件回放分块），默认 `4194304`（4 MiB）
+  单批最多读取的字节数（大文件回放分块），默认 `4194304`（4 MiB）
 - `max_lines_per_tick`
-  单次 tick 最多读取的行数（大文件回放分块），默认 `4096`
+  单批最多读取的行数（大文件回放分块），默认 `4096`
+- `catchup_slice_ms`
+  **单条输入**在一轮 tick 里最多追多久（毫秒），默认 `400`；`0` = 关闭追平。
+  `max_lines_per_tick` / `max_read_bytes_per_tick` 只是**一批**的上限，而主循环 3s 一拍 ——
+  只读一批的话单输入上限就是 `4096 行 / 3s ≈ 1365 行/秒`。一条 IDS 的 `eve.json`
+  或高频应用日志会把 checkpoint 永远甩在文件尾后面（spool 涨满后 `pause`）。
+  追平把上限从「tick 周期」变回「磁盘 / 出口的实际速度」。
+  取值是**让位粒度**：一个疯长的输入吃满自己这一片就停，别的输入照常跑。
+- `catchup_budget_ms`
+  一轮 tick 里**所有输入合计**最多追多久（毫秒），默认 `1800`（3s 拍的 60%）；`0` = 关闭追平。
+  它是**硬上限**：即使 `catchup_slice_ms` 写得比它大也不会被放大 ——
+  采集段不能把一拍吃干净。
+  判据是「本批**读到了行**」（`read_lines`），不是「产出记录」：多行折叠、
+  `drop_if_contains`、未封口块都会让记录数为 0，但文件确实在前进。
 - `spool_max_bytes`
   落盘待发队列（spool）上限（字节），默认 `268435456`（256 MiB）
 - `spool_over_limit`

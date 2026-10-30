@@ -1225,6 +1225,113 @@ fn daemon_run_once_with_output_disabled_only_reports_facts() {
     );
 }
 
+/// 追平：**一轮 tick** 里必须跨多批读到文件尾。
+///
+/// 为什么钉住它：不追平的话单输入上限是 `max_lines_per_tick / 3s`（默认 4096 行 / 3s
+/// ≈ 1365 行/秒）。一条万级 EPS 的 IDS `eve.json` 会把 checkpoint 永远甩在文件尾后面，
+/// spool 涨满后 `pause` —— 数据“采了”，但一直在滞后，比采不到更难查。
+#[test]
+fn daemon_run_once_catches_up_across_multiple_read_batches() {
+    let root = temp_dir("daemon-file-input-catchup");
+    let run_dir = root.join("run");
+    let state_dir = root.join("state");
+    let log_dir = root.join("log");
+    let input_path = root.join("app.log");
+    bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
+
+    let line_count = 5000usize;
+    let mut body = String::new();
+    for index in 0..line_count {
+        body.push_str(&format!("line-{index}\n"));
+    }
+    fs::write(&input_path, &body).expect("write input log");
+
+    let mut config = standalone_config_with_file_input(&root, &input_path);
+    // 时间片给得比测试需要的大：这条用例钉的是“会不会追”，不是“追得多快”。
+    config.telemetry.logs.catchup_slice_ms = 30_000;
+    config.telemetry.logs.catchup_budget_ms = 30_000;
+    daemon::run_once(&daemon::DaemonLoop {
+        config: &config,
+        exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
+    })
+    .expect("daemon run once");
+
+    let records = read_output_records(&root);
+    assert_eq!(records.len(), line_count, "一轮 tick 必须跨多批追到文件尾");
+    assert_eq!(records[0].body, "line-0\n");
+    assert_eq!(
+        records[line_count - 1].body,
+        format!("line-{}\n", line_count - 1)
+    );
+    let checkpoint: TestLogCheckpointState = read_json(
+        &wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "app"),
+    )
+    .expect("read checkpoint");
+    assert_eq!(
+        checkpoint.files[0].checkpoint_offset,
+        body.len() as u64,
+        "追到文件尾才提交 checkpoint"
+    );
+}
+
+/// 逃生口：`catchup_slice_ms = 0` 回到“每 tick 一批”。
+///
+/// 后半段顺带钉住 **checkpoint 在多轮之间是连续的**：第一批只读 4096 行，
+/// 下一次 `run_once` 必须从那里接着读，不重不丢。
+#[test]
+fn catchup_can_be_disabled_and_checkpoint_resumes_across_ticks() {
+    let root = temp_dir("daemon-file-input-catchup-off");
+    let run_dir = root.join("run");
+    let state_dir = root.join("state");
+    let log_dir = root.join("log");
+    let input_path = root.join("app.log");
+    bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
+
+    let line_count = 5000usize;
+    let mut body = String::new();
+    for index in 0..line_count {
+        body.push_str(&format!("line-{index}\n"));
+    }
+    fs::write(&input_path, &body).expect("write input log");
+
+    let mut config = standalone_config_with_file_input(&root, &input_path);
+    config.telemetry.logs.catchup_slice_ms = 0;
+    let loop_ctx = daemon::DaemonLoop {
+        config: &config,
+        exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
+    };
+    daemon::run_once(&loop_ctx).expect("daemon run once");
+    assert_eq!(
+        read_output_records(&root).len(),
+        4096,
+        "关闭追平后单轮只读一批（max_lines_per_tick）"
+    );
+
+    daemon::run_once(&loop_ctx).expect("daemon run once again");
+    let records = read_output_records(&root);
+    assert_eq!(
+        records.len(),
+        line_count,
+        "下一轮从 checkpoint 接着读，不重不丢"
+    );
+    assert_eq!(records[4096].body, "line-4096\n");
+}
+
+/// 读本地文件输出的全部记录（`run_once` 多轮时是追加写的）。
+fn read_output_records(root: &std::path::Path) -> Vec<TelemetryRecord> {
+    let output =
+        fs::read_to_string(root.join("log").join("wist-records.ndjson")).expect("read output");
+    output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("parse telemetry record"))
+        .collect()
+}
+
 /// 接受待命期的那条上行连接并把它读尽（sink 在轮次末断开，所以能读到 EOF）。
 ///
 /// 待命期**会**建连接（推进程列表），所以不能再断言「无连接」—— 要断言的是**连接里装了什么**。

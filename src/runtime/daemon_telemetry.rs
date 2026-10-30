@@ -1,16 +1,21 @@
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use crate::config::agent_config::{AgentConfig, LogFileInputSection, LogsOutputSection};
+use crate::config::agent_config::{
+    AgentConfig, LogFileInputSection, LogsOutputSection, LogsSection,
+};
 use wist_shared::time::now_rfc3339;
 
 use crate::control::work::{AppliedWorkGrant, WorkExporterRun};
 use crate::state_store::log_seq_state;
 use crate::telemetry::exporters;
 use crate::telemetry::logs::InputOrigin;
+use crate::telemetry::logs::files::file::FamilyCapacity;
 use crate::telemetry::logs::files::{
     FileFamilyProcessor, FileInputProcessor, ProcessOutcome, is_family_target,
 };
+use crate::telemetry::logs::gate::Withheld;
 use crate::telemetry::warp_parse::{
     RecordSink, TcpFraming, TelemetryRecordSink, uplink_write_detail,
 };
@@ -21,8 +26,8 @@ mod support;
 use support::{
     build_file_input_config, build_record_sink, capacity_failure, invalid_output_failure,
     missing_input_failure, noise_dropped_failure, processing_failure, replay_spool_only,
-    selection_filtered_failure, spool_paused_reason, unsupported_target, uplink_failure,
-    withheld_failure,
+    selection_filtered_failure, spool_paused_reason, truncated_failure, unsupported_target,
+    uplink_failure, withheld_failure,
 };
 
 // 生效输出解析要给主循环用（它在短路前算），所以在同一层再导出一次；
@@ -46,7 +51,13 @@ pub(super) enum TelemetryFailureKind {
     /// 有记录因**内容不全**被挡下不转发（边界判据在这个文件上没起作用）。
     /// 不是"采集失败"，但必须说出来 —— 否则一条永不结束的块会静默消失。
     RecordWithheld,
-    /// 文件族匹配数超过 `max_files`：新文件不再纳入跟踪（**没采全**，不是"没匹配"）。
+    /// 单行超过 `max_line_bytes` 被截断提交。
+    ///
+    /// 为什么它必须可见：对纯文本只是“少了一点尾巴”，对 **JSON Lines**（如 Suricata 的
+    /// `eve.json`）产出的是一条永远解析不了的记录。没有这一行，“下游为什么有坏 JSON”
+    /// 就只能猜。量与去重口径同 `NoiseDropped`（量在 `magnitude`）。
+    TruncatedLine,
+    /// 文件族触顶（`max_files`）：新文件不再纳入跟踪（**没采全**，不是"没匹配"）。
     CapacityExceeded,
     /// 按 `drop_if_contains` 丢掉噪音行：**配置的正常结果，不是故障**。
     ///
@@ -266,6 +277,8 @@ pub(super) async fn process_telemetry_inputs(
         failures: Vec::new(),
         notifications: Vec::new(),
     };
+    // 追平预算**一轮 tick 一份**：它是“采集段总共能占多久”，不是每条输入的。
+    let budget = CatchupBudget::new(&config.telemetry.logs);
 
     for input in &config.telemetry.logs.file_inputs {
         process_telemetry_input(
@@ -275,6 +288,7 @@ pub(super) async fn process_telemetry_inputs(
             sink,
             &mut tick,
             next_seq,
+            &budget,
         )
         .await;
     }
@@ -286,6 +300,7 @@ pub(super) async fn process_telemetry_inputs(
             sink,
             &mut tick,
             next_seq,
+            &budget,
         )
         .await;
     }
@@ -509,6 +524,103 @@ fn persist_cursor(state_dir: &Path, run: &WorkExporterRun, output: &str, fell_ba
     }
 }
 
+/// 一轮 tick 里「采集段」还能占多久。
+///
+/// 为什么需要它：`max_lines_per_tick` / `max_read_bytes_per_tick` 只是**一批**的上限，
+/// 而主循环 3s 一拍 —— 只读一批的话，单输入上限就是 `4096 行 / 3s ≈ 1365 行/秒`。
+/// 一条 IDS 的 `eve.json`（万级 EPS）会把 checkpoint 永远甩在文件尾后面，
+/// spool 涨满后 `pause`：数据“采了”，但一直在滞后。
+///
+/// 两层时限：
+///   * `slice`：**单条输入**的让位粒度（默认 400ms）—— 一个疯长的输入不能把后面的输饿死；
+///   * `deadline`：**整轮 tick** 的总预算（默认 1800ms = 3s 拍的 60%）—— 采集排在
+///     发现 / 指标之后，不能把一拍吃干净。
+///
+/// 任一为 `0` = 关闭追平，回到「每 tick 一批」的旧行为（逃生口）。
+struct CatchupBudget {
+    slice: Option<Duration>,
+    deadline: Option<Instant>,
+}
+
+impl CatchupBudget {
+    fn new(logs: &LogsSection) -> Self {
+        if logs.catchup_slice_ms == 0 || logs.catchup_budget_ms == 0 {
+            return Self {
+                slice: None,
+                deadline: None,
+            };
+        }
+        let slice = Duration::from_millis(logs.catchup_slice_ms);
+        let total = Duration::from_millis(logs.catchup_budget_ms);
+        Self {
+            slice: Some(slice),
+            // 全局预算是**硬上限**：哪怕配置把片写得比它长，也不越过它 ——
+            // 否则“采集段最多占一拍 60%”就只是一句口号。
+            deadline: Some(Instant::now() + total),
+        }
+    }
+
+    /// 本条输入的截止时刻（`None` = 追平已关闭，只跑一批）。
+    fn slice_deadline(&self) -> Option<Instant> {
+        let slice = self.slice?;
+        let slice_end = Instant::now() + slice;
+        Some(match self.deadline {
+            Some(global) if global < slice_end => global,
+            _ => slice_end,
+        })
+    }
+
+    fn exhausted(&self) -> bool {
+        self.deadline.is_some_and(|end| Instant::now() >= end)
+    }
+}
+
+/// **一条输入**在一轮 tick 里的报告汇总。
+///
+/// 为什么要汇总：追平会让同一条输入在一拍里跑多批。若每批都往 `tick.failures` 里推一条，
+/// 同一个问题在一拍里会被打 N 次（`filter_new_failures` 只跟**上一拍**的签名比，
+/// 不处理同一拍内的重复）—— 那正好把「按签名去重」毁了。所以量在这里累加，拍末只报一次。
+#[derive(Default)]
+struct InputTickReports {
+    /// 泵停时的 spool 字节数（只记第一次：暂停就跳出了，本来也只会有一批）。
+    paused_spool_bytes: Option<u64>,
+    withheld: Withheld,
+    dropped_noise: usize,
+    truncated_lines: usize,
+    selection_filtered: usize,
+    identity_unknown: usize,
+    spooled: usize,
+    sink_error: Option<String>,
+    capacity: Option<FamilyCapacity>,
+}
+
+impl InputTickReports {
+    fn observe(&mut self, outcome: &ProcessOutcome) {
+        if outcome.paused && self.paused_spool_bytes.is_none() {
+            self.paused_spool_bytes = Some(outcome.spool_bytes);
+        }
+        self.withheld.records += outcome.withheld.records;
+        self.withheld.bytes += outcome.withheld.bytes;
+        self.dropped_noise += outcome.dropped_noise;
+        self.truncated_lines += outcome.truncated_lines;
+        self.selection_filtered += outcome.selection_filtered;
+        self.identity_unknown += outcome.identity_unknown;
+        self.spooled += outcome.spooled;
+        if outcome.capacity.is_some() {
+            self.capacity = outcome.capacity.clone();
+        }
+        if let Some(detail) = outcome.sink_error.as_deref() {
+            self.sink_error = Some(detail.to_string());
+        }
+    }
+
+    /// 能不能再追一批：追平靠**读到了行**判断（`records_processed` 会被多行折叠 / 噪音丢弃
+    /// 变成 0，`checkpoint_offset` 在未封口块下不前进）。
+    fn made_progress(outcome: &ProcessOutcome) -> bool {
+        outcome.read_lines > 0 && !outcome.paused && outcome.sink_error.is_none()
+    }
+}
+
 async fn process_telemetry_input<S: RecordSink>(
     config: &AgentConfig,
     input: &LogFileInputSection,
@@ -516,6 +628,7 @@ async fn process_telemetry_input<S: RecordSink>(
     sink: &mut S,
     tick: &mut TelemetryTick,
     next_seq: &mut u64,
+    budget: &CatchupBudget,
 ) {
     // 目标形态先过一道：`**` / `~` / 相对路径采不了，要报成“形态不支持”，
     // 而不是拖到下面报“路径不存在”（那会把运维引去查权限）。
@@ -539,58 +652,87 @@ async fn process_telemetry_input<S: RecordSink>(
         return;
     }
 
-    match process_input_with_sink(config, input, origin, source_path, sink, next_seq).await {
-        Ok(outcome) => {
-            if outcome.paused {
-                tick.notifications.push(TelemetryWorkState {
-                    input_id: input.input_id.clone(),
-                    state: WorkState::Paused,
-                    reason: spool_paused_reason(outcome.spool_bytes),
-                    at: now_rfc3339(),
-                });
+    let mut reports = InputTickReports::default();
+    loop {
+        let slice_end = budget.slice_deadline();
+        let outcome = match process_input_with_sink(
+            config,
+            input,
+            origin,
+            source_path.clone(),
+            sink,
+            next_seq,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                match uplink_write_detail(&err) {
+                    // 回放阶段的出口失败也要归到出口失败类（而不是含混的「处理失败」）：
+                    // 靠 `UplinkWriteError` 标记分辨（`warp_parse`），不靠错误文本。
+                    Some(detail) => tick.failures.push(uplink_failure(input, detail, None)),
+                    None => tick
+                        .failures
+                        .push(processing_failure(input, err.to_string())),
+                }
+                break;
             }
-            // 被挡下的记录走 failure 通道，是为了蹭 daemon 已有的**按签名去重**：
-            // 一个持续存在的病态块只报一次，恢复正常后自动清掉。
-            // （量放 `magnitude`：它会变，不能进签名，否则每 tick 都算新问题。）
-            if let Some(failure) = withheld_failure(input, &outcome.withheld) {
-                tick.failures.push(failure);
-            }
-            // 触顶：不说出来，「为什么这台机器的某个容器没数据」就只能靠猜。
-            if let Some(capacity) = outcome.capacity.as_ref() {
-                tick.failures.push(capacity_failure(input, capacity));
-            }
-            // 噪音行丢弃：配置的正常结果，但**必须可对账** ——
-            // 否则“这个面怎么少了一半”只能靠猜。走 failure 通道蹭它的按签名去重。
-            if outcome.dropped_noise > 0 {
-                tick.failures
-                    .push(noise_dropped_failure(input, outcome.dropped_noise));
-            }
-            // 选源过滤：同样要能对账。与噪音丢弃分开报 ——
-            // “剔了几个文件”与“丢了几行记录”是两种量，混在一起就都看不准。
-            if outcome.selection_filtered > 0 || outcome.identity_unknown > 0 {
-                tick.failures.push(selection_filtered_failure(
-                    input,
-                    outcome.selection_filtered,
-                    outcome.identity_unknown,
-                ));
-            }
-            // 出口写失败：记录已安全进 spool，但**写出口**没成。必须说出来 ——
-            // 旧行为里第一次失败是完全静默的（只有下一轮的回放失败才会报），
-            // 而目标现在由控制面下发 —— 填错必须当场看得见，不能等 spool 涨到上限才 `pause`。
-            if let Some(detail) = outcome.sink_error.as_deref() {
-                tick.failures
-                    .push(uplink_failure(input, detail, Some(outcome.spooled)));
-            }
-            tick.outcomes.push(outcome);
+        };
+        reports.observe(&outcome);
+        let again = InputTickReports::made_progress(&outcome) && slice_end.is_some();
+        // 每批的 outcome 都留下：`is_active` / “本轮发过东西吗”本来就是“任一批”的语义。
+        tick.outcomes.push(outcome);
+        if !again {
+            break;
         }
-        Err(err) => match uplink_write_detail(&err) {
-            // 回放阶段的出口失败也要归到出口失败类（而不是含混的「处理失败」）：
-            // 靠 `UplinkWriteError` 标记分辨（`warp_parse`），不靠错误文本。
-            Some(detail) => tick.failures.push(uplink_failure(input, detail, None)),
-            None => tick
-                .failures
-                .push(processing_failure(input, err.to_string())),
-        },
+        if slice_end.is_some_and(|end| Instant::now() >= end) || budget.exhausted() {
+            break;
+        }
+    }
+
+    // 拍末一次性上报（顺序与旧行为一致：先工作状态，再失败）。
+    if let Some(spool_bytes) = reports.paused_spool_bytes {
+        tick.notifications.push(TelemetryWorkState {
+            input_id: input.input_id.clone(),
+            state: WorkState::Paused,
+            reason: spool_paused_reason(spool_bytes),
+            at: now_rfc3339(),
+        });
+    }
+    if let Some(failure) = withheld_failure(input, &reports.withheld) {
+        tick.failures.push(failure);
+    }
+    // 触顶：不说出来，「为什么这台机器的某个容器没数据」就只能靠猜。
+    if let Some(capacity) = reports.capacity.as_ref() {
+        tick.failures.push(capacity_failure(input, capacity));
+    }
+    // 噪音行丢弃：配置的正常结果，但**必须可对账** ——
+    // 否则“这个面怎么少了一半”只能靠猜。走 failure 通道蹭它的按签名去重。
+    if reports.dropped_noise > 0 {
+        tick.failures
+            .push(noise_dropped_failure(input, reports.dropped_noise));
+    }
+    // 超长行被截断：对纯文本是“丢一点尾巴”，对 **JSON Lines 就是产出一条永远解析不了的
+    // 记录**。必须让它可见，否则“下游为什么有坏 JSON”查不到源头。
+    if reports.truncated_lines > 0 {
+        tick.failures
+            .push(truncated_failure(input, reports.truncated_lines));
+    }
+    // 选源过滤：同样要能对账。与噪音丢弃分开报 ——
+    // “剔了几个文件”与“丢了几行记录”是两种量，混在一起就都看不准。
+    if reports.selection_filtered > 0 || reports.identity_unknown > 0 {
+        tick.failures.push(selection_filtered_failure(
+            input,
+            reports.selection_filtered,
+            reports.identity_unknown,
+        ));
+    }
+    // 出口写失败：记录已安全进 spool，但**写出口**没成。必须说出来 ——
+    // 旧行为里第一次失败是完全静默的（只有下一轮的回放失败才会报），
+    // 而目标现在由控制面下发 —— 填错必须当场看得见，不能等 spool 涨到上限才 `pause`。
+    if let Some(detail) = reports.sink_error.as_deref() {
+        tick.failures
+            .push(uplink_failure(input, detail, Some(reports.spooled)));
     }
 }
 
@@ -614,7 +756,63 @@ async fn process_input_with_sink<S: RecordSink>(
 
 #[cfg(test)]
 mod tests {
-    use super::{UplinkHealth, len_framing_required};
+    use std::time::{Duration, Instant};
+
+    use super::{CatchupBudget, UplinkHealth, len_framing_required};
+    use crate::config::agent_config::LogsSection;
+
+    #[test]
+    fn catchup_can_be_disabled_by_either_zero() {
+        let logs = LogsSection {
+            catchup_slice_ms: 0,
+            ..Default::default()
+        };
+        let budget = CatchupBudget::new(&logs);
+        assert!(
+            budget.slice_deadline().is_none(),
+            "slice=0 必须回到「每 tick 一批」"
+        );
+        assert!(!budget.exhausted(), "关闭追平时不应报预算耗尽");
+
+        let logs = LogsSection {
+            catchup_budget_ms: 0,
+            ..Default::default()
+        };
+        assert!(CatchupBudget::new(&logs).slice_deadline().is_none());
+    }
+
+    #[test]
+    fn catchup_slice_never_exceeds_the_tick_budget() {
+        let logs = LogsSection {
+            catchup_slice_ms: 5_000,
+            catchup_budget_ms: 1_000,
+            ..Default::default()
+        };
+        let budget = CatchupBudget::new(&logs);
+        let deadline = budget.slice_deadline().expect("追平开启时必须给截止时间");
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            remaining <= Duration::from_millis(1_000),
+            "单个片不能越过整轮预算（实际剩余 {remaining:?}）"
+        );
+    }
+
+    #[test]
+    fn tick_budget_is_a_hard_cap_even_when_the_slice_is_longer() {
+        // 配置把片写得比预算长时不放大预算：采集段不能因此吃掉整拍。
+        let logs = LogsSection {
+            catchup_slice_ms: 400,
+            catchup_budget_ms: 10,
+            ..Default::default()
+        };
+        let budget = CatchupBudget::new(&logs);
+        let deadline = budget.slice_deadline().expect("追平开启时必须有截止时间");
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            remaining <= Duration::from_millis(10),
+            "整轮预算是硬上限（实际剩余 {remaining:?}）"
+        );
+    }
 
     #[test]
     fn uplink_health_reports_recovery_once_and_only_after_a_real_send() {

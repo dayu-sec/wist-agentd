@@ -61,7 +61,7 @@ const YELLOW: &str = "33";
 const CYAN: &str = "36";
 const RESET: &str = "\x1b[0m";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Status {
     Ok,
     Warn,
@@ -69,7 +69,7 @@ pub(crate) enum Status {
 }
 
 impl Status {
-    fn tag(self) -> &'static str {
+    pub(crate) fn tag(self) -> &'static str {
         match self {
             Status::Ok => "[OK]",
             Status::Warn => "[WARN]",
@@ -77,7 +77,7 @@ impl Status {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Status::Ok => "ok",
             Status::Warn => "warn",
@@ -86,7 +86,7 @@ impl Status {
     }
 
     /// 状态对应的前景色（绿 / 黄 / 红）。
-    fn color(self) -> &'static str {
+    pub(crate) fn color(self) -> &'static str {
         match self {
             Status::Ok => GREEN,
             Status::Warn => YELLOW,
@@ -273,7 +273,7 @@ fn color_enabled(no_color: Option<&str>, force: Option<&str>, is_tty: bool) -> b
 }
 
 /// 文本输出是否上色：默认**只在 TTY** 上色（重定向 / 管道输出保持纯文本）。
-fn should_color() -> bool {
+pub(crate) fn should_color() -> bool {
     color_enabled(
         std::env::var("NO_COLOR").ok().as_deref(),
         std::env::var("CLICOLOR_FORCE").ok().as_deref(),
@@ -1225,6 +1225,7 @@ async fn uplink_local_checks(
     }
 
     checks.push(snapshot_uplink_check(config, grant, snapshot_grant));
+    checks.push(log_inputs_check(config, grant).await);
     checks.push(spool_check(config).await);
     checks.push(local_work_check(config).await);
     checks
@@ -1357,6 +1358,146 @@ async fn spool_check(config: &AgentConfig) -> Check {
         .hint("先查 `uplink.target` 是否可达；积压会在恢复后自动回放");
     }
     Check::ok("uplink.spool", "没有明显 spool 积压", detail)
+}
+
+/// 采集输入能不能读 —— diagnose 里「平台上看不到数据」的第一现场。
+///
+/// 为什么需要它：配置对、工作也派了、进程也活着，但路径写错 / 权限不足 / 被采程序没启动，
+/// 现象全是「没有数据」，而之前的 diagnose **完全不看输入** —— 现场只能猜。
+///
+/// 只读、不采：显式单文件真开一次（不读内容），glob / 目录只看**固定前缀目录**。
+/// 匹配为空**不算失败**（运行时也不把“没匹配”当错误）；采集没运行（待命 / standalone）
+/// 时说「待启用」，不制造假失败。
+async fn log_inputs_check(config: &AgentConfig, grant: Option<&AgentUplinkGrant>) -> Check {
+    let targets = log_input_targets(config).await;
+    if !effective_output(config, grant).enabled {
+        return Check::ok(
+            "telemetry.inputs",
+            "上送未启用，采集不运行",
+            format!(
+                "{} 条输入待启用（待命期不读源、不推进 checkpoint）",
+                targets.len()
+            ),
+        );
+    }
+    if targets.is_empty() {
+        return Check::ok(
+            "telemetry.inputs",
+            "没有文件采集输入",
+            "只采指标 / 只有导出器时是正常的",
+        );
+    }
+    let mut problems = Vec::new();
+    for (label, target) in &targets {
+        if let Err(problem) = check_log_target(target).await {
+            problems.push(format!("{label} {target}：{problem}"));
+        }
+    }
+    if problems.is_empty() {
+        let paths = targets
+            .iter()
+            .map(|(_, target)| target.as_str())
+            .collect::<Vec<_>>()
+            .join("，");
+        return Check::ok(
+            "telemetry.inputs",
+            format!("{} 条采集输入可读", targets.len()),
+            paths,
+        );
+    }
+    Check::fail(
+        "telemetry.inputs",
+        format!("{} 条采集输入有问题", problems.len()),
+        problems.join("；"),
+    )
+    .hint(
+        "按上面的 path 依次查：① 路径拼写；② 权限（系统级 agentd 是 root，非 root 前台跑要加组）；\
+         ③ 被采程序是否在跑 / 是否已写出文件；`work-*` 的输入来自控制面派活 ——\
+         要在管理面改单元的来源，改本机配置不会动它",
+    )
+}
+
+/// 本机此刻该采的日志目标：本机配置的 + 已生效工作折算的（与守护进程同一套判据）。
+async fn log_input_targets(config: &AgentConfig) -> Vec<(String, String)> {
+    let mut targets: Vec<(String, String)> = config
+        .telemetry
+        .logs
+        .file_inputs
+        .iter()
+        .map(|input| (input.input_id.clone(), input.path.clone()))
+        .collect();
+    let path = work::path_for(Path::new(&config.paths.state_dir));
+    if let Ok(Some(record)) = work::load_async(&path).await {
+        for standing in record
+            .standing
+            .iter()
+            .filter(|standing| standing.status == "active")
+        {
+            for unit in &standing.units {
+                if unit.capability != "collect_logs" {
+                    continue;
+                }
+                for source in &unit.sources {
+                    if source.kind == "FileGlob"
+                        && wist_contracts::work::is_executable_source(&source.kind, &source.target)
+                    {
+                        targets.push((unit.unit_id.clone(), source.target.clone()));
+                    }
+                }
+            }
+        }
+    }
+    targets
+}
+
+/// 单个目标能不能读（`Err` = 给人看的原因）。
+async fn check_log_target(target: &str) -> Result<(), String> {
+    // 形态先过一道：`**` / `~` / 相对路径在运行时会被报成“不可执行”，这里提前说同一句话。
+    if !wist_contracts::work::is_executable_source("FileGlob", target) {
+        return Err("目标形态不支持（要绝对路径；`**` 与 `~` 都不支持）".to_string());
+    }
+    if wist_contracts::work::has_glob_meta(target) {
+        let base = glob_base_dir(target);
+        return match tokio::fs::read_dir(&base).await {
+            Ok(_) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Err(format!(
+                "目录 {} 不存在（还没写出文件？匹配为空本身不是错）",
+                base.display()
+            )),
+            Err(err) => Err(format!("目录 {} 读不了（{err}）", base.display())),
+        };
+    }
+
+    let path = Path::new(target);
+    match tokio::fs::metadata(path).await {
+        Ok(meta) if meta.is_dir() => match tokio::fs::read_dir(path).await {
+            Ok(_) => Ok(()),
+            Err(err) => Err(format!("目录读不了（{err}）")),
+        },
+        // 只对普通文件真开一次：FIFO / 设备文件开读会阻塞，那不能由诊断来触发。
+        Ok(meta) if meta.is_file() => tokio::fs::File::open(path)
+            .await
+            .map(|_| ())
+            .map_err(|err| format!("文件打不开（{err}）")),
+        Ok(_) => Err("不是普通文件（管道 / 设备？采集器按行读普通文件）".to_string()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Err("不存在".to_string()),
+        Err(err) => Err(format!("读不了（{err}）")),
+    }
+}
+
+/// glob 的**固定前缀目录**：第一个元字符之前的路径去掉文件名。
+///
+/// `/var/log/suricata/eve-*.json` → `/var/log/suricata`；
+/// `/var/log/*/*.log` → `/var/log`；`/*.log` → `/`。
+fn glob_base_dir(target: &str) -> PathBuf {
+    let prefix = match target.find(['*', '?', '[']) {
+        Some(index) => &target[..index],
+        None => target,
+    };
+    match prefix.rfind('/') {
+        Some(index) if index > 0 => PathBuf::from(&prefix[..index]),
+        _ => PathBuf::from("/"),
+    }
 }
 
 /// 本地工作视图（`state/work.json`）：手里有多少活、是不是还没派活。
@@ -2306,6 +2447,78 @@ mod tests {
         assert!(colored.contains("\x1b[1;32m[OK]\x1b[0m"), "{colored:?}");
         assert!(colored.contains("\x1b[1;33m[WARN]\x1b[0m"), "{colored:?}");
         assert!(colored.contains("\x1b[1;31m[FAIL]\x1b[0m"), "{colored:?}");
+    }
+
+    #[tokio::test]
+    async fn log_inputs_check_reports_missing_files_and_accepts_readable_ones() {
+        let root = std::env::temp_dir().join(format!("doctor-inputs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("state")).expect("state dir");
+        let mut config: AgentConfig =
+            toml::from_str(&crate::config_runtime::default_config_template())
+                .expect("default config parses");
+        config.paths.state_dir = root.join("state").to_string_lossy().to_string();
+        let eve = root.join("eve.json");
+        config.telemetry.logs.file_inputs =
+            vec![crate::config::agent_config::LogFileInputSection {
+                input_id: "suricata-eve".to_string(),
+                path: eve.display().to_string(),
+                startup_position: "tail".to_string(),
+                multiline_mode: "none".to_string(),
+                exclude_globs: Vec::new(),
+                filters: Default::default(),
+                drop_if_contains: Vec::new(),
+            }];
+
+        let missing = log_inputs_check(&config, None).await;
+        assert_eq!(missing.status, Status::Fail, "{missing:?}");
+        assert!(missing.detail.contains("不存在"), "{missing:?}");
+
+        std::fs::write(&eve, b"{\"event_type\":\"stats\"}\n").expect("write eve");
+        let readable = log_inputs_check(&config, None).await;
+        assert_eq!(readable.status, Status::Ok, "{readable:?}");
+
+        // 待命（上送未启用）时不制造假失败：那个阶段本来就不读源。
+        let standby = AgentUplinkGrant::standby("2026-10-30T00:00:00Z".to_string());
+        let idle = log_inputs_check(&config, Some(&standby)).await;
+        assert_eq!(idle.status, Status::Ok, "{idle:?}");
+        assert!(idle.title.contains("上送未启用"), "{idle:?}");
+        assert!(idle.detail.contains("待启用"), "{idle:?}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn log_inputs_check_treats_an_empty_glob_as_healthy() {
+        let root = std::env::temp_dir().join(format!("doctor-inputs-glob-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("state")).expect("state dir");
+        let mut config: AgentConfig =
+            toml::from_str(&crate::config_runtime::default_config_template())
+                .expect("default config parses");
+        config.paths.state_dir = root.join("state").to_string_lossy().to_string();
+        config.telemetry.logs.file_inputs =
+            vec![crate::config::agent_config::LogFileInputSection {
+                input_id: "eve-family".to_string(),
+                path: root.join("suricata/eve-*.json").display().to_string(),
+                startup_position: "tail".to_string(),
+                multiline_mode: "none".to_string(),
+                exclude_globs: Vec::new(),
+                filters: Default::default(),
+                drop_if_contains: Vec::new(),
+            }];
+
+        // 目录不存在 → FAIL（运行时也会报 MissingInput，而不是“暂时没匹配”）。
+        let absent = log_inputs_check(&config, None).await;
+        assert_eq!(absent.status, Status::Fail, "{absent:?}");
+        assert!(absent.detail.contains("不存在"), "{absent:?}");
+
+        // 目录在但一份都没匹配上 → OK（运行时同样不把“没匹配”当错误）。
+        std::fs::create_dir_all(root.join("suricata")).expect("suricata dir");
+        let empty = log_inputs_check(&config, None).await;
+        assert_eq!(empty.status, Status::Ok, "{empty:?}");
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

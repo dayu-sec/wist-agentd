@@ -109,6 +109,13 @@ pub struct ProcessOutcome {
     pub truncated: bool,
     /// 本次因超长被截断提交的行数（每行已作为一条记录提交）。
     pub truncated_lines: usize,
+    /// 本批真正读进来的行数（不管最后变成记录、被 `drop_if_contains` 丢掉、
+    /// 还是进了未封口的多行块）。
+    ///
+    /// 它是 tick 内**追平循环**的唯一进度信号：为 0 = 已经追到文件尾（或本轮压跟不读）。
+    /// 不能用 `records_processed` 代替：一行可能只是丢噪音或进未封口块；
+    /// 也不能用 `checkpoint_offset`：未封口块下它不前进，文件族里它又是跨文件最大值。
+    pub read_lines: usize,
     /// 本次因**内容不全**被挡下（不转发、不取号）的记录。
     /// 不是 0 就说明边界判据在这个文件上没起作用（例如某个块永不结束），必须说出来。
     pub withheld: Withheld,
@@ -141,6 +148,9 @@ pub struct FamilyCapacity {
 }
 
 impl ProcessOutcome {
+    // 参数全是 `ProcessOutcome` 的字段，拆成结构体只会把同一个字面重复两遍；
+    // 与 `read_one_file` / `process_exporters` 同一取舍。
+    #[allow(clippy::too_many_arguments)]
     fn from_delivery(
         delivery: DeliveryOutcome,
         checkpoint_offset: u64,
@@ -149,6 +159,7 @@ impl ProcessOutcome {
         truncated_lines: usize,
         withheld: Withheld,
         rotated: bool,
+        read_lines: usize,
     ) -> Self {
         Self {
             kind: ProcessOutcomeKind::SourceBatch,
@@ -160,6 +171,7 @@ impl ProcessOutcome {
             replayed_spool,
             truncated,
             truncated_lines,
+            read_lines,
             withheld,
             rotated,
             paused: false,
@@ -188,6 +200,7 @@ impl ProcessOutcome {
             replayed_spool,
             truncated: false,
             truncated_lines: 0,
+            read_lines: 0,
             withheld: Withheld::default(),
             dropped_noise: 0,
             selection_filtered: 0,
@@ -214,6 +227,7 @@ impl ProcessOutcome {
             replayed_spool: 0,
             truncated: false,
             truncated_lines: 0,
+            read_lines: 0,
             withheld: Withheld::default(),
             dropped_noise: 0,
             selection_filtered: 0,
@@ -267,6 +281,7 @@ where
             checkpoints,
             checkpoint_offset,
             truncated_lines,
+            read_lines,
             dropped_noise,
             withheld,
             resume,
@@ -289,6 +304,7 @@ where
             truncated_lines,
             withheld,
             resume.rotated,
+            read_lines,
         )
         .with_dropped_noise(dropped_noise))
     }
@@ -381,6 +397,7 @@ where
         )
         .await?;
         saw_new_lines |= !active_read.lines.is_empty();
+        batch.read_lines += active_read.lines.len();
         batch.truncated_lines += active_read.truncated_lines;
         let folded = records_from_read(
             &mut gate,
@@ -458,6 +475,7 @@ where
         )
         .await?;
         let saw_new_lines = !rotated_read.lines.is_empty();
+        batch.read_lines += rotated_read.lines.len();
         batch.truncated_lines += rotated_read.truncated_lines;
         let folded = records_from_read(
             gate,
@@ -646,6 +664,7 @@ where
             checkpoints,
             checkpoint_offset,
             truncated_lines,
+            read_lines,
             dropped_noise,
             selection_filtered,
             identity_unknown,
@@ -685,6 +704,7 @@ where
             truncated_lines,
             withheld,
             rotated,
+            read_lines,
         );
         outcome.capacity = capacity;
         outcome.dropped_noise = dropped_noise;
@@ -1001,6 +1021,7 @@ where
         let consumed_bytes = read
             .committed_end_offset
             .saturating_sub(resume.start_offset);
+        batch.read_lines += consumed_lines;
         batch.truncated_lines += read.truncated_lines;
         let folded = records_from_read(
             gate,
@@ -1086,6 +1107,7 @@ where
         let consumed_bytes = read
             .committed_end_offset
             .saturating_sub(previous.checkpoint_offset);
+        batch.read_lines += consumed_lines;
         batch.truncated_lines += read.truncated_lines;
         let folded = records_from_read(
             gate,
@@ -1180,6 +1202,8 @@ struct FamilyBatch {
     checkpoints: Vec<FamilyCheckpoint>,
     checkpoint_offset: u64,
     truncated_lines: usize,
+    /// 本批真正读进来的行数（跨文件累计）。追平循环的进度信号，理由见 [`ProcessOutcome::read_lines`]。
+    read_lines: usize,
     /// 本批按 `drop_if_contains` 丢掉的记录数（噪音行，进自观测）。
     dropped_noise: usize,
     /// 本轮被 `filters` 剔掉的现存路径数（不含 `exclude_globs`）。
@@ -1202,6 +1226,7 @@ impl FamilyBatch {
             checkpoints: Vec::new(),
             checkpoint_offset: 0,
             truncated_lines: 0,
+            read_lines: 0,
             dropped_noise: 0,
             selection_filtered: 0,
             identity_unknown: 0,

@@ -223,8 +223,28 @@ pub struct LogsSection {
     #[serde(default = "default_max_read_bytes_per_tick")]
     pub max_read_bytes_per_tick: u64,
     /// 单次 tick 最多读取的行数（大文件回放分块）。
+    ///
+    /// **这是单批上限，不是单 tick 上限**：一轮 tick 里会按 [`Self::catchup_slice_ms`]
+    /// 反复读多批，直到追平或时间片用完。
     #[serde(default = "default_max_lines_per_tick")]
     pub max_lines_per_tick: u64,
+    /// 每条输入在一轮 tick 里最多追多久（毫秒）。`0` = 关闭追平（回到「每 tick 一批」）。
+    ///
+    /// 为什么需要：`max_lines_per_tick` / `max_read_bytes_per_tick` 只是**一批**的上限，
+    /// 而主循环 3s 一拍。只读一批的话，单输入上限就是 `4096 行 / 3s ≈ 1365 行/秒` ——
+    /// 一条 IDS 的 `eve.json` 或高频应用日志会把 checkpoint 永远甩在文件尾后面，
+    /// spool 一路涨到上限后 `pause`。追平把上限从「tick 周期」变回「磁盘 / 出口的实际速度」。
+    ///
+    /// 取值是**让位粒度**：一个疯长的输入吃满自己这一片就停，别的输入照常跑。
+    #[serde(default = "default_catchup_slice_ms")]
+    pub catchup_slice_ms: u64,
+    /// 一轮 tick 里所有输入合计最多追多久（毫秒）。`0` = 关闭追平。
+    ///
+    /// 为什么还要一个全局上限：每条输入各 400ms，十条输入就能把一拍拉到 4s，
+    /// 发现 / 指标 / 控制面都会被顺延。全局预算把采集段封在拍长的一个比例内
+    /// （默认 1800ms = 3s 拍的 60%）。
+    #[serde(default = "default_catchup_budget_ms")]
+    pub catchup_budget_ms: u64,
     /// 落盘待发队列（spool）上限（字节）。
     #[serde(default = "default_spool_max_bytes")]
     pub spool_max_bytes: u64,
@@ -247,6 +267,8 @@ impl Default for LogsSection {
             max_line_bytes: default_max_line_bytes(),
             max_read_bytes_per_tick: default_max_read_bytes_per_tick(),
             max_lines_per_tick: default_max_lines_per_tick(),
+            catchup_slice_ms: default_catchup_slice_ms(),
+            catchup_budget_ms: default_catchup_budget_ms(),
             spool_max_bytes: default_spool_max_bytes(),
             spool_over_limit: default_spool_over_limit(),
             spool_dir: default_logs_spool_dir(),
@@ -394,6 +416,21 @@ fn default_max_read_bytes_per_tick() -> u64 {
 /// 4096 行 / tick：大文件回放分块读取。
 fn default_max_lines_per_tick() -> u64 {
     4096
+}
+
+/// 单条输入的追平时间片：400ms。
+///
+/// 取 400ms 而不是「一拍到底」：它比一次合理的批量读（几 MB）长得多，又足够短 ——
+/// 同一拍里排在前面的输入最多占掉 400ms，后面的输入还剩时间。
+fn default_catchup_slice_ms() -> u64 {
+    400
+}
+
+/// 一轮 tick 的采集总预算：1800ms（3s 拍长的 60%）。
+///
+/// 留 40% 给发现 / 指标 / 控制面：采集排在它们之后的路径不能把一拍吃干净。
+fn default_catchup_budget_ms() -> u64 {
+    1800
 }
 
 /// 256 MiB：落盘待发队列上限（见 log-file-input-spec §7.5）。

@@ -33,6 +33,12 @@ pub(super) struct CollectedReadBatch {
     pub(super) checkpoints: Vec<PendingCheckpoint>,
     pub(super) checkpoint_offset: u64,
     pub(super) truncated_lines: usize,
+    /// 本批**真正读进来**的行数（不管最后变成记录、被丢弃、还是进了未封口块）。
+    ///
+    /// 为什么要它：追平循环需要一个“本批吃过东西吗”的信号。不能用
+    /// `records_processed`（多行折叠 / 噪音丢弃 / 未封口块都会让它是 0），
+    /// 也不能用 `checkpoint_offset`（未封口块下它不会前进，而文件族里它是跨文件的最大值）。
+    pub(super) read_lines: usize,
     /// 本批按 `drop_if_contains` 丢掉的记录数（噪音行，进自观测）。
     pub(super) dropped_noise: usize,
     /// 本次因**内容不全**被挡下（不转发）的记录。
@@ -48,6 +54,7 @@ impl CollectedReadBatch {
             checkpoints: Vec::new(),
             checkpoint_offset: 0,
             truncated_lines: 0,
+            read_lines: 0,
             dropped_noise: 0,
             withheld: Withheld::default(),
             resume,

@@ -66,6 +66,17 @@ pub(super) fn emit_telemetry_failure(failure: &TelemetryFailure) {
                 failure.detail
             );
         }
+        // 超长行被截断：对纯文本只是“少了一点尾巴”，对 JSON Lines 就是产出一条
+        // 下游永远解析不了的记录。打 `warn`：采集本身没停，但数据完整性已经受损。
+        TelemetryFailureKind::TruncatedLine => {
+            let magnitude = failure.magnitude.as_deref().unwrap_or("n/a");
+            log::warn!(
+                "telemetry line truncated input_id={} path={} detail={} magnitude={magnitude}",
+                failure.input_id,
+                failure.path,
+                failure.detail
+            );
+        }
         // 选源过滤：同样是**正常态**。`identity_unknown` 不为 0 时要能看出
         // “不是没选中，而是身份没读出来”——否则排除式看起来像没生效。
         TelemetryFailureKind::SelectionFiltered => {

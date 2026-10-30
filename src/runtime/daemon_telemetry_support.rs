@@ -274,6 +274,20 @@ pub(super) fn noise_dropped_failure(
     }
 }
 
+/// 单行超过 `max_line_bytes`，已截断提交（每行仍是一条记录）。
+///
+/// `detail` 稳定（去重按 `kind|input_id|path|detail`），量与上限放 `magnitude`。
+/// 对 JSON Lines 这类格式，截断 = 产出一条下游永远解析不了的记录 —— 不是无害的“少几个字”。
+pub(super) fn truncated_failure(input: &LogFileInputSection, lines: usize) -> TelemetryFailure {
+    TelemetryFailure {
+        kind: TelemetryFailureKind::TruncatedLine,
+        input_id: input.input_id.clone(),
+        path: input.path.clone(),
+        detail: "line exceeded max_line_bytes; submitted truncated".to_string(),
+        magnitude: Some(format!("lines={lines}")),
+    }
+}
+
 /// 按容器过滤器剔掉文件的记录（`filters` 真的生效了）。
 ///
 /// `detail` 稳定（去重按 `kind|input_id|path|detail`）；量放 `magnitude`，且把

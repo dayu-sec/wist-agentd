@@ -208,6 +208,8 @@ mod tests {
             max_line_bytes: 1024,
             max_read_bytes_per_tick: 4096,
             max_lines_per_tick: 10,
+            catchup_slice_ms: 400,
+            catchup_budget_ms: 1800,
             spool_max_bytes: 100_000,
             spool_over_limit: "pause".to_string(),
             spool_dir: "/tmp/root/state/spool".to_string(),
