@@ -3,6 +3,36 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.14.0-alpha] - 2026-10-31
+
+### 新增（负载调查：`investigate load`）
+
+`diagnose` 说「它自己为什么不对」，`disk` 说「盘被谁占了」，这一题回答**「负载高了，谁在吃 CPU / 内存 / IO」**。
+七节，判据是**每核负载**（负载不分平台都只是 runnable + uninterruptible 的**数量**，
+`load 8` 在 32 核上是闲的、在 4 核上已经过载）：
+
+- **`load.summary`**：1/5/15 分钟负载 + 核数 + 每核负载 + 运行队列（Linux）；
+  每核 ≥1.0 → WARN，≥2.0 → FAIL。
+- **`load.cpu`**：总体与每核占用（只列忙的核）；Linux 额外给 user/system/iowait/idle 去向。
+  总体 ≥85%/≥95% 分档，**单个核打满也算 WARN**——那是“负载不高但服务慢”最常见的形态（
+  单线程瓶颈，hint 直接说“加核没用”）。
+- **`load.top_processes`**：按 CPU 排的进程（pid + 名称 + RSS + 状态 + 运行时长）。
+  **不放 argv**（里面有密码/令牌），要看请对着 pid 自己 `ps`。
+- **`load.memory`**：物理内存与 swap；内存 ≥85%/≥95% 分档，swap ≥50% → WARN（已在换页）。
+  macOS 上 sysinfo 带不到 swap 总量时写「读不到」，**不**写成「未启用」（那是没证据的断言）。
+- **`load.io`**：iowait（Linux，`/proc/stat` 两次采样增量）、PSI io `some/full`（有才报）、
+  以及**不可中断睡眠（D 状态）进程数**。**负载高而 CPU 闲**时这一节就是结论：hint 把下一步
+  指向 `investigate disk`（是谁在写），而不是扩容 CPU。
+- **`load.agent_processes`**：先排除「是不是我们自己」（agentd / exec / upgrader 的 CPU 与 RSS）。
+- **`load.sample`**：采样窗口、进程数、平台能力（有没有 iowait/PSI）；进程数为 0 或窗口过短时
+  判 WARN——「没采到」绝不能长成「一切正常」。
+
+采样是有界的：两次刷新之间 300ms～1s（`--max-seconds` 可拉长，上限 1s），
+只读、不调外部命令、不跟随任何链接；进程列表按 `--top` 截断。
+
+`load` 与 `disk` 共用同一套入口：`wist-agentd investigate load`、网关一次性命令
+（`params.topic = "load"`）、状态上报的 `investigation_capabilities` 自动多一项。
+
 ## [0.13.1-alpha] - 2026-10-31
 
 ### 修复（“没出现”有三种，不能混成一种）

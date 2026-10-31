@@ -65,6 +65,10 @@ sudo wist-agentd diagnose
 # 一次性调查「磁盘满了是哪几大文件」（只读、有界）；退出码非零 = 有 FAIL
 wist-agentd investigate disk
 wist-agentd investigate disk --path /var --top 20 --json
+
+# 一次性调查「负载高了是谁在吃 CPU / 内存 / IO」
+wist-agentd investigate load
+wist-agentd investigate load --top 20 --json
 ```
 
 开发机联调：[`dev/start.sh`](dev/start.sh)（`&` + `disown`，非生产）。
@@ -99,7 +103,9 @@ TTY 下 `[OK]/[WARN]/[FAIL]` 带颜色（绿/黄/红），一眼扫到 FAIL；�
 ### 一次性调查（`investigate`）
 
 `diagnose` 回答「**它自己**为什么不对」，`investigate` 回答「**这台机器**现在怎么了」：
-一次性、按题目、给**证据表**（路径 + 体量 + 占比），而不是红绿检查。第一道题是磁盘：
+一次性、按题目、给**证据表**（路径/进程 + 数值 + 占比），而不是红绿检查。
+
+**`disk`（磁盘满）**：
 
 ```bash
 wist-agentd investigate disk                          # 查最紧张的那个文件系统的挂载点
@@ -107,10 +113,24 @@ wist-agentd investigate disk --path /var --top 20     # 查 /var，列前 20
 wist-agentd investigate disk --min-size 8MiB --json   # 只要 ≥8MiB 的，机器可读输出
 ```
 
-它给五节：文件系统占用（含 **inode**）→ 一级目录合计 → 最大的文件 → **agent 自己占多少** →
-扫描完成度（扫了多少、有没有被预算截断、哪些目录读不了）。默认预算 200k 条目 / 5s / 16 层，
-超了如实标「扫描未完成」—— 调查不会为了答案把一台已经在扛业务的机器再压一遍。
-**只读**、不需要守护进程在跑、读不到配置也能用（只是少一节 agent 自占）。详见
+它给七节：文件系统占用（含 **inode**）→ 递归累计最大的目录 + 热点下钻链 → 一级目录合计 →
+最大的文件 → **agent 自己占多少** → `df` 与扫描的差量 → 扫描完成度。
+预算按**一级目录轮流**分配（一个巨型目录不会把同级目录饿死）；没扫完/读不了/深度到顶的目录
+会被**点名**并给出重扫命令。
+
+**`load`（负载过高）**：
+
+```bash
+wist-agentd investigate load                          # 负载高了，是谁在吃 CPU / 内存 / IO
+wist-agentd investigate load --top 20 --json           # 列前 20 个进程，机器可读输出
+```
+
+同样七节：负载与**每核负载** + 运行队列 → CPU 总体与每核（Linux 还给 user/system/iowait 去向）→
+最吃 CPU 的进程 → 内存与 swap → **iowait / PSI / 不可中断睡眠（D 状态）** → agent 自己占多少 →
+采样窗口与平台能力。判据是「每核负载」而不是负载绝对值（`load 8` 在 32 核上很健康）。
+报告**不放进程 argv**（常有密码/令牌），只给 pid + 进程名，要看自己 `ps`。
+
+两题都**只读**、不需要守护进程在跑、读不到配置也能用（只是少一节 agent 自占）。详见
 [`docs/design/agentd-investigation.md`](docs/design/agentd-investigation.md)。
 
 同一份实现也能由网关以**一次性命令**触发（`kind = investigate`，`params` 见设计文档）：
@@ -228,7 +248,7 @@ Commands:
   enroll               Enroll with a one-time token; the token is never written to disk.
   diagnose             Diagnose this host: config / identity / service / connectivity / uplink.
                        Exits nonzero when anything FAILs, so scripts can gate on it.
-  investigate          One-shot, read-only investigation of this host (topic: disk).
+  investigate          One-shot, read-only investigation of this host (topics: disk | load).
                        Prints evidence (paths + sizes), not just a verdict; exits nonzero on FAIL.
 
 Service options (Linux uses systemd, macOS uses launchd):

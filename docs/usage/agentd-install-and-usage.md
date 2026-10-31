@@ -574,22 +574,25 @@ agentd 按 `command_id`（本地台账）去重，不会重复跑。本机命令
 
 ### 7.6 一次性调查（`investigate`）
 
-**先查清楚是谁占了盘，再决定删什么。**
+**先查清楚是谁占了盘 / 谁在吃 CPU，再决定删什么、扩什么。**
 
 ```bash
 wist-agentd investigate disk                             # 查最紧张的那个文件系统的挂载点
 wist-agentd investigate disk --path /var --top 20        # 查 /var，列前 20
 wist-agentd investigate disk --min-size 8MiB             # 只列 ≥8MiB 的文件
 wist-agentd investigate disk --json                      # 机器可读（脚本 / AI）
+
+wist-agentd investigate load                             # 负载高了，是谁在吃 CPU / 内存 / IO
+wist-agentd investigate load --top 20 --json             # 列前 20 个进程
 ```
 
 | 选项 | 说明 |
 | --- | --- |
-| `--path <dir>` | 扫描根（**绝对路径**）；不写 = 占用率最高的文件系统挂载点 |
-| `--top <n>` | 文件 / 目录各列前 N（默认 10，上限 50） |
-| `--min-size <size>` | 只列 ≥ 该体量的文件（`512k` / `8MiB` / `2G`，默认 0） |
-| `--depth <n>` | 最多下钻 N 层（默认 16，上限 64） |
-| `--max-seconds <n>` | 扫描时长预算（默认 5，上限 30） |
+| `--path <dir>` | 扫描根（**绝对路径**）；不写 = 占用率最高的文件系统挂载点（仅 `disk`） |
+| `--top <n>` | 文件 / 目录 / 进程各列前 N（默认 10，上限 50） |
+| `--min-size <size>` | 只列 ≥ 该体量的文件（`512k` / `8MiB` / `2G`，默认 0；仅 `disk`） |
+| `--depth <n>` | 最多下钻 N 层（默认 16，上限 64；仅 `disk`） |
+| `--max-seconds <n>` | 扫描时长预算（默认 5，上限 30）；`load` 用它拉长采样窗口（上限 1s） |
 | `--json` | 机器可读输出（与落盘报告同一份） |
 
 它给五节：
@@ -606,14 +609,37 @@ wist-agentd investigate disk --json                      # 机器可读（脚本
 时，「最大的文件」只是**已扫到的部分** —— 提高 `--max-seconds` / `--depth`，或把 `--path` 指到更窄的目录。
 以 root 跑才能看到 `root` 专属目录（如 `/var/lib/docker`）。
 
-它**只读**、不需要守护进程在跑、读不到配置也能用（只是少一节 `disk.agent_dirs`）。
+#### `load`（负载过高）
+
+「负载 80」只是一个排队长度：同样 80，可能是 16 核跑满，也可能是 CPU 闲着而进程卡在磁盘上。
+所以这一题先分流、再点名，也是七节：
+
+| 节 | 内容 | 何时变红 |
+| --- | --- | --- |
+| `load.summary` | 1/5/15 分钟负载 + 核数 + **每核负载** + 运行队列（Linux） | 每核 ≥1.0 WARN、≥2.0 FAIL |
+| `load.cpu` | 总体与每核占用；Linux 还给 user/system/iowait/idle 去向 | ≥85% WARN、≥95% FAIL；**单核打满也是 WARN** |
+| `load.top_processes` | 按 CPU 排的进程（pid + 名称 + RSS + 状态 + 运行时长） | — |
+| `load.memory` | 物理内存与 swap | 内存 ≥85% WARN；swap ≥50% WARN |
+| `load.io` | iowait / PSI 压力 / **D 状态进程数** | iowait ≥20% 或 D 状态 ≥3 → WARN |
+| `load.agent_processes` | agent 自己（agentd/exec/upgrader）占多少 | CPU ≥1 核 WARN、≥3 核 FAIL |
+| `load.sample` | 采样窗口 / 进程数 / 平台能力 | 进程数为 0 或窗口过短 → WARN |
+
+两条要记住的差别：
+
+* **判据是“每核负载”**，不是负载绝对值 —— `load 8` 在 32 核上很健康，在 4 核上已过载；
+* **负载高但 CPU 闲** 就去看 `load.io`：`D` 状态进程杀不掉也不吃 CPU，通常是磁盘/网络存储卡住，
+  下一步是 `investigate disk`，而不是扩容 CPU。
+
+报告**不放进程 argv**（常有密码/令牌），只给 pid + 进程名；要看完整命令行对着 pid 自己 `ps`。
+
+它**只读**、不需要守护进程在跑、读不到配置也能用（只是少一节 `disk.agent_dirs` / `load.agent_processes`）。
 扫描不跟随符号链接、不跨文件系统、有三重上限（条目 200k / 时长 / 深度），不会把一台已经在
 扛业务的机器再压一遍。
 
 网关也可以以**一次性命令**触发（`kind = investigate`）：执行完 ack 回结论摘要，**完整报告走数据面**
 （` IVSREP: ` 帧，正文带 `command_id`，网关靠它把报告接回那次命令），本机另留一份
-`state/investigations/disk.json`。`outcome` 只表示「调查做成了没有」，磁盘紧张是 `detail` 里的结论；
-回传失败也不改 `outcome`（查清了就是查清了，通道问题单独说）。需要数据面认识 `IVSREP` 才能入库。
+`state/investigations/<topic>.json`。`outcome` 只表示「调查做成了没有」，磁盘紧张/负载高是 `detail`
+里的结论；回传失败也不改 `outcome`（查清了就是查清了，通道问题单独说）。需要数据面认识 `IVSREP` 才能入库。
 设计取舍见 [`../design/agentd-investigation.md`](../design/agentd-investigation.md)。
 
 ## 8. 验收清单

@@ -33,8 +33,10 @@ use crate::error::{AgentdReason, AgentdResult};
 
 /// 调查题目的词表。加一个题目 = 加一个常量 + 一个 `match` 分支（见 [`execute`]）。
 pub const TOPIC_DISK: &str = "disk";
+/// 负载过高：谁在吃 CPU / 内存 / IO。
+pub const TOPIC_LOAD: &str = "load";
 
-pub const TOPICS: &[&str] = &[TOPIC_DISK];
+pub const TOPICS: &[&str] = &[TOPIC_DISK, TOPIC_LOAD];
 
 /// 网关下发的一次性命令 `kind`（词表的家在 `wist_api::status::command_kind`）。
 ///
@@ -494,6 +496,7 @@ pub async fn execute(
     // 留在 async 线程里会把 3s 的心跳/上报一起拖住。丢到 blocking 池，tick 照常走。
     let findings = tokio::task::spawn_blocking(move || match topic_for_task.as_str() {
         TOPIC_DISK => crate::investigate_disk::investigate(&request, config_for_task.as_ref()),
+        TOPIC_LOAD => crate::investigate_load::investigate(&request, config_for_task.as_ref()),
         other => Err(format!("unknown investigation topic `{other}`")),
     })
     .await
@@ -955,7 +958,13 @@ mod tests {
     fn capabilities_come_from_the_topic_registry() {
         // 上报与实现**同源**：新增一道题时，这里自动跟上；网关不会把新题当成“不会”。
         let capabilities = capabilities();
-        assert_eq!(capabilities.surfaces, vec![TOPIC_DISK.to_string()]);
+        assert_eq!(
+            capabilities.surfaces,
+            TOPICS
+                .iter()
+                .map(|topic| topic.to_string())
+                .collect::<Vec<_>>()
+        );
         // `privileged` 取决于跑测试的身份：只要求它与 `geteuid` 一致，不假设是 root。
         #[cfg(unix)]
         // SAFETY: 同 `running_as_root`。

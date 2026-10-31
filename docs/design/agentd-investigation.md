@@ -38,8 +38,8 @@
   wist-agentd          │                              │
   investigate disk ───►│  investigate::execute(req)   │──► Report { findings[] }
   --path /var          │        │                     │
-  --top 10             │        └─ investigate_disk::investigate
-                       │                              │
+  --top 10             │        ├─ investigate_disk::investigate
+                       │        └─ investigate_load::investigate
   AgentCommand         │                              │
   kind="investigate" ─►│                              │
   params={...}         └──────────────────────────────┘
@@ -65,7 +65,7 @@
 
 | 字段 | 缺省 | 约束 |
 | --- | --- | --- |
-| `topic` | `disk` | 只认词表里的值；**不认识就 `failed`**（不猜题目去扫盘） |
+| `topic` | `disk` | 只认词表里的值（`disk` / `load`）；**不认识就 `failed`**（不猜题目去扫盘） |
 | `path` | 由题目挑 | 必须是**绝对路径**（相对路径取决于进程 cwd，换一种启动方式就翻面） |
 | `top` | 10 | 夹到 1..=50 |
 | `min_size` | 0 | 字节数 |
@@ -131,7 +131,41 @@
 扫描根的选择：显式 `--path` 优先；否则取**占用率最高**的文件系统挂载点。理由：盘满的现场常常
 是数据盘（`/data`、`/var/lib/docker` 单独挂）先报警，扫 `/` 只会在系统盘上浪费时间。
 
-## 4. 扫描必须有界（三条「不」+ 三重上限）
+## 4. `load` 题给出什么
+
+「负载 80」只是一条**排队长度**：同样 80，可能是 16 核跑满，也可能 CPU 闲着而一堆进程卡在磁盘上。
+所以本题把「先分流 → 再点名」固定下来，七节：
+
+| 节 id | 内容 | 判定 |
+| --- | --- | --- |
+| `load.summary` | 1/5/15 分钟负载 + 核数 + **每核负载** + 运行队列（Linux） | 每核 ≥ 1.0 → WARN，≥ 2.0 → FAIL |
+| `load.cpu` | 总体与**每核**占用；Linux 还给 user/system/iowait/idle 去向 | 总体 ≥85% → WARN、≥95% → FAIL；**单个核打满也是 WARN**（单线程瓶颈） |
+| `load.top_processes` | 按 CPU 排的进程（pid + 名称 + RSS + 状态 + 运行时长） | 证据（不加判定） |
+| `load.memory` | 物理内存与 swap | 内存 ≥85% → WARN、≥95% → FAIL；swap ≥50% → WARN |
+| `load.io` | iowait / PSI io 压力 / **不可中断睡眠（D）进程数** | iowait ≥20% 或 D 状态 ≥3 且负载 > 核数 → WARN |
+| `load.agent_processes` | agent 自己（agentd/exec/upgrader）的 CPU 与 RSS | CPU ≥1 核 → WARN、≥3 核 → FAIL；RSS ≥1 GiB → WARN、≥4 GiB → FAIL |
+| `load.sample` | 采样窗口、进程数、平台能力（有无 iowait/PSI） | 进程数为 0 或窗口 < 300ms → WARN |
+
+几条判据的理由：
+
+* **为什么判据是每核负载**：负载不分平台都只是 runnable + uninterruptible 的**数量**，
+  拿它跟核数比才有意义。`load 8` 在 32 核上是闲的，在 4 核上已经过载。
+* **为什么单列「不可中断睡眠」**：**负载高但 CPU 空闲**的头号原因是进程卡在磁盘/网络存储上
+  （`D` 状态：杀不掉、也不吃 CPU）。只看 CPU 排行会得出“没有谁在忙”，然后去扩容 CPU —— 那不是根因。
+  本节的 hint 会把下一步指向 `investigate disk`（是谁在写）而不是 CPU 扩容。
+* **为什么单个核打满也要报**：总占用 20% 而某线程 100%，是“负载不高但服务慢”最常见的形态；
+  判定放 WARN 而不是 FAIL（机器还活着），hint 直接点「单线程瓶颈、加核没用」。
+* **为什么采样必须说窗口**：CPU% 是**两次刷新之间的增量**（sysinfo 需要 ≥200ms）。
+  默认 300ms～1s（`--max-seconds` 可拉长），报告里写明 `window=…ms`；窗口异常短时本节判 WARN。
+* **为什么 swap 要单独说**：swap 在用 = 已经在换页，延迟会抖、OOM killer 随时可能动手；
+  而 macOS 的 swap 是动态的，`sysinfo` 常报 0 —— 这时只能写「读不到」，不能写「未启用」（那是没证据的断言）。
+* **为什么先排除 agent 自己**：调查/采集本身也吃 CPU；不先把这一项摆出来，运维会去翻半天别的进程。
+
+**脱敏**：`argv` 里经常有数据库密码、令牌、证书路径，所以报告**只给进程名**，
+需要看完整命令行时由人对着 pid 自己 `ps`（hint 里给确切命令）。这条与
+[`investigation-surfaces.md`](../../../../wist-design/doc/design/center/investigation-surfaces.md) §2.2 一致。
+
+## 5. 扫描必须有界（三条「不」+ 三重上限）
 
 调查是**在生产机上**跑的，不能变成新的故障源：
 
@@ -156,7 +190,7 @@
 * 互相包含的目录（开发机布局里 `root` 包着 `state`/`log`）会合并成一行并标出角色，
   避免同一批字节算两遍。
 
-## 5. 输出契约
+## 6. 输出契约
 
 **文本**（默认，TTY 上色）：与 `diagnose` 同一版式 —— `[OK]/[WARN]/[FAIL]` + 标题 + 正文 +
 缩进的证据行 + `→` 提示 + 最后一行 `结论:`。`NO_COLOR` / 重定向 → 纯文本。
@@ -190,7 +224,7 @@
 
 **退出码**：有 FAIL → 1，其余 0（与 `diagnose` 同一条门禁语义）。
 
-### 5.1 命令回传：ack 走控制面，报告走数据面
+### 6.1 命令回传：ack 走控制面，报告走数据面
 
 网关下发的一次性调查有**两条回程**，刻意分工：
 
@@ -229,7 +263,7 @@ ack 的 `detail` 三句：`<结论摘要>` + `报告已回传（IVSREP，seq=n�
 —— 盘满时中心可能收不到帧，运维 SSH 上来还能读到它。**落盘失败不当作失败**：盘满正是要查的时候，
 报告还在内存里，能回传就够了。
 
-## 6. 怎么加一道新题目
+## 7. 怎么加一道新题目
 
 1. 在 `investigate::TOPICS` 加常量（如 `mem`），在 `execute` 的 `match` 里加分支；
 2. 新文件 `src/investigate_<topic>.rs`，导出
@@ -237,9 +271,16 @@ ack 的 `detail` 三句：`<结论摘要>` + `报告已回传（IVSREP，seq=n�
 3. 复用 `Finding::ok/warn/fail`（`id` 用 `<topic>.<section>`）与 `Row`；
 4. 新的 `params` 字段加进 `InvestigateRequest::from_params`（宽容解析 + 夹紧）。
 
+**只加一行代码不算加完** —— 题目是**跨仓的词表**，漏一处现场就是“页面上看不见”或“一下发就失败”：
+
+* `wist-gateway/src/api/investigations.rs` 的 `TOPICS`（网关自己的词表，不共用 agentd 的常量）；
+* `wist-gateway-web` 里两处 `TOPICS` 与题目文案（授权页、调查页）；
+* `wist-design` 的 `investigation-surfaces.md` §5 清单（敏感度/成本/特权）；
+* 本仓 README 与 `docs/usage/agentd-install-and-usage.md` 的用法示例。
+
 **不要把题目做成通用命令执行器**：调查是**只读**的。需要改机器时走 `ActionPlan`（`wist-exec`）。
 
-## 7. 升级与兼容
+## 8. 升级与兼容
 
 * **agentd 侧**：新命令 kind 加性与只读；不开 `managed` 也能用 CLI（`standalone` 下同样可用，
   因为它不依赖采集链路）。
@@ -250,7 +291,7 @@ ack 的 `detail` 三句：`<结论摘要>` + `报告已回传（IVSREP，seq=n�
   在这之前，ack 摘要与本机报告仍然可用。
 * **旧 agentd** 收到 `investigate` 会回 `unsupported` 并写明「尚未实现」，不会静默。
 
-### 7.1 调查面与授权（跨仓，本仓只负责“能跑”与“跑得安全”）
+### 8.1 调查面与授权（跨仓，本仓只负责“能跑”与“跑得安全”）
 
 “哪些题允许在**哪台机器**上跑”不是本仓说了算 —— 它是一道独立的授权轴，设计在
 [`investigation-surfaces.md`](../../../../wist-design/doc/design/center/investigation-surfaces.md)。
@@ -273,7 +314,7 @@ ack 的 `detail` 三句：`<结论摘要>` + `报告已回传（IVSREP，seq=n�
   （只过滤、不删文件）。本仓**不**参与这三件事：agentd 只保证“能跑、有界”，
   机器上能读什么、能读几次是控制面的策略。
 
-## 8. 没做（留给后续）
+## 9. 没做（留给后续）
 
 * 其余题目（内存/连接/进程/日志增长速率）。
 * 调查**历史**（只留最新一份；要对比「昨天 vs 今天」得另做归档）。

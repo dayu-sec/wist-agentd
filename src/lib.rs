@@ -10,6 +10,7 @@ pub mod exec;
 pub(crate) mod fs_async;
 pub(crate) mod investigate;
 pub(crate) mod investigate_disk;
+pub(crate) mod investigate_load;
 pub mod reporting;
 pub mod runtime;
 pub mod service;
