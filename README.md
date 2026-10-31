@@ -156,7 +156,8 @@ wist-agentd investigate telemetry-health # 我们瞎了多久：源还活着吗�
 spool 积压、输出闸门与全局 seq 高水位。静默 ≥15 分钟 WARN、≥24 小时 FAIL；
 没有 checkpoint / 读不到状态是 `[UNKNOWN]`（不等于正常）。只读 agentd 自己的状态，不读日志正文。
 
-五题（含 `disk` / `load`）都**只读**、不需要守护进程在跑、读不到配置也能用。详见
+六道题（`disk` / `load` / `accounts` / `persistence` / `exposure` / `telemetry-health`）都**只读**、
+不需要守护进程在跑、读不到配置也能用。详见
 [`docs/design/agentd-investigation.md`](docs/design/agentd-investigation.md)。
 
 Linux 上的真机验收（root + non-root 两轮，含“假阴性防线”与脱敏）：

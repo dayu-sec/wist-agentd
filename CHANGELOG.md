@@ -3,6 +3,18 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.18.1-alpha] - 2026-10-31
+
+### 修复（`telemetry-health` 复查）
+
+- “源里有未读字节但一条都没提交”现在明确报成 **N 个源有未读数据**（WARN），
+  不再落进“状态无法判定”的笼统标题 —— 前者是读到了没送出去，后者是不知道。
+- `telemetry.pipeline` 的 `coverage` 把 “`seq.json` 不存在”也计入 `checked`：
+  报告能看出这一节确实检查过，而不是没查。
+- checkpoint 单文件读取上限 **16 MiB**（R2：有预算才有资格登记）；超过按 `unknown` 处理，
+  不让异常大的状态文件把调查拖死或吃光内存。
+- 没有 checkpoint 的源补一条处置提示（确认 agentd 在跑 / 路径可读 / 输入已生效）。
+
 ## [0.18.0-alpha] - 2026-10-31
 
 ### 新增（遥测健康：`telemetry-health` —— 我们瞎了多久）

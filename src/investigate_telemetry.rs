@@ -41,6 +41,13 @@ pub(crate) const SILENCE_WARN_SECONDS: i64 = 15 * 60;
 /// 静默一整天：基本可以认定这个源不会再有数据了（服务停了 / 轮转换文件 / 路径写错）。
 pub(crate) const SILENCE_FAIL_SECONDS: i64 = 24 * 60 * 60;
 
+/// 单个 checkpoint 的读取上限（R2：没有预算的面不许登记）。
+///
+/// 真实值在几 KB 量级（512 个容器的文件族也只有百 KB 级）；上限是挡住
+/// “状态文件被写成 1 GB / 被别的东西占位”把调查本身拖死—— 那种情况应当
+/// 如实报 `unknown`，而不是把内存吃光。
+pub(crate) const MAX_CHECKPOINT_BYTES: u64 = 16 * 1024 * 1024;
+
 pub(crate) fn investigate(
     request: &InvestigateRequest,
     config: Option<&AgentConfig>,
@@ -90,6 +97,7 @@ fn sources_finding(config: &AgentConfig, top: usize) -> Finding {
     let mut never = 0usize;
     let mut silent_fail = 0usize;
     let mut silent_warn = 0usize;
+    let mut behind = 0usize;
     let mut missing = 0usize;
 
     for input in &config.telemetry.logs.file_inputs {
@@ -107,6 +115,20 @@ fn sources_finding(config: &AgentConfig, top: usize) -> Finding {
         }
 
         let checkpoint_path = log_checkpoints::path_for(state_dir, &input.input_id);
+        // 先看体量再读：JSON 要整份解析，所以“读一半”没有意义，只能明确拒绝。
+        if let Ok(metadata) = fs::metadata(&checkpoint_path)
+            && metadata.len() > MAX_CHECKPOINT_BYTES
+        {
+            coverage.checked += 1;
+            coverage.skipped += 1;
+            rows.push(Row::new(
+                &input.input_id,
+                "checkpoint 过大",
+                format!("超过 {} 上限，未解析", human_bytes(MAX_CHECKPOINT_BYTES)),
+            ));
+            status = worse(status, Status::Unknown);
+            continue;
+        }
         let text = match fs::read_to_string(&checkpoint_path) {
             Ok(text) => text,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -187,11 +209,11 @@ fn sources_finding(config: &AgentConfig, top: usize) -> Finding {
                 (age_text(age), Status::Warn)
             }
             Some(age) => (age_text(age), Status::Ok),
-            None if unread > 0 => (
-                "有未读数据".to_string(),
+            None if unread > 0 => {
                 // 有未读字节但一条都没提交：采集在看，但没送出来。
-                Status::Warn,
-            ),
+                behind += 1;
+                ("有未读数据".to_string(), Status::Warn)
+            }
             None => ("从未提交".to_string(), Status::Unknown),
         };
         status = worse(status, row_status);
@@ -207,6 +229,9 @@ fn sources_finding(config: &AgentConfig, top: usize) -> Finding {
     if missing > 0 {
         let _ = write!(detail, "；源路径不存在 {missing} 个");
     }
+    if behind > 0 {
+        let _ = write!(detail, "；有未读未提交 {behind} 个");
+    }
     if omitted > 0 {
         let _ = write!(detail, "；另有 {omitted} 条未列出");
     }
@@ -220,6 +245,10 @@ fn sources_finding(config: &AgentConfig, top: usize) -> Finding {
     }
     if missing > 0 {
         problems.push(format!("{missing} 个源路径不存在"));
+    }
+    if behind > 0 {
+        // “有未读但一条都没提交”与“静默”是两回事：前者是读到了没送出去，标题必须分开说。
+        problems.push(format!("{behind} 个源有未读数据"));
     }
     let title = if problems.is_empty() {
         match status {
@@ -243,6 +272,11 @@ fn sources_finding(config: &AgentConfig, top: usize) -> Finding {
         );
     } else if missing > 0 {
         finding = finding.hint("配置的路径不存在：确认服务已启动、路径没写错、轮转没有把文件挪走");
+    } else if never > 0 {
+        finding = finding
+            .hint("这些源还没有 checkpoint：确认 agentd 在跑、路径可读、输入已经在生效配置里");
+    } else if behind > 0 {
+        finding = finding.hint("源里有未读字节但一条都没提交：先看 spool 积压与 uplink 是否断开");
     }
     finding
 }
@@ -384,6 +418,10 @@ fn pipeline_finding(config: &AgentConfig) -> Finding {
             }
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            // `checked` 记“检查次数”（含不存在），与 `Tally` 的口径一致：
+            // 否则“一份报告里这节到底看过没有”就无从判断。
+            coverage.checked += 1;
+            coverage.skipped += 1;
             status = worse(status, Status::Unknown);
             Row::new(
                 "最近产出",
@@ -737,7 +775,8 @@ mod tests {
         assert!(sources.title.contains("超过 24 小时"), "{}", sources.title);
     }
 
-    /// 文件长出来了却没读：采集在源这一侧就掉队了。
+    /// 文件长出来了却没读：采集在源这一侧就掉队了。标题必须说“未读”，
+    /// 不能落到“状态无法判定”—— 那是两回事。
     #[test]
     fn unread_bytes_without_any_commit_warns() {
         let (config, _root) = one_input_config("unread", 1024, true);
@@ -745,7 +784,12 @@ mod tests {
         write_checkpoint(state_dir, "audit", &file_entry(None, 4096, 0));
         let sources = find(findings(&config), "telemetry.sources");
         assert_eq!(sources.status, Status::Warn);
-        assert!(sources.detail.contains("静默"), "{}", sources.detail);
+        assert!(sources.title.contains("有未读数据"), "{}", sources.title);
+        assert!(
+            sources.detail.contains("有未读未提交 1 个"),
+            "{}",
+            sources.detail
+        );
     }
 
     #[test]
@@ -804,6 +848,29 @@ mod tests {
             "{}",
             pipeline.detail
         );
+        // `checked` 含“不存在”：这节确实被看过了，不是“没检查”。
+        assert_eq!(pipeline.coverage.checked, 1);
+        assert_eq!(pipeline.coverage.skipped, 1);
+    }
+
+    /// 体量超预算的 checkpoint 不能把调查拖死：明确报 `unknown`。
+    #[test]
+    fn an_oversized_checkpoint_is_unknown_not_parsed() {
+        let (config, root) = one_input_config("oversized", 1024, true);
+        let dir = Path::new(&config.paths.state_dir)
+            .join("logs")
+            .join("file_inputs")
+            .join("audit");
+        fs::create_dir_all(&dir).expect("checkpoint dir");
+        fs::write(
+            dir.join("checkpoints.json"),
+            vec![b' '; (MAX_CHECKPOINT_BYTES + 1) as usize],
+        )
+        .expect("write oversized");
+        let sources = find(findings(&config), "telemetry.sources");
+        assert_eq!(sources.status, Status::Unknown);
+        assert_eq!(sources.rows[0].value, "checkpoint 过大");
+        let _ = fs::remove_dir_all(root);
     }
 
     /// `input_id` 要拼进路径：不是路径段就不读，宁可 `skipped` 也不越界。
