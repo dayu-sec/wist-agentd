@@ -27,8 +27,14 @@
 //!
 //! 为什么要有第 7 节：目录遍历一定会遇到权限与预算。**「没有大文件」与「没扫到」是两回事**，
 //! 不把扫描边界说出来，那张「最大的文件」表会被当成本机的全部真相 —— 这是现场最容易踩的坑。
+//!
+//! 预算怎么花（这决定了报告可不可信）：先花极小的代价把**扫描根的一级子目录列全**，
+//! 再让这些一级目录**轮流**花剩下的预算。若按深度优先一路走到底，一个巨型目录
+//! （macOS 的 `/Applications` 有 14 万条）会把条目上限吃干，同级的 `/Users`（真正占了
+//! 200 GiB 的那个）连名字都进不了报告 —— 现场那张「共 3 个一级目录」的表就是这么来的。
+//! 轮流分配之后，每个一级目录都至少拿到一份切片，没扫完的会被**点名**并给出单独重扫的命令。
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -51,6 +57,33 @@ const AGENT_DIR_FAIL_BYTES: u64 = 10 << 30;
 
 /// 每节最多留几条读不到的例子（只在 hint 里给人看，不做全量清单）。
 const UNREADABLE_SAMPLES: usize = 3;
+
+/// 一轮轮转里单个一级目录最多消耗多少条目：切片过大就等于让一个巨型目录
+/// （`/Applications`、`overlay2/...`）把别的目录挤掉，正是我们要避免的失败形态。
+const SCAN_SLICE_ENTRIES: u64 = 4096;
+/// 每隔多少个条目复查一次时限（只在目录边界查会让一个巨型目录一路超时跑下去）。
+const TIME_CHECK_EVERY: u64 = 512;
+/// hint 里最多点几个没扫完的一级目录（其余在表格里已经能看到）。
+const INCOMPLETE_DIRS_SHOWN: usize = 4;
+
+/// 各平台「盘满常见的大头」。报告不说这几个地方，运维还是得自己去猜 ——
+/// 而这几个目录恰恰是最常见的根因（macOS 的废纸篓能堆到几百 GiB）。
+#[cfg(target_os = "macos")]
+const USUAL_SUSPECTS: &[&str] = &[
+    "~/.Trash —— 废纸篓：删了没清空就会一直占着，常是几十上百 GiB",
+    "~/Library/Caches 与 ~/Library/Containers —— 应用缓存与沙盒数据（可安全清缓存）",
+    "~/Library/Developer —— 模拟器、Xcode 的 DerivedData",
+    "/private/var/folders —— 临时文件（重启会清；先 `--path` 扫一遍确认体量）",
+];
+#[cfg(target_os = "linux")]
+const USUAL_SUSPECTS: &[&str] = &[
+    "/var/log —— 没轮转的日志（`du -sh /var/log/* | sort -h`）",
+    "/var/lib/docker 与 /var/lib/containerd —— 镜像、容器层、卷（`docker system df`）",
+    "/var/cache 与 /tmp —— 包缓存与临时文件",
+    "/home/*/.cache —— 用户级缓存",
+];
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const USUAL_SUSPECTS: &[&str] = &["临时目录、日志目录与应用缓存"];
 
 /// 子目录要占父级多少百分比才继续往下钻（经典 `du` 下钻的“还在集中”判据）。
 const HOT_PATH_DOMINANCE: u64 = 60;
@@ -197,12 +230,15 @@ fn filesystem_finding(filesystems: &[FsUsage]) -> Finding {
     if status != Status::Ok {
         let mut hints = Vec::new();
         if worst_space != Status::Ok {
-            hints.push(
+            let mut hint = String::from(
                 "先看「最大的目录（递归累计）」里的**热点路径**：盘满的根因通常是一个深层目录\
-                 （容器层、会话、缓存），而不是某个大文件；日志/容器层\
-                 （/var/log、/var/lib/docker、/var/lib/containerd）常是头号"
-                    .to_string(),
+                 （缓存、会话、容器层），而不是某个大文件。本平台常见的大头：",
             );
+            for suspect in USUAL_SUSPECTS {
+                hint.push_str("\n- ");
+                hint.push_str(suspect);
+            }
+            hints.push(hint);
         }
         if worst_inode != Status::Ok {
             hints.push(
@@ -274,17 +310,77 @@ fn largest_dirs_finding(walk: &WalkReport) -> Finding {
         })
         .unwrap_or_else(|| format!("递归累计最大的是 {deepest}"));
     let detail = format!(
-        "扫描根 {}；{hotspot}（已扫 {}）",
+        "扫描根 {}；{hotspot}（已扫 {}）{}",
         walk.root.display(),
-        human_bytes(total)
+        human_bytes(total),
+        incomplete_caveat(walk)
     );
 
     let mut finding = Finding::ok("disk.largest_dirs", "最大的目录（递归累计）", detail).rows(rows);
 
-    if let Some(hint) = hot_path_hint(walk) {
-        finding = finding.hint(hint);
+    let hints: Vec<String> = [hot_path_hint(walk), incomplete_hint(walk)]
+        .into_iter()
+        .flatten()
+        .collect();
+    if !hints.is_empty() {
+        finding = finding.hint(hints.join("\n"));
     }
     finding
+}
+
+/// 没扫完的一级目录的相对名（`/Users` 而不是 `/System/Volumes/Data/Users`）。
+fn incomplete_labels(walk: &WalkReport) -> Vec<String> {
+    walk.incomplete_dirs
+        .iter()
+        .map(|(path, _)| {
+            path.strip_prefix(&walk.root)
+                .map(|relative| format!("/{}", relative.display()))
+                .unwrap_or_else(|_| path.display().to_string())
+        })
+        .collect()
+}
+
+/// 「有 N 个一级目录没扫完（…）」的短句（空 = 全扫完了）。
+fn incomplete_caveat(walk: &WalkReport) -> String {
+    if walk.incomplete_dirs.is_empty() {
+        return String::new();
+    }
+    let labels = incomplete_labels(walk);
+    let shown = if labels.len() > INCOMPLETE_DIRS_SHOWN {
+        format!(
+            "{} 等 {} 个",
+            labels[..INCOMPLETE_DIRS_SHOWN].join("、"),
+            labels.len()
+        )
+    } else {
+        labels.join("、")
+    };
+    format!(
+        "；**{} 个一级目录没扫完**（{shown}），它们实际只会更大",
+        labels.len()
+    )
+}
+
+/// 「这些目录没扫完，单独扫它们能拿到全量」的行动建议。
+///
+/// 没有这一句，「没扫完」只是一句免责声明；有了它，下一条命令就确定了。
+fn incomplete_hint(walk: &WalkReport) -> Option<String> {
+    if walk.incomplete_dirs.is_empty() {
+        return None;
+    }
+    let mut hint = String::from(
+        "扫描预算按一级目录**轮流**分配，下面这些没扫完（数字是已扫到的下界，实际更大）——\
+         单独扫它们能拿到全量：",
+    );
+    for (path, bytes) in walk.incomplete_dirs.iter().take(INCOMPLETE_DIRS_SHOWN) {
+        hint.push_str(&format!(
+            "\n- {} ≥ {} → `wist-agentd investigate disk --path {}`",
+            path.display(),
+            human_bytes(*bytes),
+            path.display()
+        ));
+    }
+    Some(hint)
 }
 
 /// 把热点链渲染成一行“A → B → C”，并给出“该清哪个”的建议。
@@ -374,6 +470,8 @@ fn unattributed_finding(walk: &WalkReport, filesystems: &[FsUsage]) -> Finding {
     );
     if walk.truncated {
         detail.push_str("；**扫描未完成**，差量里含未扫到的部分");
+        // 盘满但“扫不到东西”时，这一句就是整个报告的结论：大头在没扫完的那几个目录里。
+        detail.push_str(&incomplete_caveat(walk));
     }
     if deleted_files > 0 {
         detail.push_str(&format!(
@@ -474,6 +572,15 @@ fn deleted_open_bytes() -> (u64, u64) {
 
 fn top_dirs_finding(walk: &WalkReport, filesystems: &[FsUsage]) -> Finding {
     let total = walk.total_bytes;
+    // 没扫完的一级目录在表里看着“很小”，必须逐行标出来，否则那张表会被当成本机全貌。
+    let incomplete: BTreeSet<String> = walk
+        .incomplete_dirs
+        .iter()
+        .filter_map(|(path, _)| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        })
+        .collect();
     let rows: Vec<Row> = walk
         .top_dirs
         .iter()
@@ -483,11 +590,11 @@ fn top_dirs_finding(walk: &WalkReport, filesystems: &[FsUsage]) -> Finding {
             } else {
                 walk.root.join(label).display().to_string()
             };
-            Row::new(
-                path,
-                human_bytes(*bytes),
-                format!("占扫描总量 {}", percent(*bytes, total)),
-            )
+            let mut note = format!("占扫描总量 {}", percent(*bytes, total));
+            if incomplete.contains(label) {
+                note.push_str("；**没扫完**，实际更大");
+            }
+            Row::new(path, human_bytes(*bytes), note)
         })
         .collect();
 
@@ -495,15 +602,18 @@ fn top_dirs_finding(walk: &WalkReport, filesystems: &[FsUsage]) -> Finding {
         .filter(|fs| walk.root != Path::new(&fs.mount))
         .map(|fs| format!("；位于 {}（{:.1}% 已用）", fs.mount, fs.used_percent))
         .unwrap_or_default();
-    let truncated = if walk.truncated {
-        "；**扫描未完成**，占比只代表已扫到的部分"
+    let truncated = if !walk.incomplete_dirs.is_empty() {
+        incomplete_caveat(walk)
+    } else if walk.truncated {
+        "；**扫描未完成**，占比只代表已扫到的部分".to_string()
     } else {
-        ""
+        String::new()
     };
+    let dir_count = walk.top_level_dirs.max(walk.top_dirs.len());
     let detail = format!(
         "扫描根 {}{on}；共 {} 个一级目录，列出最大的 {} 个（已扫 {}）{truncated}",
         walk.root.display(),
-        walk.top_dirs.len(),
+        dir_count,
         rows.len(),
         human_bytes(total)
     );
@@ -516,7 +626,10 @@ fn top_dirs_finding(walk: &WalkReport, filesystems: &[FsUsage]) -> Finding {
             format!("扫描根 {}{on}", walk.root.display()),
         );
     }
-    finding
+    match incomplete_hint(walk) {
+        Some(hint) => finding.hint(hint),
+        None => finding,
+    }
 }
 
 fn top_files_finding(walk: &WalkReport, min_size: u64) -> Finding {
@@ -676,7 +789,7 @@ fn agent_dirs_finding(config: &AgentConfig, scan_root: &Path, walk: &WalkReport)
 
 fn scan_finding(walk: &WalkReport, request: &InvestigateRequest) -> Finding {
     let detail = format!(
-        "root={} files={} dirs={} total={} elapsed={:.1}s depth≤{} entries≤{} truncated={} unreadable={} symlinks={} other_mounts={}",
+        "root={} files={} dirs={} total={} elapsed={:.1}s depth≤{} entries≤{} truncated={} unreadable={} symlinks={} other_mounts={} incomplete_top_dirs={}",
         walk.root.display(),
         walk.files,
         walk.directories,
@@ -687,14 +800,16 @@ fn scan_finding(walk: &WalkReport, request: &InvestigateRequest) -> Finding {
         walk.truncated,
         walk.unreadable,
         walk.symlinks,
-        walk.other_filesystems
+        walk.other_filesystems,
+        walk.incomplete_dirs.len()
     );
 
     let mut hints = Vec::new();
     if walk.truncated {
         hints.push(format!(
-            "扫描没能在预算内走完（上限 {} 条 / {}s）：提高 `--max-seconds` / `--depth`，\
-             或把 `--path` 指到更窄的目录（例如 /var）",
+            "扫描没能在预算内走完（上限 {} 条 / {}s）：一级目录之间是**轮流**分配预算的，\
+             每个目录都拿到了一部分，没扫完的已在「一级目录占用」里点名；\
+             要拿全某一个目录，单独扫它（`wist-agentd investigate disk --path <目录> --max-seconds 60`）",
             SCAN_ENTRY_LIMIT, request.max_seconds
         ));
     }
@@ -843,10 +958,15 @@ pub(crate) struct WalkReport {
     pub total_bytes: u64,
     pub top_files: Vec<(PathBuf, u64)>,
     pub top_dirs: Vec<(String, u64)>,
+    /// 扫描根下**一级子目录的总数**（这一层在预算之外先列全，所以它总是可信的）。
+    pub top_level_dirs: usize,
     /// 递归累计最大的目录（**任意深度**，不含扫描根本身），按体量降序。
     pub largest_dirs: Vec<(PathBuf, u64)>,
     /// 从扫描根开始的「热点下钻链」（含根；空 = 没有普遍集中的子目录）。
     pub hot_path: Vec<(PathBuf, u64)>,
+    /// **没扫完**的一级目录及其已扫到的字节（按字节降序）。空 = 每个一级目录都扫完了。
+    /// 这一项不能省：预算撞上限时，没扫的目录在表里看起来就像“很小”。
+    pub incomplete_dirs: Vec<(PathBuf, u64)>,
     /// 硬链接被去重的字节数（同一 inode 只算一次；否则容器层会凭空多出一倍体积）。
     pub hardlinks_deduped: u64,
 }
@@ -866,10 +986,356 @@ impl WalkReport {
             total_bytes: 0,
             top_files: Vec::new(),
             top_dirs: Vec::new(),
+            top_level_dirs: 0,
             largest_dirs: Vec::new(),
             hot_path: Vec::new(),
+            incomplete_dirs: Vec::new(),
             hardlinks_deduped: 0,
         }
+    }
+}
+
+/// 单个目录的「可续游标」：预算按条目切片推进，一个巨型目录不会在一轮里吃光子预算。
+struct DirCursor {
+    path: PathBuf,
+    depth: usize,
+    /// 祖先链（含自己，从自己到扫描根）：每个文件把字节加到这些目录上（`du` 那一步）。
+    ancestors: Vec<PathBuf>,
+    entries: fs::ReadDir,
+}
+
+/// 一个一级子目录的遍历状态：`stack` = 待展开的目录，`cursor` = 正在读的那个目录。
+struct Subtree {
+    root: PathBuf,
+    stack: Vec<(PathBuf, usize)>,
+    cursor: Option<DirCursor>,
+}
+
+impl Subtree {
+    fn new(root: PathBuf, depth: usize) -> Self {
+        let stack = vec![(root.clone(), depth)];
+        Self {
+            root,
+            stack,
+            cursor: None,
+        }
+    }
+
+    fn finished(&self) -> bool {
+        self.cursor.is_none() && self.stack.is_empty()
+    }
+}
+
+/// 一轮推进的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// 这一路扫完了。
+    Ended,
+    /// 本轮切片用完，还有活（下一轮接着来）。
+    Paused,
+    /// 全局条目预算用尽。
+    OutOfEntries,
+    /// 全局时限用尽。
+    OutOfTime,
+}
+
+/// 有界目录遍历的执行体：所有可变状态收在这里，遍历被拆成「按切片推进」的可续步骤。
+struct Walker<'o> {
+    options: &'o WalkOptions,
+    root_device: u64,
+    started: Instant,
+    seen: u64,
+    report: WalkReport,
+    buckets: BTreeMap<String, u64>,
+    top_files: Vec<(u64, PathBuf)>,
+    // 目录树（父 → 子）与**递归累计**体量：每个文件把字节加到自己的所有祖先上，
+    // 这就是 `du` 那一步。`dir_bytes` 含扫描根本身（算总量用）。
+    dir_parent: BTreeMap<PathBuf, PathBuf>,
+    children: BTreeMap<PathBuf, BTreeSet<PathBuf>>,
+    dir_bytes: BTreeMap<PathBuf, u64>,
+    // 硬链接去重：`(dev, ino)` 只算一次（只对 `nlink > 1` 的文件建表，避免白花内存）。
+    seen_inodes: HashSet<(u64, u64)>,
+}
+
+impl<'o> Walker<'o> {
+    fn new(options: &'o WalkOptions, root_device: u64) -> Self {
+        let mut dir_bytes = BTreeMap::new();
+        dir_bytes.insert(options.root.clone(), 0);
+        Self {
+            options,
+            root_device,
+            started: Instant::now(),
+            seen: 0,
+            report: WalkReport::empty(options.root.clone()),
+            buckets: BTreeMap::new(),
+            top_files: Vec::new(),
+            dir_parent: BTreeMap::new(),
+            children: BTreeMap::new(),
+            dir_bytes,
+            seen_inodes: HashSet::new(),
+        }
+    }
+
+    fn out_of_entries(&self) -> bool {
+        self.seen >= self.options.max_entries
+    }
+
+    fn out_of_time(&self) -> bool {
+        self.started.elapsed() >= self.options.max_duration
+    }
+
+    fn note_unreadable(&mut self, path: &Path, err: &io::Error) {
+        self.report.unreadable += 1;
+        if self.report.unreadable_samples.len() < UNREADABLE_SAMPLES {
+            self.report
+                .unreadable_samples
+                .push(format!("{}：{err}", path.display()));
+        }
+    }
+
+    /// 打开一个目录（连带算好祖先链）；读不了只计数，不中断遍历。
+    fn open(&mut self, path: PathBuf, depth: usize) -> Option<DirCursor> {
+        let entries = match fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(err) => {
+                self.note_unreadable(&path, &err);
+                return None;
+            }
+        };
+        let mut ancestors = vec![path.clone()];
+        let mut current = path.clone();
+        while let Some(parent) = self.dir_parent.get(&current) {
+            ancestors.push(parent.clone());
+            current = parent.clone();
+        }
+        Some(DirCursor {
+            path,
+            depth,
+            ancestors,
+            entries,
+        })
+    }
+
+    /// 从游标接着读，最多消耗 `budget` 个条目；子目录压进 `sink` 等着展开。
+    fn advance(
+        &mut self,
+        cursor: &mut DirCursor,
+        budget: u64,
+        sink: &mut Vec<(PathBuf, usize)>,
+    ) -> (u64, Step) {
+        let mut consumed = 0u64;
+        while consumed < budget {
+            if self.out_of_entries() {
+                return (consumed, Step::OutOfEntries);
+            }
+            // 时限要按条目复查：只在目录边界查，一个巨型目录会一路超时跑下去。
+            if consumed.is_multiple_of(TIME_CHECK_EVERY) && self.out_of_time() {
+                return (consumed, Step::OutOfTime);
+            }
+            let Some(entry) = cursor.entries.next() else {
+                return (consumed, Step::Ended);
+            };
+            consumed += 1;
+            self.seen += 1;
+            self.absorb(entry, cursor, sink);
+        }
+        (consumed, Step::Paused)
+    }
+
+    /// 处理一个目录项：计数、累计体量、收集子目录。
+    fn absorb(
+        &mut self,
+        entry: io::Result<fs::DirEntry>,
+        cursor: &DirCursor,
+        sink: &mut Vec<(PathBuf, usize)>,
+    ) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                self.note_unreadable(&cursor.path, &err);
+                return;
+            }
+        };
+        let path = entry.path();
+        // `entry.metadata()` 走 `symlink_metadata` 语义：**不**跟随链接。
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                self.note_unreadable(&path, &err);
+                return;
+            }
+        };
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            // 链接本身不计体量（目标可能不在本机），也不跟进去（`/var/lib/docker` 里成环是常态）。
+            self.report.symlinks += 1;
+            return;
+        }
+        if !on_device(&metadata, self.root_device) {
+            // 别的挂载点（/proc、/sys、/data…）：不属于这个文件系统，跳过。
+            self.report.other_filesystems += 1;
+            return;
+        }
+        if file_type.is_dir() {
+            self.report.directories += 1;
+            self.dir_parent.insert(path.clone(), cursor.path.clone());
+            self.children
+                .entry(cursor.path.clone())
+                .or_default()
+                .insert(path.clone());
+            self.dir_bytes.entry(path.clone()).or_insert(0);
+            if cursor.depth < self.options.max_depth {
+                sink.push((path, cursor.depth + 1));
+            }
+            return;
+        }
+        if !file_type.is_file() {
+            return;
+        }
+        // 硬链接：同一个 inode 的第二个名字不再计字节（经典 `du` 行为）。
+        if let Some(inode) = hardlink_identity(&metadata)
+            && !self.seen_inodes.insert(inode)
+        {
+            self.report.files += 1;
+            self.report.hardlinks_deduped =
+                self.report.hardlinks_deduped.saturating_add(metadata.len());
+            return;
+        }
+        let size = metadata.len();
+        self.report.files += 1;
+        self.report.total_bytes = self.report.total_bytes.saturating_add(size);
+        *self
+            .buckets
+            .entry(bucket_label(&self.options.root, &path))
+            .or_insert(0) += size;
+        // 累计到所有祖先（含当前目录与扫描根）——`du` 那一步。
+        for ancestor in &cursor.ancestors {
+            match self.dir_bytes.get_mut(ancestor) {
+                Some(total) => *total = total.saturating_add(size),
+                None => {
+                    self.dir_bytes.insert(ancestor.clone(), size);
+                }
+            }
+        }
+        if size >= self.options.min_file_size && self.options.top > 0 {
+            self.top_files.push((size, path));
+            let keep = self.options.top.saturating_mul(4).max(16);
+            if self.top_files.len() > keep {
+                sort_files(&mut self.top_files);
+                self.top_files.truncate(self.options.top);
+            }
+        }
+    }
+
+    /// 把一个一级子目录推进 `quantum` 个条目（或推到它扫完）。
+    fn drain_subtree(&mut self, subtree: &mut Subtree, quantum: u64) -> Step {
+        let mut spent = 0u64;
+        loop {
+            if let Some(mut cursor) = subtree.cursor.take() {
+                let left = quantum.saturating_sub(spent);
+                if left == 0 {
+                    subtree.cursor = Some(cursor);
+                    return Step::Paused;
+                }
+                let (used, step) = self.advance(&mut cursor, left, &mut subtree.stack);
+                spent += used;
+                if step == Step::Ended {
+                    continue;
+                }
+                subtree.cursor = Some(cursor);
+                return step;
+            }
+            let Some((path, depth)) = subtree.stack.pop() else {
+                return Step::Ended;
+            };
+            if self.out_of_entries() {
+                subtree.stack.push((path, depth));
+                return Step::OutOfEntries;
+            }
+            if self.out_of_time() {
+                subtree.stack.push((path, depth));
+                return Step::OutOfTime;
+            }
+            if let Some(cursor) = self.open(path, depth) {
+                subtree.cursor = Some(cursor);
+            }
+        }
+    }
+
+    /// 一级目录之间**轮流**花预算：先扫完的会把额度让给还没扫完的。
+    ///
+    /// 这是「报告可信」的关键：深度优先一路走到底时，`/Applications` 这种十几万条的目录
+    /// 会把条目上限吃干，`/Users` 连名字都进不了表；轮流切片的代价几乎为零，
+    /// 但能保证**每个一级目录都被看到**。
+    fn drain_round_robin(&mut self, subtrees: &mut [Subtree]) -> Step {
+        let mut queue: VecDeque<usize> = (0..subtrees.len())
+            .filter(|index| !subtrees[*index].finished())
+            .collect();
+        while let Some(index) = queue.pop_front() {
+            let remaining = self.options.max_entries.saturating_sub(self.seen);
+            if remaining == 0 {
+                return Step::OutOfEntries;
+            }
+            if self.out_of_time() {
+                return Step::OutOfTime;
+            }
+            // 平分剩下的条目（`+1` = 自己），再夹一个切片上限：
+            // 既要公平，也不能让一个巨型目录在一轮里把所有人挤掉。
+            let share = remaining / (queue.len() as u64 + 1);
+            let quantum = share.clamp(1, SCAN_SLICE_ENTRIES);
+            match self.drain_subtree(&mut subtrees[index], quantum) {
+                Step::Ended => {}
+                Step::Paused => queue.push_back(index),
+                stop => return stop,
+            }
+        }
+        Step::Ended
+    }
+
+    /// 收尾：排序、裁剪，并把**没扫完的一级目录**点名。
+    fn finish(mut self, subtrees: &[Subtree]) -> WalkReport {
+        sort_files(&mut self.top_files);
+        self.top_files.truncate(self.options.top);
+        self.report.top_files = self
+            .top_files
+            .drain(..)
+            .map(|(size, path)| (path, size))
+            .collect();
+
+        let mut top_dirs: Vec<(String, u64)> =
+            std::mem::take(&mut self.buckets).into_iter().collect();
+        top_dirs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        top_dirs.truncate(self.options.top);
+        self.report.top_dirs = top_dirs;
+
+        // 递归累计最大的目录（**任意深度**，不含根）：这才是「谁占的」的直接答案。
+        let collected: Vec<(PathBuf, u64)> = self
+            .dir_bytes
+            .iter()
+            .filter(|(path, bytes)| path.as_path() != self.options.root.as_path() && **bytes > 0)
+            .map(|(path, bytes)| (path.clone(), *bytes))
+            .collect();
+        self.report.largest_dirs = prune_nested_ancestors(collected, self.options.top.max(1));
+
+        self.report.hot_path = hot_path(&self.dir_bytes, &self.children, &self.options.root);
+
+        // 没扫完的一级目录：**必须点名**。不然表里那几个数字会被当成本机全貌，
+        // “/Users 只有 3 GiB”这种假象比没有结论更糟。
+        let mut incomplete: Vec<(PathBuf, u64)> = subtrees
+            .iter()
+            .filter(|subtree| !subtree.finished())
+            .map(|subtree| {
+                (
+                    subtree.root.clone(),
+                    *self.dir_bytes.get(&subtree.root).unwrap_or(&0),
+                )
+            })
+            .collect();
+        incomplete.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        self.report.incomplete_dirs = incomplete;
+
+        self.report.elapsed_ms = self.started.elapsed().as_millis() as u64;
+        self.report
     }
 }
 
@@ -880,7 +1346,6 @@ impl WalkReport {
 /// * 不跨文件系统 —— 扫 `/` 时不能把 `/data`、`/proc`、网络盘一起算进来（那会既慢又错）；
 /// * 三重封顶 —— 这台机器正在扛业务，调查不能变成新的故障源。超限只标 `truncated`，不报错。
 fn walk(options: &WalkOptions) -> io::Result<WalkReport> {
-    let started = Instant::now();
     let root_meta = fs::metadata(&options.root)?;
     if !root_meta.is_dir() {
         return Err(io::Error::new(
@@ -888,162 +1353,33 @@ fn walk(options: &WalkOptions) -> io::Result<WalkReport> {
             "not a directory",
         ));
     }
-    let root_device = device_of(&root_meta);
+    let mut walker = Walker::new(options, device_of(&root_meta));
 
-    let mut report = WalkReport::empty(options.root.clone());
-    let mut stack: Vec<(PathBuf, usize)> = vec![(options.root.clone(), 0)];
-    let mut seen: u64 = 0;
-    let mut buckets: BTreeMap<String, u64> = BTreeMap::new();
-    let mut top_files: Vec<(u64, PathBuf)> = Vec::new();
-    // 目录树（父 → 子）与**递归累计**体量：每个文件把字节加到自己的所有祖先上，
-    // 这就是 `du` 那一步。`dir_bytes` 含扫描根本身（算总量用）。
-    let mut dir_parent: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
-    let mut children: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
-    let mut dir_bytes: BTreeMap<PathBuf, u64> = BTreeMap::new();
-    dir_bytes.insert(options.root.clone(), 0);
-    // 硬链接去重：`(dev, ino)` 只算一次（只对 `nlink > 1` 的文件建表，避免白花内存）。
-    let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
+    // 阶段一：先把扫描根的**一级子目录列全**（这层只有几十条，几乎不花预算）。
+    // 这一步保证任何情况下「本机有哪些一级目录」都是完整的 —— 现场那句
+    // 「共 3 个一级目录」正是这一层被深度优先截断的假象。
+    let mut top: Vec<(PathBuf, usize)> = Vec::new();
+    let root_step = match walker.open(options.root.clone(), 0) {
+        Some(mut cursor) => walker.advance(&mut cursor, u64::MAX, &mut top).1,
+        None => Step::Ended,
+    };
+    walker.report.top_level_dirs = top.len();
+    let mut subtrees: Vec<Subtree> = top
+        .into_iter()
+        .map(|(path, depth)| Subtree::new(path, depth))
+        .collect();
 
-    'walk: while let Some((directory, depth)) = stack.pop() {
-        if started.elapsed() >= options.max_duration {
-            report.truncated = true;
-            break;
-        }
-        // 祖先链（含自己，从自己到根）：每个目录只算一次，避免每个文件都去爬父链。
-        let mut ancestors: Vec<PathBuf> = vec![directory.clone()];
-        let mut cursor = directory.clone();
-        while let Some(parent) = dir_parent.get(&cursor) {
-            ancestors.push(parent.clone());
-            cursor = parent.clone();
-        }
-        let entries = match fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(err) => {
-                report.unreadable += 1;
-                if report.unreadable_samples.len() < UNREADABLE_SAMPLES {
-                    report
-                        .unreadable_samples
-                        .push(format!("{}：{err}", directory.display()));
-                }
-                continue;
-            }
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(err) => {
-                    report.unreadable += 1;
-                    if report.unreadable_samples.len() < UNREADABLE_SAMPLES {
-                        report
-                            .unreadable_samples
-                            .push(format!("{}：{err}", directory.display()));
-                    }
-                    continue;
-                }
-            };
-            if seen >= options.max_entries {
-                report.truncated = true;
-                break 'walk;
-            }
-            seen += 1;
-            // `symlink_metadata`：**不**跟随链接，链接本身不计入体量（目标可能不在本机）。
-            let metadata = match entry.metadata() {
-                Ok(metadata) => metadata,
-                Err(err) => {
-                    report.unreadable += 1;
-                    if report.unreadable_samples.len() < UNREADABLE_SAMPLES {
-                        report
-                            .unreadable_samples
-                            .push(format!("{}：{err}", entry.path().display()));
-                    }
-                    continue;
-                }
-            };
-            let path = entry.path();
-            let file_type = metadata.file_type();
-            if file_type.is_symlink() {
-                report.symlinks += 1;
-                continue;
-            }
-            if !on_device(&metadata, root_device) {
-                // 别的挂载点（/proc、/sys、/data…）：不属于这个文件系统，跳过。
-                report.other_filesystems += 1;
-                continue;
-            }
-            if file_type.is_dir() {
-                report.directories += 1;
-                dir_parent.insert(path.clone(), directory.clone());
-                children
-                    .entry(directory.clone())
-                    .or_default()
-                    .insert(path.clone());
-                dir_bytes.entry(path.clone()).or_insert(0);
-                if depth < options.max_depth {
-                    stack.push((path, depth + 1));
-                }
-                continue;
-            }
-            if !file_type.is_file() {
-                continue;
-            }
-            // 硬链接：同一个 inode 的第二个名字不再计字节（经典 `du` 行为）。
-            // 只对 `nlink > 1` 建表：普通文件不花内存。
-            if let Some(inode) = hardlink_identity(&metadata)
-                && !seen_inodes.insert(inode)
-            {
-                report.files += 1;
-                report.hardlinks_deduped = report.hardlinks_deduped.saturating_add(metadata.len());
-                continue;
-            }
-            let size = metadata.len();
-            report.files += 1;
-            report.total_bytes = report.total_bytes.saturating_add(size);
-            *buckets
-                .entry(bucket_label(&options.root, &path))
-                .or_insert(0) += size;
-            // 累计到所有祖先（含当前目录与扫描根）——`du` 那一步。
-            for ancestor in &ancestors {
-                match dir_bytes.get_mut(ancestor) {
-                    Some(total) => *total = total.saturating_add(size),
-                    None => {
-                        dir_bytes.insert(ancestor.clone(), size);
-                    }
-                }
-            }
-            if size >= options.min_file_size && options.top > 0 {
-                top_files.push((size, path));
-                let keep = options.top.saturating_mul(4).max(16);
-                if top_files.len() > keep {
-                    sort_files(&mut top_files);
-                    top_files.truncate(options.top);
-                }
-            }
-        }
+    // 阶段二：一级目录之间轮流分配剩下的预算。
+    let step = if root_step == Step::Ended {
+        walker.drain_round_robin(&mut subtrees)
+    } else {
+        root_step
+    };
+    if step != Step::Ended {
+        walker.report.truncated = true;
     }
 
-    sort_files(&mut top_files);
-    top_files.truncate(options.top);
-    report.top_files = top_files
-        .into_iter()
-        .map(|(size, path)| (path, size))
-        .collect();
-
-    let mut top_dirs: Vec<(String, u64)> = buckets.into_iter().collect();
-    top_dirs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    top_dirs.truncate(options.top);
-    report.top_dirs = top_dirs;
-
-    // 递归累计最大的目录（**任意深度**，不含根）：这才是「谁占的」的直接答案。
-    let collected: Vec<(PathBuf, u64)> = dir_bytes
-        .iter()
-        .filter(|(path, bytes)| path.as_path() != options.root.as_path() && **bytes > 0)
-        .map(|(path, bytes)| (path.clone(), *bytes))
-        .collect();
-    report.largest_dirs = prune_nested_ancestors(collected, options.top.max(1));
-
-    report.hot_path = hot_path(&dir_bytes, &children, &options.root);
-    report.elapsed_ms = started.elapsed().as_millis() as u64;
-    Ok(report)
+    Ok(walker.finish(&subtrees))
 }
 
 /// 排序 + **去掉“不提供新信息”的祖先**。
@@ -1368,6 +1704,100 @@ mod tests {
     }
 
     #[test]
+    fn walk_keeps_every_top_level_directory_visible_under_a_tight_budget() {
+        let dir = TempDir::new("fair-share");
+        // 一个巨型目录：足够吃光小预算（现场就是 macOS 的 /Applications）。
+        for index in 0..400 {
+            write_file(&dir.path().join(format!("huge/f{index}.bin")), 1024);
+        }
+        for name in ["alpha", "beta", "gamma"] {
+            write_file(&dir.path().join(format!("{name}/one.bin")), 2048);
+        }
+        let mut options = options(dir.path());
+        options.max_entries = 60;
+
+        let report = walk(&options).expect("walk");
+
+        assert!(report.truncated, "预算不够必须如实标出来");
+        // 一级目录的总数在预算之外先列全：不能再出现「共 3 个一级目录」那种假象。
+        assert_eq!(report.top_level_dirs, 4);
+        let labels: BTreeSet<&str> = report
+            .top_dirs
+            .iter()
+            .map(|(label, _)| label.as_str())
+            .collect();
+        for name in ["alpha", "beta", "gamma"] {
+            assert!(labels.contains(name), "{name} 被巨型目录挤掉了：{labels:?}");
+        }
+    }
+
+    #[test]
+    fn walk_names_the_top_level_dirs_that_did_not_finish() {
+        let dir = TempDir::new("incomplete");
+        for index in 0..200 {
+            write_file(&dir.path().join(format!("big/f{index}.bin")), 4096);
+        }
+        for index in 0..200 {
+            write_file(&dir.path().join(format!("bigger/deep/f{index}.bin")), 8192);
+        }
+        write_file(&dir.path().join("small/one.bin"), 16);
+        let mut options = options(dir.path());
+        options.max_entries = 40;
+
+        let report = walk(&options).expect("walk");
+
+        assert!(report.truncated);
+        let names: Vec<String> = report
+            .incomplete_dirs
+            .iter()
+            .map(|(path, _)| path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        // 没扫完的必须点名，否则表里那几个数字会被当成本机全貌。
+        assert!(names.contains(&"big".to_string()), "{names:?}");
+        assert!(names.contains(&"bigger".to_string()), "{names:?}");
+        // 扫完的目录不该出现在「没扫完」里。
+        assert!(!names.contains(&"small".to_string()), "{names:?}");
+        assert!(
+            report
+                .incomplete_dirs
+                .windows(2)
+                .all(|pair| pair[0].1 >= pair[1].1),
+            "没扫完的目录要按已扫到的体量降序：{:?}",
+            report.incomplete_dirs
+        );
+    }
+
+    #[test]
+    fn a_giant_directory_cannot_swallow_its_siblings_slice() {
+        let dir = TempDir::new("slice");
+        // 两个都很「重」的一级目录：轮流切片后两边都得有数据。
+        for index in 0..300 {
+            write_file(&dir.path().join(format!("left/f{index}.bin")), 1024);
+            write_file(&dir.path().join(format!("right/f{index}.bin")), 1024);
+        }
+        let mut options = options(dir.path());
+        options.max_entries = 100;
+
+        let report = walk(&options).expect("walk");
+
+        let bytes: BTreeMap<&str, u64> = report
+            .top_dirs
+            .iter()
+            .map(|(label, bytes)| (label.as_str(), *bytes))
+            .collect();
+        let left = *bytes.get("left").expect("left scanned");
+        let right = *bytes.get("right").expect("right scanned");
+        assert!(left > 0 && right > 0, "两边都得扫到：{bytes:?}");
+        // “均分”不需要精确相等，但绝不允许一边把另一边饿死。
+        let smaller = left.min(right);
+        let larger = left.max(right);
+        assert!(
+            smaller.saturating_mul(4) >= larger,
+            "切片不公平：left={left} right={right}"
+        );
+    }
+
+    #[test]
     fn the_scan_root_defaults_to_the_most_pressured_filesystem() {
         let filesystems = vec![
             fs_usage("/", 100, 50),
@@ -1634,6 +2064,43 @@ mod tests {
         let hint = finding.hint.expect("hint");
         assert!(hint.contains("--max-seconds"), "{hint}");
         assert!(hint.contains("permission denied"), "{hint}");
+    }
+
+    #[test]
+    fn an_unfinished_top_level_directory_is_marked_in_the_table_and_the_hint() {
+        let dir = TempDir::new("incomplete-render");
+        for index in 0..300 {
+            write_file(&dir.path().join(format!("big/f{index}.bin")), 512);
+        }
+        write_file(&dir.path().join("small/one.bin"), 512);
+        let mut options = options(dir.path());
+        options.max_entries = 40;
+        let report = walk(&options).expect("walk");
+
+        let finding = top_dirs_finding(&report, &[]);
+
+        assert!(
+            finding.detail.contains("共 2 个一级目录"),
+            "一级目录总数必须是真的：{}",
+            finding.detail
+        );
+        let big = finding
+            .rows
+            .iter()
+            .find(|row| row.label.ends_with("big"))
+            .expect("big row");
+        assert!(
+            big.note.contains("没扫完"),
+            "没扫完的行必须标出来：{}",
+            big.note
+        );
+        let hint = finding.hint.expect("hint");
+        assert!(hint.contains("--path"), "hint 要给重扫命令：{hint}");
+        assert!(hint.contains("big"), "hint 要点名没扫完的目录：{hint}");
+
+        // 「最大的目录」那一节同样要说清“还差在哪”，不能只给一张看起来完整的表。
+        let largest = largest_dirs_finding(&report);
+        assert!(largest.detail.contains("没扫完"), "{}", largest.detail);
     }
 
     #[test]
