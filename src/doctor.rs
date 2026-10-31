@@ -66,6 +66,14 @@ pub(crate) enum Status {
     Ok,
     Warn,
     Fail,
+    /// **无法判定**：这一节的数据没读到（权限 / 平台不支持 / 源不存在），
+    /// 所以既不能说它正常，也不能说它有问题。
+    ///
+    /// 为什么必须是一个独立状态而不是“空表 + OK”：安全类调查的失败方向是**假阴性**
+    /// （读不到被读成“没有”＝“安全”）。`disk` 里 `unreadable_dirs` 写 `—` 是这个道理，
+    /// 但那个仍然可以给结论（盘用了多少是读得到的）；而 `accounts.passwords` 读不到
+    /// `/etc/shadow` 时，整节没有任何可信结论。
+    Unknown,
 }
 
 impl Status {
@@ -74,6 +82,7 @@ impl Status {
             Status::Ok => "[OK]",
             Status::Warn => "[WARN]",
             Status::Fail => "[FAIL]",
+            Status::Unknown => "[UNKNOWN]",
         }
     }
 
@@ -82,15 +91,19 @@ impl Status {
             Status::Ok => "ok",
             Status::Warn => "warn",
             Status::Fail => "fail",
+            Status::Unknown => "unknown",
         }
     }
 
-    /// 状态对应的前景色（绿 / 黄 / 红）。
+    /// 状态对应的前景色（绿 / 黄 / 红 / 青）。
+    ///
+    /// 青色不是“更严重”，是“这里没有结论”——用红/黄都会让人以为查出了什么。
     pub(crate) fn color(self) -> &'static str {
         match self {
             Status::Ok => GREEN,
             Status::Warn => YELLOW,
             Status::Fail => RED,
+            Status::Unknown => CYAN,
         }
     }
 }

@@ -1,0 +1,41 @@
+{
+  "command": "investigate",
+  "topic": "disk",
+  "report_schema": "wist.investigation.disk/v1",
+  "version": "0.16.0",
+  "observed_at": "2026-10-31T08:00:00Z",
+  "judged": true,
+  "findings": [
+    {
+      "id": "disk.filesystems",
+      "status": "warn",
+      "title": "磁盘即将写满",
+      "detail": "/ 已用 88%，inode 用量 12%",
+      "hint": "按点名的目录重扫：wist-agentd investigate disk --path /var",
+      "rows": [
+        { "label": "/", "value": "88.0%", "note": "ext4，剩余 23.1 GiB" },
+        { "label": "/var/lib/docker", "value": "61.2 GiB", "note": "占 / 的 62.3%" }
+      ]
+    },
+    {
+      "id": "disk.top_files",
+      "status": "ok",
+      "title": "最大的文件",
+      "detail": "前 1 个（已扫完）",
+      "hint": null,
+      "rows": [
+        { "label": "/var/log/app.log", "value": "1.2 GiB", "note": "占 / 的 0.5%" }
+      ]
+    },
+    {
+      "id": "disk.scan",
+      "status": "ok",
+      "title": "扫描完成",
+      "detail": "共 18324 条，耗时 0.8s",
+      "hint": null,
+      "rows": []
+    }
+  ],
+  "summary": { "ok": 2, "warn": 1, "fail": 0, "unknown": 0, "overall": "warn" },
+  "verdict": "2 项正常 / 1 项警告 / 0 项失败；首要问题：磁盘即将写满"
+}

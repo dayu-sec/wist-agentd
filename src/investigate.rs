@@ -30,13 +30,32 @@ use wist_shared::time::now_rfc3339;
 use crate::config::agent_config::AgentConfig;
 use crate::doctor::Status;
 use crate::error::{AgentdReason, AgentdResult};
+use crate::investigate_safety;
 
 /// 调查题目的词表。加一个题目 = 加一个常量 + 一个 `match` 分支（见 [`execute`]）。
 pub const TOPIC_DISK: &str = "disk";
 /// 负载过高：谁在吃 CPU / 内存 / IO。
 pub const TOPIC_LOAD: &str = "load";
+/// 账号与授权：谁能在本机登录、谁能提权（Linux 先行）。
+pub const TOPIC_ACCOUNTS: &str = "accounts";
+/// 持久化：重启后还有什么会自己跑起来。
+pub const TOPIC_PERSISTENCE: &str = "persistence";
+/// 暴露面：谁在听、绑在哪（**只出证据，不做安全判定**）。
+pub const TOPIC_EXPOSURE: &str = "exposure";
 
-pub const TOPICS: &[&str] = &[TOPIC_DISK, TOPIC_LOAD];
+pub const TOPICS: &[&str] = &[
+    TOPIC_DISK,
+    TOPIC_LOAD,
+    TOPIC_ACCOUNTS,
+    TOPIC_PERSISTENCE,
+    TOPIC_EXPOSURE,
+];
+
+/// 只出证据、不做安全判定的题：`verdict` 必须说“N 项证据”，不能说“全部正常”。
+///
+/// 名单显式维护：漏登记一道这类题，报告就会把“我只是列了几行事实”说成“全正常”——
+/// 而那正好是安全类报告最不能给的那句话。
+pub const EVIDENCE_ONLY_TOPICS: &[&str] = &[TOPIC_EXPOSURE];
 
 /// 网关下发的一次性命令 `kind`（词表的家在 `wist_api::status::command_kind`）。
 ///
@@ -197,10 +216,35 @@ impl Row {
         note: impl Into<String>,
     ) -> Self {
         Self {
-            label: label.into(),
-            value: value.into(),
-            note: note.into(),
+            label: investigate_safety::sanitize_owned(label.into()),
+            value: investigate_safety::sanitize_owned(value.into()),
+            note: investigate_safety::sanitize_owned(note.into()),
         }
+    }
+}
+
+/// 一节调查的**覆盖三态**：读到多少、被拒多少、跳过多少。
+///
+/// 只记数字，不记原因（原因在 [`Finding::limits`]）：数字给机器对账，人话给人看。
+/// 全部为 0 时不上报 —— `disk` / `load` 没有“读不到”的概念，报告形状因此不变。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Coverage {
+    pub checked: usize,
+    pub denied: usize,
+    pub skipped: usize,
+}
+
+impl Coverage {
+    pub fn new(checked: usize, denied: usize, skipped: usize) -> Self {
+        Self {
+            checked,
+            denied,
+            skipped,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.checked == 0 && self.denied == 0 && self.skipped == 0
     }
 }
 
@@ -213,6 +257,10 @@ pub struct Finding {
     pub detail: String,
     pub hint: Option<String>,
     pub rows: Vec<Row>,
+    /// 这一节的覆盖三态。读不到的数据**不能**表现为“没有”（见 [`Status::Unknown`]）。
+    pub coverage: Coverage,
+    /// 这一节的能力边界（人话）。报告级 `limits` 是各节并集，去重保序。
+    pub limits: Vec<String>,
 }
 
 impl Finding {
@@ -225,10 +273,12 @@ impl Finding {
         Self {
             id,
             status,
-            title: title.into(),
-            detail: detail.into(),
+            title: investigate_safety::sanitize_owned(title.into()),
+            detail: investigate_safety::sanitize_owned(detail.into()),
             hint: None,
             rows: Vec::new(),
+            coverage: Coverage::default(),
+            limits: Vec::new(),
         }
     }
 
@@ -245,12 +295,24 @@ impl Finding {
     }
 
     pub fn hint(mut self, hint: impl Into<String>) -> Self {
-        self.hint = Some(hint.into());
+        self.hint = Some(investigate_safety::sanitize_owned(hint.into()));
         self
     }
 
     pub fn rows(mut self, rows: Vec<Row>) -> Self {
         self.rows = rows;
+        self
+    }
+
+    /// 标记这一节读到/被拒/跳过多少（安全类题目必须给）。
+    pub fn coverage(mut self, coverage: Coverage) -> Self {
+        self.coverage = coverage;
+        self
+    }
+
+    /// 加一条能力边界（人话）。报告级 `limits` 是它们的并集。
+    pub fn limit(mut self, text: impl Into<String>) -> Self {
+        self.limits.push(text.into());
         self
     }
 }
@@ -264,32 +326,91 @@ pub struct Report {
 }
 
 impl Report {
-    fn counts(&self) -> (usize, usize, usize) {
+    fn counts(&self) -> (usize, usize, usize, usize) {
         let count = |status: Status| self.findings.iter().filter(|f| f.status == status).count();
-        (count(Status::Ok), count(Status::Warn), count(Status::Fail))
+        (
+            count(Status::Ok),
+            count(Status::Warn),
+            count(Status::Fail),
+            count(Status::Unknown),
+        )
     }
 
+    /// 这一题是否给出安全判定。
+    ///
+    /// `false` 的题（如 `exposure`）只列事实：它的 `verdict` 只能说“N 项证据”，
+    /// 绝不能说“全部正常”—— 那会把“我只是把端口列了一遍”读成“这台机器没问题”。
+    pub fn judged(&self) -> bool {
+        !EVIDENCE_ONLY_TOPICS.contains(&self.topic.as_str())
+    }
+
+    /// 各节能力边界的并集（去重保序）。
+    pub fn limits(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for limit in self
+            .findings
+            .iter()
+            .flat_map(|finding| finding.limits.iter())
+        {
+            if !out.iter().any(|existing| existing == limit) {
+                out.push(limit.clone());
+            }
+        }
+        out
+    }
+
+    /// 报告总状态。优先级：失败 > 警告 > 无法判定 > 正常。
     pub fn overall(&self) -> Status {
-        if self.findings.iter().any(|f| f.status == Status::Fail) {
+        let (_, warn, fail, unknown) = self.counts();
+        if fail > 0 {
             Status::Fail
-        } else if self.findings.iter().any(|f| f.status == Status::Warn) {
+        } else if warn > 0 {
             Status::Warn
+        } else if unknown > 0 {
+            Status::Unknown
         } else {
             Status::Ok
         }
     }
 
     /// 有 FAIL → 1；其余 0（与 `diagnose` 同一口径，脚本可直接当门禁）。
+    ///
+    /// `unknown` **不让退出码变非零**：缺权限不该把 CI 变红；它只影响 verdict 与页面展示。
     pub fn exit_code(&self) -> i32 {
         i32::from(self.counts().2 > 0)
     }
 
     pub fn verdict(&self) -> String {
-        let (ok, warn, fail) = self.counts();
-        if fail == 0 && warn == 0 {
+        let (ok, warn, fail, unknown) = self.counts();
+        if !self.judged() {
+            // 证据型题目也要把 warn/fail/unknown 说出来：不说，读者就只会看到
+            // “N 项证据”，而把其中唯一一条 unknown 当成“也没什么”。
+            let total = self.findings.len();
+            let mut verdict = format!("{total} 项证据");
+            let mut extra: Vec<String> = Vec::new();
+            if warn > 0 {
+                extra.push(format!("{warn} 项警告"));
+            }
+            if fail > 0 {
+                extra.push(format!("{fail} 项失败"));
+            }
+            if unknown > 0 {
+                extra.push(format!("{unknown} 项无法判定"));
+            }
+            if !extra.is_empty() {
+                let _ = write!(verdict, "，其中 {}", extra.join(" / "));
+            }
+            verdict.push_str("（本调查不做安全判定）");
+            return verdict;
+        }
+        if fail == 0 && warn == 0 && unknown == 0 {
             return format!("全部正常（{ok} 项）");
         }
         let mut verdict = format!("{ok} 项正常 / {warn} 项警告 / {fail} 项失败");
+        // “无法判定”只在真的发生时出现 —— 否则老报告/老测试的文案会无缘无故多一截。
+        if unknown > 0 {
+            let _ = write!(verdict, " / {unknown} 项无法判定");
+        }
         if let Some(first) = self.findings.iter().find(|f| f.status == Status::Fail) {
             let _ = write!(verdict, "；首要问题：{}", first.title);
         }
@@ -381,6 +502,24 @@ impl Report {
                     let _ = writeln!(out, "       {}", paint(CYAN, &format!("{marker}{line}")));
                 }
             }
+            // 覆盖三态只在“有被拒/跳过”时打一行：全读到就不嘩噪。
+            // 但只要有缺口就必须出现在**人读输出**里 —— 否则终端用户看不到“这节其实没看全”。
+            let coverage = finding.coverage;
+            if coverage.denied > 0 || coverage.skipped > 0 {
+                let _ = writeln!(
+                    out,
+                    "         （覆盖：读到 {} / 被拒 {} / 跳过 {}）",
+                    coverage.checked, coverage.denied, coverage.skipped
+                );
+            }
+        }
+
+        let limits = self.limits();
+        if !limits.is_empty() {
+            let _ = writeln!(out, "\n{}", paint(BOLD, "边界:"));
+            for limit in &limits {
+                let _ = writeln!(out, "       - {limit}");
+            }
         }
         let verdict = paint(&format!("1;{}", self.overall().color()), &self.verdict());
         let _ = writeln!(out, "\n{} {verdict}", paint(BOLD, "结论:"));
@@ -389,12 +528,12 @@ impl Report {
 
     /// 机器可读形态（CLI `--json` 与落盘报告同一份）。
     pub fn to_json(&self) -> serde_json::Value {
-        let (ok, warn, fail) = self.counts();
+        let (ok, warn, fail, unknown) = self.counts();
         let findings: Vec<serde_json::Value> = self
             .findings
             .iter()
             .map(|finding| {
-                serde_json::json!({
+                let mut value = serde_json::json!({
                     "id": finding.id,
                     "status": finding.status.as_str(),
                     "title": finding.title,
@@ -409,19 +548,52 @@ impl Report {
                             "note": row.note,
                         }))
                         .collect::<Vec<_>>(),
-                })
+                });
+                // 覆盖三态只在有内容时出现：`disk` / `load` 没有“读不到”的节，报告形状不变。
+                if !finding.coverage.is_empty()
+                    && let Some(object) = value.as_object_mut()
+                {
+                    object.insert(
+                        "coverage".to_string(),
+                        serde_json::json!({
+                            "checked": finding.coverage.checked,
+                            "denied": finding.coverage.denied,
+                            "skipped": finding.coverage.skipped,
+                        }),
+                    );
+                }
+                value
             })
             .collect();
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "command": "investigate",
             "topic": self.topic,
             "report_schema": self.report_schema(),
             "version": env!("CARGO_PKG_VERSION"),
             "observed_at": self.observed_at,
+            // 这一题有没有做安全判定：`false` 时前端不能说“正常”。
+            "judged": self.judged(),
             "findings": findings,
-            "summary": { "ok": ok, "warn": warn, "fail": fail, "overall": self.overall().as_str() },
+            "summary": {
+                "ok": ok,
+                "warn": warn,
+                "fail": fail,
+                "unknown": unknown,
+                "overall": self.overall().as_str(),
+            },
             "verdict": self.verdict(),
-        })
+        });
+        // 边界只在有的时候出现（老报告形状不变）：它是“这份东西不能当结论”的依据。
+        let limits = self.limits();
+        if !limits.is_empty()
+            && let Some(object) = value.as_object_mut()
+        {
+            object.insert("limits".to_string(), serde_json::json!(limits));
+        }
+        // 兜底：即使某个题漏了在构造处脱敏，出口这一层也不会把凭据带出去
+        // （策略与规则见 `investigate_safety` / `investigation/redaction-policy.toml`）。
+        investigate_safety::sanitize_value(&mut value);
+        value
     }
 
     /// 报告契约 id（带版本）：`wist.investigation.<topic>/v1`。
@@ -508,6 +680,15 @@ pub async fn execute(
     let findings = tokio::task::spawn_blocking(move || match topic_for_task.as_str() {
         TOPIC_DISK => crate::investigate_disk::investigate(&request, config_for_task.as_ref()),
         TOPIC_LOAD => crate::investigate_load::investigate(&request, config_for_task.as_ref()),
+        TOPIC_ACCOUNTS => {
+            crate::investigate_accounts::investigate(&request, config_for_task.as_ref())
+        }
+        TOPIC_PERSISTENCE => {
+            crate::investigate_persistence::investigate(&request, config_for_task.as_ref())
+        }
+        TOPIC_EXPOSURE => {
+            crate::investigate_exposure::investigate(&request, config_for_task.as_ref())
+        }
         other => Err(format!("unknown investigation topic `{other}`")),
     })
     .await
@@ -583,19 +764,35 @@ pub fn report_path(state_dir: &Path, topic: &str) -> PathBuf {
 /// `/var/lib/docker`、`/root`），网关用它在界面上区分“完整答案”与“部分答案”。
 pub fn capabilities() -> wist_contracts::capability_report::InvestigationCapabilities {
     wist_contracts::capability_report::InvestigationCapabilities {
-        surfaces: TOPICS.iter().map(|topic| topic.to_string()).collect(),
+        // 只报**这台机器当前平台**真能跑的题：三类安全题先只做 Linux，
+        // 在 macOS 上报上去只会换来一串“下发即失败”的 ack 噪声。
+        surfaces: TOPICS
+            .iter()
+            .filter(|topic| topic_supported_here(topic))
+            .map(|topic| topic.to_string())
+            .collect(),
         privileged: running_as_root(),
     }
 }
 
+/// 当前平台是否实现了这道题。
+///
+/// 与各题内部的第一行检查（`if !cfg!(target_os = "linux") { Err(...) }`）**必须一致**；
+/// 不一致就会出现“上报说会、下发就失败”。两者都改在同一处时最安全。
+pub(crate) fn topic_supported_here(topic: &str) -> bool {
+    /// 先只做 Linux 的题（macOS 的用户库 / launchd 域需要另一条只读查询白名单）。
+    const LINUX_ONLY: &[&str] = &[TOPIC_ACCOUNTS, TOPIC_PERSISTENCE, TOPIC_EXPOSURE];
+    !LINUX_ONLY.contains(&topic) || cfg!(target_os = "linux")
+}
+
 #[cfg(unix)]
-fn running_as_root() -> bool {
+pub(crate) fn running_as_root() -> bool {
     // SAFETY: `geteuid` 无参数、无副作用，永远成功。
     unsafe { libc::geteuid() == 0 }
 }
 
 #[cfg(not(unix))]
-fn running_as_root() -> bool {
+pub(crate) fn running_as_root() -> bool {
     false
 }
 
@@ -798,6 +995,127 @@ mod tests {
     }
 
     #[test]
+    fn evidence_only_topics_are_registered() {
+        // 名单与词表必须同步：否则 `judged=false` 可能永远不会生效。
+        for topic in EVIDENCE_ONLY_TOPICS {
+            assert!(
+                TOPICS.contains(topic),
+                "证据型题目 `{topic}` 不在 TOPICS 里"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unjudged_topic_states_counts_but_never_claims_health() {
+        let report = Report {
+            topic: TOPIC_EXPOSURE.to_string(),
+            observed_at: "t".to_string(),
+            findings: vec![
+                finding_with("a", Status::Ok, "ok"),
+                finding_with("b", Status::Warn, "warn"),
+                finding_with("c", Status::Unknown, "unknown"),
+            ],
+        };
+        let verdict = report.verdict();
+        assert!(verdict.contains("3 项证据"), "{verdict}");
+        assert!(verdict.contains("1 项警告"), "{verdict}");
+        assert!(verdict.contains("1 项无法判定"), "{verdict}");
+        assert!(verdict.contains("不做安全判定"), "{verdict}");
+        // 不应当把证据说成健康结论。
+        assert!(!verdict.contains("全部正常"), "{verdict}");
+    }
+
+    #[test]
+    fn unknown_never_turns_into_a_nonzero_exit_code() {
+        let report = Report {
+            topic: TOPIC_ACCOUNTS.to_string(),
+            observed_at: "t".to_string(),
+            findings: vec![finding_with("a", Status::Unknown, "unknown")],
+        };
+        assert_eq!(report.exit_code(), 0);
+        assert_eq!(report.overall(), Status::Unknown);
+        assert!(
+            report.verdict().contains("1 项无法判定"),
+            "{}",
+            report.verdict()
+        );
+    }
+
+    #[test]
+    fn oversized_uplink_body_keeps_limits_and_judged() {
+        // 退化的只能是“体积”，不能是“边界”：一份丢了 `limits` 的报告会被当成结论。
+        let long = format!("/var/log/{}", "x".repeat(2000));
+        let rows: Vec<Row> = (0..50)
+            .map(|index| Row::new(format!("{long}-{index}"), "tcp / uid 0", "all"))
+            .collect();
+        let report = Report {
+            topic: TOPIC_EXPOSURE.to_string(),
+            observed_at: "t".to_string(),
+            findings: vec![
+                Finding::new("exposure.listeners", Status::Ok, "t", "d")
+                    .rows(rows)
+                    .limit("仅快照")
+                    .coverage(Coverage::new(4, 0, 0)),
+            ],
+        };
+        let body = report.to_uplink_body("cmd-1");
+        assert!(body.len() <= MAX_UPLINK_BODY_BYTES);
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        assert_eq!(value["rows_omitted"], true);
+        assert_eq!(value["judged"], false);
+        assert_eq!(value["limits"][0], "仅快照");
+        // 退化到第二级会丢 `coverage` 吗？不应该 —— 它描述的是“看到多少”。
+        assert!(value["findings"][0].get("coverage").is_some());
+    }
+
+    #[test]
+    fn text_rendering_shows_limits_and_coverage_gaps() {
+        // 终端用户看不到 `limits` = 又把“快照/未覆盖”读成结论。
+        let report = Report {
+            topic: TOPIC_EXPOSURE.to_string(),
+            observed_at: "t".to_string(),
+            findings: vec![
+                Finding::new("exposure.listeners", Status::Ok, "监听端口已列出", "d")
+                    .rows(vec![Row::new("0.0.0.0:22", "tcp / uid 0", "all")])
+                    .limit("仅快照")
+                    .coverage(Coverage::new(4, 1, 0)),
+            ],
+        };
+        let text = report.render_text(false);
+        assert!(text.contains("边界:"), "{text}");
+        assert!(text.contains("仅快照"), "{text}");
+        assert!(text.contains("被拒 1"), "{text}");
+    }
+
+    #[test]
+    fn limits_are_deduplicated_and_ordered() {
+        let report = Report {
+            topic: TOPIC_ACCOUNTS.to_string(),
+            observed_at: "t".to_string(),
+            findings: vec![
+                Finding::new("accounts.uids", Status::Ok, "a", "a").limit("L1"),
+                Finding::new("accounts.keys", Status::Ok, "b", "b")
+                    .limit("L2")
+                    .limit("L1"),
+            ],
+        };
+        assert_eq!(report.limits(), vec!["L1".to_string(), "L2".to_string()]);
+    }
+
+    #[test]
+    fn reports_without_coverage_keep_the_old_json_shape() {
+        // `disk` / `load` 不该因为新契约多出一个空 `coverage` 字段。
+        let report = Report {
+            topic: TOPIC_DISK.to_string(),
+            observed_at: "t".to_string(),
+            findings: vec![Finding::ok("disk.filesystems", "正常", "ok")],
+        };
+        let value = report.to_json();
+        assert!(value["findings"][0].get("coverage").is_none());
+        assert!(value.get("limits").is_none());
+    }
+
+    #[test]
     fn warnings_do_not_fail_the_exit_code() {
         let report = Report {
             topic: TOPIC_DISK.to_string(),
@@ -968,11 +1286,13 @@ mod tests {
     #[test]
     fn capabilities_come_from_the_topic_registry() {
         // 上报与实现**同源**：新增一道题时，这里自动跟上；网关不会把新题当成“不会”。
+        // 唯一例外是**平台**：只报本平台真能跑的题（安全三题先只做 Linux）。
         let capabilities = capabilities();
         assert_eq!(
             capabilities.surfaces,
             TOPICS
                 .iter()
+                .filter(|topic| topic_supported_here(topic))
                 .map(|topic| topic.to_string())
                 .collect::<Vec<_>>()
         );

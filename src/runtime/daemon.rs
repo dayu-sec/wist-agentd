@@ -3685,6 +3685,7 @@ mod tests {
                 capabilities.surfaces,
                 crate::investigate::TOPICS
                     .iter()
+                    .filter(|topic| crate::investigate::topic_supported_here(topic))
                     .map(|topic| topic.to_string())
                     .collect::<Vec<_>>()
             );

@@ -225,6 +225,14 @@ fn filesystem_finding(filesystems: &[FsUsage]) -> Finding {
         Status::Ok => Finding::ok("disk.filesystems", "磁盘占用正常", detail),
         Status::Warn => Finding::warn("disk.filesystems", "磁盘偏紧", detail),
         Status::Fail => Finding::fail("disk.filesystems", "磁盘即将写满", detail),
+        // `disk` 本身不产生“无法判定”（容量/ inode 都是读得到的）。这一臂是为了让
+        // `Status` 加变体时，这道题依然穷举。
+        Status::Unknown => Finding::new(
+            "disk.filesystems",
+            Status::Unknown,
+            "磁盘占用无法判定",
+            detail,
+        ),
     }
     .rows(rows);
 
@@ -850,6 +858,12 @@ fn agent_dirs_finding(config: &AgentConfig, scan_root: &Path, walk: &WalkReport)
         Status::Ok => Finding::ok("disk.agent_dirs", "agent 落点体量正常", detail),
         Status::Warn => Finding::warn("disk.agent_dirs", "agent 落点偏大", detail),
         Status::Fail => Finding::fail("disk.agent_dirs", "agent 自己占了很大一块", detail),
+        Status::Unknown => Finding::new(
+            "disk.agent_dirs",
+            Status::Unknown,
+            "agent 落点无法判定",
+            detail,
+        ),
     }
     .rows(rows);
 

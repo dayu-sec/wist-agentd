@@ -133,8 +133,36 @@ wist-agentd investigate load --top 20 --json           # 列前 20 个进程，�
 其它平台按可执行名聚合（报告会说明这是下界）。
 报告**不放进程 argv**（常有密码/令牌），只给 pid + 进程名，要看自己 `ps`。
 
-两题都**只读**、不需要守护进程在跑、读不到配置也能用（只是少一节 agent 自占）。详见
+**安全向三题（先只做 Linux）**：
+
+```bash
+wist-agentd investigate accounts        # 谁能在本机登录、谁能提权（uid 0 别名 / 空口令 / sudo NOPASSWD / authorized_keys / sshd）
+wist-agentd investigate accounts --json # 机器可读（含 coverage：读到 / 被拒 / 跳过）
+wist-agentd investigate persistence     # 重启后还有什么会自己跑（systemd enable / cron / ld.so.preload / profile.d）
+wist-agentd investigate exposure        # 谁在听、绑在哪（0.0.0.0 / 某个地址 / 只看本机）
+```
+
+三题都**只出证据**；`exposure` 连安全判定都不做（报告里 `judged=false`）——
+绑定 `0.0.0.0` 是不是问题，取决于拓扑与漏洞，主机自己答不了。
+读不到的节会是 `[UNKNOWN]` 而不是 `[OK]`：缺权限不等于没问题。
+
+四题（含 `disk` / `load`）都**只读**、不需要守护进程在跑、读不到配置也能用。详见
 [`docs/design/agentd-investigation.md`](docs/design/agentd-investigation.md)。
+
+Linux 上的真机验收（root + non-root 两轮，含“假阴性防线”与脱敏）：
+
+```bash
+sudo dev/verify-investigate-security.sh --bin ./target/debug/wist-agentd
+```
+
+在 macOS 上可以用 OrbStack 的 Docker 直接跑，不需要单独开 Linux 机器：
+
+```bash
+docker run --rm -v "$PWD":/w -w /w -e CARGO_TARGET_DIR=/tmp/t rust:1-bookworm bash -c '
+  apt-get update -qq && apt-get install -y -qq jq netcat-openbsd >/dev/null &&
+  cargo build --bin wist-agentd &&
+  WIST_VERIFY_BIN=/tmp/t/debug/wist-agentd bash dev/verify-investigate-security.sh'
+```
 
 同一份实现也能由网关以**一次性命令**触发（`kind = investigate`，`params` 见设计文档）：
 执行完 ack 回结论摘要，**完整报告走数据面**（` IVSREP: ` 帧，带 `command_id`），
@@ -237,7 +265,7 @@ Usage:
   wist-agentd service print --for <systemd|launchd>   (render for another platform)
   wist-agentd enroll [--token <token> | --token-stdin] [--config-dir <path>]
   wist-agentd diagnose [--json] [--offline] [--config-dir <path>]
-  wist-agentd investigate [disk] [--path <dir>] [--top <n>] [--min-size <size>] [--depth <n>] [--max-seconds <n>] [--json] [--config-dir <path>]
+  wist-agentd investigate [disk|load|accounts|persistence|exposure] [--path <dir>] [--top <n>] [--min-size <size>] [--depth <n>] [--max-seconds <n>] [--json] [--config-dir <path>]
 
 Commands:
   help                 Show this help message.
@@ -251,7 +279,9 @@ Commands:
   enroll               Enroll with a one-time token; the token is never written to disk.
   diagnose             Diagnose this host: config / identity / service / connectivity / uplink.
                        Exits nonzero when anything FAILs, so scripts can gate on it.
-  investigate          One-shot, read-only investigation of this host (topics: disk | load).
+  investigate          One-shot, read-only investigation of this host.
+                       Topics: disk | load | accounts | persistence | exposure
+                       (the last three are Linux-only for now).
                        Prints evidence (paths + sizes), not just a verdict; exits nonzero on FAIL.
 
 Service options (Linux uses systemd, macOS uses launchd):
@@ -335,7 +365,7 @@ src/
   control/          # daemon entry and enrollment
   discovery/        # host / network / endpoint / process / container probes
   exec/             # execution controller, process control, quarantine, recovery
-  investigate*      # one-shot investigation (model + `disk` topic)
+  investigate*      # one-shot investigation (model + `disk` / `load` / `accounts` / `persistence` / `exposure` topics)
   reporting/        # result aggregation and upstream reporting
   runtime/          # daemon loop, scheduler, self-observability
   service/          # systemd / launchd definitions, install & status

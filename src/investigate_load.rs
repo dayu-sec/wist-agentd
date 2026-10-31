@@ -812,6 +812,9 @@ fn summary_finding(snapshot: &Snapshot) -> Finding {
         Status::Ok => "负载正常",
         Status::Warn => "负载偏高",
         Status::Fail => "负载远超核数",
+        // `load` 自己不产生“无法判定”（它读的都是本地可得的数）；题目无关的模型里
+        // 必须有这一臂，否则加 `Status::Unknown` 时这里就不是穷举了。
+        Status::Unknown => "无法判定",
     };
     let mut finding = Finding::new("load.summary", status, title, detail).rows(rows);
 
@@ -911,6 +914,7 @@ fn cpu_finding(snapshot: &Snapshot) -> Finding {
             "个别核被打满（单线程瓶颈）"
         }
         (Status::Warn, _) => "CPU 偏忙",
+        (Status::Unknown, _) => "CPU 无法判定",
     };
     let mut finding = Finding::new("load.cpu", status, title, detail).rows(rows);
     if status != Status::Ok {
@@ -1015,6 +1019,7 @@ fn services_finding(snapshot: &Snapshot) -> Finding {
         Status::Ok => "没有单个服务吃掉一个核",
         Status::Warn => "有服务吃了一个核以上",
         Status::Fail => "有个服务几乎吃满多个核",
+        Status::Unknown => "无法判定",
     };
     let mut finding = Finding::new("load.top_services", status, title, detail).rows(rows);
 
@@ -1172,6 +1177,7 @@ fn memory_finding(snapshot: &Snapshot) -> Finding {
         Status::Warn if swap_percent >= SWAP_WARN_PERCENT => "内存在换页",
         Status::Warn => "内存偏紧",
         Status::Fail => "内存即将耗尽",
+        Status::Unknown => "无法判定",
     };
     let mut finding = Finding::new("load.memory", status, title, detail).rows(rows);
     if status != Status::Ok {
@@ -1319,6 +1325,7 @@ fn agent_processes_finding(snapshot: &Snapshot, have_config: bool) -> Finding {
         Status::Ok => "agent 自己占得不多",
         Status::Warn => "agent 自己就吃了不少 CPU",
         Status::Fail => "agent 自己就是负载来源",
+        Status::Unknown => "无法判定",
     };
     let mut finding = Finding::new("load.agent_processes", status, title, detail).rows(rows);
     if status != Status::Ok {

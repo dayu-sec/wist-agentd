@@ -2448,6 +2448,7 @@ dependencies = [
  "log",
  "orion-error",
  "rcgen",
+ "regex",
  "reqwest",
  "rustls",
  "serde",

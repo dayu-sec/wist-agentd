@@ -429,6 +429,10 @@ wist-agentd version                       # 已部署版本
 wist-agentd service status       # 只读自检（含真实数据/日志落点）
 sudo wist-agentd diagnose                   # 一屏诊断（配置/身份/服务/连通/上送）；退出码非零 = 有 FAIL
 wist-agentd investigate disk                # 一次性调查（磁盘满：哪几大文件、多大了）；只读、有界
+# 安全向三题（Linux）：读不到的节会显示 [UNKNOWN]，不是 [OK]
+sudo wist-agentd investigate accounts       # 谁能在本机登录、谁能提权（uid0 别名 / 空口令 / sudo / authorized_keys / sshd）
+sudo wist-agentd investigate persistence    # 重启后还有什么会自己跑（systemd enable / cron / ld.so.preload / profile.d）
+sudo wist-agentd investigate exposure       # 谁在听、绑在哪（0.0.0.0 / 具体地址 / 仅本机）
 ```
 
 | 平台 | 服务状态 | 日志 |

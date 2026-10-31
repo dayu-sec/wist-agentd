@@ -1,0 +1,83 @@
+{
+  "description": "「永不回传清单」的取证样本：每条 leaks 必须被声明的规则整值替换；clean 里的每一条必须原样通过。",
+  "leaks": [
+    {
+      "rule": "pem.private_key",
+      "text": "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB\n-----END OPENSSH PRIVATE KEY-----"
+    },
+    {
+      "rule": "hash.bcrypt",
+      "text": "$2b$12$KIXQhE9n7vY2b8mV0WJ0eO7Z0m0Q0e0Q0e0Q0e0Q0e0Q0e0Q0e0"
+    },
+    {
+      "rule": "hash.crypt",
+      "text": "root:$6$abcdefgh$0123456789abcdefghijklmnopqrstuvwxyzABCDEF"
+    },
+    {
+      "rule": "hash.argon2",
+      "text": "$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHQ$aGFzaGhhc2g"
+    },
+    {
+      "rule": "cred.uri_password",
+      "text": "postgres://app:s3cr3t@db.internal:5432/prod"
+    },
+    {
+      "rule": "cred.flag",
+      "text": "wist-agentd --token=abc123"
+    },
+    {
+      "rule": "cred.env_assignment",
+      "text": "DB_PASSWORD=hunter2"
+    },
+    {
+      "rule": "cred.json_field",
+      "text": "\"password\": \"hunter2\""
+    },
+    {
+      "rule": "cred.basic_auth",
+      "text": "Authorization: Bearer abc123"
+    },
+    {
+      "rule": "cloud.aws_access_key",
+      "text": "AKIAIOSFODNN7EXAMPLE"
+    },
+    {
+      "rule": "cloud.aws_secret",
+      "text": "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    },
+    {
+      "rule": "token.jwt",
+      "text": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+    },
+    {
+      "rule": "token.github",
+      "text": "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
+    },
+    {
+      "rule": "token.slack",
+      "text": "xoxb-123456789012-abcdefghijkl"
+    },
+    {
+      "rule": "token.openai",
+      "text": "sk-proj-abcdefghijklmnopqrstuvwxyz012345"
+    },
+    {
+      "rule": "ssh.authorized_key",
+      "text": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl dev@laptop"
+    }
+  ],
+  "clean": [
+    "/var/lib/docker/overlay2",
+    "/home/dev/.aws/credentials",
+    "/var/log/app.log",
+    "占比 62.3%",
+    "nginx: worker process",
+    "2026-10-31T08:00:00Z",
+    "disk.top_files",
+    "deleted bin: /usr/bin/sshd (deleted)",
+    "ssh: 允许 root 登录",
+    "inode 用量 12%",
+    "ext4，剩余 23.1 GiB",
+    "wist-agentd investigate disk --path /var"
+  ]
+}

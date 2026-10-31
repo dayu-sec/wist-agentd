@@ -9,8 +9,18 @@ pub mod error;
 pub mod exec;
 pub(crate) mod fs_async;
 pub(crate) mod investigate;
+/// 账号与授权（谁能在本机登录、谁能提权）。
+pub(crate) mod investigate_accounts;
 pub(crate) mod investigate_disk;
+/// 暴露面（谁在听）。只出证据，不做安全判定。
+pub(crate) mod investigate_exposure;
 pub(crate) mod investigate_load;
+/// 持久化（重启后还有什么会自己跑起来）。
+pub(crate) mod investigate_persistence;
+/// 安全向题目共用的小工具（有界读取 / 覆盖三态 / 时间）。
+pub(crate) mod investigate_probe;
+/// 调查报告的出口脱敏与结构校验（策略：`investigation/redaction-policy.toml`）。
+pub mod investigate_safety;
 pub mod reporting;
 pub mod runtime;
 pub mod service;

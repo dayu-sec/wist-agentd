@@ -1,0 +1,29 @@
+{
+  "command": "investigate",
+  "topic": "exposure",
+  "report_schema": "wist.investigation.exposure/v1",
+  "version": "0.17.0",
+  "observed_at": "2026-10-31T09:05:00Z",
+  "judged": false,
+  "limits": [
+    "这是一次快照：生命周期短于一次读取的连接不会出现在报告里",
+    "只覆盖 agent 所在 netns；容器里的监听端口不在本报告里"
+  ],
+  "findings": [
+    {
+      "id": "exposure.listeners",
+      "status": "ok",
+      "title": "监听端口已列出",
+      "detail": "监听套接字 3 个；绑定全部地址（0.0.0.0 / ::）2 个",
+      "hint": "绑定 `0.0.0.0` / `::` 只说明本机在听；是否真的对外取决于反代、安全组与拓扑",
+      "rows": [
+        { "label": "0.0.0.0:22", "value": "tcp / uid 0", "note": "all；sshd" },
+        { "label": "0.0.0.0:443", "value": "tcp / uid 0", "note": "all；nginx" },
+        { "label": "127.0.0.1:5432", "value": "tcp / uid 105", "note": "loopback；postgres" }
+      ],
+      "coverage": { "checked": 4, "denied": 0, "skipped": 0 }
+    }
+  ],
+  "summary": { "ok": 1, "warn": 0, "fail": 0, "unknown": 0, "overall": "ok" },
+  "verdict": "1 项证据（本调查不做安全判定）"
+}

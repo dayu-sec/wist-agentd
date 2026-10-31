@@ -6,6 +6,9 @@ license = "Apache-2.0"
 
 [dependencies]
 globset = "0.4"
+# 调查报告的出口脱敏（“永不回传清单”）：策略在 `investigation/redaction-policy.toml`，
+# 由 `investigate_safety` 编译与执行。
+regex = "1"
 libc = "0.2"
 sysinfo = { version = "0.39", default-features = false, features = ["system", "disk"] }
 jumo-derive = "0.1"

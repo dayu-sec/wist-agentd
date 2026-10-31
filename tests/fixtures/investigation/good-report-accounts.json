@@ -1,0 +1,58 @@
+{
+  "command": "investigate",
+  "topic": "accounts",
+  "report_schema": "wist.investigation.accounts/v1",
+  "version": "0.17.0",
+  "observed_at": "2026-10-31T09:00:00Z",
+  "judged": true,
+  "limits": [
+    "只看 /etc/passwd；LDAP/SSSD/NIS 提供的账号不在其中",
+    "不连认证后端：LDAP/SSSD 账号在本机 shadow 里没有记录属正常",
+    "只读 `~/.ssh/authorized_keys`；sshd 的自定义 AuthorizedKeysFile 未覆盖"
+  ],
+  "findings": [
+    {
+      "id": "accounts.uids",
+      "status": "ok",
+      "title": "账号 uid 分布正常",
+      "detail": "共 41 个本地账号；uid 0 别名 0 个；系统账号带登录 shell 0 个",
+      "hint": null,
+      "rows": [],
+      "coverage": { "checked": 1, "denied": 0, "skipped": 0 }
+    },
+    {
+      "id": "accounts.passwords",
+      "status": "unknown",
+      "title": "口令状态无法判定",
+      "detail": "读取 /etc/shadow 失败（需要 root）",
+      "hint": null,
+      "rows": [],
+      "coverage": { "checked": 0, "denied": 1, "skipped": 0 }
+    },
+    {
+      "id": "accounts.sudoers",
+      "status": "warn",
+      "title": "1 条 NOPASSWD: ALL 授权",
+      "detail": "规则 3 条；全权（ALL）2 条；NOPASSWD 全权 1 条",
+      "hint": "NOPASSWD: ALL 等于把这台机器的 root 交给该用户：确认是否必须",
+      "rows": [
+        { "label": "deploy ALL=(ALL) NOPASSWD: ALL", "value": "NOPASSWD: ALL", "note": "无需口令即可提权" }
+      ],
+      "coverage": { "checked": 3, "denied": 0, "skipped": 0 }
+    },
+    {
+      "id": "accounts.keys",
+      "status": "ok",
+      "title": "授权密钥已列出",
+      "detail": "2 个用户配置了授权密钥，共 3 条；近 7 天有变更 0 个",
+      "hint": null,
+      "rows": [
+        { "label": "deploy", "value": "2 条", "note": "ssh-ed25519" },
+        { "label": "ops", "value": "1 条", "note": "ssh-rsa" }
+      ],
+      "coverage": { "checked": 2, "denied": 0, "skipped": 1 }
+    }
+  ],
+  "summary": { "ok": 2, "warn": 1, "fail": 0, "unknown": 1, "overall": "warn" },
+  "verdict": "2 项正常 / 1 项警告 / 0 项失败 / 1 项无法判定"
+}

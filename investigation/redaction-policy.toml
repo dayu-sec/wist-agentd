@@ -1,0 +1,147 @@
+# 调查报告脱敏策略（单一事实来源）
+#
+# 谁读它：
+#   * agentd：`include_str!` 内嵌，`Row::new` / `Finding::new` 在**产出时**脱敏，
+#     `Report::to_json` 再整体过一遍（上送、落盘、`--json` 同一份结果）；
+#   * CI：`tests/investigation_redaction_policy.rs` + 本模块单测校验策略本身合法、
+#     并用 fixtures 钉住“该脱的脱了、不该动的没动”；
+#   * 网关 / web：渲染前用同一套规则做只读检查（复制本文件或由发布物携带）。
+#
+# 两条原则：
+#   1. **整值替换**，不做部分打码 —— 半个 token 也是 token；
+#   2. **规则必须窄** —— 每多一条会误伤的规则，现场就少一条可用证据。
+#
+# 新增调查题时**必须**在 `[topics.*]` 登记 id 前缀：这不是形式主义，
+# 登记的那一刻就意味着“有人看过这题的输出会长什么样”。
+
+version = 1
+description = "调查报告的字段白名单与「永不回传」值规则"
+schema_prefix = "wist.investigation"
+
+[envelope]
+# 顶层只允许这些键（`deny_unknown_fields` 的运行时版本）。
+top_keys = ["command", "topic", "report_schema", "version", "observed_at", "judged", "limits", "findings", "summary", "verdict", "command_id", "rows_omitted"]
+finding_keys = ["id", "status", "title", "detail", "hint", "rows", "coverage"]
+row_keys = ["label", "value", "note"]
+summary_keys = ["ok", "warn", "fail", "unknown", "overall"]
+report_schema_pattern = '^wist\.investigation\.[a-z0-9][a-z0-9-]*/v[0-9]+$'
+
+[topics.disk]
+id_prefixes = ["disk."]
+
+[topics.load]
+id_prefixes = ["load."]
+
+[topics.accounts]
+id_prefixes = ["accounts."]
+
+[topics.persistence]
+id_prefixes = ["persistence."]
+
+[topics.exposure]
+id_prefixes = ["exposure."]
+
+# ---------------------------------------------------------------------------
+# 字段名黑名单
+#
+# 信封已经白名单化了，这一组是**第二道网**：将来若某个题引入嵌套结构
+# （比如 `rows[].extra`），它仍然挡得住“把正文塞进一个自解释的键名”。
+# ---------------------------------------------------------------------------
+
+[[forbidden_key_names]]
+id = "key.credential"
+pattern = '(?i)^(password|passwd|passphrase|secret|token|access_token|refresh_token|private_key|client_secret|api_key|authorization|cookie|session_id)$'
+reason = "键名表明正文是凭据本体"
+
+[[forbidden_key_names]]
+id = "key.content"
+pattern = '(?i)^(content|body|stdout|stderr|raw|payload)$'
+reason = "调查报告只放证据元数据，不放文件/日志正文"
+
+# ---------------------------------------------------------------------------
+# 值规则：命中即把**整个字符串值**替换为 `[redacted:<id>]`
+#
+# 顺序有含义：**具体规则在前，泛化规则在后**（返回第一条命中的 id）。
+# `cred.env_assignment` 近乎万能，所以它排在最后 —— 否则 `aws_secret_access_key = …`
+# 会被它抢先命中，报告里就丢掉了“这是 AWS 秘钥”这条更有用的线索。
+# ---------------------------------------------------------------------------
+
+[[value_rules]]
+id = "pem.private_key"
+pattern = '-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----'
+reason = "私钥正文"
+
+[[value_rules]]
+id = "hash.bcrypt"
+pattern = '\$2[abxy]?\$[0-9]{2}\$[./A-Za-z0-9]{50,}'
+reason = "bcrypt 口令哈希"
+
+[[value_rules]]
+id = "hash.crypt"
+pattern = '\$[156]\$[./A-Za-z0-9]{1,16}\$[./A-Za-z0-9]{20,}'
+reason = "crypt(3) 口令哈希（md5 / sha256 / sha512）"
+
+[[value_rules]]
+id = "hash.argon2"
+pattern = '\$argon2(id|i|d)?\$'
+reason = "argon2 口令哈希"
+
+[[value_rules]]
+id = "cred.uri_password"
+pattern = '[a-z][a-z0-9+.-]*://[^/\s:@]+:[^@\s/]+@'
+reason = "连接串里内嵌的口令（postgres://user:pass@host）"
+
+[[value_rules]]
+id = "cred.flag"
+pattern = '(?i)--?(password|passwd|passphrase|token|api[-_]?key|secret)\s*[= ]\s*\S+'
+reason = "命令行参数里的口令/令牌"
+
+[[value_rules]]
+id = "cred.json_field"
+pattern = '(?i)"(password|passwd|secret|token|api[_-]?key)"\s*:\s*"[^"]+"'
+reason = "配置片段里的明文凭据字段"
+
+[[value_rules]]
+id = "cred.basic_auth"
+pattern = '(?i)\bauthorization:\s*(basic|bearer|token)\s+\S+'
+reason = "HTTP 认证头"
+
+[[value_rules]]
+id = "cloud.aws_access_key"
+pattern = '\b(AKIA|ASIA)[0-9A-Z]{16}\b'
+reason = "AWS access key id"
+
+[[value_rules]]
+id = "cloud.aws_secret"
+pattern = '(?i)aws_?secret_?access_?key\s*[=:]\s*\S{20,}'
+reason = "AWS secret access key"
+
+[[value_rules]]
+id = "token.jwt"
+pattern = '\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b'
+reason = "JWT"
+
+[[value_rules]]
+id = "token.github"
+pattern = '\bgh[pousr]_[A-Za-z0-9]{30,}\b'
+reason = "GitHub token"
+
+[[value_rules]]
+id = "token.slack"
+pattern = '\bxox[baprs]-[A-Za-z0-9-]{10,}\b'
+reason = "Slack token"
+
+[[value_rules]]
+id = "token.openai"
+pattern = '\bsk-[A-Za-z0-9_-]{20,}\b'
+reason = "OpenAI / 兼容格式的 API key"
+
+[[value_rules]]
+id = "ssh.authorized_key"
+pattern = '\bssh-(rsa|dss|ed25519|ecdsa-sha2-nistp[0-9]+) AAAA[^ ]{20,}'
+reason = "authorized_keys 正文（只回指纹，不回正文）"
+
+[[value_rules]]
+id = "cred.env_assignment"
+pattern = '(?i)^\s*[A-Z0-9_]*(PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY|ACCESS_?KEY)[A-Z0-9_]*\s*=\s*\S+'
+reason = ".env / 环境变量赋值（最泛的一条，放最后）"

@@ -294,19 +294,43 @@ ack 的 `detail` 三句：`<结论摘要>` + `报告已回传（IVSREP，seq=n�
 —— 盘满时中心可能收不到帧，运维 SSH 上来还能读到它。**落盘失败不当作失败**：盘满正是要查的时候，
 报告还在内存里，能回传就够了。
 
+### 6.2 出口脱敏（策略即代码）
+
+报告会进数据面 sink（可再分发到 Atlas / 外部），所以**掩码在 agentd 做**，不指望网关或前端事后清洗。
+规则不是散在代码里，而是一份可评审、可校验的策略：
+
+| 落点 | 作用 |
+| --- | --- |
+| `investigation/redaction-policy.toml` | 单一事实来源：字段白名单 + “永不回传”值规则（私钥、口令哈希、连接串口令、云/平台 token、`authorized_keys` 正文） |
+| `src/investigate_safety.rs` | 编译并执行策略：`Row::new` / `Finding::new` 产出时脱敏，`Report::to_json` 整体兜底；`scan()` 检查结构（字段白名单 / 题目登记 / `finding.id` 前缀） |
+| `tests/investigation_redaction_policy.rs` | CI 闸门：样本必须被声明的规则命中、普通证据不得误伤、真实形状的报告必须零违规 |
+
+两条规矩：
+
+* **整值替换**为 `[redacted:<rule>]`，不做部分打码（半个 token 也是 token），并保留命中的规则名；
+* **具体规则在前、泛化规则在后**（`cred.env_assignment` 放最后，否则 `aws_secret_access_key = …` 会被它抢先命中）。
+
+新题必须做两件事（缺一不可）：在策略里登记 `<topic>.` 前缀；往 `tests/fixtures/investigation/` 加一份该题的
+`good-report-*.json`。前者保证“加题时有人看过输出”，后者保证“结构白名单不会误伤正常报告”。
+
+策略是 `include_str!` 内嵌的，改完必须重新编译；CI 里有一条用例专门比对内嵌副本与仓库文件是否一致。
+
 ## 7. 怎么加一道新题目
 
 1. 在 `investigate::TOPICS` 加常量（如 `mem`），在 `execute` 的 `match` 里加分支；
 2. 新文件 `src/investigate_<topic>.rs`，导出
    `fn investigate(&InvestigateRequest, Option<&AgentConfig>) -> Result<Vec<Finding>, String>`；
 3. 复用 `Finding::ok/warn/fail`（`id` 用 `<topic>.<section>`）与 `Row`；
-4. 新的 `params` 字段加进 `InvestigateRequest::from_params`（宽容解析 + 夹紧）。
+4. 新的 `params` 字段加进 `InvestigateRequest::from_params`（宽容解析 + 夹紧）；
+5. 在 `investigation/redaction-policy.toml` 的 `[topics]` 登记 `<topic>.` 前缀，并加一份
+   `tests/fixtures/investigation/good-report-<topic>.json`（见 §6.2）。
 
 **只加一行代码不算加完** —— 题目是**跨仓的词表**，漏一处现场就是“页面上看不见”或“一下发就失败”：
 
 * `wist-gateway/src/api/investigations.rs` 的 `TOPICS`（网关自己的词表，不共用 agentd 的常量）；
 * `wist-gateway-web` 里两处 `TOPICS` 与题目文案（授权页、调查页）；
 * `wist-design` 的 `investigation-surfaces.md` §5 清单（敏感度/成本/特权）；
+* 本仓 `investigation/redaction-policy.toml` 的 `[topics]` 与 `tests/fixtures/investigation/`（§6.2）；
 * 本仓 README 与 `docs/usage/agentd-install-and-usage.md` 的用法示例。
 
 **不要把题目做成通用命令执行器**：调查是**只读**的。需要改机器时走 `ActionPlan`（`wist-exec`）。
@@ -347,7 +371,66 @@ ack 的 `detail` 三句：`<结论摘要>` + `报告已回传（IVSREP，seq=n�
 
 ## 9. 没做（留给后续）
 
-* 其余题目（内存/连接/进程/日志增长速率）。
+* 其余题目（内存 / 连接 / 进程 / 日志增长速率）。
 * 调查**历史**（只留最新一份；要对比「昨天 vs 今天」得另做归档）。
 * 网关侧的展示与「从这里一键派调查」入口（本设计只覆盖 agentd）。
 * 大目录的增量扫描（现在是每次从头遍历；对「刚才查过」的场景没有缓存）。
+
+## 10. 安全向三题（`accounts` / `persistence` / `exposure`）
+
+先只做 Linux：三题都要读 `/etc`、`/proc`、`/etc/systemd`；macOS 的用户库（DirectoryService）、
+launchd 域与 `netstat` 走的是另一套“只读查询命令白名单”，不在这版里假装支持。
+`capabilities()` 因此**按平台过滤**：macOS 上只报 `disk` / `load`，不会把答不了的题报上去。
+
+### 10.1 为什么是这三题
+
+它们回答的是**属性**（一次枚举就是全集），不是**行为**（要连续观测才准）。
+出站流量因此明确**不做**：`NetworkFlow` 那类数据源在观测层就有结构性缺口
+（短连接、`NOTRACK`、offload、netns），放进采集面会用“零丢失”的措辞包装一份残缺数据。
+
+| 题 | 一句话 | 主要来源 |
+| --- | --- | --- |
+| `accounts` | 谁能在本机登录、谁能提权 | `/etc/passwd`、`/etc/shadow`、`/etc/sudoers{,.d}`、`~/.ssh/authorized_keys`、`sshd_config`（含 `Include`） |
+| `persistence` | 重启后还有什么会自己跑 | `/etc/systemd/system/*.wants`、cron/at、`ld.so.preload`、`rc.local`、`profile.d` |
+| `exposure` | 谁在听、绑在哪 | `/proc/net/{tcp,tcp6,udp,udp6}` + `/proc/<pid>/fd` |
+
+### 10.2 三条契约（跨题，且对所有题成立）
+
+| 字段 | 作用 | 为什么不能省 |
+| --- | --- | --- |
+| `Status::Unknown` | 整节“无法判定” | 非 root 读不到 `/etc/shadow` 时，显示 `OK` 等于说“这台机器很安全”——安全题的假阴性 |
+| `finding.coverage` | `checked` / `denied` / `skipped` | 让“端口可见但属主不可见”这种**半可见**能被表达出来 |
+| `report.judged` | 这一题做不做安全判定 | `exposure` 只列事实；若不标 `false`，`verdict` 会输出“全部正常” |
+| `report.limits` | 能力边界（人话，各节并集） | 前端不能把“只快照 / 未覆盖容器 netns”渲染成结论 |
+
+`unknown` **不让退出码变非零**（缺权限不该把 CI 变红），它只影响 verdict 与页面。
+`overall` 的优先级：`Fail > Warn > Unknown > Ok`。
+
+### 10.3 各题节与判定
+
+**`accounts`**：`uids`（uid 0 别名 → FAIL；系统账号带登录 shell → WARN）、
+`passwords`（空口令且可登录 → FAIL；只分类 `none/locked/set`，**哈希永不回传**）、
+`sudoers`（非 root 的 `NOPASSWD: ALL` → WARN；别名不展开要写进 limits）、
+`keys`（符号链接 / 近 7 天新增 → WARN；只给类型与条数）、
+`ssh`（`PermitEmptyPasswords yes` → FAIL；`PermitRootLogin yes` → WARN）。
+
+`sshd_config` 按 sshd_config(5) 的**首个取值生效**求值，`Include` 在原位置展开，`Match` 之后不求值。
+这一点极容易写反（大多数配置是后者覆盖），代码与单测都钉住了它。
+
+**`persistence`**：`units`（本地/非包管理单元优先列；enable 状态 = `.wants` 符号链接，
+不调 `systemctl`）、`scheduled`（cron/at；只报程序与是否“下载并执行”）、
+`hooks`（`ld.so.preload` 非空 → FAIL）、`recent`（近 7 天新增汇总）。
+
+**`exposure`**：`listeners`（`bind_scope` 分 `all` / `specific` / `loopback`）。
+它是 `EVIDENCE_ONLY_TOPICS` 里唯一的题：`0.0.0.0` 是好是坏取决于拓扑与漏洞，主机答不了。
+
+### 10.4 只读与预算
+
+* 不 exec：不跑 `systemctl` / `sshd -T` / `ss` / `netstat` / `dscl`；不碰网络；不写盘。
+* 单文件读上限（`authorized_keys` 1 MiB / 200 条）、`Include` 递归深度、
+  `/proc/<pid>/fd` 扫描 20 万条上限。
+* 出口仍走 §6.2 的脱敏策略；三题都已在 `investigation/redaction-policy.toml` 登记，
+  并各有一份 `tests/fixtures/investigation/good-report-*.json`。
+* 真机验收：`sudo dev/verify-investigate-security.sh`（root + non-root 两轮；
+  macOS 上可用 OrbStack 的 Docker 跑，命令见 README）。它验单测证明不了的三件事：
+  “非 root → `unknown` 而不是 `ok`”、`ld.so.preload` 真的会 FAIL、报告里搜不到 `$6$`。
