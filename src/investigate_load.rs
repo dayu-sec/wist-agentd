@@ -691,8 +691,12 @@ fn io_finding(snapshot: &Snapshot) -> Finding {
         format!("{} 个", snapshot.d_state),
         if snapshot.d_state >= D_STATE_WARN {
             "杀不掉也不吃 CPU —— 通常卡在磁盘/网络存储".to_string()
-        } else {
+        } else if cfg!(target_os = "linux") {
             String::new()
+        } else {
+            // 非 Linux 的进程状态来自平台 API，D 状态可能映射不全：
+            // 0 个不等于「没有」，只能说「没看到」。
+            "本平台的状态映射可能不全：0 个 ≠ 没有".to_string()
         },
     ));
     if snapshot.d_state >= D_STATE_WARN && snapshot.load1 > snapshot.logical_cores as f64 {
@@ -746,7 +750,7 @@ fn agent_processes_finding(snapshot: &Snapshot, have_config: bool) -> Finding {
         Status::Ok
     };
 
-    let rows: Vec<Row> = snapshot
+    let mut rows: Vec<Row> = snapshot
         .processes
         .iter()
         .filter(|process| process.agent)
@@ -758,6 +762,18 @@ fn agent_processes_finding(snapshot: &Snapshot, have_config: bool) -> Finding {
             )
         })
         .collect();
+    // 合计算的是**全量**，行只来自 CPU 前 N。对不上就把剩下的行补一句，
+    // 否则「3 个进程」配 1 行会让人以为另外两个不存在。
+    if rows.len() < snapshot.agent_processes {
+        rows.push(Row::new(
+            format!(
+                "其余 {} 个 agent 进程",
+                snapshot.agent_processes - rows.len()
+            ),
+            "—",
+            "CPU 没进前 N，已计入合计",
+        ));
+    }
 
     let detail = format!(
         "agent 自己合计 {:.1}% CPU / {}（{} 个进程）{}",
@@ -1198,6 +1214,28 @@ mod tests {
 
         let quiet = base();
         assert_eq!(agent_processes_finding(&quiet, true).status, Status::Ok);
+    }
+
+    #[test]
+    fn agent_rows_account_for_processes_outside_the_top_list() {
+        let mut snapshot = base();
+        // 全量 3 个 agent 进程，但只有 1 个进了 CPU 前 N 的列表。
+        snapshot.agent_processes = 3;
+        snapshot.agent_cpu = 40.0;
+        snapshot.processes = vec![ProcessSample {
+            agent: true,
+            ..process(99, "wist-agentd", 20.0, 30 << 20)
+        }];
+
+        let finding = agent_processes_finding(&snapshot, true);
+
+        assert_eq!(finding.rows.len(), 2, "{:?}", finding.rows);
+        assert!(
+            finding.rows[1].label.contains("其余 2 个"),
+            "{:?}",
+            finding.rows[1]
+        );
+        assert!(finding.detail.contains("40.0% CPU"), "{}", finding.detail);
     }
 
     #[test]
