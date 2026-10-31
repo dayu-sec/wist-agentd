@@ -310,11 +310,12 @@ impl Report {
 
     /// 挑**最像证据**的一节：题目无关。
     ///
-    /// 优先 `*.top_files`（最具体：哪个文件、多大），其次 `*.top_dirs`，再退到第一个带证据表的节。
+    /// 优先 `*.largest_dirs`（盘满时“哪个目录”才是根因，单个大文件常常不是），
+    /// 其次 `*.top_files`（最具体：哪个文件、多大），再次 `*.top_dirs`，最后退到第一个带表的节。
     /// 为什么不写死 id：`summary` 是题目无关的 —— 写死 `disk.top_files` 会让加第二道题时，
     /// 摘要静默只剩结论、没有任何证据（而且不会报错）。
     fn evidence(&self) -> Option<&Finding> {
-        for suffix in [".top_files", ".top_dirs"] {
+        for suffix in [".largest_dirs", ".top_files", ".top_dirs"] {
             if let Some(finding) = self
                 .findings
                 .iter()

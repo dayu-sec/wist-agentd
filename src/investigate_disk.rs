@@ -1,18 +1,34 @@
 //! 磁盘调查（`wist-agentd investigate disk`）：**磁盘满了，到底是哪几大文件、多大了**。
 //!
 //! 现场问「磁盘满」时，运维真正要的不是「/ 用了 96%」（`diagnose`/指标早就有了），而是
-//! **下一条命令该做什么**：清哪个目录、删哪个文件、还是扩盘。所以这一题固定给四节证据：
+//! **下一条命令该做什么**：清哪个目录、删哪个文件、还是扩盘。所以这一题给这几节证据：
 //!
 //! 1. `disk.filesystems` — 每个本地文件系统的占用（字节 + **inode**）；
-//! 2. `disk.top_dirs` — 扫描根下**一级目录**的合计（谁把盘吃掉了）；
-//! 3. `disk.top_files` — 最大的 N 个文件（具体删哪个）；
-//! 4. `disk.agent_dirs` — **agent 自己**占了多少（日志/状态/数据/运行；先排除「是不是我们自己」）；
-//! 5. `disk.scan` — 这次扫描的规模与**完成度**（扫了多少、有没有被上限截断、哪些目录读不了）。
+//! 2. `disk.largest_dirs` — **递归累计**最大的目录（任意深度）+ **热点下钻链**；
+//! 3. `disk.top_dirs` — 扫描根下**一级目录**的合计（粗粒度、便于对账）；
+//! 4. `disk.top_files` — 最大的 N 个文件（具体删哪个）；
+//! 5. `disk.agent_dirs` — **agent 自己**占了多少（日志/状态/数据/运行；先排除「是不是我们自己」）；
+//! 6. `disk.unattributed` — 盘上用了但**不在扫描根里**的那部分（快照/保留块/已删除仍被打开）；
+//! 7. `disk.scan` — 这次扫描的规模与**完成度**（扫了多少、有没有被上限截断、哪些目录读不了）。
 //!
-//! 为什么要有第 5 节：目录遍历一定会遇到权限与预算。**「没有大文件」与「没扫到」是两回事**，
+//! 为什么要有「递归累计目录」这一节：**最大的文件不一定是根因**。现场的典型形态是一堆
+//! 中小文件堆在一个深层目录里（容器层、会话目录、把一百万个 4 KiB 小文件写满 inode），
+//! 单个文件都不大，而 `du` 式的目录累计一眼就能看出是谁。所以这里用经典的两歩：
+//!
+//! * **自底向上累计**（`du` 的做法）：每个文件把字节加到它**所有祖先目录**上，得到
+//!   每个目录的递归体量；硬链接只算一次（同一 inode 算两次会凭空多出一倍体积）。
+//! * **逐层下钻**（`du -h --max-depth=1 | sort -h | tail -1` 重复做）：从扫描根开始，
+//!   每次选占父级 ≥ 60% 的那个子目录，直到不再集中 —— 得到一条「热点路径」，
+//!   告诉你「到底是哪一层在长」，而不是让你自己对着一级目录表猜。
+//!
+//! 为什么要有「未归因」这一节：`df` 说满、`du` 却找不出来是经典事故（文件删了但进程还开着、
+//! 快照、文件系统保留块、或者数据在别的挂载点）。不说清这块钱，会让人把「找不到」
+//! 误当成「工具坏了」。
+//!
+//! 为什么要有第 7 节：目录遍历一定会遇到权限与预算。**「没有大文件」与「没扫到」是两回事**，
 //! 不把扫描边界说出来，那张「最大的文件」表会被当成本机的全部真相 —— 这是现场最容易踩的坑。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -35,6 +51,18 @@ const AGENT_DIR_FAIL_BYTES: u64 = 10 << 30;
 
 /// 每节最多留几条读不到的例子（只在 hint 里给人看，不做全量清单）。
 const UNREADABLE_SAMPLES: usize = 3;
+
+/// 子目录要占父级多少百分比才继续往下钻（经典 `du` 下钻的“还在集中”判据）。
+const HOT_PATH_DOMINANCE: u64 = 60;
+/// 下钻链最多多少层（报告体量 + 人读得下去）。
+const HOT_PATH_MAX_DEPTH: usize = 8;
+/// 「未归因」至少这么大才值得单独报（小差量是文件系统元数据/保留块的正常噪声）。
+const UNATTRIBUTED_MIN_BYTES: u64 = 512 * 1024 * 1024;
+/// 扫「已删除仍打开」的时限与条目上限：它只用来解释差量，不能把调查拖长。
+#[cfg(target_os = "linux")]
+const DELETED_OPEN_BUDGET_MS: u64 = 150;
+#[cfg(target_os = "linux")]
+const DELETED_OPEN_MAX_FILES: u64 = 20_000;
 
 /// 一个文件系统的占用情况。
 #[derive(Debug, Clone, PartialEq)]
@@ -80,11 +108,13 @@ pub(crate) fn investigate(
     .map_err(|err| format!("扫描 {} 失败：{err}", scan_root.display()))?;
 
     let mut findings = vec![filesystem_finding(&filesystems)];
+    findings.push(largest_dirs_finding(&walk));
     findings.push(top_dirs_finding(&walk, &filesystems));
     findings.push(top_files_finding(&walk, request.min_size));
     if let Some(config) = config {
         findings.push(agent_dirs_finding(config, &scan_root, &walk));
     }
+    findings.push(unattributed_finding(&walk, &filesystems));
     findings.push(scan_finding(&walk, request));
     Ok(findings)
 }
@@ -168,7 +198,8 @@ fn filesystem_finding(filesystems: &[FsUsage]) -> Finding {
         let mut hints = Vec::new();
         if worst_space != Status::Ok {
             hints.push(
-                "按下面「一级目录占用」→「最大的文件」顺序确认是谁在长；日志/容器层\
+                "先看「最大的目录（递归累计）」里的**热点路径**：盘满的根因通常是一个深层目录\
+                 （容器层、会话、缓存），而不是某个大文件；日志/容器层\
                  （/var/log、/var/lib/docker、/var/lib/containerd）常是头号"
                     .to_string(),
             );
@@ -183,6 +214,262 @@ fn filesystem_finding(filesystems: &[FsUsage]) -> Finding {
         finding = finding.hint(hints.join("\n"));
     }
     finding
+}
+
+/// 递归累计最大的目录（任意深度）+ 热点下钻链 —— **这就是“盘满了是谁占的”的直接答案**。
+///
+/// 为什么不是只给一级目录：一级目录都“不大”而盘却满了，是现场最常见的形态（容器层、
+/// 会话目录、百万小文件把 inode 写满）。一个 40 GiB 的 overlay 层藏在 `/var/lib/docker` 里时，
+/// 一级目录只会告诉你“/var 很大”，对下一步清理没有用。
+fn largest_dirs_finding(walk: &WalkReport) -> Finding {
+    let total = walk.total_bytes;
+    let rows: Vec<Row> = walk
+        .largest_dirs
+        .iter()
+        .map(|(path, bytes)| {
+            let note = if walk.truncated {
+                format!("占已扫总量 {}（扫描未完成）", percent(*bytes, total))
+            } else {
+                format!("占扫描总量 {}", percent(*bytes, total))
+            };
+            Row::new(path.display().to_string(), human_bytes(*bytes), note)
+        })
+        .collect();
+
+    if rows.is_empty() {
+        return Finding::ok(
+            "disk.largest_dirs",
+            "没有可列出的目录",
+            format!(
+                "扫描根 {} 下没有非空子目录（已扫 {}）",
+                walk.root.display(),
+                human_bytes(total)
+            ),
+        );
+    }
+
+    let deepest = walk
+        .largest_dirs
+        .first()
+        .map(|(path, bytes)| {
+            format!(
+                "{}（{}，占扫描总量 {}）",
+                path.display(),
+                human_bytes(*bytes),
+                percent(*bytes, total)
+            )
+        })
+        .unwrap_or_else(|| "-".to_string());
+    // 摘要里优先说**热点链末端**（真正在长的那一层），而不是“最大的那个祖先目录”。
+    let hotspot = walk
+        .hot_path
+        .last()
+        .map(|(path, bytes)| {
+            format!(
+                "热点在 {}（{}，占扫描总量 {}）",
+                path.display(),
+                human_bytes(*bytes),
+                percent(*bytes, total)
+            )
+        })
+        .unwrap_or_else(|| format!("递归累计最大的是 {deepest}"));
+    let detail = format!(
+        "扫描根 {}；{hotspot}（已扫 {}）",
+        walk.root.display(),
+        human_bytes(total)
+    );
+
+    let mut finding = Finding::ok("disk.largest_dirs", "最大的目录（递归累计）", detail).rows(rows);
+
+    if let Some(hint) = hot_path_hint(walk) {
+        finding = finding.hint(hint);
+    }
+    finding
+}
+
+/// 把热点链渲染成一行“A → B → C”，并给出“该清哪个”的建议。
+///
+/// 链上除了根，其余用**相对扫描根**的路径：`/var/lib/docker/...` 已经是相对路径，
+/// 而现场常见的长前缀（`/var/folders/…`、挂载点很长的盘）会把这一行撑成一堵墙。
+fn hot_path_hint(walk: &WalkReport) -> Option<String> {
+    if walk.hot_path.len() < 2 {
+        return None;
+    }
+    let total = walk.total_bytes.max(1);
+    let mut chain = String::new();
+    for (index, (path, bytes)) in walk.hot_path.iter().enumerate() {
+        if index == 0 {
+            chain.push_str(&path.display().to_string());
+            continue;
+        }
+        let parent_bytes = walk.hot_path[index - 1].1.max(1);
+        let label = path
+            .strip_prefix(&walk.root)
+            .map(|relative| format!("/{}", relative.display()))
+            .unwrap_or_else(|_| path.display().to_string());
+        chain.push_str(&format!(
+            " → {}（{}，占父级 {} / 占总量 {}）",
+            label,
+            human_bytes(*bytes),
+            percent(*bytes, parent_bytes),
+            percent(*bytes, total)
+        ));
+    }
+    let (leaf, leaf_bytes) = walk.hot_path.last()?;
+    let mut hint = format!("热点路径（每层占父级 ≥{HOT_PATH_DOMINANCE}%）：{chain}");
+    // 如果深处就一个大文件在撑，直接指出来 —— “最大的文件不一定是根因”反过来说：
+    // 根因在目录，但落地动作往往是删那个文件。
+    if let Some((file, file_bytes)) = walk.top_files.first()
+        && file.starts_with(leaf)
+        && file_bytes.saturating_mul(100) >= leaf_bytes.saturating_mul(50)
+    {
+        hint.push_str(&format!(
+            "\n这条链最深处的主要体量是一个文件：{}（{}，占该目录 {}）——确认后再删，不要整目录 rm",
+            file.display(),
+            human_bytes(*file_bytes),
+            percent(*file_bytes, *leaf_bytes),
+        ));
+    }
+    Some(hint)
+}
+
+/// `df` 说满了、但扫描根里找不到那么多：把差量摊到明面上（经典事故，不是“工具坏了”）。
+///
+/// 只看「扫描根就是挂载点」的情形：扫的是子目录时，差量里天然包含挂载点的其余部分，
+/// 把它当成“未归因”会误导人。
+fn unattributed_finding(walk: &WalkReport, filesystems: &[FsUsage]) -> Finding {
+    let Some(fs_usage) = filesystem_for_path(&walk.root, filesystems) else {
+        return Finding::ok(
+            "disk.unattributed",
+            "无法归因差量",
+            "扫描根没匹配到任何本地文件系统（异常布局）",
+        );
+    };
+    if Path::new(&fs_usage.mount) != walk.root.as_path() {
+        return Finding::ok(
+            "disk.unattributed",
+            "不适用（扫描的是子目录）",
+            format!(
+                "扫描根 {} 只是 {} 的一部分；盘上其余占用不参与归因",
+                walk.root.display(),
+                fs_usage.mount
+            ),
+        );
+    }
+
+    let gap = fs_usage.used.saturating_sub(walk.total_bytes);
+    let used = fs_usage.used.max(1);
+    let gap_percent = percent(gap, used);
+    let significant = gap >= UNATTRIBUTED_MIN_BYTES
+        && gap.saturating_mul(100) >= fs_usage.total.saturating_mul(5);
+
+    let (deleted_bytes, deleted_files) = deleted_open_bytes();
+    let mut detail = format!(
+        "盘上已用 {}，扫描归因 {}（{}），差量 {}（占已用 {}）",
+        human_bytes(fs_usage.used),
+        human_bytes(walk.total_bytes),
+        percent(walk.total_bytes, used),
+        human_bytes(gap),
+        gap_percent
+    );
+    if walk.truncated {
+        detail.push_str("；**扫描未完成**，差量里含未扫到的部分");
+    }
+    if deleted_files > 0 {
+        detail.push_str(&format!(
+            "；其中 {} 个已删除但仍被进程打开的文件占 {}（需要重启对应进程才能释放）",
+            deleted_files,
+            human_bytes(deleted_bytes)
+        ));
+    }
+
+    let status = if significant && !walk.truncated {
+        Status::Warn
+    } else {
+        Status::Ok
+    };
+    let mut finding = Finding::new(
+        "disk.unattributed",
+        status,
+        if significant && !walk.truncated {
+            "有相当一部分盘上占用不在扫描根里"
+        } else {
+            "扫描基本能解释盘上的占用"
+        },
+        detail,
+    );
+
+    if significant && !walk.truncated {
+        let mut hints = vec![
+            "差量常见的四个来源：其它挂载点（数据盘、容器卷）、文件系统快照/副本、\
+             ext4 保留块（默认 5%，`tune2fs -m`）、**已删除但仍被打开**的文件（重启/重开对应进程才释放）"
+                .to_string(),
+        ];
+        if deleted_files == 0 {
+            hints.push(
+                "本机没扫到“已删除仍打开”的文件（需 root 才扫得全）；仍建议 `lsof +L1` 交叉核对"
+                    .to_string(),
+            );
+        }
+        finding = finding.hint(hints.join("\n"));
+    }
+    finding
+}
+
+/// 已删除但仍被进程打开的文件：`df` 满而 `du` 找不出来的头号原因。
+///
+/// 只读 `/proc/<pid>/fd` 的链接名，不读内容；按时限与条目双重封顶（它只是解释差量，
+/// 不值得让它把调查拖长）。非 Linux 平台没有免依赖的做法，直接返回 0。
+#[cfg(target_os = "linux")]
+fn deleted_open_bytes() -> (u64, u64) {
+    let started = Instant::now();
+    let budget = Duration::from_millis(DELETED_OPEN_BUDGET_MS);
+    let mut bytes = 0u64;
+    let mut files = 0u64;
+    let Ok(procs) = fs::read_dir("/proc") else {
+        return (0, 0);
+    };
+    for proc_entry in procs.flatten() {
+        if started.elapsed() >= budget || files >= DELETED_OPEN_MAX_FILES {
+            break;
+        }
+        let name = proc_entry.file_name();
+        if !name
+            .to_string_lossy()
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+        {
+            continue;
+        }
+        let fd_dir = proc_entry.path().join("fd");
+        let Ok(fds) = fs::read_dir(&fd_dir) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            if started.elapsed() >= budget || files >= DELETED_OPEN_MAX_FILES {
+                break;
+            }
+            let Ok(target) = fs::read_link(fd.path()) else {
+                continue;
+            };
+            if !target.to_string_lossy().ends_with(" (deleted)") {
+                continue;
+            }
+            // `fd` 路径可直接 stat（跟随到 inode）：拿到它现在占的字节。
+            if let Ok(meta) = fs::metadata(fd.path()) {
+                if meta.is_file() {
+                    bytes = bytes.saturating_add(meta.len());
+                    files += 1;
+                }
+            }
+        }
+    }
+    (bytes, files)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn deleted_open_bytes() -> (u64, u64) {
+    (0, 0)
 }
 
 fn top_dirs_finding(walk: &WalkReport, filesystems: &[FsUsage]) -> Finding {
@@ -540,7 +827,8 @@ struct WalkOptions {
     max_duration: Duration,
 }
 
-/// 一次目录遍历的结果。`top_files` / `top_dirs` 已按体量降序，`top_dirs` 只到**一级目录**。
+/// 一次目录遍历的结果。`top_files` / `top_dirs` 已按体量降序，`top_dirs` 只到**一级目录**；
+/// `largest_dirs` 是**任意深度**的递归累计，`hot_path` 是从根下钻的集中链。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WalkReport {
     pub root: PathBuf,
@@ -555,6 +843,12 @@ pub(crate) struct WalkReport {
     pub total_bytes: u64,
     pub top_files: Vec<(PathBuf, u64)>,
     pub top_dirs: Vec<(String, u64)>,
+    /// 递归累计最大的目录（**任意深度**，不含扫描根本身），按体量降序。
+    pub largest_dirs: Vec<(PathBuf, u64)>,
+    /// 从扫描根开始的「热点下钻链」（含根；空 = 没有普遍集中的子目录）。
+    pub hot_path: Vec<(PathBuf, u64)>,
+    /// 硬链接被去重的字节数（同一 inode 只算一次；否则容器层会凭空多出一倍体积）。
+    pub hardlinks_deduped: u64,
 }
 
 impl WalkReport {
@@ -572,6 +866,9 @@ impl WalkReport {
             total_bytes: 0,
             top_files: Vec::new(),
             top_dirs: Vec::new(),
+            largest_dirs: Vec::new(),
+            hot_path: Vec::new(),
+            hardlinks_deduped: 0,
         }
     }
 }
@@ -598,11 +895,26 @@ fn walk(options: &WalkOptions) -> io::Result<WalkReport> {
     let mut seen: u64 = 0;
     let mut buckets: BTreeMap<String, u64> = BTreeMap::new();
     let mut top_files: Vec<(u64, PathBuf)> = Vec::new();
+    // 目录树（父 → 子）与**递归累计**体量：每个文件把字节加到自己的所有祖先上，
+    // 这就是 `du` 那一步。`dir_bytes` 含扫描根本身（算总量用）。
+    let mut dir_parent: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+    let mut children: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
+    let mut dir_bytes: BTreeMap<PathBuf, u64> = BTreeMap::new();
+    dir_bytes.insert(options.root.clone(), 0);
+    // 硬链接去重：`(dev, ino)` 只算一次（只对 `nlink > 1` 的文件建表，避免白花内存）。
+    let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
 
     'walk: while let Some((directory, depth)) = stack.pop() {
         if started.elapsed() >= options.max_duration {
             report.truncated = true;
             break;
+        }
+        // 祖先链（含自己，从自己到根）：每个目录只算一次，避免每个文件都去爬父链。
+        let mut ancestors: Vec<PathBuf> = vec![directory.clone()];
+        let mut cursor = directory.clone();
+        while let Some(parent) = dir_parent.get(&cursor) {
+            ancestors.push(parent.clone());
+            cursor = parent.clone();
         }
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
@@ -660,6 +972,12 @@ fn walk(options: &WalkOptions) -> io::Result<WalkReport> {
             }
             if file_type.is_dir() {
                 report.directories += 1;
+                dir_parent.insert(path.clone(), directory.clone());
+                children
+                    .entry(directory.clone())
+                    .or_default()
+                    .insert(path.clone());
+                dir_bytes.entry(path.clone()).or_insert(0);
                 if depth < options.max_depth {
                     stack.push((path, depth + 1));
                 }
@@ -668,12 +986,30 @@ fn walk(options: &WalkOptions) -> io::Result<WalkReport> {
             if !file_type.is_file() {
                 continue;
             }
+            // 硬链接：同一个 inode 的第二个名字不再计字节（经典 `du` 行为）。
+            // 只对 `nlink > 1` 建表：普通文件不花内存。
+            if let Some(inode) = hardlink_identity(&metadata)
+                && !seen_inodes.insert(inode)
+            {
+                report.files += 1;
+                report.hardlinks_deduped = report.hardlinks_deduped.saturating_add(metadata.len());
+                continue;
+            }
             let size = metadata.len();
             report.files += 1;
             report.total_bytes = report.total_bytes.saturating_add(size);
             *buckets
                 .entry(bucket_label(&options.root, &path))
                 .or_insert(0) += size;
+            // 累计到所有祖先（含当前目录与扫描根）——`du` 那一步。
+            for ancestor in &ancestors {
+                match dir_bytes.get_mut(ancestor) {
+                    Some(total) => *total = total.saturating_add(size),
+                    None => {
+                        dir_bytes.insert(ancestor.clone(), size);
+                    }
+                }
+            }
             if size >= options.min_file_size && options.top > 0 {
                 top_files.push((size, path));
                 let keep = options.top.saturating_mul(4).max(16);
@@ -696,8 +1032,103 @@ fn walk(options: &WalkOptions) -> io::Result<WalkReport> {
     top_dirs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     top_dirs.truncate(options.top);
     report.top_dirs = top_dirs;
+
+    // 递归累计最大的目录（**任意深度**，不含根）：这才是「谁占的」的直接答案。
+    let collected: Vec<(PathBuf, u64)> = dir_bytes
+        .iter()
+        .filter(|(path, bytes)| path.as_path() != options.root.as_path() && **bytes > 0)
+        .map(|(path, bytes)| (path.clone(), *bytes))
+        .collect();
+    report.largest_dirs = prune_nested_ancestors(collected, options.top.max(1));
+
+    report.hot_path = hot_path(&dir_bytes, &children, &options.root);
     report.elapsed_ms = started.elapsed().as_millis() as u64;
     Ok(report)
+}
+
+/// 排序 + **去掉“不提供新信息”的祖先**。
+///
+/// 一条主链（`/var → /var/lib → /var/lib/docker → …`）里每一层的递归体量完全一样：
+/// 直接把 Top N 交出去，人会看到同一串数字重复四遍，而且真正的叶子可能被挤掉。
+/// 所以：同体量时**深的优先**（“是它”要指向最具体的一层），且祖先若与已保留的后代
+/// 体量几乎一样（多出来的 < 5%）就不列 —— 那种条目只说“还是那个目录”。
+fn prune_nested_ancestors(mut entries: Vec<(PathBuf, u64)>, top: usize) -> Vec<(PathBuf, u64)> {
+    entries.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| b.0.components().count().cmp(&a.0.components().count()))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let mut kept: Vec<(PathBuf, u64)> = Vec::new();
+    for candidate in entries {
+        let redundant = kept.iter().any(|(kept_path, kept_bytes)| {
+            kept_path.starts_with(&candidate.0)
+                && kept_bytes.saturating_mul(100) >= candidate.1.saturating_mul(95)
+        });
+        if redundant {
+            continue;
+        }
+        kept.push(candidate);
+        if kept.len() >= top {
+            break;
+        }
+    }
+    kept
+}
+
+/// 逐层下钻：从根开始，每层选**占父级 ≥ [`HOT_PATH_DOMINANCE`]** 的子目录，
+/// 直到不再集中（或到 [`HOT_PATH_MAX_DEPTH`]）。
+///
+/// 这就是「`du -h --max-depth=1 | sort -h | tail -1` 重复做」的自动化：
+/// 一级目录全都不大但总盘满了时，它会把 `/var → /var/lib → /var/lib/docker → …` 这条
+/// 真正在长的路径拎出来，而不是把一级目录表扔给人自己猜。
+fn hot_path(
+    dir_bytes: &BTreeMap<PathBuf, u64>,
+    children: &BTreeMap<PathBuf, BTreeSet<PathBuf>>,
+    root: &Path,
+) -> Vec<(PathBuf, u64)> {
+    let mut chain: Vec<(PathBuf, u64)> =
+        vec![(root.to_path_buf(), *dir_bytes.get(root).unwrap_or(&0))];
+    let mut current = root.to_path_buf();
+    while chain.len() < HOT_PATH_MAX_DEPTH {
+        let parent_bytes = *dir_bytes.get(&current).unwrap_or(&0);
+        if parent_bytes == 0 {
+            break;
+        }
+        let next = children.get(&current).and_then(|kids| {
+            kids.iter()
+                .map(|kid| (kid, *dir_bytes.get(kid).unwrap_or(&0)))
+                .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
+        });
+        let Some((kid, kid_bytes)) = next else { break };
+        // 子目录没到「占父级 60%」就不再往下：再往下已经是均摊，不是“谁在长”。
+        if kid_bytes == 0
+            || kid_bytes.saturating_mul(100) < parent_bytes.saturating_mul(HOT_PATH_DOMINANCE)
+        {
+            break;
+        }
+        chain.push((kid.clone(), kid_bytes));
+        current = kid.clone();
+    }
+    // 只有根自己 = 没有集中点：不输出（避免多一节“什么也没说”的表）。
+    if chain.len() < 2 { Vec::new() } else { chain }
+}
+
+/// 一个文件是否属于「可能被多个名字引用的 inode」；是则返回去重用的标识。
+///
+/// 非 Unix 平台拿不到 inode，退化成不去重（宁可多算也不误合并）。
+#[cfg(unix)]
+fn hardlink_identity(metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    if metadata.nlink() > 1 {
+        Some((metadata.dev(), metadata.ino()))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn hardlink_identity(_metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 fn sort_files(files: &mut [(u64, PathBuf)]) {
@@ -981,6 +1412,161 @@ mod tests {
         assert_eq!(finding.rows[0].label, "/logs");
         assert!(finding.detail.contains("/logs"), "{}", finding.detail);
         assert!(finding.hint.is_some());
+    }
+
+    /// 递归累计 + 下钻：一级目录“都不大”但深层目录占大头时，要能直接指出那条路径。
+    ///
+    /// 场景就是现场：容器层（`/var/lib/docker/overlay2/...`）吃了大块，单个文件都不算最大，
+    /// 一级目录上看只有“/var 很大”——对下一步清理没有用。
+    #[test]
+    fn largest_dirs_aggregates_recursively_and_drills_down_the_dominant_path() {
+        let dir = TempDir::new("recursive");
+        // 深层元凶：三层以后的一堆中小文件。
+        for index in 0..6 {
+            write_file(
+                &dir.path().join(format!(
+                    "var/lib/docker/overlay2/layer{index}/diff/blob.bin"
+                )),
+                40_000,
+            );
+        }
+        // 噪音：其它一级目录各一点。
+        write_file(&dir.path().join("etc/app.conf"), 800);
+        write_file(&dir.path().join("home/u/a.txt"), 2_000);
+
+        let report = walk(&options(dir.path())).expect("walk");
+        let hot = &report.hot_path;
+        // 链：root → var → lib → docker → overlay2 → 某一层 …… 至少 5 层才说明真在往下钻。
+        assert!(
+            hot.len() >= 5,
+            "热点链太短，下钻没生效：{:?}",
+            hot.iter()
+                .map(|(p, _)| p.display().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(hot[0].0 == dir.path(), "链头必须是扫描根");
+        assert!(hot.iter().any(|(path, _)| path.ends_with("docker")));
+        // 每层都是上一层的子路径（否则不是“链”）。
+        for window in hot.windows(2) {
+            assert!(
+                window[1].0.starts_with(&window[0].0),
+                "{:?} 不是 {:?} 的子路径",
+                window[1].0,
+                window[0].0
+            );
+            assert!(window[1].1 <= window[0].1, "子目录不能比父目录大");
+        }
+
+        // 递归累计第一：`overlay2`（祖先已被剪掉——`var`/`lib`/`docker` 与它体量一样，不提供新信息）。
+        let (top_path, top_bytes) = report.largest_dirs.first().expect("largest dirs");
+        assert_eq!(*top_bytes, 6 * 40_000);
+        assert!(
+            top_path.ends_with("overlay2"),
+            "体量相同的祖先必须被剪掉，只留最具体的一层，实际 {}",
+            top_path.display()
+        );
+        // 六个容器层均摊，没有单层占 60%：下钻链应在 overlay2 停下来（“集中点就是它”）。
+        let (leaf, leaf_bytes) = hot.last().expect("hot path leaf");
+        assert!(
+            leaf.ends_with("overlay2"),
+            "均摊时不该假装钻到某一层，实际 {}",
+            leaf.display()
+        );
+        assert_eq!(*leaf_bytes, 6 * 40_000);
+
+        // 一行人话：有表、有“该清哪里”的提示。
+        let finding = largest_dirs_finding(&report);
+        assert_eq!(finding.id, "disk.largest_dirs");
+        assert!(!finding.rows.is_empty());
+        let hint = finding.hint.expect("热点链必须作为提示给出来");
+        assert!(hint.contains("热点路径"), "{hint}");
+    }
+
+    /// 集中在一层时，下钻必须一级一级地走到底（而不是停在“/var 很大”）。
+    #[test]
+    fn a_single_dominant_layer_is_drilled_all_the_way_down() {
+        let dir = TempDir::new("dominant");
+        write_file(
+            &dir.path()
+                .join("var/lib/docker/overlay2/layer3/diff/app/data.db"),
+            500_000,
+        );
+        // 少量噪音：不能把集中度稀释到 60% 以下。
+        write_file(
+            &dir.path()
+                .join("var/lib/docker/overlay2/layer0/diff/tiny.bin"),
+            1_000,
+        );
+        write_file(&dir.path().join("etc/app.conf"), 500);
+
+        let report = walk(&options(dir.path())).expect("walk");
+        assert!(
+            report.hot_path.len() >= 7,
+            "集中度 99% 以上时必须一路钻到叶子，实际 {}",
+            report.hot_path.len()
+        );
+        let (leaf, bytes) = report.hot_path.last().expect("leaf");
+        assert!(
+            leaf.ends_with("app"),
+            "链末端应落在真正装数据的那个目录（app），实际 {}",
+            leaf.display()
+        );
+        assert!(*bytes >= 500_000);
+        // 人话提示里要带「该清哪一层」，而不是只给根目录。
+        let hint = hot_path_hint(&report).expect("hint");
+        assert!(hint.contains("热点路径"), "{hint}");
+    }
+
+    /// 硬链接只算一次：同一 inode 的第二个名字不该再计字节（经典 `du` 行为）。
+    #[cfg(unix)]
+    #[test]
+    fn hardlinks_are_counted_once() {
+        let dir = TempDir::new("hardlink");
+        let original = dir.path().join("data/blob.bin");
+        write_file(&original, 20_000);
+        let link = dir.path().join("data/blob-link.bin");
+        fs::hard_link(&original, &link).expect("hard link");
+
+        let report = walk(&options(dir.path())).expect("walk");
+        assert_eq!(report.total_bytes, 20_000, "硬链接不能把体积算两遍");
+        assert_eq!(report.hardlinks_deduped, 20_000);
+        // 两个名字都还在（文件数照实计）。
+        assert_eq!(report.files, 2);
+    }
+
+    /// 「未归因」只对「扫描根就是挂载点」有意义：扫子目录时差量天然来自挂在同一分区的其它东西。
+    #[test]
+    fn unattributed_is_skipped_when_the_scan_root_is_a_subdirectory() {
+        let walk = WalkReport {
+            root: PathBuf::from("/var"),
+            total_bytes: 1000,
+            ..WalkReport::empty(PathBuf::from("/var"))
+        };
+        let filesystems = vec![fs_usage("/", 100_000, 10_000)];
+        let finding = unattributed_finding(&walk, &filesystems);
+        assert_eq!(finding.id, "disk.unattributed");
+        assert_eq!(finding.status, Status::Ok);
+        assert!(
+            finding.title.contains("不适用"),
+            "扫子目录时不该把整个分区的占用算成差量：{}",
+            finding.title
+        );
+    }
+
+    /// `df` 已用远大于扫描合计（且扫描完成）：必须提醒“还有东西不在这里”。
+    #[test]
+    fn a_large_gap_between_df_and_du_is_reported_as_unattributed() {
+        let root = PathBuf::from("/data");
+        let walk = WalkReport {
+            root: root.clone(),
+            total_bytes: 1_000_000_000,
+            ..WalkReport::empty(root)
+        };
+        // 10 GiB 的盘，用了 9 GiB，但扫描只解释了 1 GB。
+        let filesystems = vec![fs_usage("/data", 10 << 30, 1 << 30)];
+        let finding = unattributed_finding(&walk, &filesystems);
+        assert_eq!(finding.status, Status::Warn);
+        assert!(finding.hint.is_some(), "要给出「为什么会差这么多」的方向");
     }
 
     #[test]
