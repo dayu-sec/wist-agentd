@@ -3,6 +3,39 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.13.0-alpha] - 2026-10-31
+
+### 修复（磁盘调查：先「一级目录列全」，再均匀花预算）
+
+现场报告（926 GiB 的 macOS）暴露的问题：`/Applications` 有 14 万条，深度优先一路走到底
+把 200k 条目上限吃干，同级的 `/Users`（真正占了 200 GiB，`~/.Trash` 就 151 GiB）连名字都
+没进报告，`disk.top_dirs` 只写了「共 3 个一级目录」——**看起来像扫全了，答案却不在表里**。
+
+- **预算改成「一级目录轮流分配」**：先用极小代价枚举根下一级目录全集（这一层不计预算），
+  再让各一级目录各持一个**可续游标**轮流花剩余预算（每轮每目录最多 4096 条），
+  先扫完的目录会把额度让出来。巨型目录不再能把同级目录饿死。
+- **`disk.top_dirs` 的「共 N 个一级目录」现在总是真的**（取枚举全量，不再是被截断后的条数）。
+- **没扫完的一级目录点名**：报告新增 `incomplete_dirs`（路径 + 已扫到的字节，按体量降序），
+  `disk.top_dirs` / `disk.largest_dirs` / `disk.unattributed` 都会写「N 个一级目录没扫完（/Users、…），
+  它们实际只会更大」，对应的行标注 `没扫完，实际更大`。
+- **每条「没扫完」都配一条可直接复制的重扫命令**
+  （`wist-agentd investigate disk --path <目录> --max-seconds 60`）。
+  「没扫完」不是免责声明，而是**下一步该跑什么**。
+- **时限按条目复查**（每 512 条）：只在目录边界查，一个巨型目录会一路超时跑下去。
+- **平台化的大头提示**：磁盘紧张时按平台给出常见元凶 ——
+  macOS：`~/.Trash`、`~/Library/Caches`、`~/Library/Containers`、`~/Library/Developer`、`/private/var/folders`；
+  Linux：`/var/log`、`/var/lib/docker`、`/var/lib/containerd`、`/var/cache`、`/home/*/.cache`。
+- `disk.scan` 的正文多一项 `incomplete_top_dirs=N`，hint 改为引导「单独扫某个目录」
+  （`--depth` 不再是瓶颈，条目/时长才是）。
+
+实测（同一台机器）：默认参数下归因从 25 GiB 提升到 ~83 GiB，且指向的目录是对的；
+按提示单独扫 `/Users`（30s）后，`~/.Trash` 151.9 GiB（占扫描总量 70.2%）立刻成为热点。
+
+### 兼容性
+
+报告 schema 仍为 `wist.investigation.disk/v1`（本次只增字段与文案，不改结构）；
+网关/web 无需变更。
+
 ## [0.12.0-alpha] - 2026-10-30
 
 ### 新增（磁盘调查：先找「哪个目录」，再找文件）
