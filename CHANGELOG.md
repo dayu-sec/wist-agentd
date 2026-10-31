@@ -3,6 +3,33 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.15.1-alpha] - 2026-10-31
+
+### 修复（对 `load` 题做了 5 轮 review，找到 4 个真缺陷）
+
+- **百分比的分母用了“想等多久”而不是“真实经过多久”**（最严重）：机器越忙 `sleep` 越容易超时，
+  而那种机器恰好就是调查对象。用 `window` 当分母会把每个服务的 CPU **同时**算高，
+  看起来像“整机负载高”，实际只是分母错了。现在计时从基准读完开始，用
+  `Instant::elapsed()`；`load.sample` 同时报 `window=` 与 `elapsed=`。
+- **`/proc/stat` 把 `guest` / `guest_nice` 算了两遍**：它们已经含在 `user` / `nice` 里，
+  多加一遍会让分母虚高，`load.cpu` 的 user/system/iowait/idle 去向全部偏低
+  （跑虚拟机的机器上尤其明显）。改为只加前 8 项。
+- **服务名里带 `-pod` 的普通 unit 被误归成 k8s pod**：`mypod-worker.service` 会被写成
+  `k8s:pod/worker.service`，于是下一条命令变成 `kubectl`。现在先确认 `kubepods` 前缀。
+- **“有 cgroup 口径”被误报成“没有 cgroup 口径”**：精确值计数是在**截断后**数的，
+  所以当排在前面的都是采样值时，正文会写“无 cgroup 口径：非 Linux，或没权限”。
+  现在计数覆盖全量，并把三种情况分开说：有精确值 / 归属可用但读不到用量 / 非 Linux。
+- 顺带：pod uid（UUID 带连字符）截断前先去掉 `-`，不再出现 `1a2b3c4d-5e6` 这种“像被截坏”的 ID；
+  `/proc/<pid>/cgroup` 读取改为**每 pid 一次 + 总次数封顶**（`LabelCache`），
+  大进程数机器上不会把一次调查拖成 IO 长跑；服务行的 CPU 做了非负夹紧。
+
+### 测试（+11，共 46）
+
+分母取真实 elapsed、`guest` 不双计、`-pod` 不误判、直接落在 pod cgroup 的进程、
+标签缓存的“同 pid 只读一次”与“超预算退回可执行名”、无法命名的进程仍有着落、
+精确计数覆盖全量、三种口径的文案区分、无任何服务时不能报“干净”、
+进程节指向服务节。
+
 ## [0.15.0-alpha] - 2026-10-31
 
 ### 新增（`load` 题：从「哪个进程」到「哪个服务」）

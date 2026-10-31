@@ -78,10 +78,10 @@ const SAMPLE_WINDOW_CEIL_MS: u64 = 3_000;
 /// 窗口短于这个值，数字只能当参考（`load.sample` 会判 WARN）。
 const SAMPLE_WINDOW_SUSPECT_MS: u64 = 300;
 
-/// cgroup 归属扫描的上限：一次调查最多看这么多进程/这么多个 cgroup。
-/// 容器化机器上 cgroup 数量可能上千，不加闸就会把一次 1s 的调查拖成 10s。
-#[cfg(target_os = "linux")]
+/// `/proc/<pid>/cgroup` 读取上限（每台机器一次调查）。
+/// 归属是**锦上添花**：超了就退回可执行名，不能让它把调查拖成 IO 长跑。
 const CGROUP_PID_LIMIT: usize = 4_096;
+/// 被跟踪的 cgroup 数量上限（容器化机器上可能上千）。
 #[cfg(target_os = "linux")]
 const CGROUP_TRACK_LIMIT: usize = 256;
 
@@ -200,7 +200,10 @@ pub(crate) struct Snapshot {
     /// 处于不可中断睡眠（`D`）的进程数。
     pub d_state: usize,
     pub io: IoSignals,
+    /// 想等的采样窗口（毫秒）。
     pub window_ms: u64,
+    /// **真实**经过的时间（毫秒）：机器忙时 `sleep` 会超时，百分比的分母用的是它。
+    pub elapsed_ms: u64,
     pub agent_cpu: f64,
     pub agent_rss: u64,
     pub agent_processes: usize,
@@ -259,6 +262,8 @@ fn sample(request: &InvestigateRequest, config: Option<&AgentConfig>) -> Result<
     // cgroup 累计值：CPU 时间的**权威口径**（不依赖进程采样，窗口内起落的也算得到）。
     let pids: Vec<u32> = system.processes().keys().map(|pid| pid.as_u32()).collect();
     let cgroup_before = collect_cgroup_usage(&pids, None);
+    // 计时从**基准读完**开始：分母取真实经过的时间，而不是我们想等的 `window`。
+    let started = std::time::Instant::now();
 
     std::thread::sleep(window);
 
@@ -267,6 +272,7 @@ fn sample(request: &InvestigateRequest, config: Option<&AgentConfig>) -> Result<
     system.refresh_memory();
     let stat_after = cpu_times_before();
     let cgroup_after = collect_cgroup_usage(&[], Some(&cgroup_before));
+    let elapsed = started.elapsed().max(window);
 
     let load = System::load_average();
     let logical_cores = system.cpus().len();
@@ -279,6 +285,7 @@ fn sample(request: &InvestigateRequest, config: Option<&AgentConfig>) -> Result<
 
     let mut processes: Vec<ProcessSample> = Vec::new();
     let mut d_state = 0usize;
+    let mut labels = LabelCache::default();
     for (pid, process) in system.processes() {
         let name = process.name().to_string_lossy().to_string();
         let state = describe_status(process.status());
@@ -289,7 +296,7 @@ fn sample(request: &InvestigateRequest, config: Option<&AgentConfig>) -> Result<
             d_state += 1;
         }
         let agent = is_agent_process(&name, process.exe(), config);
-        let (service, service_source) = service_of(pid.as_u32(), &name, process.exe());
+        let (service, service_source) = labels.get(pid.as_u32(), &name, process.exe());
         processes.push(ProcessSample {
             pid: pid.as_u32(),
             name: if name.is_empty() {
@@ -320,12 +327,12 @@ fn sample(request: &InvestigateRequest, config: Option<&AgentConfig>) -> Result<
         .fold((0.0f64, 0u64, 0usize), |(cpu, rss, count), process| {
             (cpu + process.cpu as f64, rss + process.rss, count + 1)
         });
-    let exact_cpu = exact_service_cpu(&cgroup_before, &cgroup_after, window);
+    let exact_cpu = exact_service_cpu(&cgroup_before, &cgroup_after, elapsed);
     let service_identity_cgroup = processes
         .iter()
         .any(|process| process.service_source == "cgroup");
-    let (services, service_total) = build_services(&processes, &exact_cpu, request.top.max(1));
-    let services_exact = services.iter().filter(|service| service.cpu_exact).count();
+    let (services, service_total, services_exact) =
+        build_services(&processes, &exact_cpu, request.top.max(1));
     processes.truncate(request.top.max(1));
 
     let loadavg = read_loadavg();
@@ -365,6 +372,7 @@ fn sample(request: &InvestigateRequest, config: Option<&AgentConfig>) -> Result<
             psi_full: psi.map(|value| value.1),
         },
         window_ms: window.as_millis() as u64,
+        elapsed_ms: elapsed.as_millis() as u64,
         agent_cpu,
         agent_rss,
         agent_processes,
@@ -425,6 +433,11 @@ fn service_of(pid: u32, name: &str, exe: Option<&std::path::Path>) -> (String, &
         return (label, "cgroup");
     }
     let _ = pid;
+    exe_service(name, exe)
+}
+
+/// 归属的**退路**：按可执行名（拿不到 cgroup，或读次数超限时用）。
+fn exe_service(name: &str, exe: Option<&std::path::Path>) -> (String, &'static str) {
     // `exe` 的 basename 比 `comm`（Linux 上被截到 15 字符）更像服务名。
     let from_exe = exe
         .and_then(|path| path.file_name())
@@ -434,6 +447,35 @@ fn service_of(pid: u32, name: &str, exe: Option<&std::path::Path>) -> (String, &
         Some(value) => (value, "exe"),
         None if !name.is_empty() => (name.to_string(), "exe"),
         None => ("(unknown)".to_string(), "exe"),
+    }
+}
+
+/// pid → 归属的缓存：每个 pid 最多读一次 `/proc/<pid>/cgroup`，
+/// 总量封顶 [`CGROUP_PID_LIMIT`]（超了退回可执行名）。
+#[derive(Default)]
+struct LabelCache {
+    labels: std::collections::HashMap<u32, (String, &'static str)>,
+    reads: usize,
+}
+
+impl LabelCache {
+    fn get(
+        &mut self,
+        pid: u32,
+        name: &str,
+        exe: Option<&std::path::Path>,
+    ) -> (String, &'static str) {
+        if let Some(hit) = self.labels.get(&pid) {
+            return hit.clone();
+        }
+        let value = if self.reads < CGROUP_PID_LIMIT {
+            self.reads += 1;
+            service_of(pid, name, exe)
+        } else {
+            exe_service(name, exe)
+        };
+        self.labels.insert(pid, value.clone());
+        value
     }
 }
 
@@ -485,13 +527,16 @@ fn service_label_from_cgroup(path: &str) -> Option<String> {
         return Some(last.to_string());
     }
     // k8s：`kubepods-burstable-pod<uid>.slice`
-    if let Some(index) = last.find("-pod") {
-        let uid = last[index + 4..].trim_end_matches(".slice");
-        if !uid.is_empty() {
-            return Some(format!("k8s:pod/{}", short_id(uid)));
-        }
-    }
+    //
+    // **必须先确认是 kubepods 前缀**：`find("-pod")` 会把 `mypod-worker.service`
+    // 这种普通 unit 误判成 pod（服务名里带 “-pod” 并不罕见）。
     if last.starts_with("kubepods") {
+        if let Some(index) = last.find("-pod") {
+            let uid = last[index + 4..].trim_end_matches(".slice");
+            if !uid.is_empty() {
+                return Some(format!("k8s:pod/{}", short_id(uid)));
+            }
+        }
         return Some("k8s:kubepods".to_string());
     }
     // 用户会话（session-3.scope / user@1000.service 已被上面接住）
@@ -502,9 +547,12 @@ fn service_label_from_cgroup(path: &str) -> Option<String> {
 }
 
 /// 容器 ID / pod uid 太长，取前 12 位（`docker ps --filter id=<前缀>` 能用）。
+///
+/// pod uid 是 UUID（带连字符），先把 `-` 去掉再截：否则前 12 位会摊上一个 `-`，
+/// 看起来像被截坏的 ID。
 #[cfg(any(target_os = "linux", test))]
 fn short_id(value: &str) -> String {
-    value.chars().take(12).collect()
+    value.chars().filter(|ch| *ch != '-').take(12).collect()
 }
 
 /// 一次采样里收集到的 cgroup 用量：`path → (服务名, usage_usec)`。
@@ -549,12 +597,16 @@ fn collect_cgroup_usage(_pids: &[u32], _previous: Option<&CgroupUsage>) -> Cgrou
 }
 
 /// 两次 cgroup 累计值之差 → 每个服务的 CPU%（100% = 一个核）。
+///
+/// `elapsed` 必须是**真实经过的时间**，不是我们想等的 `window`：机器越忙，`sleep`
+/// 越容易超时 —— 而这种机器恰好就是调查对象用分母去“应该等多久”，会把每个服务的 CPU
+/// 都算高（同一个错误会同时抬高所有行，看起来反而像“整体负载高”）。
 fn exact_service_cpu(
     before: &CgroupUsage,
     after: &CgroupUsage,
-    window: Duration,
+    elapsed: Duration,
 ) -> std::collections::BTreeMap<String, f64> {
-    let window_us = window.as_micros().max(1) as f64;
+    let window_us = elapsed.as_micros().max(1) as f64;
     let mut totals: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     for (path, (label, after_us)) in after {
         let Some((_, before_us)) = before.get(path) else {
@@ -577,7 +629,7 @@ fn build_services(
     processes: &[ProcessSample],
     exact: &std::collections::BTreeMap<String, f64>,
     top: usize,
-) -> (Vec<ServiceGroup>, usize) {
+) -> (Vec<ServiceGroup>, usize, usize) {
     let mut groups: std::collections::BTreeMap<&str, (usize, f64, u64, &'static str)> =
         std::collections::BTreeMap::new();
     for process in processes {
@@ -597,7 +649,7 @@ fn build_services(
                     label: label.to_string(),
                     source,
                     processes: count,
-                    cpu: *value,
+                    cpu: value.max(0.0),
                     cpu_exact: true,
                     rss,
                 },
@@ -605,7 +657,7 @@ fn build_services(
                     label: label.to_string(),
                     source,
                     processes: count,
-                    cpu: sampled,
+                    cpu: sampled.max(0.0),
                     cpu_exact: false,
                     rss,
                 },
@@ -633,8 +685,11 @@ fn build_services(
             .then_with(|| a.label.cmp(&b.label))
     });
     let total = services.len();
+    // 精确值计数要在**截断前**算：截断后数，会把“有 cgroup 口径但排在前面的都是采样值”
+    // 误报成“本机没有 cgroup 口径”。
+    let exact_total = services.iter().filter(|service| service.cpu_exact).count();
     services.truncate(top);
-    (services, total)
+    (services, total, exact_total)
 }
 
 #[cfg(target_os = "linux")]
@@ -933,11 +988,14 @@ fn services_finding(snapshot: &Snapshot) -> Finding {
     let top = &snapshot.services[0];
     let precision = if snapshot.services_exact > 0 {
         format!(
-            "其中 {} 个是 cgroup 累计值（含窗口内起落的进程）",
+            "其中 {} 个有 cgroup 精确值（含窗口内起落的进程）",
             snapshot.services_exact
         )
+    } else if snapshot.service_identity_cgroup {
+        // 归属拿到了、用量没拿到：这跟“没有 cgroup”是两件事，不能说成同一句。
+        "cgroup 归属可用，但读不到累计用量（权限/内核不支持）—— CPU 是进程采样加总".to_string()
     } else {
-        "按进程采样加总（无 cgroup 口径：非 Linux，或没权限）".to_string()
+        "按进程采样加总（无 cgroup 口径：非 Linux）".to_string()
     };
     let identity = if snapshot.service_identity_cgroup {
         ""
@@ -1023,10 +1081,10 @@ fn top_processes_finding(snapshot: &Snapshot, top: usize) -> Finding {
         .collect();
 
     let detail = format!(
-        "进程共 {} 个；按 CPU 列出前 {} 个（采样窗口 {}ms，百分比是**窗口内平均**）",
+        "进程共 {} 个；按 CPU 列出前 {} 个（多进程服务的合计见上一节；采样窗口 {}ms，百分比是**窗口内平均**）",
         snapshot.process_total,
         rows.len(),
-        snapshot.window_ms
+        snapshot.elapsed_ms
     );
     if rows.is_empty() {
         return Finding::warn(
@@ -1274,13 +1332,14 @@ fn agent_processes_finding(snapshot: &Snapshot, have_config: bool) -> Finding {
 
 fn sample_finding(snapshot: &Snapshot, request: &InvestigateRequest) -> Finding {
     let detail = format!(
-        "cores={} physical={} window={}ms procs={} services={} exact={} top={} iowait={} psi_io={} psi_cpu={} d_state={} platform={}",
+        "cores={} physical={} window={}ms elapsed={}ms procs={} services={} exact={} top={} iowait={} psi_io={} psi_cpu={} d_state={} platform={}",
         snapshot.logical_cores,
         snapshot
             .physical_cores
             .map(|value| value.to_string())
             .unwrap_or_else(|| "-".to_string()),
         snapshot.window_ms,
+        snapshot.elapsed_ms,
         snapshot.process_total,
         snapshot.service_total,
         snapshot.services_exact,
@@ -1364,14 +1423,15 @@ fn cpu_times_before() -> Option<CpuTimes> {
 
 /// 解析 `/proc/stat` 的第一行（`cpu user nice system idle iowait irq softirq steal …`）。
 ///
-/// 只在 Linux 与测试里编译：非 Linux 平台没有 `/proc/stat`，但解析本身是纯函数，
-/// 值得在每台开发机上都能被单测盖到（不靠“在 macOS 上跑不到就不测”）。
+/// **只加前 8 个字段**：`guest` / `guest_nice`（第 9/10 项）已经包含在 `user` / `nice` 里，
+/// 再加一遍会让分母偏大，于是所有百分比都偏低 —— 跑虚拟机的机器上尤其明显。
 #[cfg(any(target_os = "linux", test))]
 fn parse_proc_stat(text: &str) -> Option<CpuTimes> {
     let line = text.lines().find(|line| line.starts_with("cpu "))?;
     let values: Vec<u64> = line
         .split_whitespace()
         .skip(1)
+        .take(8)
         .filter_map(|value| value.parse::<u64>().ok())
         .collect();
     if values.len() < 5 {
@@ -1508,6 +1568,7 @@ mod tests {
             d_state: 0,
             io: IoSignals::default(),
             window_ms: 300,
+            elapsed_ms: 300,
             agent_cpu: 1.0,
             agent_rss: 50 << 20,
             agent_processes: 1,
@@ -1825,7 +1886,7 @@ mod tests {
                 )
             })
             .collect();
-        let (services, total) = build_services(&processes, &Default::default(), 10);
+        let (services, total, _) = build_services(&processes, &Default::default(), 10);
 
         assert_eq!(total, 1);
         assert_eq!(services[0].label, "gunicorn.service");
@@ -1843,7 +1904,7 @@ mod tests {
         // cgroup 说它用了 250%（包含采样时已退出的子进程），以 cgroup 为准。
         let exact = std::collections::BTreeMap::from([("app.service".to_string(), 250.0)]);
 
-        let (services, _) = build_services(&processes, &exact, 10);
+        let (services, _, _) = build_services(&processes, &exact, 10);
 
         assert!(services[0].cpu_exact);
         assert!((services[0].cpu - 250.0).abs() < 0.01, "{:?}", services[0]);
@@ -1854,7 +1915,7 @@ mod tests {
         // 周期任务（cron/批处理）：采样时已经没有进程了，但 cgroup 说它真跑了。
         let exact = std::collections::BTreeMap::from([("backup.service".to_string(), 80.0)]);
 
-        let (services, total) = build_services(&[], &exact, 10);
+        let (services, total, _) = build_services(&[], &exact, 10);
 
         assert_eq!(total, 1);
         assert_eq!(services[0].processes, 0);
@@ -1879,7 +1940,7 @@ mod tests {
             service_process(2, "b", "b.service", 50.0, 1),
             service_process(3, "c", "c.service", 20.0, 1),
         ];
-        let (services, total) = build_services(&processes, &Default::default(), 2);
+        let (services, total, _) = build_services(&processes, &Default::default(), 2);
 
         assert_eq!(total, 3);
         assert_eq!(services.len(), 2);
@@ -2015,6 +2076,168 @@ mod tests {
         );
         let hint = finding.hint.expect("hint");
         assert!(hint.contains("排队等 CPU"), "{hint}");
+    }
+
+    fn group(
+        label: &str,
+        source: &'static str,
+        processes: usize,
+        cpu: f64,
+        exact: bool,
+    ) -> ServiceGroup {
+        ServiceGroup {
+            label: label.to_string(),
+            source,
+            processes,
+            cpu,
+            cpu_exact: exact,
+            rss: 1 << 20,
+        }
+    }
+
+    #[test]
+    fn exact_cpu_divides_by_the_real_elapsed_time_not_the_intended_window() {
+        // 2 秒 CPU 时间，真实等了 4 秒 → 50%。机器忙时 sleep 会超时，最忌拿“想等多久”当分母。
+        let before: CgroupUsage = std::collections::BTreeMap::from([(
+            "/system.slice/app.service".to_string(),
+            ("app.service".to_string(), 1_000_000),
+        )]);
+        let after: CgroupUsage = std::collections::BTreeMap::from([(
+            "/system.slice/app.service".to_string(),
+            ("app.service".to_string(), 3_000_000),
+        )]);
+
+        let exact = exact_service_cpu(&before, &after, Duration::from_secs(4));
+
+        assert!((exact["app.service"] - 50.0).abs() < 0.01, "{exact:?}");
+    }
+
+    #[test]
+    fn guest_time_is_not_counted_twice_in_proc_stat() {
+        // user nice system idle iowait irq softirq steal guest guest_nice
+        // guest/guest_nice 已经含在 user/nice 里，再加一遍会让分母虚高、所有百分比偏低。
+        let text = "cpu  100 10 50 800 40 5 5 0 30 30\n";
+        let times = parse_proc_stat(text).expect("parse");
+        assert_eq!(times.total, 1_010, "只算前 8 项（不含 guest）");
+    }
+
+    #[test]
+    fn a_unit_name_containing_pod_is_not_mistaken_for_a_kubernetes_pod() {
+        // 服务名里带 “-pod” 很常见，不能因此被归到 k8s。
+        assert_eq!(
+            service_label_from_cgroup("/system.slice/mypod-worker.service").as_deref(),
+            Some("mypod-worker.service")
+        );
+    }
+
+    #[test]
+    fn a_process_sitting_directly_in_a_pod_cgroup_is_recognised() {
+        assert_eq!(
+            service_label_from_cgroup(
+                "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d.slice"
+            )
+            .as_deref(),
+            Some("k8s:pod/1a2b3c4d5e6f")
+        );
+    }
+
+    #[test]
+    fn the_label_cache_reads_each_pid_at_most_once() {
+        let mut cache = LabelCache::default();
+        let first = cache.get(42, "nginx", None);
+        let second = cache.get(42, "nginx", None);
+        assert_eq!(first, second);
+        assert_eq!(cache.reads, 1, "同一个 pid 不该重复读 /proc");
+    }
+
+    #[test]
+    fn the_label_cache_stops_reading_at_the_budget() {
+        let mut cache = LabelCache {
+            labels: std::collections::HashMap::new(),
+            reads: CGROUP_PID_LIMIT,
+        };
+        let (label, source) = cache.get(7, "nginx", None);
+        assert_eq!(label, "nginx");
+        assert_eq!(source, "exe", "超预算后必须退回可执行名，不能继续读");
+    }
+
+    #[test]
+    fn an_unnameable_process_still_gets_a_label() {
+        assert_eq!(exe_service("", None).0, "(unknown)");
+        assert_eq!(exe_service("worker", None).0, "worker");
+    }
+
+    #[test]
+    fn the_exact_counter_covers_the_whole_list_not_just_the_top() {
+        let processes = vec![
+            service_process(1, "a", "a.service", 50.0, 1),
+            service_process(2, "b", "b.service", 40.0, 1),
+            service_process(3, "c", "c.service", 30.0, 1),
+        ];
+        // 只有排第三的 c 有精确值；只数前两名就会误报“本机没有 cgroup 口径”。
+        let exact = std::collections::BTreeMap::from([("c.service".to_string(), 30.0)]);
+
+        let (services, total, exact_total) = build_services(&processes, &exact, 2);
+
+        assert_eq!(total, 3);
+        assert_eq!(services.len(), 2);
+        assert_eq!(exact_total, 1);
+    }
+
+    #[test]
+    fn the_detail_tells_missing_usage_apart_from_missing_cgroup() {
+        let mut with_exact = base();
+        with_exact.services = vec![group("app.service", "cgroup", 2, 150.0, true)];
+        with_exact.service_total = 1;
+        with_exact.services_exact = 1;
+        with_exact.service_identity_cgroup = true;
+        assert!(
+            services_finding(&with_exact)
+                .detail
+                .contains("cgroup 精确值")
+        );
+
+        // 归属拿到了、用量没读到：与“没有 cgroup”是两件事。
+        let mut no_usage = base();
+        no_usage.services = vec![group("app.service", "cgroup", 2, 150.0, false)];
+        no_usage.service_total = 1;
+        no_usage.service_identity_cgroup = true;
+        assert!(
+            services_finding(&no_usage)
+                .detail
+                .contains("读不到累计用量")
+        );
+
+        let mut non_linux = base();
+        non_linux.services = vec![group("firefox", "exe", 1, 150.0, false)];
+        non_linux.service_total = 1;
+        assert!(services_finding(&non_linux).detail.contains("非 Linux"));
+    }
+
+    #[test]
+    fn no_services_at_all_is_a_warning_not_a_clean_bill() {
+        let mut snapshot = base();
+        snapshot.services.clear();
+        snapshot.service_total = 0;
+        let finding = services_finding(&snapshot);
+        assert_eq!(finding.status, Status::Warn);
+        assert!(
+            finding.detail.contains("不能当成没人吃"),
+            "{}",
+            finding.detail
+        );
+    }
+
+    #[test]
+    fn the_process_section_points_at_the_service_section() {
+        let mut snapshot = base();
+        snapshot.processes = vec![process(1, "worker", 10.0, 1)];
+        let finding = top_processes_finding(&snapshot, 10);
+        assert!(
+            finding.detail.contains("多进程服务的合计"),
+            "{}",
+            finding.detail
+        );
     }
 
     #[test]
