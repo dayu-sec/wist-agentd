@@ -3,6 +3,56 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.13.1-alpha] - 2026-10-31
+
+### 修复（“没出现”有三种，不能混成一种）
+
+对 0.13.0 的实现做了 5 轮 review，找到同一类错误的另外两个变体 —— 都是「目录不出现 → 被当成它不存在」：
+
+- **整目录读不了的一级目录不再消失**（权限，如 macOS 的 `.Spotlight-V100` /
+  `.DocumentRevisions-V100` / `.fseventsd`）：以前它们不贡献字节，就从 `disk.top_dirs` 里整条
+  不见了，看起来像“本机只有这几个目录”。现在：
+  - 新增 `unreadable_dirs`（整个目录打不开的一级目录），`disk.top_dirs` 里给它们补一行，
+    值写 `—`（**不是 `0 B`**），备注「读不了（需要 root），这里不是 0」；
+  - `disk.largest_dirs` / `disk.top_dirs` / `disk.unattributed` 的正文会写
+    「**N 个一级目录读不了**（…）—— 它们一个字节也没计入，需 root」；
+  - `disk.scan` 的正文多一项 `unreadable_top_dirs=N`，hint 点名具体目录。
+- **`--depth` 到顶不再静默**：深度到顶的目录里的内容**不会被计入**，但以前 `truncated=false`，
+  那些数字会被当成完整值。现在计数器 `depth_limited`：`disk.scan` 正文多一项
+  `depth_limited=N`，标题写成「扫描完成（部分目录深度到顶）」，hint 说明
+  「体量/占比都是下界，要更全就把 `--depth` 加大」。
+  （不把状态刷成 WARN：默认 `depth=16` 几乎每台机器都有到顶目录，那会让 WARN 变成噪声。）
+- **“读不了”不再说成“没有”**：扫描根读不了、或目录全读不了时，`disk.top_dirs` /
+  `disk.largest_dirs` 的标题从「没有子目录（只有文件）」改成「读不了（权限）」，正文引导 `sudo`。
+- 「没扫完」的文案统一为「表里是已扫到的下界，实际更大」（原文案“它们实际只会更大”缺主语）。
+
+### 测试（+9）
+
+`src/investigate_disk.rs`：
+
+- `resuming_a_cursor_never_counts_a_file_twice`：预算被切成 5+ 片时，字节数必须等于
+  `文件数 × 单文件大小`（守住可续游标不重读）；
+- `a_scan_with_enough_budget_reports_nothing_unfinished`：反例守卫，别让「没扫完」变成常驻噪音；
+- `walk_counts_directories_it_stopped_descending_at_the_depth_cap`：`depth_limited` 必须有值，
+  且深度外的体量不能凭空出现；
+- `walk_names_a_top_level_directory_it_cannot_open`（unix，root 下跳过）：`chmod 000` 的一级
+  目录必须进 `unreadable_dirs`，且不能把其它目录的扫描带崩；
+- `top_dirs_renders_an_unreadable_directory_instead_of_dropping_it`：读不了的目录必须有行、
+  备注写读不了；
+- `unfinished_and_unreadable_directories_are_reported_apart`：两种处置（重扫 vs 要 root）分开说；
+- `the_incomplete_hint_lists_a_bounded_number_of_rescan_commands`：hint 最多列
+  `INCOMPLETE_DIRS_SHOWN` 条命令，总数在正文里说；
+- `the_scan_section_says_when_depth_stopped_the_walk`：`depth_limited` 进正文 + 标题 + hint；
+- `unattributed_points_at_the_directories_it_could_not_read`：差量解释里点名读不了的目录。
+
+实测（926 GiB 的 macOS）：默认参数下 `disk.top_dirs` 现在写
+「共 18 个一级目录」，4 个没扫完 + 3 个读不了全部点名；`disk.scan` 带
+`incomplete_top_dirs=4 unreadable_top_dirs=3 depth_limited=41`。
+
+### 兼容性
+
+报告 schema 仍为 `wist.investigation.disk/v1`（只增字段与文案）；网关/web 无需变更。
+
 ## [0.13.0-alpha] - 2026-10-31
 
 ### 修复（磁盘调查：先「一级目录列全」，再均匀花预算）
