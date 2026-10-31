@@ -834,7 +834,11 @@ mod tests {
     #[test]
     fn the_report_json_carries_the_telemetry_topic() {
         let (config, _root) = one_input_config("json", 1024, true);
-        let report = Report::for_tests("telemetry-health", findings(&config));
+        let report = crate::investigate::Report {
+            topic: "telemetry-health".to_string(),
+            observed_at: "2026-01-01T00:00:00Z".to_string(),
+            findings: findings(&config),
+        };
         let value = report.to_json();
         assert_eq!(value["topic"], "telemetry-health");
         assert_eq!(
@@ -843,26 +847,5 @@ mod tests {
         );
         assert_eq!(value["judged"], true);
         assert_eq!(value["findings"][0]["id"], "telemetry.sources");
-    }
-
-    /// 测试里只用到 `Report` 的构造；放在这里避免为测试单独开一个公开构造器。
-    struct Report {
-        inner: crate::investigate::Report,
-    }
-
-    impl Report {
-        fn for_tests(topic: &str, findings: Vec<Finding>) -> Self {
-            Self {
-                inner: crate::investigate::Report {
-                    topic: topic.to_string(),
-                    observed_at: "2026-01-01T00:00:00Z".to_string(),
-                    findings,
-                },
-            }
-        }
-
-        fn to_json(&self) -> serde_json::Value {
-            self.inner.to_json()
-        }
     }
 }

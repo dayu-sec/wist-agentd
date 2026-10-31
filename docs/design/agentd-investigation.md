@@ -233,8 +233,11 @@
   "command": "investigate",
   "topic": "disk",
   "report_schema": "wist.investigation.disk/v1",
-  "version": "0.11.0-alpha",
+  "version": "0.18.0",
   "observed_at": "2026-10-30T09:50:33Z",
+  "boot_id": "0f5d1f2e-9c4a-4a55-9b1e-6d2c3f7a8b10",
+  "boot_time": "2026-10-28T03:12:41Z",
+  "judged": true,
   "findings": [
     {
       "id": "disk.filesystems",
@@ -245,13 +248,15 @@
       "rows": [{ "label": "/data", "value": "96.8% 已用", "note": "…" }]
     }
   ],
-  "summary": { "ok": 2, "warn": 1, "fail": 1, "overall": "fail" },
+  "summary": { "ok": 2, "warn": 1, "fail": 1, "unknown": 0, "overall": "fail" },
   "verdict": "2 项正常 / 1 项警告 / 1 项失败；首要问题：磁盘即将写满"
 }
 ```
 
 `finding.id` 是**稳定标识**，脚本/AI 按 id 取用；`rows` 是证据（`label` 路径、`value` 体量、
 `note` 占比/设备/inode）；`report_schema` 是**带版本的契约 id**，网关按它选渲染/落库规则。
+`boot_id` / `boot_time` 是**时间线锚点**：报告要与采集流拼到同一次开机上（见 §11.4），
+读不到时省略。
 
 **退出码**：有 FAIL → 1，其余 0（与 `diagnose` 同一条门禁语义）。
 
