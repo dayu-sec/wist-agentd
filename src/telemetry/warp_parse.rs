@@ -724,13 +724,33 @@ mod tests {
         }
     }
 
+    /// 拿一个“确定会拒连”的端口。
+    ///
+    /// 不能直接用 `bind(127.0.0.1:0)` 再 drop：拿到的 ephemeral 端口会在 drop 之后
+    /// **被内核再次分配**给别人（同一轮测试里另一个 bind、或机器上任何新连接），
+    /// 于是 connect 有时会成功 —— 这就是这个用例偶发失败的原因。
+    ///
+    /// 这里改用 **ephemeral 段之外**的固定端口（Linux 典型 32768-60999，macOS 49152-65535）：
+    /// 内核不会自动分配它们，drop 之后只有显式 bind 才能占到，概率可以忽略。
+    async fn closed_port() -> u16 {
+        // 取几不在两个平台的 ephemeral 区间里的值；绑不上（被真实服务占用）就换下一个。
+        for candidate in [29_417u16, 29_531, 29_611] {
+            if let Ok(listener) = TcpListener::bind(("127.0.0.1", candidate)).await {
+                let port = listener.local_addr().expect("addr").port();
+                drop(listener);
+                return port;
+            }
+        }
+        // 极端环境下全部被占：退回 ephemeral（接受极小概率的竞态，不让用例直接失败）。
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        port
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn tcp_sink_backs_off_after_connect_failure() {
-        // 绑定后立即 drop，拿到一个确定关闭的端口，connect 会立即 ECONNREFUSED。
-        let port = {
-            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-            listener.local_addr().expect("addr").port()
-        };
+        let port = closed_port().await;
         // 测试用缩短退避窗口，避免真实等待 1s。
         let mut sink = TcpRecordSink::new("127.0.0.1".to_string(), port, TcpFraming::Line)
             .with_backoff(Duration::from_millis(10));
