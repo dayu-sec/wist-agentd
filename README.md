@@ -125,9 +125,12 @@ wist-agentd investigate load                          # 负载高了，是谁在
 wist-agentd investigate load --top 20 --json           # 列前 20 个进程，机器可读输出
 ```
 
-同样七节：负载与**每核负载** + 运行队列 → CPU 总体与每核（Linux 还给 user/system/iowait 去向）→
-最吃 CPU 的进程 → 内存与 swap → **iowait / PSI / 不可中断睡眠（D 状态）** → agent 自己占多少 →
-采样窗口与平台能力。判据是「每核负载」而不是负载绝对值（`load 8` 在 32 核上很健康）。
+同样八节：负载与**每核负载** + 运行队列 → CPU 总体与每核（Linux 还给 user/system/iowait 去向）→
+**按服务聚合**（多 worker 服务只有加总才看得见）→ 最吃 CPU 的进程 → 内存与 swap →
+**iowait / PSI / 不可中断睡眠（D 状态）** → agent 自己占多少 → 采样窗口与平台能力。
+判据是「每核负载」而不是负载绝对值（`load 8` 在 32 核上很健康）；Linux 上服务归属取 cgroup
+（systemd unit / docker / k8s pod）且 CPU 用 `cpu.stat` 累计差值（包含窗口内起落的进程），
+其它平台按可执行名聚合（报告会说明这是下界）。
 报告**不放进程 argv**（常有密码/令牌），只给 pid + 进程名，要看自己 `ps`。
 
 两题都**只读**、不需要守护进程在跑、读不到配置也能用（只是少一节 agent 自占）。详见

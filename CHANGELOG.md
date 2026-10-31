@@ -3,6 +3,37 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.15.0-alpha] - 2026-10-31
+
+### 新增（`load` 题：从「哪个进程」到「哪个服务」）
+
+上一版只给进程榜，而现场的答案经常不在单进程里：**nginx / gunicorn / JVM / 容器里的服务都是
+多进程多 worker**，8 个 worker 各 12% 时，进程榜里谁都不显眼，服务合计却是一个核。
+这与磁盘题“最大的文件不是根因，目录才是”是同一条道理。
+
+- **`load.top_services`**：按**服务**聚合 CPU/RSS（多 worker 已加总），与 `disk.largest_dirs` 同构；
+  判据放在服务层：≥1 核 → WARN，≥3 核 → FAIL。每行给出「N 个进程 / 占整机 X% / RSS」。
+- **服务归属**：Linux 读 `/proc/<pid>/cgroup` —— `system.slice/xxx.service`、
+  `docker-<id>.scope`、`kubepods…/pod<uid>`、`session-N.scope`；容器/pod 只给 12 位前缀
+  （`docker ps --filter id=<前缀>` 能用）。其它平台按可执行名聚合，并在正文**注明是下界**
+  （同一服务的多个可执行文件会被拆开，例如 Firefox 的 plugin-container / GPU Helper）。
+- **精确累计**（Linux）：读 cgroup `cpu.stat` 的 `usage_usec` 两次差值，得到**不依赖进程采样**的
+  每服务 CPU，包含窗口内起落的进程；这种服务在表里以 `进程数 = 0` 出现，备注写「窗口内已退出」。
+  读不到就退回“进程采样加总”，正文标注精确值与采样值的数量。
+- **采样窗口 1s～3s**（`--max-seconds` 拉长到 3s，默认 3s）：1s 里周期性批处理/GC 的尖峰经常
+  刚好躲过，多等 2s 是值得的。
+- **CPU 压力（PSI）**：Linux 读 `/proc/pressure/cpu`，在 `load.summary` 里给出 some/full avg10；
+  some ≥30% 时提示“有任务在排队等 CPU，光看平均利用率会低估饱和程度”。
+- `load.summary` 的 hint 改为「先看服务 → 再看进程 → 再谈扩容」；`load.sample` 增报
+  `services / exact / psi_cpu`。
+
+### 测试（+12，共 35）
+
+`build_services`（8 个 worker 加成 96%、精确值优先、窗口内起落的服务、排序与截断）、
+服务阈值（1 核 WARN / 3 核 FAIL）、exe 归属的「下界」声明、每类服务的下一条命令、
+`/proc/*/cgroup` 的 v1/v2 解析、cgroup 路径 → 服务名（unit/docker/cri/k8s/session/无法识别）、
+`usage_usec` 差值 → 核数、采样窗口夹紧、PSI CPU 行。
+
 ## [0.14.1-alpha] - 2026-10-31
 
 ### 修复（`load` 题的两处诚实性）

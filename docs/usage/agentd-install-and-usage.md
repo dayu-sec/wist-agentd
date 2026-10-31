@@ -616,17 +616,21 @@ wist-agentd investigate load --top 20 --json             # 列前 20 个进程
 
 | 节 | 内容 | 何时变红 |
 | --- | --- | --- |
-| `load.summary` | 1/5/15 分钟负载 + 核数 + **每核负载** + 运行队列（Linux） | 每核 ≥1.0 WARN、≥2.0 FAIL |
+| `load.summary` | 1/5/15 分钟负载 + 核数 + **每核负载** + 运行队列 / CPU 压力（Linux） | 每核 ≥1.0 WARN、≥2.0 FAIL |
 | `load.cpu` | 总体与每核占用；Linux 还给 user/system/iowait/idle 去向 | ≥85% WARN、≥95% FAIL；**单核打满也是 WARN** |
+| `load.top_services` | 按**服务**聚合的 CPU/RSS（多 worker 已加总；Linux 用 cgroup 归属，其它平台按可执行名） | 服务 ≥1 核 WARN、≥3 核 FAIL |
 | `load.top_processes` | 按 CPU 排的进程（pid + 名称 + RSS + 状态 + 运行时长） | — |
 | `load.memory` | 物理内存与 swap | 内存 ≥85% WARN；swap ≥50% WARN |
 | `load.io` | iowait / PSI 压力 / **D 状态进程数** | iowait ≥20% 或 D 状态 ≥3 → WARN |
 | `load.agent_processes` | agent 自己（agentd/exec/upgrader）占多少 | CPU ≥1 核 WARN、≥3 核 FAIL |
-| `load.sample` | 采样窗口 / 进程数 / 平台能力 | 进程数为 0 或窗口过短 → WARN |
+| `load.sample` | 采样窗口 / 进程数 / 平台能力（cgroup、iowait、PSI） | 进程数为 0 或窗口过短 → WARN |
 
-两条要记住的差别：
+三条要记住的差别：
 
 * **判据是“每核负载”**，不是负载绝对值 —— `load 8` 在 32 核上很健康，在 4 核上已过载；
+* **找的是“服务”不是“进程”**：8 个 worker 各 12% 时，进程榜里谁都不显眼，服务却是 96%；
+  Linux 上服务身份来自 cgroup（`systemctl status <unit>` / `docker stats`），其它平台按可执行名
+  聚合（报告会注明这是**下界**）；
 * **负载高但 CPU 闲** 就去看 `load.io`：`D` 状态进程杀不掉也不吃 CPU，通常是磁盘/网络存储卡住，
   下一步是 `investigate disk`，而不是扩容 CPU。
 

@@ -134,29 +134,41 @@
 ## 4. `load` 题给出什么
 
 「负载 80」只是一条**排队长度**：同样 80，可能是 16 核跑满，也可能 CPU 闲着而一堆进程卡在磁盘上。
-所以本题把「先分流 → 再点名」固定下来，七节：
+所以本题把「先分流 → 再点名」固定下来，八节：
 
 | 节 id | 内容 | 判定 |
 | --- | --- | --- |
-| `load.summary` | 1/5/15 分钟负载 + 核数 + **每核负载** + 运行队列（Linux） | 每核 ≥ 1.0 → WARN，≥ 2.0 → FAIL |
+| `load.summary` | 1/5/15 分钟负载 + 核数 + **每核负载** + 运行队列 / CPU 压力（Linux） | 每核 ≥ 1.0 → WARN，≥ 2.0 → FAIL |
 | `load.cpu` | 总体与**每核**占用；Linux 还给 user/system/iowait/idle 去向 | 总体 ≥85% → WARN、≥95% → FAIL；**单个核打满也是 WARN**（单线程瓶颈） |
+| `load.top_services` | 按**服务**聚合的 CPU/RSS（cgroup 归属 + 累加） | 服务 ≥1 核 → WARN，≥3 核 → FAIL |
 | `load.top_processes` | 按 CPU 排的进程（pid + 名称 + RSS + 状态 + 运行时长） | 证据（不加判定） |
 | `load.memory` | 物理内存与 swap | 内存 ≥85% → WARN、≥95% → FAIL；swap ≥50% → WARN |
 | `load.io` | iowait / PSI io 压力 / **不可中断睡眠（D）进程数** | iowait ≥20% 或 D 状态 ≥3 且负载 > 核数 → WARN |
 | `load.agent_processes` | agent 自己（agentd/exec/upgrader）的 CPU 与 RSS | CPU ≥1 核 → WARN、≥3 核 → FAIL；RSS ≥1 GiB → WARN、≥4 GiB → FAIL |
-| `load.sample` | 采样窗口、进程数、平台能力（有无 iowait/PSI） | 进程数为 0 或窗口 < 300ms → WARN |
+| `load.sample` | 采样窗口、进程数、平台能力（cgroup/iowait/PSI） | 进程数为 0 或窗口 < 300ms → WARN |
 
 几条判据的理由：
 
 * **为什么判据是每核负载**：负载不分平台都只是 runnable + uninterruptible 的**数量**，
   拿它跟核数比才有意义。`load 8` 在 32 核上是闲的，在 4 核上已经过载。
+* **为什么必须有一节是「服务」**：磁盘题的教训是「最大的文件不是根因，目录才是」；CPU 一模一样 ——
+  nginx/gunicorn/JVM/容器里的服务都是**多进程多 worker**，每个子进程单看都不大（8 个 worker × 12%
+  在进程榜里一个都不显眼），加起来才是一个核。只给进程榜，现场会得出“没人忙”的错误结论。
+* **服务归属从哪来**：Linux 读 `/proc/<pid>/cgroup` —— `system.slice/xxx.service`、
+  `docker-<id>.scope`、`kubepods…/pod<uid>`，这才是“服务”的权威身份（进程名会重名，容器里处处是 `java`）。
+  其它平台只能按**可执行名**聚合，渲染层会明说「同一服务的多个可执行文件可能被拆开」——
+  不把局限写出来，那张表会被当成完整答案。
+* **精确累计**：Linux 读 cgroup 的 `cpu.stat`（`usage_usec`）两次差值，得到**不依赖进程采样**的
+  每服务 CPU；它包含「窗口内起落、采样时已经没了」的进程，这种服务在表里会出现（`进程数 = 0`，
+  备注写「窗口内已退出」）。读不到（权限/非 Linux）就退回“进程采样加总”，并在正文标注。
 * **为什么单列「不可中断睡眠」**：**负载高但 CPU 空闲**的头号原因是进程卡在磁盘/网络存储上
   （`D` 状态：杀不掉、也不吃 CPU）。只看 CPU 排行会得出“没有谁在忙”，然后去扩容 CPU —— 那不是根因。
   本节的 hint 会把下一步指向 `investigate disk`（是谁在写）而不是 CPU 扩容。
 * **为什么单个核打满也要报**：总占用 20% 而某线程 100%，是“负载不高但服务慢”最常见的形态；
   判定放 WARN 而不是 FAIL（机器还活着），hint 直接点「单线程瓶颈、加核没用」。
 * **为什么采样必须说窗口**：CPU% 是**两次刷新之间的增量**（sysinfo 需要 ≥200ms）。
-  默认 300ms～1s（`--max-seconds` 可拉长），报告里写明 `window=…ms`；窗口异常短时本节判 WARN。
+  窗口 1s～3s（`--max-seconds` 可拉长到 3s）：1s 里周期性批处理/GC 的尖峰经常刚好躲过，
+  多等 2s 是值得的。报告里写明 `window=…ms`；窗口异常短时本节判 WARN。
 * **为什么 swap 要单独说**：swap 在用 = 已经在换页，延迟会抖、OOM killer 随时可能动手；
   而 macOS 的 swap 是动态的，`sysinfo` 常报 0 —— 这时只能写「读不到」，不能写「未启用」（那是没证据的断言）。
 * **为什么先排除 agent 自己**：调查/采集本身也吃 CPU；不先把这一项摆出来，运维会去翻半天别的进程。
