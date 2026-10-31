@@ -53,12 +53,23 @@ pub const MAX_TOP: usize = 50;
 pub const DEFAULT_DEPTH: usize = 16;
 pub const MAX_DEPTH: usize = 64;
 
-/// 单次扫描的时长上限（秒）。默认 5s：足够扫完一台普通机器的根盘，又不至于卡住一次状态上报。
-pub const DEFAULT_MAX_SCAN_SECONDS: u64 = 5;
-pub const MAX_SCAN_SECONDS: u64 = 30;
+/// 单次扫描的时长上限（秒）。
+///
+/// 默认 **120s**：调查是**一次性、只读、人工触发**的，而“盘满了到底是哪个目录”
+/// 在真实机器上就需要这么久 —— 实测：macOS 上 `~/devspace` 单是它自己就有 1.6M 条，
+/// 本机约 24k 条/秒，扫完它要一分多钟。用小默认值换来的“快”只是“没扫到”的假象
+/// （现场反馈：最大的目录根本进不了表）。扫完就提前结束，小盘上依旧毫秒级。
+pub const DEFAULT_MAX_SCAN_SECONDS: u64 = 120;
+/// 上限 300s：留给“整盘几十万个目录”的极端现场。
+pub const MAX_SCAN_SECONDS: u64 = 300;
 
-/// 扫描条目上限（个）：挡住「几百万小文件」把时间和内存吃掉的情况。
-pub const SCAN_ENTRY_LIMIT: u64 = 200_000;
+/// 扫描条目上限（个）：挡住「几百万小文件」把时间吃掉的情况。
+///
+/// 这个值**不能小**：以前钉在 200k，结果 5.9s 就撞上限，`--max-seconds` 再大也无效
+/// （现场那台 macOS 的 `/Users` 就是 200 万条，永远扫不到 `devspace`）。
+/// 内存靠 [`crate::investigate_disk`] 的目录 arena + 目录数封顶来控制（每目录 ~100B），
+/// 而不是靠把条目数钉死。
+pub const SCAN_ENTRY_LIMIT: u64 = 3_000_000;
 
 /// 报告契约前缀：完整报告与数据面 `IVSREP` 帧共用一个带版本的 id
 /// （`wist.investigation.<topic>/v1`）。网关按它选渲染/落库规则，未知版本降级为原文展示。

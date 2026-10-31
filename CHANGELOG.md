@@ -3,6 +3,47 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.16.0-alpha] - 2026-10-31
+
+### 修复（“最大的目录根本没找到” —— 三个真原因）
+
+现场反馈：`/Users/zuowenjian/devspace/rust` 是最大的目录，报告里完全没有它。
+重查后确认是三个叠加的缺陷，不是“没扫完”一句话能交代的：
+
+1. **体量用错了口径（最严重）**：用的是 `metadata.len()`（逻辑大小），不是盘上实际占用。
+   稀疏文件（VM 磁盘镜像）的 `len()` 能是实际占用的几十倍 —— 现场实测：
+   OrbStack 的一个镜像 `len()` = **927 GiB**，实际只占 **63 GiB**（而整盘才 926 GiB）。
+   结果是报告凭空多出 800 多 GiB，并且把真正的目录（104 GiB）挤出榜单。
+   现在统一用 `st_blocks * 512`（与 `du` 同口径），`disk.top_files` 同理。
+2. **条目上限 200k 把预算锁死了**：实测 5.9s 就撞上限，`--max-seconds` 再大也**无效** ——
+   而现场那台 macOS 的 `/Users` 有 **200 万条**、`~/devspace` 自己就 160 万条。
+   现在条目上限提到 **3M**，由**时间**主导（默认 **120s**、上限 **300s**；扫完提前结束）。
+3. **每个目录 1.4 KB 的内存成本**（旧实现一个目录存 3~4 份完整路径，200k 条 = 66 MB）
+   是上一条解不开的直接原因。改成**目录 arena**（一份路径 + id 互指，~100B/目录）：
+   同样 200k 条从 **66 MB → 28 MB**，扫描从 **3.9s → 2.1s**；现在 1.5M 条/30s 也能跑。
+
+修完实测（同一条命令 `investigate disk --path /Users`，默认 120s）：
+
+```
+/Users/zuowenjian                      377.5 GiB
+/Users/zuowenjian/Library              105.6 GiB
+/Users/zuowenjian/devspace              99.7 GiB   ← 之前根本不出现
+/Users/zuowenjian/devspace/rust         93.1 GiB   ← 用户指的那个
+.../devspace/rust/x-topology/wist       73.6 GiB
+```
+
+其他随行：
+
+- 重扫 hint 直接给 `--max-seconds 300`（旧值 60 秒对两百万条的目录依旧 “没扫完”，等于让人再失望一次）；
+- 新增 `disk.scan` 的 `dirs_untracked=`（跟踪目录数封顶 80 万时的兜底计数，不为 0 就说明有体量没归到目录上）；
+- 网关侧 `max_seconds` 夹紧同步改为 1..=300（旧值 30 会把 UI 的请求夹回去）。
+
+### 测试（+2，共 37；lib 1000 全绿）
+
+- `a_sparse_file_is_counted_by_its_allocated_size_not_its_length`：512 MiB 的空洞文件不能按 512 MiB 计；
+- `the_incomplete_hint_gives_a_budget_that_can_actually_finish`：hint 必须给到上限预算。
+- 受口径变化影响的 10 个旧用例改成“按 `disk_size()` 算期望值”（文件系统块大小相关的断言不再写死字节数）。
+
 ## [0.15.1-alpha] - 2026-10-31
 
 ### 修复（对 `load` 题做了 5 轮 review，找到 4 个真缺陷）
