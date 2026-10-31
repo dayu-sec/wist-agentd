@@ -33,6 +33,8 @@ use support::{
 // 生效输出解析要给主循环用（它在短路前算），所以在同一层再导出一次；
 // `pub(crate)` 也让 `doctor` 复用同一套判定（工具说一套、进程做一套是没有意义的）。
 pub(crate) use support::effective_output;
+/// 调查（`telemetry-health`）复用同一条 spool 路径：两处各写一份迟早会漂。
+pub(crate) use support::spool_path_for;
 
 #[derive(::jumo_derive::Jumo)]
 #[jumo(kind = "struct", domain = "Reporting", module = "Reporting.Health")]

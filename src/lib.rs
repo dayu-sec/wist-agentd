@@ -21,6 +21,8 @@ pub(crate) mod investigate_persistence;
 pub(crate) mod investigate_probe;
 /// 调查报告的出口脱敏与结构校验（策略：`investigation/redaction-policy.toml`）。
 pub mod investigate_safety;
+/// 遥测健康（我们瞎了多久）：源还在产出吗、积压送得出去吗。
+pub(crate) mod investigate_telemetry;
 pub mod reporting;
 pub mod runtime;
 pub mod service;

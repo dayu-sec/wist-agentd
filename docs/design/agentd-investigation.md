@@ -434,3 +434,53 @@ launchd 域与 `netstat` 走的是另一套“只读查询命令白名单”，�
 * 真机验收：`sudo dev/verify-investigate-security.sh`（root + non-root 两轮；
   macOS 上可用 OrbStack 的 Docker 跑，命令见 README）。它验单测证明不了的三件事：
   “非 root → `unknown` 而不是 `ok`”、`ld.so.preload` 真的会 FAIL、报告里搜不到 `$6$`。
+
+## 11. 遥测健康（`telemetry-health`）：我们瞎了多久
+
+前面几题回答“这台机器有什么”，这一题回答“**我们的眼睛还在不在**”。
+`accounts` / `persistence` 在最坏的情况下也照样能给出漂亮报告 —— 越漂亮越危险，
+因为它掩盖了“这 6 小时一条日志都没采到”。
+
+两平台都实现（判据全部来自 agentd 自己的状态文件，不依赖 `/proc` 或系统命令）。
+
+### 11.1 三节
+
+| 节 | 证据 | 判定 |
+| --- | --- | --- |
+| `telemetry.sources` | 每个配置输入：源路径在不在、有没有 checkpoint、最近一次**提交**多久前、积压未读字节 | 静默 ≥ 15 分钟 → WARN；≥ 24 小时 → FAIL；无 checkpoint / 读不到 → UNKNOWN |
+| `telemetry.backlog` | 每个输入的 spool 文件大小与最后写入时间 | 有积压 → WARN；到 `spool_max_bytes` → FAIL（运行时会把该输入 `pause`） |
+| `telemetry.pipeline` | 输出闸门（`[telemetry.logs.output] enabled/kind`）、全局 `seq` 高水位（`state/logs/seq.json`）的写入时间 | 输出关闭 → WARN；从未产出 → UNKNOWN |
+
+为什么静默分两档：15 分钟是“该看一眼”，24 小时是“这个源基本不会再有数据了”。
+只有一档阈值时，要么天天误报（低流量源），要么在真正的停摆上保持沉默。
+
+### 11.2 数据来源与口径
+
+* checkpoint：`state/logs/file_inputs/<input_id>/checkpoints.json`，取 `files[].last_commit_point_at`
+  的最大值。**宽容解析**（只认用到的字段）：真实结构体是 `deny_unknown_fields`，
+  但调查工具不该因为状态里多了一个键就整节失效。
+* spool：与采集器**同一个函数**算路径（`daemon_telemetry::spool_path_for`），
+  调查按另一套路径去猜，只会得到“报告说没积压、采集其实在 pause”。
+* `seq.json` 只在确实处理过记录时推进（`ran_any`），所以它的写入时间≈“最后一次见到任何记录”。
+* 只对**字面路径**做存在性检查；glob / 目录按 `is_family_target` 交给 checkpoint 判断，不展开匹配。
+
+### 11.3 不做什么
+
+* 不读日志正文：只看 checkpoint / spool / seq 的元数据。
+* 不 exec、不连网络、不写盘；控制面连通性仍归 `diagnose`。
+* “静默”不等于“采集坏了”：报告给的是**时长**，结论仍需结合业务（低流量源本来就安静）。
+* 不是证据型题目：`judged = true`。静默是采集面的故障，不是“好坏取决于拓扑”的事实。
+
+已在 `investigation/redaction-policy.toml` 登记（`[topics."telemetry-health"] id_prefixes = ["telemetry."]`），
+样本：`tests/fixtures/investigation/good-report-telemetry.json`。
+
+### 11.4 报告头的时间线锚点
+
+`to_json` / 数据面 `IVSREP` 正文多了两个字段：
+
+| 字段 | 来源 | 为什么 |
+| --- | --- | --- |
+| `boot_id` | Linux `/proc/sys/kernel/random/boot_id`；其它平台省略 | 报告要和采集流拼**同一次开机**的时间线：重启前的事件不该和重启后的报告混在一起 |
+| `boot_time` | `sysinfo::System::boot_time()` | 只有 `observed_at` 时，时钟被改过就再也对不上 |
+
+两者都可能缺失（非 Linux / 读不到）—— 缺失时如实省略，不编一个数。

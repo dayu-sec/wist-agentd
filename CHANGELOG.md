@@ -3,6 +3,30 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.18.0-alpha] - 2026-10-31
+
+### 新增（遥测健康：`telemetry-health` —— 我们瞎了多久）
+
+- `investigate telemetry-health`：回答“配好的安全日志源还活着吗”，而不是“机器上有什么”。
+  * `telemetry.sources`：每个配置输入的最近一次**提交**、源路径可读性、未读字节；
+    静默 ≥ 15 分钟 WARN、≥ 24 小时 FAIL；没有 checkpoint / 读不到是 `unknown`（不是 `ok`）。
+  * `telemetry.backlog`：每个输入的 spool 积压；到 `spool_max_bytes` 判 FAIL（运行时会把该输入 `pause`）。
+  * `telemetry.pipeline`：输出闸门（待命态 `enabled=false` → WARN）与全局 `seq` 高水位的写入时间。
+- 只读 agentd 自己的状态（checkpoint / spool / `seq.json`）：**不读日志正文**、不 exec、不连网络。
+- 两平台都实现（判据不依赖 `/proc`），`capabilities` 会把它报上去。
+
+### 新增（报告头的时间线锚点）
+
+- `to_json` 与数据面 `IVSREP` 正文新增 `boot_id`（Linux 读 `/proc`）与 `boot_time`：
+  调查报告要和采集流拼**同一次开机**的时间线；读不到就省略，不编一个数。
+- 出口脱敏策略的顶层白名单同步登记这两个键。
+
+### 文档 / 验收
+
+- `dev/verify-investigate-security.sh` 增加 `telemetry-health` 三段（没有 checkpoint → `unknown`、
+  近期提交 → `ok`、`boot_id` 存在），root 与非 root 两轮都跑。
+- 设计文档新增 §11（数据来源、判定与边界）。
+
 ## [0.17.0-alpha] - 2026-10-31
 
 ### 新增（安全向调查：`accounts` / `persistence` / `exposure`，Linux）

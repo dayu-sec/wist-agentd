@@ -146,7 +146,17 @@ wist-agentd investigate exposure        # 谁在听、绑在哪（0.0.0.0 / 某�
 绑定 `0.0.0.0` 是不是问题，取决于拓扑与漏洞，主机自己答不了。
 读不到的节会是 `[UNKNOWN]` 而不是 `[OK]`：缺权限不等于没问题。
 
-四题（含 `disk` / `load`）都**只读**、不需要守护进程在跑、读不到配置也能用。详见
+**遥测健康（两平台）**：
+
+```bash
+wist-agentd investigate telemetry-health # 我们瞎了多久：源还活着吗、积压送得出去吗
+```
+
+它回答的不是“机器有什么”，而是“**我们的眼睛还在不在**”：每个配置输入的最近提交时间、
+spool 积压、输出闸门与全局 seq 高水位。静默 ≥15 分钟 WARN、≥24 小时 FAIL；
+没有 checkpoint / 读不到状态是 `[UNKNOWN]`（不等于正常）。只读 agentd 自己的状态，不读日志正文。
+
+五题（含 `disk` / `load`）都**只读**、不需要守护进程在跑、读不到配置也能用。详见
 [`docs/design/agentd-investigation.md`](docs/design/agentd-investigation.md)。
 
 Linux 上的真机验收（root + non-root 两轮，含“假阴性防线”与脱敏）：

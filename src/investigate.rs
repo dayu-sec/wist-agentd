@@ -42,6 +42,8 @@ pub const TOPIC_ACCOUNTS: &str = "accounts";
 pub const TOPIC_PERSISTENCE: &str = "persistence";
 /// 暴露面：谁在听、绑在哪（**只出证据，不做安全判定**）。
 pub const TOPIC_EXPOSURE: &str = "exposure";
+/// 遥测健康：配好的安全日志源还活着吗（“我们瞎了多久”）。
+pub const TOPIC_TELEMETRY: &str = "telemetry-health";
 
 pub const TOPICS: &[&str] = &[
     TOPIC_DISK,
@@ -49,6 +51,7 @@ pub const TOPICS: &[&str] = &[
     TOPIC_ACCOUNTS,
     TOPIC_PERSISTENCE,
     TOPIC_EXPOSURE,
+    TOPIC_TELEMETRY,
 ];
 
 /// 只出证据、不做安全判定的题：`verdict` 必须说“N 项证据”，不能说“全部正常”。
@@ -571,6 +574,9 @@ impl Report {
             "report_schema": self.report_schema(),
             "version": env!("CARGO_PKG_VERSION"),
             "observed_at": self.observed_at,
+            // 与采集流拼时间线用的锚点：见 `boot_id` / `boot_time_rfc3339`。
+            "boot_id": boot_id(),
+            "boot_time": boot_time_rfc3339(),
             // 这一题有没有做安全判定：`false` 时前端不能说“正常”。
             "judged": self.judged(),
             "findings": findings,
@@ -689,6 +695,9 @@ pub async fn execute(
         TOPIC_EXPOSURE => {
             crate::investigate_exposure::investigate(&request, config_for_task.as_ref())
         }
+        TOPIC_TELEMETRY => {
+            crate::investigate_telemetry::investigate(&request, config_for_task.as_ref())
+        }
         other => Err(format!("unknown investigation topic `{other}`")),
     })
     .await
@@ -800,6 +809,32 @@ pub(crate) fn running_as_root() -> bool {
 fn load_optional_config(config_root: &Path) -> Option<AgentConfig> {
     let path = crate::config_runtime::resolve_config_path(config_root);
     crate::config_runtime::load_from_path(&path).ok()
+}
+
+/// 本机这次开机的唯一标识（Linux 从 `/proc` 读；其它平台没有同语义的稳定值，返回 `None`）。
+///
+/// 为什么要它：调查报告与采集流必须能拼到**同一次开机**上 —— 重启前的事件不该和
+/// 重启后的报告混在一起，而 `observed_at` 只给了墙钟（时钟被改过就对不上）。
+pub fn boot_id() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// 开机时刻（RFC3339）。取自 `sysinfo`，跨平台；读不到就给 `None`，不编一个数。
+pub fn boot_time_rfc3339() -> Option<String> {
+    let seconds = i64::try_from(sysinfo::System::boot_time()).ok()?;
+    let boot = time::OffsetDateTime::from_unix_timestamp(seconds).ok()?;
+    boot.format(&time::format_description::well_known::Rfc3339)
+        .ok()
 }
 
 /// 人类可读的体量（二进制单位，一位小数）：`12.3 GiB`。

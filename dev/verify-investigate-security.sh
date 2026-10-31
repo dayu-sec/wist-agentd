@@ -78,6 +78,52 @@ investigate() {
   "$BIN" investigate "$1" --json 2>/dev/null
 }
 
+# ---- telemetry-health（不依赖 root：验“没采到 ≠ 正常”）--------------------
+telemetry_suite() {
+  printf '\n== telemetry-health ==\n'
+  local dir cfg out now
+  dir=$(mktemp -d)
+  cfg="$dir/cfg"
+  mkdir -p "$cfg" "$dir/state" "$dir/spool"
+  : >"$dir/source.log"
+  # 最小配置：一个真实存在的源，但还没有任何 checkpoint。
+  cat >"$cfg/agentd.toml" <<CFG
+schema_version = "v1"
+
+[paths]
+state_dir = "$dir/state"
+
+[telemetry.logs]
+spool_dir = "$dir/spool"
+
+[[telemetry.logs.file_inputs]]
+input_id = "verify"
+path = "$dir/source.log"
+CFG
+
+  out=$("$BIN" investigate telemetry-health --config-dir "$cfg" --json 2>/dev/null)
+  assert_jq "telemetry-health 标记了 judged" "$out" '.judged == true'
+  assert_jq "telemetry-health 带 boot_id（时间线锚点）" "$out" '.boot_id != null'
+  assert_jq "telemetry-health 带 boot_time" "$out" '.boot_time != null'
+  assert_jq "没有 checkpoint → 源是 unknown（不是 ok）" "$out" \
+    '.findings[] | select(.id == "telemetry.sources") | .status == "unknown"'
+  assert_no "没采到不说“全部正常”" "$out" '全部正常'
+
+  # 写一份“刚刚提交过”的 checkpoint：同一个源必须是 ok。
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  mkdir -p "$dir/state/logs/file_inputs/verify"
+  cat >"$dir/state/logs/file_inputs/verify/checkpoints.json" <<JSON
+{"schema_version":"v1","input_id":"verify","updated_at":"$now","files":[{"file_id":"f1","path":"$dir/source.log","device_id":null,"inode":null,"fingerprint":null,"checkpoint_offset":0,"checkpoint_probe":null,"last_size":0,"last_read_at":"$now","last_commit_point_at":"$now","rotated_from_path":null}]}
+JSON
+  out=$("$BIN" investigate telemetry-health --config-dir "$cfg" --json 2>/dev/null)
+  assert_jq "近期提交 → 源是 ok" "$out" \
+    '.findings[] | select(.id == "telemetry.sources") | .status == "ok"'
+  assert_jq "没有积压时 backlog 是 ok" "$out" \
+    '.findings[] | select(.id == "telemetry.backlog") | .status == "ok"'
+
+  rm -rf "$dir"
+}
+
 # ---- 注入/清理（root 一轮专用） --------------------------------------------
 
 PRELOAD_TEST=0
@@ -104,6 +150,7 @@ cleanup_state() {
 
 root_suite() {
   printf '\n== root ==\n'
+  telemetry_suite
 
   # 1) accounts 基线：契约字段齐全，且不含任何口令哈希。
   local out
@@ -213,6 +260,7 @@ DROPIN
 
 nonroot_suite() {
   printf '\n== nobody（假阴性防线）==\n'
+  telemetry_suite
   local out
   out=$(investigate accounts)
   assert_jq "非 root：accounts 总状态是 unknown（不是 ok）" "$out" \

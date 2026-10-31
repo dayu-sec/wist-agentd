@@ -308,7 +308,11 @@ pub(super) fn selection_filtered_failure(
     }
 }
 
-fn spool_path_for(config: &AgentConfig, input: &LogFileInputSection) -> PathBuf {
+/// 输入对应的 spool 文件。
+///
+/// `pub(crate)` 是为了让 `investigate telemetry-health` 看**同一个**文件：
+/// 调查按另一套路径去猜，只会得到“报告说没积压、采集其实在 pause”。
+pub(crate) fn spool_path_for(config: &AgentConfig, input: &LogFileInputSection) -> PathBuf {
     Path::new(&config.telemetry.logs.spool_dir).join(format!("{}.ndjson", input.input_id))
 }
 

@@ -20,7 +20,7 @@ schema_prefix = "wist.investigation"
 
 [envelope]
 # 顶层只允许这些键（`deny_unknown_fields` 的运行时版本）。
-top_keys = ["command", "topic", "report_schema", "version", "observed_at", "judged", "limits", "findings", "summary", "verdict", "command_id", "rows_omitted"]
+top_keys = ["command", "topic", "report_schema", "version", "observed_at", "boot_id", "boot_time", "judged", "limits", "findings", "summary", "verdict", "command_id", "rows_omitted"]
 finding_keys = ["id", "status", "title", "detail", "hint", "rows", "coverage"]
 row_keys = ["label", "value", "note"]
 summary_keys = ["ok", "warn", "fail", "unknown", "overall"]
@@ -40,6 +40,11 @@ id_prefixes = ["persistence."]
 
 [topics.exposure]
 id_prefixes = ["exposure."]
+
+# 主题名是 `telemetry-health`（带连字符，TOML 里要加引号），
+# 节 id 统一用 `telemetry.` 前缀。
+[topics."telemetry-health"]
+id_prefixes = ["telemetry."]
 
 # ---------------------------------------------------------------------------
 # 字段名黑名单

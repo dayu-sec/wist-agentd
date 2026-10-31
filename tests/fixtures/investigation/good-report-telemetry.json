@@ -1,0 +1,56 @@
+{
+  "command": "investigate",
+  "topic": "telemetry-health",
+  "report_schema": "wist.investigation.telemetry-health/v1",
+  "version": "0.18.0",
+  "observed_at": "2026-10-31T09:00:00Z",
+  "boot_id": "0f5d1f2e-9c4a-4a55-9b1e-6d2c3f7a8b10",
+  "boot_time": "2026-10-28T03:12:41Z",
+  "judged": true,
+  "limits": [
+    "静默时长按 checkpoint 里最近一次**提交**记录算；低流量源本来就安静，不等于采集坏了",
+    "只对字面路径做存在性检查；文件族（glob / 目录）只按 checkpoint 判断，不展开匹配",
+    "不读日志正文，只看 checkpoint 元数据",
+    "积压按 spool 文件字节数估算；是否 `pause` 由运行时决定（`spool_over_limit` 当前只有 `pause`）",
+    "只读 agentd 自己的状态（`state/logs/seq.json` / 输出配置）；控制面连通性由 `diagnose` 判定"
+  ],
+  "findings": [
+    {
+      "id": "telemetry.sources",
+      "status": "warn",
+      "title": "1 个源静默超过 15 分钟",
+      "detail": "配置输入 2 个；读到 checkpoint 2 个；无 checkpoint 0 个；静默 1 个",
+      "hint": "静默可能是真的没流量，也可能是服务停了 / 轮转换了文件 / 路径写错：先去源上确认最后一条日志是什么时候、服务是否还在跑",
+      "rows": [
+        { "label": "auditd", "value": "2 小时 14 分钟前", "note": "1 个文件" },
+        { "label": "suricata", "value": "刚刚", "note": "3 个文件；未读 120 B" }
+      ],
+      "coverage": { "checked": 2, "denied": 0, "skipped": 0 }
+    },
+    {
+      "id": "telemetry.backlog",
+      "status": "warn",
+      "title": "1 个输入有未送出的积压",
+      "detail": "输入 2 个；spool 可读 1 个；有积压 1 个",
+      "hint": "积压说明记录还在本地、没送到平台：先看 uplink 是否断开（`diagnose`），再谈采集本身",
+      "rows": [
+        { "label": "auditd", "value": "4.2 MiB", "note": "上限 256 MiB；最后写入 12 分钟前" }
+      ],
+      "coverage": { "checked": 2, "denied": 0, "skipped": 0 }
+    },
+    {
+      "id": "telemetry.pipeline",
+      "status": "ok",
+      "title": "采集链路在产出",
+      "detail": "配置输入 2 个；输出闸门 开启（tcp 10.0.1.9:7801）",
+      "hint": null,
+      "rows": [
+        { "label": "采集输出", "value": "开启", "note": "tcp 10.0.1.9:7801" },
+        { "label": "最近产出", "value": "刚刚", "note": "state/logs/seq.json 的写入时间" }
+      ],
+      "coverage": { "checked": 1, "denied": 0, "skipped": 0 }
+    }
+  ],
+  "summary": { "ok": 1, "warn": 2, "fail": 0, "unknown": 0, "overall": "warn" },
+  "verdict": "1 项正常 / 2 项警告 / 0 项失败；首要问题：1 个源静默超过 15 分钟"
+}
