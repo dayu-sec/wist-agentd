@@ -43,7 +43,8 @@ use std::time::{Duration, Instant};
 use crate::config::agent_config::AgentConfig;
 use crate::doctor::Status;
 use crate::investigate::{
-    Finding, InvestigateRequest, Row, SCAN_ENTRY_LIMIT, human_bytes, percent, scan_budget,
+    Finding, InvestigateRequest, MAX_DEPTH, Row, SCAN_ENTRY_LIMIT, human_bytes, percent,
+    scan_budget,
 };
 
 /// 空间 / inode 的告警线：到 85% 就该动手，95% 基本已经在掉功能（日志写不进、临时文件建不了）。
@@ -273,13 +274,25 @@ fn largest_dirs_finding(walk: &WalkReport) -> Finding {
         .collect();
 
     if rows.is_empty() {
+        // 「读不了」与「真的空」必须分开说，否则一个没权限的盘会被当成空盘。
+        let (title, why) = if walk.unreadable > 0 {
+            (
+                "没有可列出的目录（读不了）",
+                "需要 root：`sudo wist-agentd investigate disk`".to_string(),
+            )
+        } else {
+            (
+                "没有可列出的目录",
+                format!("扫描根 {} 下没有非空子目录", walk.root.display()),
+            )
+        };
         return Finding::ok(
             "disk.largest_dirs",
-            "没有可列出的目录",
+            title,
             format!(
-                "扫描根 {} 下没有非空子目录（已扫 {}）",
-                walk.root.display(),
-                human_bytes(total)
+                "{why}（已扫 {}）{}",
+                human_bytes(total),
+                unreadable_caveat(walk)
             ),
         );
     }
@@ -310,10 +323,11 @@ fn largest_dirs_finding(walk: &WalkReport) -> Finding {
         })
         .unwrap_or_else(|| format!("递归累计最大的是 {deepest}"));
     let detail = format!(
-        "扫描根 {}；{hotspot}（已扫 {}）{}",
+        "扫描根 {}；{hotspot}（已扫 {}）{}{}",
         walk.root.display(),
         human_bytes(total),
-        incomplete_caveat(walk)
+        incomplete_caveat(walk),
+        unreadable_caveat(walk)
     );
 
     let mut finding = Finding::ok("disk.largest_dirs", "最大的目录（递归累计）", detail).rows(rows);
@@ -328,15 +342,31 @@ fn largest_dirs_finding(walk: &WalkReport) -> Finding {
     finding
 }
 
-/// 没扫完的一级目录的相对名（`/Users` 而不是 `/System/Volumes/Data/Users`）。
-fn incomplete_labels(walk: &WalkReport) -> Vec<String> {
+/// 把一级目录写成相对扫描根的名字（`/Users` 而不是 `/System/Volumes/Data/Users`）。
+fn relative_label(walk: &WalkReport, path: &Path) -> String {
+    path.strip_prefix(&walk.root)
+        .map(|relative| format!("/{}", relative.display()))
+        .unwrap_or_else(|_| path.display().to_string())
+}
+
+/// 列表太长就只点名前几个（后面的靠表格自己看）。
+fn join_labels(walk: &WalkReport, dirs: &[PathBuf]) -> String {
+    let labels: Vec<String> = dirs.iter().map(|path| relative_label(walk, path)).collect();
+    if labels.len() > INCOMPLETE_DIRS_SHOWN {
+        format!(
+            "{} 等 {} 个",
+            labels[..INCOMPLETE_DIRS_SHOWN].join("、"),
+            labels.len()
+        )
+    } else {
+        labels.join("、")
+    }
+}
+
+fn incomplete_paths(walk: &WalkReport) -> Vec<PathBuf> {
     walk.incomplete_dirs
         .iter()
-        .map(|(path, _)| {
-            path.strip_prefix(&walk.root)
-                .map(|relative| format!("/{}", relative.display()))
-                .unwrap_or_else(|_| path.display().to_string())
-        })
+        .map(|(path, _)| path.clone())
         .collect()
 }
 
@@ -345,19 +375,22 @@ fn incomplete_caveat(walk: &WalkReport) -> String {
     if walk.incomplete_dirs.is_empty() {
         return String::new();
     }
-    let labels = incomplete_labels(walk);
-    let shown = if labels.len() > INCOMPLETE_DIRS_SHOWN {
-        format!(
-            "{} 等 {} 个",
-            labels[..INCOMPLETE_DIRS_SHOWN].join("、"),
-            labels.len()
-        )
-    } else {
-        labels.join("、")
-    };
     format!(
-        "；**{} 个一级目录没扫完**（{shown}），它们实际只会更大",
-        labels.len()
+        "；**{} 个一级目录没扫完**（{}）—— 表里是已扫到的下界，实际更大",
+        walk.incomplete_dirs.len(),
+        join_labels(walk, &incomplete_paths(walk))
+    )
+}
+
+/// 「有 N 个一级目录整条读不了（…）」的短句（空 = 没有）。
+fn unreadable_caveat(walk: &WalkReport) -> String {
+    if walk.unreadable_dirs.is_empty() {
+        return String::new();
+    }
+    format!(
+        "；**{} 个一级目录读不了**（{}）—— 它们一个字节也没计入，需 root",
+        walk.unreadable_dirs.len(),
+        join_labels(walk, &walk.unreadable_dirs)
     )
 }
 
@@ -473,6 +506,7 @@ fn unattributed_finding(walk: &WalkReport, filesystems: &[FsUsage]) -> Finding {
         // 盘满但“扫不到东西”时，这一句就是整个报告的结论：大头在没扫完的那几个目录里。
         detail.push_str(&incomplete_caveat(walk));
     }
+    detail.push_str(&unreadable_caveat(walk));
     if deleted_files > 0 {
         detail.push_str(&format!(
             "；其中 {} 个已删除但仍被进程打开的文件占 {}（需要重启对应进程才能释放）",
@@ -497,6 +531,16 @@ fn unattributed_finding(walk: &WalkReport, filesystems: &[FsUsage]) -> Finding {
         detail,
     );
 
+    let unreadable_hint = if walk.unreadable_dirs.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "{} 个一级目录整条读不了（{}）：那一块体量没算进来，以 root 重跑才能看见",
+            walk.unreadable_dirs.len(),
+            join_labels(walk, &walk.unreadable_dirs)
+        ))
+    };
+
     if significant && !walk.truncated {
         let mut hints = vec![
             "差量常见的四个来源：其它挂载点（数据盘、容器卷）、文件系统快照/副本、\
@@ -509,7 +553,13 @@ fn unattributed_finding(walk: &WalkReport, filesystems: &[FsUsage]) -> Finding {
                     .to_string(),
             );
         }
+        if let Some(hint) = unreadable_hint {
+            hints.push(hint);
+        }
         finding = finding.hint(hints.join("\n"));
+    } else if let Some(hint) = unreadable_hint {
+        // 差量不够“显著”、但确实有目录整条没读：也要把原因说出来。
+        finding = finding.hint(hint);
     }
     finding
 }
@@ -581,7 +631,7 @@ fn top_dirs_finding(walk: &WalkReport, filesystems: &[FsUsage]) -> Finding {
                 .map(|name| name.to_string_lossy().to_string())
         })
         .collect();
-    let rows: Vec<Row> = walk
+    let mut rows: Vec<Row> = walk
         .top_dirs
         .iter()
         .map(|(label, bytes)| {
@@ -597,33 +647,59 @@ fn top_dirs_finding(walk: &WalkReport, filesystems: &[FsUsage]) -> Finding {
             Row::new(path, human_bytes(*bytes), note)
         })
         .collect();
+    // 整目录读不了的不在 `top_dirs` 里（没字节可分桶）—— 直接补行，
+    // 否则它们在报告里等于“不存在”，又回到本次要修的那个坑。
+    for path in &walk.unreadable_dirs {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let represented = walk.top_dirs.iter().any(|(label, _)| label == &name);
+        if !represented {
+            rows.push(Row::new(
+                path.display().to_string(),
+                "—",
+                "**读不了**（需要 root），这里不是 0",
+            ));
+        }
+    }
 
     let on = filesystem_for_path(&walk.root, filesystems)
         .filter(|fs| walk.root != Path::new(&fs.mount))
         .map(|fs| format!("；位于 {}（{:.1}% 已用）", fs.mount, fs.used_percent))
         .unwrap_or_default();
-    let truncated = if !walk.incomplete_dirs.is_empty() {
-        incomplete_caveat(walk)
-    } else if walk.truncated {
-        "；**扫描未完成**，占比只代表已扫到的部分".to_string()
-    } else {
-        String::new()
-    };
+    let mut truncated = String::new();
+    if walk.truncated && walk.incomplete_dirs.is_empty() {
+        truncated.push_str("；**扫描未完成**，占比只代表已扫到的部分");
+    }
+    truncated.push_str(&incomplete_caveat(walk));
+    truncated.push_str(&unreadable_caveat(walk));
     let dir_count = walk.top_level_dirs.max(walk.top_dirs.len());
     let detail = format!(
         "扫描根 {}{on}；共 {} 个一级目录，列出最大的 {} 个（已扫 {}）{truncated}",
         walk.root.display(),
         dir_count,
-        rows.len(),
+        walk.top_dirs.len(),
         human_bytes(total)
     );
 
     let mut finding = Finding::ok("disk.top_dirs", "一级目录占用", detail).rows(rows);
     if walk.top_dirs.is_empty() {
+        let (title, why) = if walk.unreadable > 0 {
+            (
+                "扫描根读不了（权限）",
+                "没有权限读扫描根，也就没有一级目录可列（需要 root）".to_string(),
+            )
+        } else {
+            (
+                "扫描根下没有子目录（只有文件）",
+                "扫描根里只有文件、没有子目录".to_string(),
+            )
+        };
         finding = Finding::ok(
             "disk.top_dirs",
-            "扫描根下没有子目录（只有文件）",
-            format!("扫描根 {}{on}", walk.root.display()),
+            title,
+            format!("{why}；扫描根 {}{on}", walk.root.display()),
         );
     }
     match incomplete_hint(walk) {
@@ -789,7 +865,7 @@ fn agent_dirs_finding(config: &AgentConfig, scan_root: &Path, walk: &WalkReport)
 
 fn scan_finding(walk: &WalkReport, request: &InvestigateRequest) -> Finding {
     let detail = format!(
-        "root={} files={} dirs={} total={} elapsed={:.1}s depth≤{} entries≤{} truncated={} unreadable={} symlinks={} other_mounts={} incomplete_top_dirs={}",
+        "root={} files={} dirs={} total={} elapsed={:.1}s depth≤{} entries≤{} truncated={} unreadable={} symlinks={} other_mounts={} incomplete_top_dirs={} unreadable_top_dirs={} depth_limited={}",
         walk.root.display(),
         walk.files,
         walk.directories,
@@ -801,7 +877,9 @@ fn scan_finding(walk: &WalkReport, request: &InvestigateRequest) -> Finding {
         walk.unreadable,
         walk.symlinks,
         walk.other_filesystems,
-        walk.incomplete_dirs.len()
+        walk.incomplete_dirs.len(),
+        walk.unreadable_dirs.len(),
+        walk.depth_limited
     );
 
     let mut hints = Vec::new();
@@ -811,6 +889,19 @@ fn scan_finding(walk: &WalkReport, request: &InvestigateRequest) -> Finding {
              每个目录都拿到了一部分，没扫完的已在「一级目录占用」里点名；\
              要拿全某一个目录，单独扫它（`wist-agentd investigate disk --path <目录> --max-seconds 60`）",
             SCAN_ENTRY_LIMIT, request.max_seconds
+        ));
+    }
+    if walk.depth_limited > 0 {
+        hints.push(format!(
+            "有 {} 个目录在 `--depth {}` 处到顶，它们的深层内容**没计入**（体量/占比都是下界）；\
+             要更全就把 `--depth` 加大（上限 {}）",
+            walk.depth_limited, request.depth, MAX_DEPTH
+        ));
+    }
+    if !walk.unreadable_dirs.is_empty() {
+        hints.push(format!(
+            "整目录读不了（需 root，当前完全没计入）：{}",
+            join_labels(walk, &walk.unreadable_dirs)
         ));
     }
     if walk.unreadable > 0 {
@@ -834,6 +925,8 @@ fn scan_finding(walk: &WalkReport, request: &InvestigateRequest) -> Finding {
         "disk.scan",
         status,
         match status {
+            // 深度到顶不是「扫描失败」，但数字确实是下界 —— 标题不能只写「完成」。
+            Status::Ok if walk.depth_limited > 0 => "扫描完成（部分目录深度到顶）",
             Status::Ok => "扫描完成",
             _ => "扫描没走全（结论只覆盖已扫到的部分）",
         },
@@ -967,6 +1060,12 @@ pub(crate) struct WalkReport {
     /// **没扫完**的一级目录及其已扫到的字节（按字节降序）。空 = 每个一级目录都扫完了。
     /// 这一项不能省：预算撞上限时，没扫的目录在表里看起来就像“很小”。
     pub incomplete_dirs: Vec<(PathBuf, u64)>,
+    /// **整个目录读不了**（权限）的一级目录。它们会从「一级目录占用」里整条消失 ——
+    /// 与「预算不够」是同一类假象（没出现被当成不存在），但处置不同（要 root，不是重扫）。
+    pub unreadable_dirs: Vec<PathBuf>,
+    /// 因为 `--depth` 到顶而没有展开的目录数。它们的深层体量**没算进来** ——
+    /// 只要不为 0，报告里所有体量/占比就都是下界。
+    pub depth_limited: u64,
     /// 硬链接被去重的字节数（同一 inode 只算一次；否则容器层会凭空多出一倍体积）。
     pub hardlinks_deduped: u64,
 }
@@ -990,6 +1089,8 @@ impl WalkReport {
             largest_dirs: Vec::new(),
             hot_path: Vec::new(),
             incomplete_dirs: Vec::new(),
+            unreadable_dirs: Vec::new(),
+            depth_limited: 0,
             hardlinks_deduped: 0,
         }
     }
@@ -1009,6 +1110,8 @@ struct Subtree {
     root: PathBuf,
     stack: Vec<(PathBuf, usize)>,
     cursor: Option<DirCursor>,
+    /// 这个一级目录**根本打不开**（权限）：它不会贡献任何字节，必须单独点名。
+    unreadable: bool,
 }
 
 impl Subtree {
@@ -1018,6 +1121,7 @@ impl Subtree {
             root,
             stack,
             cursor: None,
+            unreadable: false,
         }
     }
 
@@ -1186,6 +1290,10 @@ impl<'o> Walker<'o> {
             self.dir_bytes.entry(path.clone()).or_insert(0);
             if cursor.depth < self.options.max_depth {
                 sink.push((path, cursor.depth + 1));
+            } else {
+                // 深度到顶：这个目录里的东西**不会被计入**。不计数就会让下面的体量
+                // 看起来像“已全量”，而实际上漏了一层以后的所有内容。
+                self.report.depth_limited += 1;
             }
             return;
         }
@@ -1256,8 +1364,15 @@ impl<'o> Walker<'o> {
                 subtree.stack.push((path, depth));
                 return Step::OutOfTime;
             }
-            if let Some(cursor) = self.open(path, depth) {
-                subtree.cursor = Some(cursor);
+            let is_subtree_root = path == subtree.root;
+            match self.open(path, depth) {
+                Some(cursor) => subtree.cursor = Some(cursor),
+                None => {
+                    if is_subtree_root {
+                        /* 整目录读不了：它连一个字节都不会贡献，得在报告里点名 */
+                        subtree.unreadable = true;
+                    }
+                }
             }
         }
     }
@@ -1333,6 +1448,15 @@ impl<'o> Walker<'o> {
             .collect();
         incomplete.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         self.report.incomplete_dirs = incomplete;
+
+        // 整个读不了的一级目录：与「没扫完」分开报 —— 处置不同（需要 root，不是重扫）。
+        let mut unreadable: Vec<PathBuf> = subtrees
+            .iter()
+            .filter(|subtree| subtree.unreadable)
+            .map(|subtree| subtree.root.clone())
+            .collect();
+        unreadable.sort();
+        self.report.unreadable_dirs = unreadable;
 
         self.report.elapsed_ms = self.started.elapsed().as_millis() as u64;
         self.report
@@ -2067,6 +2191,112 @@ mod tests {
     }
 
     #[test]
+    fn a_scan_with_enough_budget_reports_nothing_unfinished() {
+        let dir = TempDir::new("complete");
+        write_file(&dir.path().join("a/f.bin"), 10);
+        write_file(&dir.path().join("b/c/f.bin"), 20);
+
+        let report = walk(&options(dir.path())).expect("walk");
+
+        // 反例守卫：别让“没扫完”变成永远挂着的免责声明。
+        assert!(!report.truncated);
+        assert!(
+            report.incomplete_dirs.is_empty(),
+            "{:?}",
+            report.incomplete_dirs
+        );
+        assert!(
+            report.unreadable_dirs.is_empty(),
+            "{:?}",
+            report.unreadable_dirs
+        );
+        assert_eq!(report.depth_limited, 0);
+        assert_eq!(report.top_level_dirs, 2);
+    }
+
+    #[test]
+    fn resuming_a_cursor_never_counts_a_file_twice() {
+        let dir = TempDir::new("resume");
+        for index in 0..50 {
+            write_file(&dir.path().join(format!("d/f{index}.bin")), 100);
+        }
+        let mut options = options(dir.path());
+        // 12 条预算 = 至少被切成 5 片；如果「续扫」退化成「从头重扫」，字节数会成倍膨胀。
+        options.max_entries = 12;
+
+        let report = walk(&options).expect("walk");
+
+        assert!(report.truncated);
+        assert!(report.files > 0, "应当已经扫到一些文件");
+        assert!(
+            report.files <= 50,
+            "文件数不能超过真实数量：{}",
+            report.files
+        );
+        assert_eq!(
+            report.total_bytes,
+            report.files * 100,
+            "每个文件只能计一次（{} 个文件）",
+            report.files
+        );
+    }
+
+    #[test]
+    fn walk_counts_directories_it_stopped_descending_at_the_depth_cap() {
+        let dir = TempDir::new("depth-cap");
+        write_file(&dir.path().join("a/b/f.bin"), 999);
+        let mut options = options(dir.path());
+        options.max_depth = 1;
+
+        let report = walk(&options).expect("walk");
+
+        assert_eq!(report.depth_limited, 1, "到顶的目录必须计数");
+        assert_eq!(report.files, 0, "深度之外的体量不能凭空出现");
+        // 到顶不是「扫描失败」，但它确实让数字变成下界 —— 由 `disk.scan` 明说。
+        assert!(!report.truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_names_a_top_level_directory_it_cannot_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // root 无视权限位，测不出来 —— 以 root 跑时跳过（CI/容器内常见）。
+        // SAFETY: `geteuid` 无参数、无副作用。
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = TempDir::new("unreadable");
+        write_file(&dir.path().join("ok/f.bin"), 10);
+        let locked = dir.path().join("locked");
+        write_file(&locked.join("hidden.bin"), 20);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+
+        let report = walk(&options(dir.path())).expect("walk");
+
+        // 先把权限改回来，否则 TempDir 的清理会静默失败。
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("restore");
+
+        assert!(
+            report
+                .unreadable_dirs
+                .iter()
+                .any(|path| path.ends_with("locked")),
+            "整目录读不了的一级目录必须点名：{:?}",
+            report.unreadable_dirs
+        );
+        assert!(report.unreadable > 0);
+        // 一个没权限的目录不能把其它目录的扫描带崩。
+        assert!(report.top_dirs.iter().any(|(label, _)| label == "ok"));
+        assert!(
+            !report
+                .unreadable_dirs
+                .iter()
+                .any(|path| path.ends_with("ok"))
+        );
+    }
+
+    #[test]
     fn an_unfinished_top_level_directory_is_marked_in_the_table_and_the_hint() {
         let dir = TempDir::new("incomplete-render");
         for index in 0..300 {
@@ -2101,6 +2331,94 @@ mod tests {
         // 「最大的目录」那一节同样要说清“还差在哪”，不能只给一张看起来完整的表。
         let largest = largest_dirs_finding(&report);
         assert!(largest.detail.contains("没扫完"), "{}", largest.detail);
+    }
+
+    #[test]
+    fn top_dirs_renders_an_unreadable_directory_instead_of_dropping_it() {
+        let mut report = WalkReport::empty(PathBuf::from("/data"));
+        report.top_level_dirs = 2;
+        report.total_bytes = 100;
+        report.top_dirs = vec![("ok".to_string(), 100)];
+        report.unreadable = 1;
+        report.unreadable_dirs = vec![PathBuf::from("/data/locked")];
+
+        let finding = top_dirs_finding(&report, &[]);
+
+        let row = finding
+            .rows
+            .iter()
+            .find(|row| row.label.ends_with("locked"))
+            .expect("读不了的目录必须有行");
+        assert!(row.note.contains("读不了"), "{}", row.note);
+        assert!(finding.detail.contains("读不了"), "{}", finding.detail);
+    }
+
+    #[test]
+    fn unfinished_and_unreadable_directories_are_reported_apart() {
+        let mut report = WalkReport::empty(PathBuf::from("/data"));
+        report.top_level_dirs = 3;
+        report.truncated = true;
+        report.total_bytes = 1_000;
+        report.top_dirs = vec![("big".to_string(), 1_000)];
+        report.incomplete_dirs = vec![(PathBuf::from("/data/big"), 1_000)];
+        report.unreadable_dirs = vec![PathBuf::from("/data/locked")];
+
+        let finding = top_dirs_finding(&report, &[]);
+
+        // 两种情况的处置不同（重扫 vs 要 root），必须分开说。
+        assert!(finding.detail.contains("没扫完"), "{}", finding.detail);
+        assert!(finding.detail.contains("读不了"), "{}", finding.detail);
+        assert!(
+            finding.detail.contains("共 3 个一级目录"),
+            "{}",
+            finding.detail
+        );
+        assert!(finding.hint.expect("hint").contains("--path"));
+    }
+
+    #[test]
+    fn the_incomplete_hint_lists_a_bounded_number_of_rescan_commands() {
+        let mut report = WalkReport::empty(PathBuf::from("/data"));
+        report.incomplete_dirs = (0..10)
+            .map(|index| (PathBuf::from(format!("/data/d{index}")), 100 - index as u64))
+            .collect();
+
+        let hint = incomplete_hint(&report).expect("hint");
+
+        // hint 要能直接复制，但不能长成一堵墙；总数在 caveat 里说。
+        assert_eq!(hint.matches("--path").count(), INCOMPLETE_DIRS_SHOWN);
+        assert!(incomplete_caveat(&report).contains("10 个一级目录没扫完"));
+    }
+
+    #[test]
+    fn the_scan_section_says_when_depth_stopped_the_walk() {
+        let mut report = WalkReport::empty(PathBuf::from("/data"));
+        report.depth_limited = 7;
+
+        let finding = scan_finding(&report, &InvestigateRequest::default());
+
+        assert!(
+            finding.detail.contains("depth_limited=7"),
+            "{}",
+            finding.detail
+        );
+        assert!(finding.title.contains("深度到顶"), "{}", finding.title);
+        let hint = finding.hint.expect("hint");
+        assert!(hint.contains("--depth"), "{hint}");
+    }
+
+    #[test]
+    fn unattributed_points_at_the_directories_it_could_not_read() {
+        let mut report = WalkReport::empty(PathBuf::from("/data"));
+        report.total_bytes = 10 << 30;
+        report.unreadable_dirs = vec![PathBuf::from("/data/locked")];
+        let filesystems = vec![fs_usage("/data", 100 << 30, 5 << 30)];
+
+        let finding = unattributed_finding(&report, &filesystems);
+
+        let hint = finding.hint.expect("hint");
+        assert!(hint.contains("读不了"), "{hint}");
+        assert!(hint.contains("locked"), "{hint}");
     }
 
     #[test]
