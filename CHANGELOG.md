@@ -3,6 +3,32 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.17.0-alpha] - 2026-10-31
+
+### 新增（安全向调查：`accounts` / `persistence` / `exposure`，Linux）
+
+- `investigate accounts`：谁能在本机登录、谁能提权 —— uid 0 别名、空口令、`NOPASSWD: ALL`、
+  密钥符号链接与近 7 天新增、sshd 生效策略（含 `Include` 与 drop-in）。
+- `investigate persistence`：重启后还有什么会自己起来 —— systemd 启用状态（不调 `systemctl`）、
+  cron/at（标出“下载并执行”）、`ld.so.preload`、`rc.local`、`profile.d`，并汇总近 7 天新增。
+  只在 `/etc/systemd/system` 里躺着、没被任何 `.wants` 拉起的单元会明确标成“未启用”。
+- `investigate exposure`：谁在听、绑在哪（`0.0.0.0` / 具体地址 / 仅本机）。
+
+三题**只出证据**；`exposure` 连判定都不做（`judged=false`）。先只支持 Linux，macOS 不会收到这三道题。
+
+### 新增（报告契约：读不到不再等于正常）
+
+- 新增 `unknown` 状态：非 root 读不到 `/etc/shadow` 时整节是“无法判定”，不会显示成 `[OK]`；
+  `unknown` 不让退出码变非零。
+- 每节带 `coverage`（读到 / 被拒 / 跳过），报告带 `limits`（能力边界）；终端输出也会打印这两项。
+- 不做安全判定的题，结论只说“N 项证据”，不会输出“全部正常”。
+
+### 新增（报告出口脱敏）
+
+- “永不回传清单”变成可执行策略：口令哈希、私钥、连接串口令、云/平台 token、`authorized_keys`
+  正文命中即整值替换为 `[redacted:<规则>]`，并有 CI 闸门防止回归。
+- 新增 `dev/verify-investigate-security.sh`：Linux 上 root / 非 root 两轮验收，可经 OrbStack Docker 运行。
+
 ## [0.16.0-alpha] - 2026-10-31
 
 ### 修复（“最大的目录根本没找到” —— 三个真原因）
