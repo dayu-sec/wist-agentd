@@ -1362,7 +1362,16 @@ async fn handle_command_queue(
                 // 扫描跑完后由主循环的 drain 收尾（落盘 / 回传 / ack）。
                 if investigation_already_running(inflight, &command.command_id) {
                     // 网关在收到 ack 之前每 3s 都会重发同一条：正在跑就不再起第二个。
-                    // 这里**不**回 ack（结果只能有一份，由那个任务完成时统一回）。
+                    // 阶段回报照旧再推一条 —— 上一条 `accepted` 万一丢了，页面会一直
+                    // 卡在「等待认领」；网关侧认领时刻只认第一次，重复不会把计时归零。
+                    // 终态 ack 只能有一份，仍由那个任务完成时统一回。
+                    if source == CommandSource::Remote {
+                        turn.acks.push(AgentCommandAck {
+                            command_id: command.command_id.clone(),
+                            outcome: command_outcome::ACCEPTED.to_string(),
+                            detail: format!("已取走，扫描中（最长 {}s）", request.max_seconds),
+                        });
+                    }
                     continue;
                 }
                 log::info!(
@@ -1371,6 +1380,16 @@ async fn handle_command_queue(
                     command.kind,
                     source.as_str()
                 );
+                // 取走就先回一条 `accepted`（阶段回报）：网关据此把页面从「等待认领」
+                // 切到「调查中」。它**不是**终态 —— 网关不会写 `acked_at`，结果仍由
+                // 扫描结束后的那条终态 ack 给。
+                if source == CommandSource::Remote {
+                    turn.acks.push(AgentCommandAck {
+                        command_id: command.command_id.clone(),
+                        outcome: command_outcome::ACCEPTED.to_string(),
+                        detail: format!("已取走，扫描中（最长 {}s）", request.max_seconds),
+                    });
+                }
                 let config_for_task = AgentConfig::clone(config);
                 let task = tokio::spawn(async move {
                     crate::investigate::run_for_command(&config_for_task, &request).await
@@ -6082,7 +6101,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// 网关在 ack 之前每 3s 重发同一条：正在跑就不能起第二个，也不能回假 ack。
+    /// 网关在 ack 之前每 3s 重发同一条：正在跑就不能起第二个，也不能回终态 ack
+    /// （阶段回报 `accepted` 会补发，见 `a_redelivered_running_scan_re_acks_accepted_without_a_second_task`）。
     #[tokio::test]
     async fn a_redelivered_investigation_is_not_started_twice() {
         let (release, wait) = tokio::sync::oneshot::channel::<()>();
@@ -6114,7 +6134,8 @@ mod tests {
     /// 这一轮就会变成「扫描多久、这一轮就多久」（disk 默认 120s），心跳/命令认领/采集全停。
     /// 断言是结构性的（不靠计时）：
     ///   * `inflight` 里必须有那一条 —— 说明是 **spawn** 出去的；
-    ///   * 本轮 `acks` 必须为空 —— 扫描没跑完就不能回 ack。
+    ///   * 本轮 `acks` 恰好一条 `accepted` —— 取走就回报，别让页面一直等认领；
+    ///   * 台账**不能**动 —— `accepted` 是阶段回报，不是终态，落台账只能等扫描结果。
     #[tokio::test]
     async fn the_command_turn_hands_the_scan_to_a_task_instead_of_waiting() {
         let root = local_state_dir("investigate-turn");
@@ -6155,7 +6176,13 @@ mod tests {
         .expect("命令处理不能被扫描按住");
 
         assert!(turn.accepted_refresh.is_none(), "调查不是重采");
-        assert!(turn.acks.is_empty(), "扫描没跑完就不能回 ack");
+        assert_eq!(turn.acks.len(), 1, "取走就要回一条阶段 ack");
+        assert_eq!(turn.acks[0].command_id, "cmd-turn");
+        assert_eq!(
+            turn.acks[0].outcome,
+            command_outcome::ACCEPTED,
+            "阶段 ack 必须是 accepted（不是终态，结果由扫描结束那条给）"
+        );
         assert!(!turn.history_dirty, "扫描没跑完不该改台账");
         assert_eq!(
             inflight.len(),
@@ -6164,6 +6191,132 @@ mod tests {
         );
         assert_eq!(inflight[0].command.command_id, "cmd-turn");
 
+        for entry in inflight.drain(..) {
+            entry.task.abort();
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 本机命令行发起的调查不需要阶段回报 —— 没有网关在等这条 ack。
+    ///
+    /// 回归点：`accepted` 是给管理面看的，如果哪天无差别地对 Local 也回，
+    /// 日志/台账会出现没人消费的 `accepted`。
+    #[tokio::test]
+    async fn a_local_command_reports_no_accepted() {
+        let root = local_state_dir("investigate-local-turn");
+        let mut config = test_config();
+        config.paths.state_dir = root.join("state").display().to_string();
+        let scan_root = root.join("scan");
+        std::fs::create_dir_all(&scan_root).expect("create scan dir");
+        std::fs::write(scan_root.join("sample.log"), b"line\n").expect("write sample");
+
+        let command = AgentCommand {
+            command_id: "cmd-local-turn".to_string(),
+            requested_at_ms: now_ts_ms(),
+            kind: crate::investigate::COMMAND_KIND.to_string(),
+            params: serde_json::json!({
+                "topic": "disk",
+                "path": scan_root.display().to_string(),
+                "max_seconds": 1,
+            })
+            .to_string(),
+        };
+        let mut history = commands::CommandHistory::default();
+        let mut inflight = Vec::new();
+        let mut last_refresh: Option<Instant> = None;
+
+        let turn = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handle_command_queue(
+                vec![(command, CommandSource::Local)],
+                &config,
+                &mut inflight,
+                &mut history,
+                &mut last_refresh,
+                std::time::Duration::from_secs(60),
+                now_ts_ms(),
+            ),
+        )
+        .await
+        .expect("本机调查也不能按住命令循环");
+
+        assert!(
+            turn.acks.is_empty(),
+            "本机命令没有对端在等 ack，不该回 accepted"
+        );
+        assert!(!turn.history_dirty, "扫描没跑完不该改台账");
+        assert_eq!(inflight.len(), 1, "本机调查同样要 spawn 到独立任务");
+
+        for entry in inflight.drain(..) {
+            entry.task.abort();
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 网关没收到 `accepted` 会一直重发同一条：正在跑时**补发**阶段回报，但不起第二个任务。
+    ///
+    /// 这是 `accepted` 丢掉后的自愈路径：只靠第一次那条，丢包就会让页面永久停在
+    /// 「等待认领」（旧的 ack 丢失就是这么表现的）。
+    #[tokio::test]
+    async fn a_redelivered_running_scan_re_acks_accepted_without_a_second_task() {
+        let root = local_state_dir("investigate-redeliver");
+        let mut config = test_config();
+        config.paths.state_dir = root.join("state").display().to_string();
+        let scan_root = root.join("scan");
+        std::fs::create_dir_all(&scan_root).expect("create scan dir");
+        std::fs::write(scan_root.join("sample.log"), b"line\n").expect("write sample");
+
+        let command = AgentCommand {
+            command_id: "cmd-redeliver".to_string(),
+            requested_at_ms: now_ts_ms(),
+            kind: crate::investigate::COMMAND_KIND.to_string(),
+            params: serde_json::json!({
+                "topic": "disk",
+                "path": scan_root.display().to_string(),
+                "max_seconds": 30,
+            })
+            .to_string(),
+        };
+
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let mut inflight = vec![InflightInvestigation {
+            command: command.clone(),
+            source: CommandSource::Remote,
+            task: tokio::spawn(async move {
+                let _ = wait.await;
+                Err::<(crate::investigate::Report, PathBuf), String>("never".to_string())
+            }),
+        }];
+        let mut history = commands::CommandHistory::default();
+        let mut last_refresh: Option<Instant> = None;
+
+        let turn = handle_command_queue(
+            vec![(command, CommandSource::Remote)],
+            &config,
+            &mut inflight,
+            &mut history,
+            &mut last_refresh,
+            std::time::Duration::from_secs(60),
+            now_ts_ms(),
+        )
+        .await;
+
+        assert_eq!(turn.acks.len(), 1, "重发时要补一条阶段 ack");
+        assert_eq!(turn.acks[0].command_id, "cmd-redeliver");
+        assert_eq!(
+            turn.acks[0].outcome,
+            command_outcome::ACCEPTED,
+            "补发的是阶段回报，不是终态"
+        );
+        assert!(
+            turn.acks[0].detail.contains("30"),
+            "细节里带上扫描上限：{}",
+            turn.acks[0].detail
+        );
+        assert_eq!(inflight.len(), 1, "不能起第二个任务");
+        assert!(!turn.history_dirty, "阶段回报不进台账");
+
+        drop(release);
         for entry in inflight.drain(..) {
             entry.task.abort();
         }
@@ -6291,9 +6444,11 @@ mod tests {
     /// 这是仓里唯一一条**跑真实主循环**的用例：假控制面在第一次状态上报的回执里下发一条
     /// `investigate`，之后只数上报。断言的是**顺序**：
     ///
-    /// * ack **不能**搭在紧接着的下一份上报上 —— 那正是「主循环在这一轮里把扫描 `await`
-    ///   完了」的形状（老实现，一次 disk 调查 120s 就是 120s 没有心跳）；
-    /// * 扫描期间必须至少有一次“纯心跳”（不带 ack 的上报）。
+    /// * 阶段 ack（`accepted`）**必须**紧接在下一份上报上 —— 页面靠它从「等待认领」
+    ///   切到「调查中」；
+    /// * 终态 ack（`succeeded`）**不能**搭在紧接着的下一份上报上 —— 那正是「主循环在这一轮里
+    ///   把扫描 `await` 完了」的形状（老实现，一次 disk 调查 120s 就是 120s 没有心跳）；
+    /// * 扫描期间必须至少有一次“只有阶段 ack”的上报。
     ///
     /// 这条断言不依赖扫描真实耗时（扫描跑完再快，ack 也得等到下一轮 drain），所以不会因为
     /// 机器快慢而抖。把 spawn 换回 inline `await` 会稳定报「交付 #0，ack 却在 #1」。
@@ -6447,16 +6602,20 @@ mod tests {
         };
 
         let deadline = Instant::now() + Duration::from_secs(90);
-        let ack_index = loop {
+        let (claimed_index, ack_index) = loop {
             if runner.is_finished() {
                 panic!("主循环提前退出：{:?}", runner.await);
             }
             let snapshot = hits.lock().expect("hits").clone();
-            if let Some(index) = snapshot
-                .iter()
-                .position(|hit| hit.acks.iter().any(|(id, _)| id == COMMAND_ID))
-            {
-                break index;
+            let find = |want_stage: bool| {
+                snapshot.iter().position(|hit| {
+                    hit.acks.iter().any(|(id, outcome)| {
+                        id == COMMAND_ID && (outcome == command_outcome::ACCEPTED) == want_stage
+                    })
+                })
+            };
+            if let (Some(claimed), Some(ack)) = (find(true), find(false)) {
+                break (claimed, ack);
             }
             assert!(
                 Instant::now() < deadline,
@@ -6467,20 +6626,31 @@ mod tests {
         };
 
         let snapshot = hits.lock().expect("hits").clone();
-        // 交付在第 0 次上报里。若主循环在等扫描，ack 会紧接在第 1 次 —— 那正是要防的回归。
+        // 交付在第 0 次上报里。若主循环在等扫描，终态 ack 会紧接在第 1 次 —— 那正是要防的回归。
         assert!(
             ack_index >= 2,
-            "扫描期间必须还有心跳：交付 #0，ack 却在 #{ack_index}"
+            "扫描期间必须还有心跳：交付 #0，终态 ack 却在 #{ack_index}"
+        );
+        assert!(
+            claimed_index < ack_index,
+            "阶段 ack 要先到：已认领 #{claimed_index}，终态 #{ack_index}"
         );
         assert!(snapshot[0].acks.is_empty(), "交付那次还没有结果");
-        let outcome = snapshot[ack_index]
-            .acks
-            .iter()
-            .find(|(id, _)| id == COMMAND_ID)
-            .map(|(_, outcome)| outcome.clone())
-            .expect("调查的 ack");
+        let outcome_at = |index: usize| {
+            snapshot[index]
+                .acks
+                .iter()
+                .find(|(id, _)| id == COMMAND_ID)
+                .map(|(_, outcome)| outcome.clone())
+                .expect("调查的 ack")
+        };
         assert_eq!(
-            outcome,
+            outcome_at(claimed_index),
+            command_outcome::ACCEPTED,
+            "先到的那条是阶段回报（页面显示「调查中」）"
+        );
+        assert_eq!(
+            outcome_at(ack_index),
             command_outcome::SUCCEEDED,
             "文件出口下也算查成了（回传失败不影响 outcome）"
         );
