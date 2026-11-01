@@ -6,10 +6,10 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use wist_agentd::bootstrap;
-use wist_agentd::config::agent_config::{DiscoverySection, LogFileInputSection};
+use wist_agentd::config::agent_config::{AgentConfig, DiscoverySection};
 use wist_agentd::control::work::AppliedWorkGrant;
 use wist_agentd::daemon;
-use wist_agentd::self_observability::DiscoveryReadiness;
+use wist_agentd::self_observability::{DiscoveryReadiness, RuntimeHealthSnapshot};
 use wist_api::work::WorkGrant;
 use wist_contracts::discovery::{
     CollectionCandidate, DiscoveredResource, DiscoveredTarget, DiscoveryCacheMeta,
@@ -19,8 +19,8 @@ use wist_contracts::work::{StandingWork, WorkSpec, WorkSpecSource, WorkSpecUnit}
 use wist_shared::fs::read_json;
 
 use super::common::{
-    TestLogCheckpointState, standalone_config_with_file_input, standalone_config_with_file_inputs,
-    standalone_config_with_tcp_file_input, temp_dir, test_exec_bin,
+    TestLogCheckpointState, standalone_config, standalone_config_with_file_input,
+    standalone_config_with_file_output, standalone_config_with_tcp_output, temp_dir, test_exec_bin,
 };
 
 fn bind_tcp_listener(addr: &str) -> Option<TcpListener> {
@@ -44,9 +44,25 @@ fn raw_body_sections(payload: &str) -> Vec<String> {
         .collect()
 }
 
-/// 一份“网关授权了指标采集”的授权快照（`run_once` 不做轮询，得直接给）。
-fn granted_metrics_work() -> AppliedWorkGrant {
-    granted_work("HostMetrics", "collect_metrics", "MetricInterval", "15s")
+/// 在本机配置 + 一份工作授权下跑一轮（`run_once` 本身不拉授权，得直接给）。
+///
+/// 采集路径只认授权工作：`run_once` 不带授权就等于「这台机器没被派活」—— 配置里的
+/// `telemetry.logs.file_inputs` 已废弃，不再产生任何输入。
+fn run_once_with(
+    root: &std::path::Path,
+    config: &AgentConfig,
+    work: &AppliedWorkGrant,
+) -> RuntimeHealthSnapshot {
+    daemon::run_once_with_work(
+        &daemon::DaemonLoop {
+            config,
+            exec_bin: &test_exec_bin(root),
+            upgrader_bin: ::std::path::Path::new(""),
+            config_dir: ::std::path::Path::new(""),
+        },
+        work,
+    )
+    .expect("daemon run once")
 }
 
 /// 授权一份工作（一个单元、一个来源）——授权快照是 agentd 唯一的工作来源。
@@ -67,30 +83,156 @@ fn granted_work_multiline(
     source_target: &str,
     multiline: &str,
 ) -> AppliedWorkGrant {
-    let spec = WorkSpec {
-        units: vec![WorkSpecUnit {
-            unit_id: format!("unit-{family}"),
-            capability: capability.to_string(),
-            rule_ref: "agent_uplink".to_string(),
-            requires_privilege: "none".to_string(),
-            sources: vec![WorkSpecSource {
-                kind: source_kind.to_string(),
-                target: source_target.to_string(),
-                multiline: multiline.to_string(),
-                exclude_globs: Vec::new(),
-                filters: Default::default(),
-                drop_if_contains: Vec::new(),
-            }],
+    grant_work(
+        family,
+        vec![collect_unit(
+            format!("unit-{family}"),
+            capability,
+            source_kind,
+            source_target,
+            multiline,
+        )],
+    )
+}
+
+/// 授权里的一条日志来源：`unit_id` 会进折算出的 input_id（`work-<family>-<unit>`），
+/// 因此它同时决定 checkpoint 与 spool 的落盘名字。
+struct GrantedLogUnit<'a> {
+    unit_id: &'a str,
+    target: &'a str,
+    multiline: &'a str,
+    exclude_globs: Vec<String>,
+}
+
+fn log_unit<'a>(unit_id: &'a str, target: &'a str) -> GrantedLogUnit<'a> {
+    GrantedLogUnit {
+        unit_id,
+        target,
+        multiline: "none",
+        exclude_globs: Vec::new(),
+    }
+}
+
+impl<'a> GrantedLogUnit<'a> {
+    /// 选源排除项是**策展结论**（跟着单元走），不是本机偏好。
+    fn excluding(mut self, exclude_globs: Vec<String>) -> Self {
+        self.exclude_globs = exclude_globs;
+        self
+    }
+}
+
+/// 授权一份日志采集工作（`collect_logs` + `FileGlob`），一个单元对应一条输入。
+///
+/// 授权折算出的 `startup_position` **恒为 `tail`**（授权不重放历史，见
+/// `AppliedWorkGrant::log_inputs`）：要验证「采到新内容」就得**先跑一轮建立位点 → 追加 →
+/// 再跑一轮**，而不是往配置里写 `head`。
+fn granted_log_work(family: &str, units: Vec<GrantedLogUnit<'_>>) -> AppliedWorkGrant {
+    grant_work(
+        family,
+        units
+            .into_iter()
+            .map(|unit| {
+                collect_logs_unit(
+                    unit.unit_id,
+                    unit.target,
+                    unit.multiline,
+                    unit.exclude_globs,
+                )
+            })
+            .collect(),
+    )
+}
+
+/// 日志 + 指标同时授权：两者共用一条上行连接，指标帧优先（日志帧在后）。
+fn granted_log_and_metrics_work(log_units: Vec<GrantedLogUnit<'_>>) -> AppliedWorkGrant {
+    let log_units: Vec<WorkSpecUnit> = log_units
+        .into_iter()
+        .map(|unit| {
+            collect_logs_unit(
+                unit.unit_id,
+                unit.target,
+                unit.multiline,
+                unit.exclude_globs,
+            )
+        })
+        .collect();
+    grant_work_families(vec![
+        ("Test", log_units),
+        (
+            "HostMetrics",
+            vec![collect_metrics_unit("unit-HostMetrics", "15s")],
+        ),
+    ])
+}
+
+fn collect_logs_unit(
+    unit_id: &str,
+    target: &str,
+    multiline: &str,
+    exclude_globs: Vec<String>,
+) -> WorkSpecUnit {
+    WorkSpecUnit {
+        unit_id: unit_id.to_string(),
+        capability: "collect_logs".to_string(),
+        rule_ref: "agent_uplink".to_string(),
+        requires_privilege: "none".to_string(),
+        sources: vec![WorkSpecSource {
+            kind: "FileGlob".to_string(),
+            target: target.to_string(),
+            multiline: multiline.to_string(),
+            exclude_globs,
+            filters: Default::default(),
+            drop_if_contains: Vec::new(),
         }],
-    };
-    let mut applied = AppliedWorkGrant::default();
-    applied.apply(&WorkGrant {
-        agent_id: "agent-001".to_string(),
-        standing: vec![StandingWork {
+    }
+}
+
+fn collect_metrics_unit(unit_id: &str, interval: &str) -> WorkSpecUnit {
+    collect_unit(
+        unit_id.to_string(),
+        "collect_metrics",
+        "MetricInterval",
+        interval,
+        "none",
+    )
+}
+
+fn collect_unit(
+    unit_id: String,
+    capability: &str,
+    source_kind: &str,
+    source_target: &str,
+    multiline: &str,
+) -> WorkSpecUnit {
+    WorkSpecUnit {
+        unit_id,
+        capability: capability.to_string(),
+        rule_ref: "agent_uplink".to_string(),
+        requires_privilege: "none".to_string(),
+        sources: vec![WorkSpecSource {
+            kind: source_kind.to_string(),
+            target: source_target.to_string(),
+            multiline: multiline.to_string(),
+            exclude_globs: Vec::new(),
+            filters: Default::default(),
+            drop_if_contains: Vec::new(),
+        }],
+    }
+}
+
+fn grant_work(family: &str, units: Vec<WorkSpecUnit>) -> AppliedWorkGrant {
+    grant_work_families(vec![(family, units)])
+}
+
+/// 把若干份工作合成**一份**授权快照：`apply` 只做一次，避免同序号的多份快照互相覆盖。
+fn grant_work_families(families: Vec<(&str, Vec<WorkSpecUnit>)>) -> AppliedWorkGrant {
+    let standing = families
+        .into_iter()
+        .map(|(family, units)| StandingWork {
             work_id: format!("work-agent-001-{family}"),
             agent_id: "agent-001".to_string(),
             family: family.to_string(),
-            spec: spec.encode().expect("encode spec"),
+            spec: WorkSpec { units }.encode().expect("encode spec"),
             catalog_version: 1,
             proposal_id: None,
             plan_version: 1,
@@ -98,7 +240,12 @@ fn granted_work_multiline(
             status: "active".to_string(),
             updated_by: "admin".to_string(),
             updated_at: "2026-09-23T00:00:00Z".to_string(),
-        }],
+        })
+        .collect();
+    let mut applied = AppliedWorkGrant::default();
+    applied.apply(&WorkGrant {
+        agent_id: "agent-001".to_string(),
+        standing,
         one_shot: Vec::new(),
         sequence: 1,
         granted_at: "2026-09-23T00:00:00Z".to_string(),
@@ -145,23 +292,25 @@ struct TestMetricsCollectionTargetSample {
 
 #[cfg(unix)]
 #[test]
-fn daemon_run_once_processes_configured_file_input() {
+fn daemon_run_once_processes_granted_log_work() {
     let root = temp_dir("daemon-file-input");
     let run_dir = root.join("run");
     let state_dir = root.join("state");
     let log_dir = root.join("log");
     let input_path = root.join("app.log");
     bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
-    fs::write(&input_path, "first\nsecond\n").expect("write input log");
+    // 授权采集是 `tail`（不重放历史）：第一轮只建立位点，第二轮才采到新增内容。
+    fs::write(&input_path, "").expect("create empty input log");
 
-    let config = standalone_config_with_file_input(&root, &input_path);
-    let snapshot = daemon::run_once(&daemon::DaemonLoop {
-        config: &config,
-        exec_bin: &test_exec_bin(&root),
-        upgrader_bin: ::std::path::Path::new(""),
-        config_dir: ::std::path::Path::new(""),
-    })
-    .expect("daemon run once");
+    let config = standalone_config_with_file_output(&root);
+    let work = granted_log_work(
+        "Test",
+        vec![log_unit("app", input_path.to_str().expect("utf8 path"))],
+    );
+    // 第一轮：空文件上建立 tail 位点（offset = 0）。
+    run_once_with(&root, &config, &work);
+    fs::write(&input_path, "first\nsecond\n").expect("write input log");
+    let snapshot = run_once_with(&root, &config, &work);
 
     let output_path = root.join("log").join("wist-records.ndjson");
     let output = fs::read_to_string(&output_path).expect("read output");
@@ -170,7 +319,8 @@ fn daemon_run_once_processes_configured_file_input() {
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("parse telemetry record"))
         .collect();
-    let checkpoint_path = wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "app");
+    let checkpoint_path =
+        wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "work-Test-app");
     let checkpoint: TestLogCheckpointState = read_json(&checkpoint_path).expect("read checkpoint");
     let discovery_root = state_dir.join("discovery");
     let discovery_resources: Vec<DiscoveredResource> =
@@ -430,11 +580,10 @@ fn daemon_run_once_can_enable_high_cardinality_discovery_explicitly() {
     let run_dir = root.join("run");
     let state_dir = root.join("state");
     let log_dir = root.join("log");
-    let input_path = root.join("app.log");
     bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
-    fs::write(&input_path, "first\n").expect("write input log");
 
-    let mut config = standalone_config_with_file_input(&root, &input_path);
+    // 本用例只盯发现：不派日志工作，也不在配置里写已废弃的 `file_inputs`。
+    let mut config = standalone_config(&root);
     config.discovery = DiscoverySection {
         host_enabled: true,
         network_enabled: true,
@@ -485,17 +634,16 @@ fn daemon_run_once_continues_when_discovery_cache_store_fails() {
     let log_dir = root.join("log");
     let input_path = root.join("app.log");
     bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
-    fs::write(&input_path, "first\n").expect("write input log");
+    // 授权采集是 tail：第一轮只建立位点（同时也写下 discovery 缓存）。
+    fs::write(&input_path, "").expect("create empty input log");
 
     let discovery_dir = state_dir.join("discovery");
-    let config = standalone_config_with_file_input(&root, &input_path);
-    daemon::run_once(&daemon::DaemonLoop {
-        config: &config,
-        exec_bin: &test_exec_bin(&root),
-        upgrader_bin: ::std::path::Path::new(""),
-        config_dir: ::std::path::Path::new(""),
-    })
-    .expect("initial daemon run once");
+    let config = standalone_config_with_file_output(&root);
+    let work = granted_log_work(
+        "Test",
+        vec![log_unit("app", input_path.to_str().expect("utf8 path"))],
+    );
+    run_once_with(&root, &config, &work);
 
     let mut perms = fs::metadata(&discovery_dir)
         .expect("discovery dir metadata")
@@ -504,14 +652,8 @@ fn daemon_run_once_continues_when_discovery_cache_store_fails() {
     perms.set_mode(0o500);
     fs::set_permissions(&discovery_dir, perms).expect("set discovery dir readonly");
 
-    fs::write(&input_path, "first\nsecond\n").expect("append test input");
-    let snapshot = daemon::run_once(&daemon::DaemonLoop {
-        config: &config,
-        exec_bin: &test_exec_bin(&root),
-        upgrader_bin: ::std::path::Path::new(""),
-        config_dir: ::std::path::Path::new(""),
-    })
-    .expect("daemon run once with discovery store failure");
+    fs::write(&input_path, "first\nsecond\n").expect("write test input");
+    let snapshot = run_once_with(&root, &config, &work);
 
     let output_path = root.join("log").join("wist-records.ndjson");
     let output = fs::read_to_string(&output_path).expect("read output");
@@ -541,28 +683,21 @@ fn daemon_run_once_rebuilds_when_discovery_cache_is_corrupt() {
     let log_dir = root.join("log");
     let input_path = root.join("app.log");
     bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
-    fs::write(&input_path, "first\n").expect("write input log");
+    // 授权采集是 tail：第一轮只建立位点（同时也写下 discovery 缓存）。
+    fs::write(&input_path, "").expect("create empty input log");
 
-    let config = standalone_config_with_file_input(&root, &input_path);
-    daemon::run_once(&daemon::DaemonLoop {
-        config: &config,
-        exec_bin: &test_exec_bin(&root),
-        upgrader_bin: ::std::path::Path::new(""),
-        config_dir: ::std::path::Path::new(""),
-    })
-    .expect("initial daemon run once");
+    let config = standalone_config_with_file_output(&root);
+    let work = granted_log_work(
+        "Test",
+        vec![log_unit("app", input_path.to_str().expect("utf8 path"))],
+    );
+    run_once_with(&root, &config, &work);
 
     let discovery_dir = state_dir.join("discovery");
     fs::write(discovery_dir.join("meta.json"), "{broken-json}\n").expect("corrupt meta");
     fs::write(&input_path, "first\nsecond\n").expect("update input log");
 
-    let snapshot = daemon::run_once(&daemon::DaemonLoop {
-        config: &config,
-        exec_bin: &test_exec_bin(&root),
-        upgrader_bin: ::std::path::Path::new(""),
-        config_dir: ::std::path::Path::new(""),
-    })
-    .expect("daemon run once after corrupt cache");
+    let snapshot = run_once_with(&root, &config, &work);
 
     let output_path = root.join("log").join("wist-records.ndjson");
     let output = fs::read_to_string(&output_path).expect("read output");
@@ -600,16 +735,15 @@ fn daemon_run_once_uses_cached_metrics_snapshot_when_target_view_is_missing() {
     let log_dir = root.join("log");
     let input_path = root.join("app.log");
     bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
-    fs::write(&input_path, "first\n").expect("write input log");
+    // 授权采集是 tail：第一轮只建立位点（同时生成可用的 metrics target view 与快照）。
+    fs::write(&input_path, "").expect("create empty input log");
 
-    let config = standalone_config_with_file_input(&root, &input_path);
-    daemon::run_once(&daemon::DaemonLoop {
-        config: &config,
-        exec_bin: &test_exec_bin(&root),
-        upgrader_bin: ::std::path::Path::new(""),
-        config_dir: ::std::path::Path::new(""),
-    })
-    .expect("initial daemon run once");
+    let config = standalone_config_with_file_output(&root);
+    let work = granted_log_work(
+        "Test",
+        vec![log_unit("app", input_path.to_str().expect("utf8 path"))],
+    );
+    run_once_with(&root, &config, &work);
 
     let telemetry_dir = state_dir.join("telemetry");
     let target_view_path = telemetry_dir.join("metrics_target_view.json");
@@ -625,14 +759,8 @@ fn daemon_run_once_uses_cached_metrics_snapshot_when_target_view_is_missing() {
     perms.set_mode(0o500);
     fs::set_permissions(&telemetry_dir, perms).expect("set telemetry dir readonly");
 
-    fs::write(&input_path, "first\nsecond\n").expect("append input log");
-    let snapshot = daemon::run_once(&daemon::DaemonLoop {
-        config: &config,
-        exec_bin: &test_exec_bin(&root),
-        upgrader_bin: ::std::path::Path::new(""),
-        config_dir: ::std::path::Path::new(""),
-    })
-    .expect("daemon run once with missing target view");
+    fs::write(&input_path, "first\nsecond\n").expect("write input log");
+    let snapshot = run_once_with(&root, &config, &work);
 
     let runtime_snapshot: TestMetricsRuntimeSnapshot =
         read_json(&runtime_snapshot_path).expect("read runtime snapshot after fallback");
@@ -733,7 +861,7 @@ fn daemon_run_once_uses_cached_metrics_snapshot_when_target_view_is_missing() {
 
 #[cfg(unix)]
 #[test]
-fn daemon_run_once_continues_when_one_file_input_fails() {
+fn daemon_run_once_continues_when_one_granted_input_fails() {
     // 「失败」用**不存在的显式路径**：W1 起目录/glob 是合法目标，且无匹配不算失败，
     // 所以目录不再能当这个用例的失败样本。
     let root = temp_dir("daemon-file-input-error-isolated");
@@ -743,38 +871,21 @@ fn daemon_run_once_continues_when_one_file_input_fails() {
     let good_input = root.join("good.log");
     let bad_input = root.join("missing-dir").join("bad.log");
     bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
-    fs::write(&good_input, "good\n").expect("write good input");
+    // 授权采集是 tail：先给一个空的好文件（第一轮只建立位点），坏文件根本不存在。
+    fs::write(&good_input, "").expect("create good input");
 
-    let config = standalone_config_with_file_inputs(
-        &root,
+    let config = standalone_config_with_file_output(&root);
+    let work = granted_log_work(
+        "Test",
         vec![
-            LogFileInputSection {
-                input_id: "bad".to_string(),
-                path: bad_input.display().to_string(),
-                startup_position: "head".to_string(),
-                multiline_mode: "none".to_string(),
-                exclude_globs: Vec::new(),
-                filters: Default::default(),
-                drop_if_contains: Vec::new(),
-            },
-            LogFileInputSection {
-                input_id: "good".to_string(),
-                path: good_input.display().to_string(),
-                startup_position: "head".to_string(),
-                multiline_mode: "none".to_string(),
-                exclude_globs: Vec::new(),
-                filters: Default::default(),
-                drop_if_contains: Vec::new(),
-            },
+            log_unit("bad", bad_input.to_str().expect("utf8 path")),
+            log_unit("good", good_input.to_str().expect("utf8 path")),
         ],
     );
-    let snapshot = daemon::run_once(&daemon::DaemonLoop {
-        config: &config,
-        exec_bin: &test_exec_bin(&root),
-        upgrader_bin: ::std::path::Path::new(""),
-        config_dir: ::std::path::Path::new(""),
-    })
-    .expect("daemon run once");
+    // 第一轮：坏输入每轮都失败，好输入只建立位点。
+    run_once_with(&root, &config, &work);
+    fs::write(&good_input, "good\n").expect("write good input");
+    let snapshot = run_once_with(&root, &config, &work);
 
     let output_path = root.join("log").join("wist-records.ndjson");
     let output = fs::read_to_string(&output_path).expect("read output");
@@ -783,7 +894,8 @@ fn daemon_run_once_continues_when_one_file_input_fails() {
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("parse telemetry record"))
         .collect();
-    let checkpoint_path = wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "good");
+    let checkpoint_path =
+        wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "work-Test-good");
     let checkpoint: TestLogCheckpointState = read_json(&checkpoint_path).expect("read checkpoint");
 
     assert_eq!(
@@ -794,7 +906,9 @@ fn daemon_run_once_continues_when_one_file_input_fails() {
     assert_eq!(records[0].body, "good\n");
     assert_eq!(checkpoint.files.len(), 1);
     // 失败的输入不产生采集任务：连 checkpoint 文件都不该建。
-    assert!(!wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "bad").exists());
+    assert!(
+        !wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "work-Test-bad").exists()
+    );
 }
 
 #[cfg(unix)]
@@ -812,29 +926,33 @@ fn daemon_run_once_collects_a_file_family_glob_with_excludes() {
     let first = containers.join("a.log");
     let second = containers.join("b.log");
     let skipped = containers.join("skip-me.log");
-    fs::write(&first, "a\n").expect("write a");
-    fs::write(&second, "b\n").expect("write b");
+    fs::write(&first, "a-history\n").expect("write a");
+    fs::write(&second, "b-history\n").expect("write b");
     fs::write(&skipped, "skipped\n").expect("write skipped");
 
-    let config = standalone_config_with_file_inputs(
-        &root,
-        vec![LogFileInputSection {
-            input_id: "family".to_string(),
-            path: containers.join("*.log").display().to_string(),
-            startup_position: "head".to_string(),
-            multiline_mode: "none".to_string(),
-            exclude_globs: vec![containers.join("skip-*.log").display().to_string()],
-            filters: Default::default(),
-            drop_if_contains: Vec::new(),
-        }],
+    let config = standalone_config_with_file_output(&root);
+    let work = granted_log_work(
+        "Test",
+        vec![
+            log_unit(
+                "family",
+                containers.join("*.log").to_str().expect("utf8 path"),
+            )
+            .excluding(vec![
+                containers
+                    .join("skip-*.log")
+                    .to_str()
+                    .expect("utf8 path")
+                    .to_string(),
+            ]),
+        ],
     );
-    daemon::run_once(&daemon::DaemonLoop {
-        config: &config,
-        exec_bin: &test_exec_bin(&root),
-        upgrader_bin: ::std::path::Path::new(""),
-        config_dir: ::std::path::Path::new(""),
-    })
-    .expect("daemon run once");
+    // 第一轮：目录里已经有历史行，授权采集是 tail，所以这一轮只建立位点。
+    run_once_with(&root, &config, &work);
+    fs::write(&first, "a-history\na\n").expect("append a");
+    fs::write(&second, "b-history\nb\n").expect("append b");
+    fs::write(&skipped, "skipped\nskipped-again\n").expect("append skipped");
+    run_once_with(&root, &config, &work);
 
     let output =
         fs::read_to_string(root.join("log").join("wist-records.ndjson")).expect("read output");
@@ -850,7 +968,8 @@ fn daemon_run_once_collects_a_file_family_glob_with_excludes() {
     bodies.sort();
     assert_eq!(bodies, vec!["a\n", "b\n"]);
 
-    let checkpoint_path = wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "family");
+    let checkpoint_path =
+        wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "work-Test-family");
     let checkpoint: TestLogCheckpointState = read_json(&checkpoint_path).expect("read checkpoint");
     assert_eq!(checkpoint.files.len(), 2, "{:?}", checkpoint.files);
     assert!(
@@ -873,39 +992,22 @@ fn daemon_run_once_assigns_globally_monotonic_seq_across_inputs() {
     let input_a = root.join("a.log");
     let input_b = root.join("b.log");
     bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
-    fs::write(&input_a, "a1\na2\n").expect("write input a");
-    fs::write(&input_b, "b1\nb2\nb3\n").expect("write input b");
+    // 授权采集是 tail：两个输入先建空文件，第一轮只建立位点。
+    fs::write(&input_a, "").expect("create input a");
+    fs::write(&input_b, "").expect("create input b");
 
-    let config = standalone_config_with_file_inputs(
-        &root,
+    let config = standalone_config_with_file_output(&root);
+    let work = granted_log_work(
+        "Test",
         vec![
-            LogFileInputSection {
-                input_id: "a".to_string(),
-                path: input_a.display().to_string(),
-                startup_position: "head".to_string(),
-                multiline_mode: "none".to_string(),
-                exclude_globs: Vec::new(),
-                filters: Default::default(),
-                drop_if_contains: Vec::new(),
-            },
-            LogFileInputSection {
-                input_id: "b".to_string(),
-                path: input_b.display().to_string(),
-                startup_position: "head".to_string(),
-                multiline_mode: "none".to_string(),
-                exclude_globs: Vec::new(),
-                filters: Default::default(),
-                drop_if_contains: Vec::new(),
-            },
+            log_unit("a", input_a.to_str().expect("utf8 path")),
+            log_unit("b", input_b.to_str().expect("utf8 path")),
         ],
     );
-    daemon::run_once(&daemon::DaemonLoop {
-        config: &config,
-        exec_bin: &test_exec_bin(&root),
-        upgrader_bin: ::std::path::Path::new(""),
-        config_dir: ::std::path::Path::new(""),
-    })
-    .expect("daemon run once");
+    run_once_with(&root, &config, &work);
+    fs::write(&input_a, "a1\na2\n").expect("append input a");
+    fs::write(&input_b, "b1\nb2\nb3\n").expect("append input b");
+    run_once_with(&root, &config, &work);
 
     let output_path = root.join("log").join("wist-records.ndjson");
     let output = fs::read_to_string(&output_path).expect("read output");
@@ -916,7 +1018,7 @@ fn daemon_run_once_assigns_globally_monotonic_seq_across_inputs() {
         .collect();
 
     assert_eq!(records.len(), 5);
-    // 跨 input 共享同一个单调计数器：5 条日志 seq 全局连续且不撞号（起始值被先行发送的指标帧占掉）。
+    // 跨 input 共享同一个单调计数器：5 条日志 seq 全局连续且不撞号。
     let seqs: Vec<u64> = records.iter().map(|record| record.seq).collect();
     let start = seqs[0];
     assert_eq!(seqs, (start..start + 5).collect::<Vec<u64>>());
@@ -924,7 +1026,7 @@ fn daemon_run_once_assigns_globally_monotonic_seq_across_inputs() {
 
 #[cfg(unix)]
 #[test]
-fn daemon_run_once_marks_active_when_only_file_input_fails() {
+fn daemon_run_once_marks_active_when_only_the_granted_input_fails() {
     // 同上的样本口径：不存在的显式路径 = 采集失败（MissingInput），目录 = 合法文件族目标。
     let root = temp_dir("daemon-file-input-only-error");
     let run_dir = root.join("run");
@@ -933,25 +1035,12 @@ fn daemon_run_once_marks_active_when_only_file_input_fails() {
     let bad_input = root.join("missing-dir").join("bad.log");
     bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
 
-    let config = standalone_config_with_file_inputs(
-        &root,
-        vec![LogFileInputSection {
-            input_id: "bad".to_string(),
-            path: bad_input.display().to_string(),
-            startup_position: "head".to_string(),
-            multiline_mode: "none".to_string(),
-            exclude_globs: Vec::new(),
-            filters: Default::default(),
-            drop_if_contains: Vec::new(),
-        }],
+    let config = standalone_config_with_file_output(&root);
+    let work = granted_log_work(
+        "Test",
+        vec![log_unit("bad", bad_input.to_str().expect("utf8 path"))],
     );
-    let snapshot = daemon::run_once(&daemon::DaemonLoop {
-        config: &config,
-        exec_bin: &test_exec_bin(&root),
-        upgrader_bin: ::std::path::Path::new(""),
-        config_dir: ::std::path::Path::new(""),
-    })
-    .expect("daemon run once");
+    let snapshot = run_once_with(&root, &config, &work);
 
     assert_eq!(
         snapshot.state,
@@ -962,7 +1051,7 @@ fn daemon_run_once_marks_active_when_only_file_input_fails() {
 
 #[cfg(unix)]
 #[test]
-fn daemon_run_once_marks_active_when_configured_file_is_missing() {
+fn daemon_run_once_marks_active_when_the_granted_file_is_missing() {
     let root = temp_dir("daemon-file-input-missing");
     let run_dir = root.join("run");
     let state_dir = root.join("state");
@@ -970,32 +1059,25 @@ fn daemon_run_once_marks_active_when_configured_file_is_missing() {
     let missing_input = root.join("missing.log");
     bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
 
-    let config = standalone_config_with_file_inputs(
-        &root,
-        vec![LogFileInputSection {
-            input_id: "missing".to_string(),
-            path: missing_input.display().to_string(),
-            startup_position: "head".to_string(),
-            multiline_mode: "none".to_string(),
-            exclude_globs: Vec::new(),
-            filters: Default::default(),
-            drop_if_contains: Vec::new(),
-        }],
+    let config = standalone_config_with_file_output(&root);
+    let work = granted_log_work(
+        "Test",
+        vec![log_unit(
+            "missing",
+            missing_input.to_str().expect("utf8 path"),
+        )],
     );
-    let snapshot = daemon::run_once(&daemon::DaemonLoop {
-        config: &config,
-        exec_bin: &test_exec_bin(&root),
-        upgrader_bin: ::std::path::Path::new(""),
-        config_dir: ::std::path::Path::new(""),
-    })
-    .expect("daemon run once");
+    let snapshot = run_once_with(&root, &config, &work);
 
     assert_eq!(
         snapshot.state,
         wist_agentd::self_observability::DaemonWorkState::Active
     );
     assert!(!root.join("log").join("wist-records.ndjson").exists());
-    assert!(!wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "missing").exists());
+    assert!(
+        !wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "work-Test-missing")
+            .exists()
+    );
 }
 
 #[cfg(unix)]
@@ -1008,16 +1090,17 @@ fn daemon_run_once_replays_existing_spool_even_when_source_file_is_missing() {
     let missing_input = root.join("missing.log");
     bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
 
+    // spool 文件按折算出的 input_id（`work-<family>-<unit>`）命名。
     let spool_path = root
         .join("state")
         .join("spool")
         .join("logs")
-        .join("missing.ndjson");
+        .join("work-Test-missing.ndjson");
     fs::create_dir_all(spool_path.parent().expect("spool dir")).expect("create spool dir");
     let first = serde_json::to_string(&TelemetryRecord::new_log(
         "agent-test".to_string(),
         "2026-04-14T00:00:00Z".to_string(),
-        "missing".to_string(),
+        "work-Test-missing".to_string(),
         missing_input.display().to_string(),
         "first\n".to_string(),
         0,
@@ -1028,7 +1111,7 @@ fn daemon_run_once_replays_existing_spool_even_when_source_file_is_missing() {
     let second = serde_json::to_string(&TelemetryRecord::new_log(
         "agent-test".to_string(),
         "2026-04-14T00:00:01Z".to_string(),
-        "missing".to_string(),
+        "work-Test-missing".to_string(),
         missing_input.display().to_string(),
         "second\n".to_string(),
         6,
@@ -1038,25 +1121,15 @@ fn daemon_run_once_replays_existing_spool_even_when_source_file_is_missing() {
     .expect("encode second");
     fs::write(&spool_path, format!("{first}\n{second}\n")).expect("write spool");
 
-    let config = standalone_config_with_file_inputs(
-        &root,
-        vec![LogFileInputSection {
-            input_id: "missing".to_string(),
-            path: missing_input.display().to_string(),
-            startup_position: "head".to_string(),
-            multiline_mode: "none".to_string(),
-            exclude_globs: Vec::new(),
-            filters: Default::default(),
-            drop_if_contains: Vec::new(),
-        }],
+    let config = standalone_config_with_file_output(&root);
+    let work = granted_log_work(
+        "Test",
+        vec![log_unit(
+            "missing",
+            missing_input.to_str().expect("utf8 path"),
+        )],
     );
-    let snapshot = daemon::run_once(&daemon::DaemonLoop {
-        config: &config,
-        exec_bin: &test_exec_bin(&root),
-        upgrader_bin: ::std::path::Path::new(""),
-        config_dir: ::std::path::Path::new(""),
-    })
-    .expect("daemon run once");
+    let snapshot = run_once_with(&root, &config, &work);
 
     let output_path = root.join("log").join("wist-records.ndjson");
     let output = fs::read_to_string(&output_path).expect("read output");
@@ -1085,54 +1158,57 @@ fn daemon_run_once_sends_raw_log_lines_to_tcp_output() {
     let log_dir = root.join("log");
     let input_path = root.join("app.log");
     bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
-    fs::write(&input_path, "alpha\nbeta\n").expect("write input log");
+    // 授权采集是 tail：第一轮只建立位点（同时也会为事实帧开一条连接）。
+    fs::write(&input_path, "").expect("create empty input log");
 
     let Some(listener) = bind_tcp_listener("127.0.0.1:0") else {
         return;
     };
     let port = listener.local_addr().expect("listener addr").port();
+    // 两轮各自开一条连接（事实帧也走这条上行），服务端收两条并拼起来。
     let server = thread::spawn(move || {
-        let (mut socket, _) = listener.accept().expect("accept");
-        socket
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("set timeout");
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 128];
-        loop {
-            match socket.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    break;
+        let mut collected = String::new();
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set timeout");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 128];
+            loop {
+                match socket.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        break;
+                    }
+                    Err(err) => panic!("read tcp payload: {err}"),
                 }
-                Err(err) => panic!("read tcp payload: {err}"),
             }
+            collected.push_str(&String::from_utf8(buf).expect("utf8 payload"));
         }
-        String::from_utf8(buf).expect("utf8 payload")
+        collected
     });
 
-    let config =
-        standalone_config_with_tcp_file_input(&root, &input_path, "127.0.0.1", port, "line");
-    // 指标上送需要**授权的指标工作**：没有授权就不上送（见下一个用例）。
-    let work = granted_metrics_work();
-    let snapshot = daemon::run_once_with_work(
-        &daemon::DaemonLoop {
-            config: &config,
-            exec_bin: &test_exec_bin(&root),
-            upgrader_bin: ::std::path::Path::new(""),
-            config_dir: ::std::path::Path::new(""),
-        },
-        &work,
-    )
-    .expect("daemon run once");
+    let config = standalone_config_with_tcp_output(&root, "127.0.0.1", port, "line");
+    // 指标上送需要**授权的指标工作**：没有授权就不上送（见后面的用例）。
+    // 日志采集则来自同一份授权里的日志单元。
+    let work = granted_log_and_metrics_work(vec![log_unit(
+        "app",
+        input_path.to_str().expect("utf8 path"),
+    )]);
+    run_once_with(&root, &config, &work);
+    fs::write(&input_path, "alpha\nbeta\n").expect("write input log");
+    let snapshot = run_once_with(&root, &config, &work);
 
     let payload = server.join().expect("join server");
-    let checkpoint_path = wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "app");
+    let checkpoint_path =
+        wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "work-Test-app");
     let checkpoint: TestLogCheckpointState = read_json(&checkpoint_path).expect("read checkpoint");
 
     assert_eq!(
@@ -1153,11 +1229,10 @@ fn daemon_run_once_sends_raw_log_lines_to_tcp_output() {
     assert!(payload.contains("\"schema\":\"v1\""));
     assert!(payload.contains("\"agent\":\"agent-001\""));
     assert!(payload.contains("\"seq\":0"));
-    // 本机手工配置的输入**不来自任何采集面**：帧里就不带 `family`/`unit`。
-    // 这不是缺字段 —— “不是平台派活来的”本身就是有用的信息。
+    // 授权派活的输入把**来源身份**带进帧：这是「这条来自哪个面」唯一的依据。
     assert!(
-        !payload.contains("\"family\":"),
-        "手工配置的输入不该带采集面：{payload}"
+        payload.contains(r#""family":"Test","unit":"app""#),
+        "授权采集要把面与目录单元带进帧：{payload}"
     );
     assert_eq!(checkpoint.files.len(), 1);
     assert_eq!(
@@ -1191,20 +1266,15 @@ fn daemon_run_once_with_output_disabled_only_reports_facts() {
     let port = listener.local_addr().expect("listener addr").port();
 
     // 目标齐全但总闸关闭：连接里只该有事实帧。
-    let mut config =
-        standalone_config_with_tcp_file_input(&root, &input_path, "127.0.0.1", port, "line");
+    let mut config = standalone_config_with_tcp_output(&root, "127.0.0.1", port, "line");
     config.telemetry.logs.output.enabled = false;
 
-    daemon::run_once_with_work(
-        &daemon::DaemonLoop {
-            config: &config,
-            exec_bin: &test_exec_bin(&root),
-            upgrader_bin: ::std::path::Path::new(""),
-            config_dir: ::std::path::Path::new(""),
-        },
-        &granted_metrics_work(),
-    )
-    .expect("daemon run once");
+    // 日志与指标都**有授权**：待命期不发它们不是因为“没活”，而是因为总闸关着。
+    let work = granted_log_and_metrics_work(vec![log_unit(
+        "app",
+        input_path.to_str().expect("utf8 path"),
+    )]);
+    run_once_with(&root, &config, &work);
 
     // 待命期**会**建连接（推进程列表），但连接里只有事实帧。
     let payload = accept_and_drain(&listener);
@@ -1217,7 +1287,8 @@ fn daemon_run_once_with_output_disabled_only_reports_facts() {
     assert!(!root.join("log").join("wist-records.ndjson").exists());
 
     // 源文件 offset 不前进：待命期根本不读源，checkpoint 不该被创建/推进。
-    let checkpoint_path = wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "app");
+    let checkpoint_path =
+        wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "work-Test-app");
     assert!(
         !checkpoint_path.exists(),
         "待命期不该推进 log checkpoint：{}",
@@ -1244,19 +1315,20 @@ fn daemon_run_once_catches_up_across_multiple_read_batches() {
     for index in 0..line_count {
         body.push_str(&format!("line-{index}\n"));
     }
-    fs::write(&input_path, &body).expect("write input log");
+    // 授权采集是 tail：先给空文件建立位点，再看一轮能不能追 5000 行。
+    fs::write(&input_path, "").expect("create empty input log");
 
-    let mut config = standalone_config_with_file_input(&root, &input_path);
+    let mut config = standalone_config_with_file_output(&root);
     // 时间片给得比测试需要的大：这条用例钉的是“会不会追”，不是“追得多快”。
     config.telemetry.logs.catchup_slice_ms = 30_000;
     config.telemetry.logs.catchup_budget_ms = 30_000;
-    daemon::run_once(&daemon::DaemonLoop {
-        config: &config,
-        exec_bin: &test_exec_bin(&root),
-        upgrader_bin: ::std::path::Path::new(""),
-        config_dir: ::std::path::Path::new(""),
-    })
-    .expect("daemon run once");
+    let work = granted_log_work(
+        "Test",
+        vec![log_unit("app", input_path.to_str().expect("utf8 path"))],
+    );
+    run_once_with(&root, &config, &work);
+    fs::write(&input_path, &body).expect("write input log");
+    run_once_with(&root, &config, &work);
 
     let records = read_output_records(&root);
     assert_eq!(records.len(), line_count, "一轮 tick 必须跨多批追到文件尾");
@@ -1266,7 +1338,7 @@ fn daemon_run_once_catches_up_across_multiple_read_batches() {
         format!("line-{}\n", line_count - 1)
     );
     let checkpoint: TestLogCheckpointState = read_json(
-        &wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "app"),
+        &wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "work-Test-app"),
     )
     .expect("read checkpoint");
     assert_eq!(
@@ -1294,24 +1366,37 @@ fn catchup_can_be_disabled_and_checkpoint_resumes_across_ticks() {
     for index in 0..line_count {
         body.push_str(&format!("line-{index}\n"));
     }
-    fs::write(&input_path, &body).expect("write input log");
+    // 授权采集是 tail：第一轮在空文件上建立位点后，再写入这 5000 行。
+    fs::write(&input_path, "").expect("create empty input log");
 
-    let mut config = standalone_config_with_file_input(&root, &input_path);
+    let mut config = standalone_config_with_file_output(&root);
     config.telemetry.logs.catchup_slice_ms = 0;
-    let loop_ctx = daemon::DaemonLoop {
-        config: &config,
-        exec_bin: &test_exec_bin(&root),
-        upgrader_bin: ::std::path::Path::new(""),
-        config_dir: ::std::path::Path::new(""),
-    };
-    daemon::run_once(&loop_ctx).expect("daemon run once");
+    let work = granted_log_work(
+        "Test",
+        vec![log_unit("app", input_path.to_str().expect("utf8 path"))],
+    );
+    run_once_with(&root, &config, &work);
+    fs::write(&input_path, &body).expect("write input log");
+    run_once_with(&root, &config, &work);
+    // 一轮只吃一批：checkpoint 应该正好停在第 4096 行的行尾。
+    //
+    // 不能只数输出文件里的记录数：内存预算（`in_memory_buffer_bytes`）溢出时，一批里
+    // 尾部那几条会先转进 spool（下一轮开头按序回放）—— 那是**交付层**的策略，
+    // 不是“这一轮读了几行”。checkpoint 才是读进度的权威。
+    let first_batch_end: u64 = body
+        .split_inclusive('\n')
+        .take(4096)
+        .map(|line| line.len() as u64)
+        .sum();
+    let checkpoint_path =
+        wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "work-Test-app");
+    let checkpoint: TestLogCheckpointState = read_json(&checkpoint_path).expect("read checkpoint");
     assert_eq!(
-        read_output_records(&root).len(),
-        4096,
+        checkpoint.files[0].checkpoint_offset, first_batch_end,
         "关闭追平后单轮只读一批（max_lines_per_tick）"
     );
 
-    daemon::run_once(&loop_ctx).expect("daemon run once again");
+    run_once_with(&root, &config, &work);
     let records = read_output_records(&root);
     assert_eq!(
         records.len(),
@@ -1367,11 +1452,12 @@ fn accept_and_drain(listener: &TcpListener) -> String {
 /// 用于跨轮断言：`run_once` 每轮自己建 sink、连一次、写完整轮、断开，所以“这一轮发了什么”
 /// 就是一次 accept + 读到 EOF。
 #[cfg(unix)]
-fn run_once_collecting_tcp(
-    root: &std::path::Path,
-    input_path: &std::path::Path,
-    enabled: bool,
-) -> Vec<String> {
+/// 跑一轮（在给定授权下），把这一轮上送出去的**日志原文**收集回来（按 ` LOGRAW: ` 帧切分）。
+///
+/// 用于跨轮断言：`run_once` 每轮自己建 sink、连一次、写完整轮、断开，所以“这一轮发了什么”
+/// 就是一次 accept + 读到 EOF。每轮都会建连接（事实帧也走同一上行）。
+#[cfg(unix)]
+fn run_once_collecting_tcp(root: &std::path::Path, work: &AppliedWorkGrant) -> Vec<String> {
     let Some(listener) = bind_tcp_listener("127.0.0.1:0") else {
         return Vec::new();
     };
@@ -1395,19 +1481,8 @@ fn run_once_collecting_tcp(
         raw_body_sections(&String::from_utf8_lossy(&buf))
     });
 
-    let mut config =
-        standalone_config_with_tcp_file_input(root, input_path, "127.0.0.1", port, "line");
-    config.telemetry.logs.output.enabled = enabled;
-    daemon::run_once_with_work(
-        &daemon::DaemonLoop {
-            config: &config,
-            exec_bin: &test_exec_bin(root),
-            upgrader_bin: ::std::path::Path::new(""),
-            config_dir: ::std::path::Path::new(""),
-        },
-        &granted_metrics_work(),
-    )
-    .expect("daemon run once");
+    let config = standalone_config_with_tcp_output(root, "127.0.0.1", port, "line");
+    run_once_with(root, &config, work);
     reader.join().expect("reader thread")
 }
 
@@ -1427,8 +1502,11 @@ fn daemon_standby_leaves_the_spool_untouched() {
     bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
     fs::write(&input_path, "alpha\n").expect("write input log");
 
-    // 预置一份「上次没发出去」的 spool。
-    let spool_path = state_dir.join("spool").join("logs").join("app.ndjson");
+    // 预置一份「上次没发出去」的 spool（文件名跟着授权折算出的 input_id 走）。
+    let spool_path = state_dir
+        .join("spool")
+        .join("logs")
+        .join("work-Test-app.ndjson");
     fs::create_dir_all(spool_path.parent().expect("spool parent")).expect("mkdir spool");
     let spooled = "{\"agent_id\":\"agent-001\",\"raw\":\"beta\"}\n";
     fs::write(&spool_path, spooled).expect("seed spool");
@@ -1440,20 +1518,15 @@ fn daemon_standby_leaves_the_spool_untouched() {
     listener.set_nonblocking(true).expect("nonblocking");
     let port = listener.local_addr().expect("listener addr").port();
 
-    let mut config =
-        standalone_config_with_tcp_file_input(&root, &input_path, "127.0.0.1", port, "line");
+    let mut config = standalone_config_with_tcp_output(&root, "127.0.0.1", port, "line");
     config.telemetry.logs.output.enabled = false;
 
-    daemon::run_once_with_work(
-        &daemon::DaemonLoop {
-            config: &config,
-            exec_bin: &test_exec_bin(&root),
-            upgrader_bin: ::std::path::Path::new(""),
-            config_dir: ::std::path::Path::new(""),
-        },
-        &granted_metrics_work(),
-    )
-    .expect("daemon run once");
+    // 日志与指标都有授权：spool 不动是因为总闸关着，不是因为压根没这条输入。
+    let work = granted_log_and_metrics_work(vec![log_unit(
+        "app",
+        input_path.to_str().expect("utf8 path"),
+    )]);
+    run_once_with(&root, &config, &work);
 
     thread::sleep(Duration::from_millis(200));
     // 待命**会**建连接推进程列表，但它不该回放 spool：上行里不能有日志帧（` LOGRAW: `）。
@@ -1482,49 +1555,52 @@ fn daemon_reenable_after_standby_resumes_from_the_previous_checkpoint() {
     bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
     fs::write(&input_path, "alpha\n").expect("write input log");
 
-    // 第一轮：启用，把 alpha 发出去，checkpoint 前进到文件尾。
-    let first = run_once_collecting_tcp(&root, &input_path, true);
-    assert!(first.iter().any(|body| body.contains("alpha")), "{first:?}");
+    let work = granted_log_work(
+        "Test",
+        vec![log_unit("app", input_path.to_str().expect("utf8 path"))],
+    );
+    // 第一轮：授权采集是 tail，历史行 alpha 不被采（只建立位点）。
+    let baseline = run_once_collecting_tcp(&root, &work);
+    assert!(
+        baseline.is_empty(),
+        "授权采集不重放历史（tail）：{baseline:?}"
+    );
 
-    // 追加 beta，然后**关闸**跑一轮：不该有任何连接（也不该推进 checkpoint）。
-    fs::write(&input_path, "alpha\nbeta\n").expect("append input log");
+    // 第二轮：启用着，把 beta 发出去，checkpoint 前进到文件尾。
+    fs::write(&input_path, "alpha\nbeta\n").expect("append beta");
+    let first = run_once_collecting_tcp(&root, &work);
+    assert!(first.iter().any(|body| body.contains("beta")), "{first:?}");
+
+    // 追加 gamma，然后**关闸**跑一轮：不该有任何连接（也不该推进 checkpoint）。
+    fs::write(&input_path, "alpha\nbeta\ngamma\n").expect("append gamma");
     let Some(listener) = bind_tcp_listener("127.0.0.1:0") else {
         return;
     };
     listener.set_nonblocking(true).expect("nonblocking");
     let port = listener.local_addr().expect("listener addr").port();
-    let mut gated =
-        standalone_config_with_tcp_file_input(&root, &input_path, "127.0.0.1", port, "line");
+    let mut gated = standalone_config_with_tcp_output(&root, "127.0.0.1", port, "line");
     gated.telemetry.logs.output.enabled = false;
-    daemon::run_once_with_work(
-        &daemon::DaemonLoop {
-            config: &gated,
-            exec_bin: &test_exec_bin(&root),
-            upgrader_bin: ::std::path::Path::new(""),
-            config_dir: ::std::path::Path::new(""),
-        },
-        &granted_metrics_work(),
-    )
-    .expect("gated run");
+    run_once_with(&root, &gated, &work);
     thread::sleep(Duration::from_millis(200));
     assert!(listener.accept().is_err(), "关闸那一轮不该建立连接");
 
-    // 再启用：beta 必须发出来（从旧 offset 续读，没丢），alpha 不该重复发。
-    let resumed = run_once_collecting_tcp(&root, &input_path, true);
+    // 再启用：gamma 必须发出来（从旧 offset 续读，没丢），beta 不该重复发。
+    let resumed = run_once_collecting_tcp(&root, &work);
     assert!(
-        resumed.iter().any(|body| body.contains("beta")),
+        resumed.iter().any(|body| body.contains("gamma")),
         "重新启用后待命期写入的行不能丢：{resumed:?}"
     );
     assert!(
-        !resumed.iter().any(|body| body.contains("alpha")),
+        !resumed.iter().any(|body| body.contains("beta")),
         "checkpoint 不该回退：已发过的行不能重复发：{resumed:?}"
     );
 }
 
-/// 没有授权的指标工作 → **不上送指标**，但配置里的日志采集照旧。
+/// 没有授权的指标工作 → **不上送指标**，但已授权的日志采集照旧。
 ///
 /// 这是“不做任务工作的 Agent”在数据面上的具体含义：默认不发指标；
-/// 而本机运维在配置里手工加的那条日志任务是逃生舱，不该被平台派活机制连带关掉。
+/// 而日志采集走的是**网关派的活**（不是本机配置里的手工源 —— 那条已废弃），
+/// 两类授权各管各的，不该被连带关掉。
 #[cfg(unix)]
 #[test]
 fn daemon_run_once_without_granted_metrics_work_skips_the_metrics_frame() {
@@ -1534,38 +1610,44 @@ fn daemon_run_once_without_granted_metrics_work_skips_the_metrics_frame() {
     let log_dir = root.join("log");
     let input_path = root.join("app.log");
     bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
-    fs::write(&input_path, "alpha\n").expect("write input log");
+    // 授权采集是 tail：第一轮只建立位点，第二轮才采到 alpha。
+    fs::write(&input_path, "").expect("create empty input log");
 
     let Some(listener) = bind_tcp_listener("127.0.0.1:0") else {
         return;
     };
     let port = listener.local_addr().expect("listener addr").port();
+    // 两轮各开一条连接（事实帧也走同一上行），服务端收两条并拼起来。
     let server = thread::spawn(move || {
-        let (mut socket, _) = listener.accept().expect("accept");
-        socket
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("set timeout");
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 128];
-        loop {
-            match socket.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                Err(_) => break,
+        let mut collected = String::new();
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set timeout");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 128];
+            loop {
+                match socket.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                }
             }
+            collected.push_str(&String::from_utf8(buf).expect("utf8 payload"));
         }
-        String::from_utf8(buf).expect("utf8 payload")
+        collected
     });
 
-    let config =
-        standalone_config_with_tcp_file_input(&root, &input_path, "127.0.0.1", port, "line");
-    daemon::run_once(&daemon::DaemonLoop {
-        config: &config,
-        exec_bin: &test_exec_bin(&root),
-        upgrader_bin: ::std::path::Path::new(""),
-        config_dir: ::std::path::Path::new(""),
-    })
-    .expect("daemon run once");
+    let config = standalone_config_with_tcp_output(&root, "127.0.0.1", port, "line");
+    // 只授日志，不授指标。
+    let work = granted_log_work(
+        "Test",
+        vec![log_unit("app", input_path.to_str().expect("utf8 path"))],
+    );
+    run_once_with(&root, &config, &work);
+    fs::write(&input_path, "alpha\n").expect("write input log");
+    run_once_with(&root, &config, &work);
 
     let payload = server.join().expect("join server");
     assert!(!payload.contains(" METRICS: "), "{payload}");
@@ -1612,10 +1694,8 @@ fn a_granted_log_work_collects_the_glob_without_any_config_file_input() {
         collected
     });
 
-    let mut config =
-        standalone_config_with_tcp_file_input(&root, &input_path, "127.0.0.1", port, "line");
+    let config = standalone_config_with_tcp_output(&root, "127.0.0.1", port, "line");
     // 配置里**没有**任何 file_inputs：本用例要证明采集完全来自授权工作。
-    config.telemetry.logs.file_inputs.clear();
     let work = granted_work(
         "CrashPanic",
         "collect_logs",
@@ -1672,7 +1752,8 @@ fn daemon_run_once_replays_spool_when_tcp_output_recovers() {
     let log_dir = root.join("log");
     let input_path = root.join("app.log");
     bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
-    fs::write(&input_path, "first\nsecond\n").expect("write input log");
+    // 授权采集是 tail：第一轮只建立位点（此时上行不可达，但没有记录可 spool）。
+    fs::write(&input_path, "").expect("create empty input log");
 
     let Some(reserved) = bind_tcp_listener("127.0.0.1:0") else {
         return;
@@ -1680,20 +1761,21 @@ fn daemon_run_once_replays_spool_when_tcp_output_recovers() {
     let port = reserved.local_addr().expect("listener addr").port();
     drop(reserved);
 
-    let failing_config =
-        standalone_config_with_tcp_file_input(&root, &input_path, "127.0.0.1", port, "line");
-    let first_snapshot = daemon::run_once(&daemon::DaemonLoop {
-        config: &failing_config,
-        exec_bin: &test_exec_bin(&root),
-        upgrader_bin: ::std::path::Path::new(""),
-        config_dir: ::std::path::Path::new(""),
-    })
-    .expect("first daemon run once");
+    let work = granted_log_work(
+        "Test",
+        vec![log_unit("app", input_path.to_str().expect("utf8 path"))],
+    );
+    let failing_config = standalone_config_with_tcp_output(&root, "127.0.0.1", port, "line");
+    run_once_with(&root, &failing_config, &work);
+
+    // 第二轮：有记录要发但上行不可达 → 全部进 spool。
+    fs::write(&input_path, "first\nsecond\n").expect("write input log");
+    let first_snapshot = run_once_with(&root, &failing_config, &work);
     let spool_path = root
         .join("state")
         .join("spool")
         .join("logs")
-        .join("app.ndjson");
+        .join("work-Test-app.ndjson");
     let spooled = fs::read_to_string(&spool_path).expect("read spool");
 
     assert_eq!(
@@ -1732,17 +1814,11 @@ fn daemon_run_once_replays_spool_when_tcp_output_recovers() {
         String::from_utf8(buf).expect("utf8 payload")
     });
 
-    let recovered_config =
-        standalone_config_with_tcp_file_input(&root, &input_path, "127.0.0.1", port, "line");
-    let second_snapshot = daemon::run_once(&daemon::DaemonLoop {
-        config: &recovered_config,
-        exec_bin: &test_exec_bin(&root),
-        upgrader_bin: ::std::path::Path::new(""),
-        config_dir: ::std::path::Path::new(""),
-    })
-    .expect("second daemon run once");
+    let recovered_config = standalone_config_with_tcp_output(&root, "127.0.0.1", port, "line");
+    let second_snapshot = run_once_with(&root, &recovered_config, &work);
     let payload = server.join().expect("join server");
-    let checkpoint_path = wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "app");
+    let checkpoint_path =
+        wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "work-Test-app");
     let checkpoint: TestLogCheckpointState = read_json(&checkpoint_path).expect("read checkpoint");
 
     assert_eq!(
@@ -1774,7 +1850,8 @@ fn daemon_run_once_exposes_paused_input_and_recovers_in_health_snapshot() {
     let log_dir = root.join("log");
     let input_path = root.join("app.log");
     bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
-    fs::write(&input_path, "first\nsecond\n").expect("write input log");
+    // 授权采集是 tail：先给空文件建立位点（此时没有记录可 spool）。
+    fs::write(&input_path, "").expect("create empty input log");
 
     // 预留一个端口后立即释放，模拟 TCP 输出不可达，从而触发 spool。
     let Some(reserved) = bind_tcp_listener("127.0.0.1:0") else {
@@ -1783,30 +1860,26 @@ fn daemon_run_once_exposes_paused_input_and_recovers_in_health_snapshot() {
     let port = reserved.local_addr().expect("listener addr").port();
     drop(reserved);
 
-    let mut failing_config =
-        standalone_config_with_tcp_file_input(&root, &input_path, "127.0.0.1", port, "line");
+    let work = granted_log_work(
+        "Test",
+        vec![log_unit("app", input_path.to_str().expect("utf8 path"))],
+    );
+    let mut failing_config = standalone_config_with_tcp_output(&root, "127.0.0.1", port, "line");
     // 任意非空 spool 都视为超限，便于固定背压路径。
     failing_config.telemetry.logs.spool_max_bytes = 1;
+    run_once_with(&root, &failing_config, &work);
 
-    // 第一次：尚无 spool，先落 spool，不进入暂停。
-    let first_snapshot = daemon::run_once(&daemon::DaemonLoop {
-        config: &failing_config,
-        exec_bin: &test_exec_bin(&root),
-        upgrader_bin: ::std::path::Path::new(""),
-        config_dir: ::std::path::Path::new(""),
-    })
-    .expect("first daemon run once");
+    // 写入两行：尚无 spool，先落 spool，不进入暂停。
+    fs::write(&input_path, "first\nsecond\n").expect("write input log");
+    let first_snapshot = run_once_with(&root, &failing_config, &work);
     assert!(first_snapshot.paused_inputs.is_empty());
 
-    // 第二次：spool 已存在且上报仍不通，进入暂停，健康快照应暴露该输入。
-    let paused_snapshot = daemon::run_once(&daemon::DaemonLoop {
-        config: &failing_config,
-        exec_bin: &test_exec_bin(&root),
-        upgrader_bin: ::std::path::Path::new(""),
-        config_dir: ::std::path::Path::new(""),
-    })
-    .expect("paused daemon run once");
-    assert_eq!(paused_snapshot.paused_inputs, vec!["app".to_string()]);
+    // 再一轮：spool 已存在且上报仍不通，进入暂停，健康快照应暴露该输入。
+    let paused_snapshot = run_once_with(&root, &failing_config, &work);
+    assert_eq!(
+        paused_snapshot.paused_inputs,
+        vec!["work-Test-app".to_string()]
+    );
 
     // 恢复：TCP 可连后 spool 回放成功，退出暂停。
     let Some(listener) = bind_tcp_listener(&format!("127.0.0.1:{port}")) else {
@@ -1837,15 +1910,8 @@ fn daemon_run_once_exposes_paused_input_and_recovers_in_health_snapshot() {
         String::from_utf8(buf).expect("utf8 payload")
     });
 
-    let recovered_config =
-        standalone_config_with_tcp_file_input(&root, &input_path, "127.0.0.1", port, "line");
-    let recovered_snapshot = daemon::run_once(&daemon::DaemonLoop {
-        config: &recovered_config,
-        exec_bin: &test_exec_bin(&root),
-        upgrader_bin: ::std::path::Path::new(""),
-        config_dir: ::std::path::Path::new(""),
-    })
-    .expect("recovered daemon run once");
+    let recovered_config = standalone_config_with_tcp_output(&root, "127.0.0.1", port, "line");
+    let recovered_snapshot = run_once_with(&root, &recovered_config, &work);
     let _payload = server.join().expect("join server");
 
     assert!(recovered_snapshot.paused_inputs.is_empty());
@@ -1862,26 +1928,28 @@ fn daemon_restart_recovers_checkpoint_without_loss_or_duplication() {
     bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
 
     let first_lines = "first\nsecond\n";
+    // 授权采集是 tail：首轮在空文件上建立位点。
+    fs::write(&input_path, "").expect("create empty log");
+
+    let config = standalone_config_with_file_output(&root);
+    let work = granted_log_work(
+        "Test",
+        vec![log_unit("app", input_path.to_str().expect("utf8 path"))],
+    );
+
+    // 第一轮：只建立位点（此时还没写入任何内容）。
+    run_once_with(&root, &config, &work);
+
+    // 第二轮：首次真正采到内容，并把 checkpoint 持久化到磁盘。
     fs::write(&input_path, first_lines).expect("write initial log");
-
-    let config = standalone_config_with_file_input(&root, &input_path);
-    let exec_bin = test_exec_bin(&root);
-    let daemon_loop = daemon::DaemonLoop {
-        config: &config,
-        exec_bin: &exec_bin,
-        upgrader_bin: ::std::path::Path::new(""),
-        config_dir: ::std::path::Path::new(""),
-    };
-
-    // 第一次运行：处理初始两行，并持久化 checkpoint 到磁盘。
-    daemon::run_once(&daemon_loop).expect("first run");
+    run_once_with(&root, &config, &work);
 
     // 崩溃窗口：进程已退出（不优雅停机），但源文件仍在增长。
     let second_lines = "third\nfourth\n";
     fs::write(&input_path, format!("{first_lines}{second_lines}")).expect("append after crash");
 
-    // 重启：新的一次 run_once 从持久化 checkpoint 恢复，只读新增行。
-    daemon::run_once(&daemon_loop).expect("restart run");
+    // 重启：新的一次 run（全新运行时）从持久化 checkpoint 恢复，只读新增行。
+    run_once_with(&root, &config, &work);
 
     // 不丢不重：四行各恰好一次、顺序正确。
     let output_path = root.join("log").join("wist-records.ndjson");
@@ -1898,10 +1966,55 @@ fn daemon_restart_recovers_checkpoint_without_loss_or_duplication() {
     assert_eq!(bodies, vec!["first\n", "second\n", "third\n", "fourth\n"]);
 
     // checkpoint 最终偏移覆盖全部内容，确认无回退。
-    let checkpoint_path = wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "app");
+    let checkpoint_path =
+        wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "work-Test-app");
     let checkpoint: TestLogCheckpointState = read_json(&checkpoint_path).expect("read checkpoint");
     assert_eq!(
         checkpoint.files[0].checkpoint_offset,
         (first_lines.len() + second_lines.len()) as u64
+    );
+}
+
+/// 本机手工源（`telemetry.logs.file_inputs`）**已废弃**：配置里写了也不再采。
+///
+/// 为什么改：采集路径统一由网关派活（`Control.Agent.Work`）决定，本机再配一遍只会制造“配了、
+/// 也以为在采、其实没人管”的错觉（0.18.5）。这条用例原本验证“配置里的手工源会被采集”，
+/// 该语义在废弃之后已不成立 —— 现在钉住的是**新语义**：它既不上送、也不建 checkpoint / spool。
+#[cfg(unix)]
+#[test]
+fn daemon_run_once_ignores_deprecated_configured_file_input() {
+    let root = temp_dir("daemon-deprecated-file-input");
+    let run_dir = root.join("run");
+    let state_dir = root.join("state");
+    let log_dir = root.join("log");
+    let input_path = root.join("app.log");
+    bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
+    fs::write(&input_path, "first\nsecond\n").expect("write input log");
+
+    // 配置里写了手工源，但没有任何授权：这条输入不该被任何路径采到。
+    let config = standalone_config_with_file_input(&root, &input_path);
+    daemon::run_once(&daemon::DaemonLoop {
+        config: &config,
+        exec_bin: &test_exec_bin(&root),
+        upgrader_bin: ::std::path::Path::new(""),
+        config_dir: ::std::path::Path::new(""),
+    })
+    .expect("daemon run once");
+
+    assert!(
+        !root.join("log").join("wist-records.ndjson").exists(),
+        "已废弃的手工源不该产生任何记录"
+    );
+    assert!(
+        !wist_agentd::state_store::log_checkpoints::path_for(&state_dir, "app").exists(),
+        "已废弃的手工源不该建 checkpoint"
+    );
+    assert!(
+        !state_dir
+            .join("spool")
+            .join("logs")
+            .join("app.ndjson")
+            .exists(),
+        "已废弃的手工源不该产生 spool"
     );
 }

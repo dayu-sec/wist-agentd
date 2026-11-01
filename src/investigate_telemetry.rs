@@ -32,7 +32,7 @@ use crate::config::agent_config::AgentConfig;
 use crate::doctor::Status;
 use crate::investigate::{Coverage, Finding, InvestigateRequest, Row, human_bytes};
 use crate::investigate_probe::truncate_rows;
-use crate::runtime::daemon::telemetry_support::spool_path_for;
+use crate::runtime::daemon::telemetry_support::spool_path_for_id;
 use crate::state_store::log_checkpoints;
 use crate::telemetry::logs::files::is_family_target;
 
@@ -59,35 +59,124 @@ pub(crate) fn investigate(
                 "telemetry.sources",
                 Status::Unknown,
                 "没有读到 agentd 配置，无法判断该采什么",
-                "遥测健康要对照 `[telemetry.logs] file_inputs` 才说得清“该有而没来”",
+                "遥测健康要对照本机实际生效的采集任务（`state/work.json`）才说得清“该有而没来”",
             )
             .hint("用 `--config-dir` 指向 agentd 配置目录；或确认 /etc/wist-agentd 下的配置可读"),
         ]);
     };
-    if config.telemetry.logs.file_inputs.is_empty() {
+    // 判据取**本机实际生效的采集任务**（网关派活折算出来的），不取 `[telemetry.logs].file_inputs`：
+    // 后者已废弃（本机手工源不再采集）—— 拿它判空会把“网关派了 5 个面、正在采”说成
+    // “没有配置任何日志输入”，结论正好反过来。
+    let inputs = match load_effective_inputs(config) {
+        EffectiveInputs::Known(inputs) => inputs,
+        EffectiveInputs::Unknown(why) => {
+            return Ok(vec![
+                Finding::new(
+                    "telemetry.sources",
+                    Status::Unknown,
+                    "没有本机工作快照，无法判断该采什么",
+                    format!(
+                        "{why}；采集任务由网关派活折算，看不到它就说不出“该有而没来”"
+                    ),
+                )
+                .hint("确认 agentd 已连上网关并收到工作授权；`wist-agentd diagnose` 会给出连不上/未授权的具体原因"),
+            ]);
+        }
+    };
+    if inputs.is_empty() {
         return Ok(vec![
             Finding::new(
                 "telemetry.sources",
                 Status::Unknown,
-                "没有配置任何日志输入",
-                "`[telemetry.logs] file_inputs` 为空：agentd 不会采集任何主机日志",
+                "网关没有给这台机器派采集面",
+                "本机工作快照里没有任何采集任务：agentd 现在不会采集主机日志",
             )
-            .hint("这台机器本该有安全日志的话，先补上 `[[telemetry.logs.file_inputs]]`"),
+            .hint(
+                "去管理面给这台机器派采集工作；本机 `[[telemetry.logs.file_inputs]]` 已废弃，配了也不会采",
+            ),
         ]);
     }
     let top = request.top.max(1);
     Ok(vec![
-        sources_finding(config, top),
-        backlog_finding(config, top),
+        sources_finding(config, &inputs, top),
+        backlog_finding(config, &inputs, top),
         pipeline_finding(config),
     ])
+}
+
+/// 一个**有效**采集输入：网关派活折算出来的采集任务（`state/work.json` 的 `standing[].tasks[]`）。
+///
+/// 与采集循环用的是同一份真相（`config/work.rs` 的 `log_inputs()` → 落盘 `work.json`），
+/// 所以“调查看到的”与“真正在采的”不会分叉。
+struct EffectiveInput {
+    input_id: String,
+    path: String,
+}
+
+/// 有效输入集的读取结果。
+///
+/// 刻意把“不知道”与“知道且为空”分开：没有工作快照时说“没采”同样是反向结论。
+enum EffectiveInputs {
+    /// 读到了工作视图：这里就是这台机器在采的全部（可能为空 = 网关真没派活）。
+    Known(Vec<EffectiveInput>),
+    /// 没有 / 读不动工作快照：**不知道**，不是“没采”。
+    Unknown(&'static str),
+}
+
+/// 从 `state/work.json` 取采集任务。
+///
+/// 用宽容结构而不是 `WorkRecord`：工作视图可能由**另一个版本**的 agentd 写（升级中途、
+/// 回滚），调查工具不该因为多了一个键就整节失效 —— 与 checkpoint 的解析纪律一致。
+fn load_effective_inputs(config: &AgentConfig) -> EffectiveInputs {
+    #[derive(Deserialize)]
+    struct WorkViewSlice {
+        #[serde(default)]
+        standing: Vec<StandingSlice>,
+    }
+    #[derive(Deserialize)]
+    struct StandingSlice {
+        #[serde(default)]
+        tasks: Vec<TaskSlice>,
+    }
+    #[derive(Deserialize)]
+    struct TaskSlice {
+        #[serde(default)]
+        input_id: String,
+        #[serde(default)]
+        path: String,
+    }
+
+    let path = crate::state_store::work::path_for(Path::new(&config.paths.state_dir));
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return EffectiveInputs::Unknown(
+                "本机还没有工作快照（刚装 / 从没连上网关 / state 被删）",
+            );
+        }
+        Err(_) => return EffectiveInputs::Unknown("读不到本机工作快照（权限 / IO）"),
+    };
+    let Ok(view) = serde_json::from_str::<WorkViewSlice>(&text) else {
+        return EffectiveInputs::Unknown("本机工作快照不是合法 JSON（旧版本 / 半写）");
+    };
+    EffectiveInputs::Known(
+        view.standing
+            .into_iter()
+            .flat_map(|work| work.tasks)
+            .filter(|task| !task.input_id.is_empty())
+            .map(|task| EffectiveInput {
+                input_id: task.input_id,
+                path: task.path,
+            })
+            .collect(),
+    )
 }
 
 // ---------------------------------------------------------------------------
 // telemetry.sources
 // ---------------------------------------------------------------------------
 
-fn sources_finding(config: &AgentConfig, top: usize) -> Finding {
+fn sources_finding(config: &AgentConfig, inputs: &[EffectiveInput], top: usize) -> Finding {
     let state_dir = Path::new(&config.paths.state_dir);
     let now = now_secs();
     let mut coverage = Coverage::new(0, 0, 0);
@@ -100,7 +189,7 @@ fn sources_finding(config: &AgentConfig, top: usize) -> Finding {
     let mut behind = 0usize;
     let mut missing = 0usize;
 
-    for input in &config.telemetry.logs.file_inputs {
+    for input in inputs {
         coverage.checked += 1;
         if !is_plain_segment(&input.input_id) {
             // 配置坏了，不当来源去读：`input_id` 是要拼进路径的。
@@ -222,8 +311,8 @@ fn sources_finding(config: &AgentConfig, top: usize) -> Finding {
 
     let (rows, omitted) = truncate_rows(rows, top);
     let mut detail = format!(
-        "配置输入 {} 个；读到 checkpoint {read_ok} 个；无 checkpoint {never} 个；静默 {} 个",
-        config.telemetry.logs.file_inputs.len(),
+        "采集任务 {} 个；读到 checkpoint {read_ok} 个；无 checkpoint {never} 个；静默 {} 个",
+        inputs.len(),
         silent_fail + silent_warn
     );
     if missing > 0 {
@@ -305,7 +394,7 @@ fn source_presence(path: &str) -> Presence {
 // telemetry.backlog
 // ---------------------------------------------------------------------------
 
-fn backlog_finding(config: &AgentConfig, top: usize) -> Finding {
+fn backlog_finding(config: &AgentConfig, inputs: &[EffectiveInput], top: usize) -> Finding {
     let cap = config.telemetry.logs.spool_max_bytes;
     let spool_dir = Path::new(&config.telemetry.logs.spool_dir);
     let now = now_secs();
@@ -316,13 +405,13 @@ fn backlog_finding(config: &AgentConfig, top: usize) -> Finding {
     let mut at_cap = 0usize;
     let mut readable = 0usize;
 
-    for input in &config.telemetry.logs.file_inputs {
+    for input in inputs {
         coverage.checked += 1;
         if !is_plain_segment(&input.input_id) {
             coverage.skipped += 1;
             continue;
         }
-        let path = spool_path_for(config, input);
+        let path = spool_path_for_id(config, &input.input_id);
         let metadata = match fs::metadata(&path) {
             Ok(metadata) => metadata,
             // 没有 spool 文件 = 从没积压过（直投时根本不落盘），这不是异常。
@@ -360,7 +449,7 @@ fn backlog_finding(config: &AgentConfig, top: usize) -> Finding {
     let (rows, omitted) = truncate_rows(rows, top);
     let mut detail = format!(
         "输入 {} 个；spool 可读 {readable} 个；有积压 {} 个",
-        config.telemetry.logs.file_inputs.len(),
+        inputs.len(),
         backlogged + at_cap
     );
     if at_cap > 0 {
@@ -602,7 +691,11 @@ mod tests {
         dir
     }
 
-    /// 用真实配置解析路径：这样 `file_inputs` / `spool_dir` 的默认值与解析规则都参与测试。
+    /// 造一份配置 + 一份**本机工作视图**（`state/work.json`）。
+    ///
+    /// 采集任务现在只来自网关派活，所以测试里要表达“这台机器在采什么”就必须写工作视图
+    /// （`inputs` 会被写成 `standing[].tasks[]`），而不是写已废弃的
+    /// `[[telemetry.logs.file_inputs]]`。
     fn config_with(
         state_dir: &Path,
         spool_dir: &Path,
@@ -610,7 +703,7 @@ mod tests {
         inputs: &[(&str, &str)],
         output_enabled: bool,
     ) -> AgentConfig {
-        let mut text = format!(
+        let text = format!(
             "schema_version = \"v1\"\n\
              [paths]\n\
              state_dir = \"{}\"\n\
@@ -622,13 +715,39 @@ mod tests {
             state_dir.display(),
             spool_dir.display()
         );
-        for (input_id, path) in inputs {
-            let _ = write!(
-                text,
-                "\n[[telemetry.logs.file_inputs]]\ninput_id = \"{input_id}\"\npath = \"{path}\"\n"
-            );
-        }
-        toml::from_str(&text).expect("config parses")
+        let config: AgentConfig = toml::from_str(&text).expect("config parses");
+        write_work_view(state_dir, inputs);
+        config
+    }
+
+    /// 写一份与 agentd 落盘同形的 `state/work.json`（只含采集任务，够调查用）。
+    fn write_work_view(state_dir: &Path, inputs: &[(&str, &str)]) {
+        fs::create_dir_all(state_dir).expect("state dir");
+        let tasks: Vec<String> = inputs
+            .iter()
+            .map(|(input_id, path)| {
+                format!(
+                    "{{\"input_id\":\"{input_id}\",\"path\":\"{path}\",\"startup_position\":\"tail\"}}"
+                )
+            })
+            .collect();
+        let standing = if tasks.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ",\"standing\":[{{\"work_id\":\"work-test\",\"family\":\"Test\",\"status\":\"active\",\
+                 \"plan_version\":1,\"acknowledged_version\":1,\"effective_from\":\"2026-01-01T00:00:00Z\",\
+                 \"units\":[],\"tasks\":[{}]}}]",
+                tasks.join(",")
+            )
+        };
+        fs::write(
+            state_dir.join("work.json"),
+            format!(
+                "{{\"schema_version\":\"v1\",\"recorded_at\":\"2026-01-01T00:00:00Z\",\"gateway_sequence\":1{standing}}}"
+            ),
+        )
+        .expect("write work view");
     }
 
     fn write_checkpoint(state_dir: &Path, input_id: &str, files: &str) {
@@ -696,6 +815,124 @@ mod tests {
             .into_iter()
             .find(|finding| finding.id == id)
             .unwrap_or_else(|| panic!("缺少 `{id}`"))
+    }
+
+    /// 回归：判据必须是**网关派活折算的采集任务**，不是已废弃的 `[[telemetry.logs.file_inputs]]`。
+    ///
+    /// 事故形状：网关派了 5 个面、机器正在采，本机 `file_inputs` 是空的，
+    /// 旧实现于是报「没有配置任何日志输入 / agentd 不会采集任何主机日志」—— 结论正好反了。
+    #[test]
+    fn the_judgement_basis_is_dispatched_tasks_not_deprecated_file_inputs() {
+        let root = temp_dir("dispatched-only");
+        let state_dir = root.join("state");
+        let spool_dir = root.join("spool");
+        fs::create_dir_all(&state_dir).expect("state dir");
+        // 配置里一条手工源都没有（事故现场就是这样）。
+        let text = format!(
+            "schema_version = \"v1\"\n[paths]\nstate_dir = \"{state}\"\n\
+             [telemetry.logs]\nspool_dir = \"{spool}\"\n[telemetry.logs.output]\nenabled = true\n",
+            state = state_dir.display(),
+            spool = spool_dir.display()
+        );
+        let config: AgentConfig = toml::from_str(&text).expect("config parses");
+
+        // 网关派了两个面（真实环境是 5 个，形状一样）。
+        let source = root.join("app.log");
+        fs::write(&source, b"").expect("source file");
+        let path = source.to_string_lossy().to_string();
+        write_work_view(
+            &state_dir,
+            &[
+                ("work-Demo-app", path.as_str()),
+                ("work-Demo-two", path.as_str()),
+            ],
+        );
+        write_checkpoint(&state_dir, "work-Demo-app", &file_entry(Some(5), 100, 100));
+
+        let finding = find(findings(&config), "telemetry.sources");
+        assert!(
+            !finding.title.contains("没有配置任何日志输入"),
+            "不能再说“没配日志输入”：{} — {}",
+            finding.title,
+            finding.detail
+        );
+        assert!(
+            finding.detail.contains("采集任务 2 个"),
+            "要按网关派的 2 个任务统计：{}",
+            finding.detail
+        );
+        assert!(
+            finding.rows.iter().any(|row| row.label == "work-Demo-app"),
+            "派活的源要出现在报告里：{:?}",
+            finding
+                .rows
+                .iter()
+                .map(|row| &row.label)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// 配置里写着手工源、网关又没派活：手工源已废弃，**不能被当成“在采”**。
+    #[test]
+    fn deprecated_file_inputs_are_not_counted_as_sources() {
+        let root = temp_dir("deprecated-local");
+        let state_dir = root.join("state");
+        let spool_dir = root.join("spool");
+        fs::create_dir_all(&state_dir).expect("state dir");
+        let text = format!(
+            "schema_version = \"v1\"\n[paths]\nstate_dir = \"{state}\"\n\
+             [telemetry.logs]\nspool_dir = \"{spool}\"\n\
+             [[telemetry.logs.file_inputs]]\ninput_id = \"manual-a\"\npath = \"/var/log/a\"\n\
+             [[telemetry.logs.file_inputs]]\ninput_id = \"manual-b\"\npath = \"/var/log/b\"\n",
+            state = state_dir.display(),
+            spool = spool_dir.display()
+        );
+        let config: AgentConfig = toml::from_str(&text).expect("config parses");
+        // 工作视图存在，但没有任何采集任务 = 网关没派活。
+        write_work_view(&state_dir, &[]);
+
+        let finding = find(findings(&config), "telemetry.sources");
+        assert_eq!(finding.status, Status::Unknown);
+        assert!(
+            finding.title.contains("没有给这台机器派采集面"),
+            "{}",
+            finding.title
+        );
+        assert!(
+            finding
+                .hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("file_inputs"),
+            "提示要说清本机 file_inputs 已废弃：{:?}",
+            finding.hint
+        );
+        assert!(finding.rows.is_empty(), "不能把已废弃的手工源列成行");
+    }
+
+    /// 没有工作快照（刚装 / 从没连上网关）：“不知道”不是“没采”。
+    #[test]
+    fn a_missing_work_view_is_unknown_not_healthy() {
+        let root = temp_dir("no-work-view");
+        let state_dir = root.join("state");
+        let spool_dir = root.join("spool");
+        fs::create_dir_all(&state_dir).expect("state dir");
+        let text = format!(
+            "schema_version = \"v1\"\n[paths]\nstate_dir = \"{state}\"\n\
+             [telemetry.logs]\nspool_dir = \"{spool}\"\n",
+            state = state_dir.display(),
+            spool = spool_dir.display()
+        );
+        let config: AgentConfig = toml::from_str(&text).expect("config parses");
+
+        let finding = find(findings(&config), "telemetry.sources");
+        assert_eq!(finding.status, Status::Unknown);
+        assert!(
+            finding.title.contains("没有本机工作快照"),
+            "{}",
+            finding.title
+        );
+        assert!(!finding.title.contains("正常"), "缺快照不能说正常");
     }
 
     #[test]

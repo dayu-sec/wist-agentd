@@ -319,17 +319,13 @@ fn cpu_percent_since(previous: &CpuSample, now: Instant, ticks_per_sec: u64) -> 
 /// 构造上报用的**本机工作内容视图**：`state/work.json` 的同形子集 + 本机配置里手工加的日志输入。
 ///
 /// 两处数据缺一不可 —— 网关要回答「这台机器到底在采哪些文件」，一半是本机授权折算出的采集
-/// 任务（`device_view`），另一半是配置里手工加的输入（`telemetry.logs.file_inputs`）；后者
-/// **不在**工作视图里，网关无从得知。
+/// 任务（`device_view`），另一半是配置里手工加的输入（`telemetry.logs.file_inputs`）—— 后者
+/// **已废弃**（0.18.5 起不再采集），保留只是为了旧配置还能启动，所以这里恒报空。
 ///
 /// 没收到过任何授权快照时（`device_view` 返回 `None`）也要上报：授权那半为空
-/// （空 standing/one_shot、序号 0），但配置里那半必须照报 —— 它独立于网关。
+/// （空 standing/one_shot、序号 0）—— 这本身就是一条信息。
 /// 这里没有可错的输入，构造**不会失败**，所以直接返回 `AgentLocalWork`。
-fn build_local_work(
-    config: &AgentConfig,
-    work: &AppliedWorkGrant,
-    recorded_at: &str,
-) -> AgentLocalWork {
+fn build_local_work(work: &AppliedWorkGrant, recorded_at: &str) -> AgentLocalWork {
     let view = work.device_view(recorded_at);
     let standing = view
         .as_ref()
@@ -379,18 +375,11 @@ fn build_local_work(
         gateway_sequence: view.as_ref().map_or(0, |view| view.gateway_sequence),
         standing,
         one_shot,
-        // 本机配置里手工加的日志输入（运维逃生舱）：不来自任何采集面，只能由 agent 自报。
-        local_inputs: config
-            .telemetry
-            .logs
-            .file_inputs
-            .iter()
-            .map(|input| AgentLocalTask {
-                input_id: input.input_id.clone(),
-                path: input.path.clone(),
-                startup_position: input.startup_position.clone(),
-            })
-            .collect(),
+        // 本机手工源**已废弃**（0.18.5）：采集只认网关派活的采集面。
+        //
+        // 字段留着是为了网关侧报文的形状不变（旧网关还能正常解析）；恒为空后，
+        // 管理面也不会再把这台机器当成“在采本机配的那几条”。
+        local_inputs: Vec::new(),
         metrics_interval_seconds: view.and_then(|view| view.metrics_interval_seconds),
     }
 }
@@ -571,7 +560,7 @@ async fn report_status_to_control_plane(
     let instance_id = config.agent.instance_name.as_deref().unwrap_or_default();
     // 本机工作视图是 best-effort：它只决定页面能不能看见「在采哪些文件」，
     // 构造不出来也不该影响状态上报本身，所以始终送 `Some(...)`（没快照时授权那半为空）。
-    let local_work = Some(build_local_work(config, work, &now_rfc3339()));
+    let local_work = Some(build_local_work(work, &now_rfc3339()));
     // 生效上送状态同样是 best-effort 的**声明**：没有可错的输入，所以始终送 `Some(...)`
     // （`None` 的语义是「本次没带」，与本机工作视图同口径，留给旧版本 agent）。
     let uplink_state = Some(build_uplink_state(config, uplink, uplink_health));
@@ -1169,7 +1158,7 @@ async fn deliver_investigation(
     let stored = format!("；完整报告：{}", path.display());
 
     let output = effective_output(config, uplink.grant());
-    let delivery = match build_telemetry_sink(config, work, &output) {
+    let delivery = match build_telemetry_sink(work, &output) {
         Ok(mut sink) if sink.carries_investigation_frames() => {
             let seq_path = log_seq_state::path_for(state_dir);
             // 与日志/指标/事实共用同一个 seq 空间（`(agent, seq)` 是数据面的去重键）。
@@ -1816,6 +1805,15 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     // 一次性命令：本机 `refresh-facts` 与网关回执里的命令共用同一份台账与同一条执行路径。
     // `last_refresh_facts` 只是重采这一种 kind 的节流计时（重启即清零是刻意的）。
     let command_state_dir = PathBuf::from(&loop_ctx.config.paths.state_dir);
+    // 旧配置里还写着手工采集源：如实提醒一句，否则“配了却没采”会当成采集故障去查。
+    // 只提示一次（启动时），不每个 tick 刷屏；不阻断启动（旧 toml 必须还能用）。
+    let deprecated_local_inputs = loop_ctx.config.telemetry.logs.file_inputs.len();
+    if deprecated_local_inputs > 0 || loop_ctx.config.telemetry.logs.file_inputs_file.is_some() {
+        log::warn!(
+            "event=DeprecatedConfigIgnored section=telemetry.logs.file_inputs count={deprecated_local_inputs} \
+             detail=\"本机手工采集源已废弃：采集面由网关派活下发，这段配置不会被读取\""
+        );
+    }
     let refresh_facts_interval = refresh_facts_min_interval();
     let mut last_refresh_facts: Option<Instant> = None;
     let mut command_history = commands::load_history_async(&command_state_dir)
@@ -2272,7 +2270,7 @@ async fn run_once_with_failure_cache(
     // 日志源候选跟着**事实摘要**上送（同一拍、同一份快照，见 `control::log_sources`）：
     // 摘要真发出去了才跟着发，不另造一套节流。
     let mut facts_reported = false;
-    let telemetry_tick = match build_telemetry_sink(loop_ctx.config, work, &effective) {
+    let telemetry_tick = match build_telemetry_sink(work, &effective) {
         Ok(mut sink) => {
             if !effective.enabled {
                 // 待命（本机 `enabled = false`，或控制面 grant 明确 `enabled = false`）：
@@ -2376,7 +2374,7 @@ async fn run_once_with_failure_cache(
             // 待命时 sink 建不起来（例如本机 `kind` 非法）也只是“没有可发的目标”，静默即可 ——
             // 不能报成故障（待命本就是正常态）。只有启用后才把输出配置错误报出来。
             if effective.enabled {
-                invalid_output_tick(loop_ctx.config, work, err.to_string())
+                invalid_output_tick(work, err.to_string())
             } else {
                 TelemetryTick::silent()
             }
@@ -4721,10 +4719,10 @@ mod tests {
         AppliedWorkGrant::restore(&record)
     }
 
-    /// 状态上报必须带上**本机工作内容视图**：授权折算出的采集任务 + 配置里手工加的输入，
-    /// 两半合起来才是「这台机器在采哪些文件」（见 `build_local_work`）。
+    /// 状态上报必须带上**本机工作内容视图**（授权折算出的采集任务），
+    /// 而本机 `file_inputs` 已废弃 —— 即使配置里写了，`local_inputs` 也必须恒为空。
     #[tokio::test]
-    async fn report_status_carries_the_local_work_view_and_configured_inputs() {
+    async fn report_status_carries_the_local_work_view_and_ignores_deprecated_inputs() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
         let server = tokio::spawn(async move {
@@ -4738,12 +4736,10 @@ mod tests {
                 ),
                 "{request}"
             );
-            // 配置那半：手工加的日志输入（不在 work.json 里）。
+            // 已废弃的本机手工源不得再出现在上报里：写了也不生效，报上去只会让人以为在采。
             assert!(
-                request.contains(
-                    "\"local_inputs\":[{\"input_id\":\"manual-app\",\"path\":\"/var/log/manual.log\""
-                ),
-                "{request}"
+                request.contains("\"local_inputs\":[]"),
+                "file_inputs 已废弃，local_inputs 必须恒空：{request}"
             );
             let response =
                 "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";

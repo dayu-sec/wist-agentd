@@ -34,7 +34,7 @@ use support::{
 // `pub(crate)` 也让 `doctor` 复用同一套判定（工具说一套、进程做一套是没有意义的）。
 pub(crate) use support::effective_output;
 /// 调查（`telemetry-health`）复用同一条 spool 路径：两处各写一份迟早会漂。
-pub(crate) use support::spool_path_for;
+pub(crate) use support::spool_path_for_id;
 
 #[derive(::jumo_derive::Jumo)]
 #[jumo(kind = "struct", domain = "Reporting", module = "Reporting.Health")]
@@ -210,18 +210,11 @@ pub(super) fn len_framing_required<'a>(
 /// 分帧取的是**生效输出**（`[telemetry.logs.output]` 与 grant 合流后的结论，见
 /// [`effective_output`]），因此 grant 把本机 `file` 覆盖成 tcp 时也照样升级。
 pub(super) fn build_telemetry_sink(
-    config: &AgentConfig,
     work: &AppliedWorkGrant,
     output: &LogsOutputSection,
 ) -> io::Result<TelemetryRecordSink> {
     let from_work = work.log_inputs();
-    let required = len_framing_required(
-        output,
-        from_work
-            .iter()
-            .map(|entry| &entry.input)
-            .chain(config.telemetry.logs.file_inputs.iter()),
-    );
+    let required = len_framing_required(output, from_work.iter().map(|entry| &entry.input));
     let Some(input_id) = required else {
         return build_record_sink(output, None);
     };
@@ -232,22 +225,12 @@ pub(super) fn build_telemetry_sink(
 }
 
 /// 当 sink 无法构建（非法输出配置）时，为每个输入生成一条 `InvalidOutput` 失败。
-pub(super) fn invalid_output_tick(
-    config: &AgentConfig,
-    work: &AppliedWorkGrant,
-    detail: String,
-) -> TelemetryTick {
-    let from_config = config
-        .telemetry
-        .logs
-        .file_inputs
-        .iter()
-        .map(|input| invalid_output_failure(input, detail.clone()));
-    let from_work = work
+pub(super) fn invalid_output_tick(work: &AppliedWorkGrant, detail: String) -> TelemetryTick {
+    let failures = work
         .log_inputs()
         .into_iter()
-        .map(|entry| invalid_output_failure(&entry.input, detail.clone()));
-    let failures = from_config.chain(from_work).collect();
+        .map(|entry| invalid_output_failure(&entry.input, detail.clone()))
+        .collect();
     TelemetryTick {
         outcomes: Vec::new(),
         failures,
@@ -282,18 +265,12 @@ pub(super) async fn process_telemetry_inputs(
     // 追平预算**一轮 tick 一份**：它是“采集段总共能占多久”，不是每条输入的。
     let budget = CatchupBudget::new(&config.telemetry.logs);
 
-    for input in &config.telemetry.logs.file_inputs {
-        process_telemetry_input(
-            config,
-            input,
-            &InputOrigin::default(),
-            sink,
-            &mut tick,
-            next_seq,
-            &budget,
-        )
-        .await;
-    }
+    // **只跑网关派活折算出来的采集任务**。
+    //
+    // 本机 `[[telemetry.logs.file_inputs]]` 已废弃（0.18.5）：规模化部署里路径由网关按
+    // “采集面 + 平台单元”下发，这 5 个面已经覆盖了原来本机手写的那几条（install.log /
+    // launchd.log / wifi.log …），本机再配一遍只会制造“配了、也以为在采、其实没人管”的错觉。
+    // 字段保留只为让旧 toml 还能启动（值被忽略）。
     for entry in work.log_inputs() {
         process_telemetry_input(
             config,

@@ -208,10 +208,18 @@ pub struct TelemetrySection {
 #[jumo(kind = "struct", domain = "Discovery", module = "Discovery.Config")]
 #[serde(deny_unknown_fields)]
 pub struct LogsSection {
+    /// **已废弃（0.18.5+）**：本机手工源不再采集。
+    ///
+    /// 采集面由网关派活下发（`units.file_sources`），这里配的条目**不会被读取**：
+    /// 不采集、不上报 `local_inputs`、也不参与 `telemetry-health` 的判定。
+    /// 字段保留**只是为了让旧 `agentd.toml` 还能启动**（`deny_unknown_fields` 下删字段 = 旧配置直接起不来）。
+    ///
+    /// 为什么废弃：规模化部署不可能一台台手配路径，而网关按“采集面 + 平台单元”已经
+    /// 能把同几条路径（install.log / launchd.log / wifi.log …）派下来；两处都能配
+    /// 只会制造“配了、以为在采、实际没人管”的错觉。
     #[serde(default)]
     pub file_inputs: Vec<LogFileInputSection>,
-    /// 采集任务清单外置文件（可选）：路径相对本配置文件解析。
-    /// 设置后不能再同时写内联 `[[telemetry.logs.file_inputs]]`（二选一）。
+    /// **已废弃（0.18.5+）**：外置采集任务清单，同样不再读取（理由见 [`Self::file_inputs`]）。
     #[serde(default)]
     pub file_inputs_file: Option<String>,
     #[serde(default = "default_logs_buffer_bytes")]

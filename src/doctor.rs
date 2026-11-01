@@ -1430,37 +1430,28 @@ async fn log_inputs_check(config: &AgentConfig, grant: Option<&AgentUplinkGrant>
     )
 }
 
-/// 本机此刻该采的日志目标：本机配置的 + 已生效工作折算的（与守护进程同一套判据）。
+/// 本机此刻该采的日志目标：**只来自已生效工作折算的采集任务**。
+///
+/// 本机 `[[telemetry.logs.file_inputs]]` 已废弃（不再采集），所以这里也不再并进去 ——
+/// 否则 `diagnose` 会报一堆“根本没人读”的路径，把真问题淹掉。
 async fn log_input_targets(config: &AgentConfig) -> Vec<(String, String)> {
-    let mut targets: Vec<(String, String)> = config
-        .telemetry
-        .logs
-        .file_inputs
-        .iter()
-        .map(|input| (input.input_id.clone(), input.path.clone()))
-        .collect();
+    // 取 `tasks[]`（而不是从 `units[].sources` 再推一遍）：它就是 `log_inputs()` 的产物 ——
+    // 已按“正在干活”过滤、已剔除不可执行的来源，与采集循环看的是同一份。
     let path = work::path_for(Path::new(&config.paths.state_dir));
-    if let Ok(Some(record)) = work::load_async(&path).await {
-        for standing in record
-            .standing
-            .iter()
-            .filter(|standing| standing.status == "active")
-        {
-            for unit in &standing.units {
-                if unit.capability != "collect_logs" {
-                    continue;
-                }
-                for source in &unit.sources {
-                    if source.kind == "FileGlob"
-                        && wist_contracts::work::is_executable_source(&source.kind, &source.target)
-                    {
-                        targets.push((unit.unit_id.clone(), source.target.clone()));
-                    }
-                }
-            }
-        }
-    }
-    targets
+    let Ok(Some(record)) = work::load_async(&path).await else {
+        return Vec::new();
+    };
+    record
+        .standing
+        .iter()
+        .filter(|standing| standing.status == "active")
+        .flat_map(|standing| {
+            standing
+                .tasks
+                .iter()
+                .map(|task| (task.input_id.clone(), task.path.clone()))
+        })
+        .collect()
 }
 
 /// 单个目标能不能读（`Err` = 给人看的原因）。
@@ -2462,6 +2453,27 @@ mod tests {
         assert!(colored.contains("\x1b[1;31m[FAIL]\x1b[0m"), "{colored:?}");
     }
 
+    /// 写一份 `state/work.json`，只带采集任务（`diagnose` 的采集目标只看这里）。
+    fn write_work_tasks(state_dir: &std::path::Path, tasks: &[(&str, &str)]) {
+        std::fs::create_dir_all(state_dir).expect("state dir");
+        let tasks: Vec<String> = tasks
+            .iter()
+            .map(|(input_id, path)| {
+                format!(
+                    "{{\"input_id\":\"{input_id}\",\"path\":\"{path}\",\"startup_position\":\"tail\"}}"
+                )
+            })
+            .collect();
+        let body = format!(
+            "{{\"schema_version\":\"v1\",\"recorded_at\":\"2026-01-01T00:00:00Z\",\"gateway_sequence\":1,\
+             \"standing\":[{{\"work_id\":\"work-test\",\"family\":\"Test\",\"status\":\"active\",\
+             \"plan_version\":1,\"acknowledged_version\":1,\"effective_from\":\"2026-01-01T00:00:00Z\",\
+             \"units\":[],\"tasks\":[{}]}}]}}",
+            tasks.join(",")
+        );
+        std::fs::write(state_dir.join("work.json"), body).expect("write work view");
+    }
+
     #[tokio::test]
     async fn log_inputs_check_reports_missing_files_and_accepts_readable_ones() {
         let root = std::env::temp_dir().join(format!("doctor-inputs-{}", std::process::id()));
@@ -2472,16 +2484,10 @@ mod tests {
                 .expect("default config parses");
         config.paths.state_dir = root.join("state").to_string_lossy().to_string();
         let eve = root.join("eve.json");
-        config.telemetry.logs.file_inputs =
-            vec![crate::config::agent_config::LogFileInputSection {
-                input_id: "suricata-eve".to_string(),
-                path: eve.display().to_string(),
-                startup_position: "tail".to_string(),
-                multiline_mode: "none".to_string(),
-                exclude_globs: Vec::new(),
-                filters: Default::default(),
-                drop_if_contains: Vec::new(),
-            }];
+        write_work_tasks(
+            &root.join("state"),
+            &[("work-Test-suricata-eve", &eve.to_string_lossy())],
+        );
 
         let missing = log_inputs_check(&config, None).await;
         assert_eq!(missing.status, Status::Fail, "{missing:?}");
@@ -2510,16 +2516,13 @@ mod tests {
             toml::from_str(&crate::config_runtime::default_config_template())
                 .expect("default config parses");
         config.paths.state_dir = root.join("state").to_string_lossy().to_string();
-        config.telemetry.logs.file_inputs =
-            vec![crate::config::agent_config::LogFileInputSection {
-                input_id: "eve-family".to_string(),
-                path: root.join("suricata/eve-*.json").display().to_string(),
-                startup_position: "tail".to_string(),
-                multiline_mode: "none".to_string(),
-                exclude_globs: Vec::new(),
-                filters: Default::default(),
-                drop_if_contains: Vec::new(),
-            }];
+        write_work_tasks(
+            &root.join("state"),
+            &[(
+                "work-Test-suricata-eve",
+                &root.join("suricata/eve-*.json").to_string_lossy(),
+            )],
+        );
 
         // 目录不存在 → FAIL（运行时也会报 MissingInput，而不是“暂时没匹配”）。
         let absent = log_inputs_check(&config, None).await;

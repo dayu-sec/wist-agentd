@@ -83,61 +83,9 @@ source_resolve = true
 # # state_dir = "state"
 # # log_dir = "/var/log/wist-agentd"
 #
-# 采集任务与运行设定的稳定度不同：可以把 [[telemetry.logs.file_inputs]] 清单移到独立文件，
-# 在 [telemetry.logs] 内用 file_inputs_file 引用（路径相对本配置文件，与内联二选一）：
-# file_inputs_file = "tasks/apps.toml"
-#   tasks/apps.toml 内容示例：
-#   [[file_inputs]]
-#   input_id = "monitoring-app"
-#   path = "/var/log/monitoring/app.log"
-#   startup_position = "tail"
-#   multiline_mode = "none"
-#
-# 示例：把某个监控系统日志文件送到本地 warp-parse record 输出文件。
-# 取消注释后，把 path 改成你的真实日志路径。
-#
-# [[telemetry.logs.file_inputs]]
-# input_id = "monitoring-app"
-# path = "/var/log/monitoring/app.log"
-# startup_position = "head"
-# multiline_mode = "none"
-#
-# macOS P0 采集清单（示例，按需取消注释）：只支持“可追加的单个文本文件”。
-# 需要 root/Full Disk Access 才能读的路径，agent 用户态读取失败会被跳过/进本地缓冲重试，
-# 生产请用 root helper 采集；新增文件（.ips）与统一日志/audit 需 Phase 2 source。
-# 注：install.log / launchd.log 体量大，默认 tail（只收新增行）；需要首次回放历史时改 head。
-#
-# [[telemetry.logs.file_inputs]]
-# input_id = "macos_install_log"
-# path = "/var/log/install.log"
-# startup_position = "tail"
-# # 实测约 28% 的行是缩进续行（一条 installer 事件后面跟 plist/TOML 详情块）。
-# # 声明 indented 后 agentd 会把上送自动升到 len 分帧（协议 §3：line 只用于单行）。
-# multiline_mode = "indented"
-#
-# [[telemetry.logs.file_inputs]]
-# input_id = "macos_launchd"
-# path = "/var/log/com.apple.xpc.launchd/launchd.log"
-# startup_position = "tail"
-# multiline_mode = "none"
-#
-# [[telemetry.logs.file_inputs]]
-# input_id = "macos_shutdown_monitor"
-# path = "/var/log/shutdown_monitor.log"
-# startup_position = "tail"
-# multiline_mode = "none"
-#
-# [[telemetry.logs.file_inputs]]
-# input_id = "macos_fsck"
-# path = "/var/log/fsck_apfs.log"
-# startup_position = "head"
-# multiline_mode = "none"
-#
-# [[telemetry.logs.file_inputs]]
-# input_id = "macos_wifi"
-# path = "/var/log/wifi.log"
-# startup_position = "tail"
-# multiline_mode = "none"
+# 采集什么由**网关派活**决定（管理面「采集工作」按采集面下发 family + 路径 + 起读位置），
+# 本机不需要配。旧版本的本机手工源（`[telemetry.logs] file_inputs` / `file_inputs_file`）
+# **已废弃**：写在配置里也不会被采集（字段只为让旧配置还能启动）。
 #
 # 示例：把日志通过 TCP 发到本机数据面的 tcp_src。
 # [telemetry.logs.output]

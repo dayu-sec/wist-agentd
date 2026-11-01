@@ -74,16 +74,27 @@ fn ensure_default_config_reuses_legacy_agent_toml_when_present() {
 }
 
 #[test]
-fn default_config_template_contains_file_input_example() {
+fn default_config_template_does_not_teach_local_file_inputs() {
     let template = default_config_template();
 
     assert!(template.contains("[telemetry.logs]"));
     assert!(template.contains("[telemetry.logs.output]"));
     assert!(template.contains("[discovery]"));
     assert!(template.contains("process_enabled = true"));
-    assert!(template.contains("# [[telemetry.logs.file_inputs]]"));
-    assert!(template.contains("input_id = \"macos_install_log\""));
-    assert!(template.contains("input_id = \"macos_launchd\""));
+    // 采集面由网关派活下发，模板不再教人手工配源（0.18.5 起 `file_inputs` 已废弃）：
+    // 模板里再留示例，等于把人往“逐台手配”的错路上引。
+    assert!(
+        !template.contains("[[telemetry.logs.file_inputs]]"),
+        "模板不应再出现 file_inputs 示例"
+    );
+    assert!(
+        !template.contains("# file_inputs_file"),
+        "外置清单示例也要删（说明文字里提到废弃不算示例）"
+    );
+    assert!(
+        template.contains("网关派活"),
+        "要说明采集面由网关下发，而不是本机配"
+    );
     // 采集输出路径不再硬编码：未声明时按“数据”落 <数据根>/data。
     assert!(template.contains("# path = \"/var/lib/wist-agentd/data/wist-records.ndjson\""));
     assert!(template.contains("数据（run/state/spool + 采集输出 data/）落 /var/lib/wist-agentd"));

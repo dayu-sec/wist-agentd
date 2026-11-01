@@ -144,50 +144,35 @@ pub(crate) fn standalone_config_with_file_input(
     root: &std::path::Path,
     input_path: &std::path::Path,
 ) -> AgentConfig {
-    standalone_config(root).with_telemetry(TelemetrySection {
-        logs: LogsSection {
-            file_inputs: vec![LogFileInputSection {
-                input_id: "app".to_string(),
-                path: input_path.display().to_string(),
-                startup_position: "head".to_string(),
-                multiline_mode: "none".to_string(),
-                exclude_globs: Vec::new(),
-                filters: Default::default(),
-                drop_if_contains: Vec::new(),
-            }],
-            file_inputs_file: None,
-            max_line_bytes: 1_048_576,
-            max_read_bytes_per_tick: 4_194_304,
-            max_lines_per_tick: 4096,
-            catchup_slice_ms: 400,
-            catchup_budget_ms: 1800,
-            spool_max_bytes: 268_435_456,
-            spool_over_limit: "pause".to_string(),
-            in_memory_buffer_bytes: 1_048_576,
-            spool_dir: root
-                .join("state")
-                .join("spool")
-                .join("logs")
-                .display()
-                .to_string(),
-            output: LogsOutputSection {
-                kind: "file".to_string(),
-                file: LogsFileOutputSection {
-                    path: root
-                        .join("log")
-                        .join("wist-records.ndjson")
-                        .display()
-                        .to_string(),
-                },
-                ..LogsOutputSection::default()
-            },
-        },
-    })
+    standalone_config_with_file_inputs(root, vec![file_input("app", input_path)])
 }
 
 pub(crate) fn standalone_config_with_file_inputs(
     root: &std::path::Path,
     file_inputs: Vec<LogFileInputSection>,
+) -> AgentConfig {
+    standalone_config_with_logs(root, file_inputs, file_output(root))
+}
+
+/// 只配**文件输出**、不配任何日志输入：采集完全由授权工作决定（`file_inputs` 已废弃）。
+pub(crate) fn standalone_config_with_file_output(root: &std::path::Path) -> AgentConfig {
+    standalone_config_with_logs(root, Vec::new(), file_output(root))
+}
+
+/// 只配 **TCP 输出**、不配任何日志输入：同上。
+pub(crate) fn standalone_config_with_tcp_output(
+    root: &std::path::Path,
+    addr: &str,
+    port: u16,
+    framing: &str,
+) -> AgentConfig {
+    standalone_config_with_logs(root, Vec::new(), tcp_output(addr, port, framing))
+}
+
+fn standalone_config_with_logs(
+    root: &std::path::Path,
+    file_inputs: Vec<LogFileInputSection>,
+    output: LogsOutputSection,
 ) -> AgentConfig {
     standalone_config(root).with_telemetry(TelemetrySection {
         logs: LogsSection {
@@ -207,65 +192,47 @@ pub(crate) fn standalone_config_with_file_inputs(
                 .join("logs")
                 .display()
                 .to_string(),
-            output: LogsOutputSection {
-                kind: "file".to_string(),
-                file: LogsFileOutputSection {
-                    path: root
-                        .join("log")
-                        .join("wist-records.ndjson")
-                        .display()
-                        .to_string(),
-                },
-                ..LogsOutputSection::default()
-            },
+            output,
         },
     })
 }
 
-pub(crate) fn standalone_config_with_tcp_file_input(
-    root: &std::path::Path,
-    input_path: &std::path::Path,
-    addr: &str,
-    port: u16,
-    framing: &str,
-) -> AgentConfig {
-    standalone_config(root).with_telemetry(TelemetrySection {
-        logs: LogsSection {
-            file_inputs: vec![LogFileInputSection {
-                input_id: "app".to_string(),
-                path: input_path.display().to_string(),
-                startup_position: "head".to_string(),
-                multiline_mode: "none".to_string(),
-                exclude_globs: Vec::new(),
-                filters: Default::default(),
-                drop_if_contains: Vec::new(),
-            }],
-            file_inputs_file: None,
-            max_line_bytes: 1_048_576,
-            max_read_bytes_per_tick: 4_194_304,
-            max_lines_per_tick: 4096,
-            catchup_slice_ms: 400,
-            catchup_budget_ms: 1800,
-            spool_max_bytes: 268_435_456,
-            spool_over_limit: "pause".to_string(),
-            in_memory_buffer_bytes: 1_048_576,
-            spool_dir: root
-                .join("state")
-                .join("spool")
-                .join("logs")
+fn file_input(input_id: &str, input_path: &std::path::Path) -> LogFileInputSection {
+    LogFileInputSection {
+        input_id: input_id.to_string(),
+        path: input_path.display().to_string(),
+        startup_position: "head".to_string(),
+        multiline_mode: "none".to_string(),
+        exclude_globs: Vec::new(),
+        filters: Default::default(),
+        drop_if_contains: Vec::new(),
+    }
+}
+
+fn file_output(root: &std::path::Path) -> LogsOutputSection {
+    LogsOutputSection {
+        kind: "file".to_string(),
+        file: LogsFileOutputSection {
+            path: root
+                .join("log")
+                .join("wist-records.ndjson")
                 .display()
                 .to_string(),
-            output: LogsOutputSection {
-                kind: "tcp".to_string(),
-                tcp: LogsTcpOutputSection {
-                    addr: addr.to_string(),
-                    port,
-                    framing: framing.to_string(),
-                },
-                ..LogsOutputSection::default()
-            },
         },
-    })
+        ..LogsOutputSection::default()
+    }
+}
+
+fn tcp_output(addr: &str, port: u16, framing: &str) -> LogsOutputSection {
+    LogsOutputSection {
+        kind: "tcp".to_string(),
+        tcp: LogsTcpOutputSection {
+            addr: addr.to_string(),
+            port,
+            framing: framing.to_string(),
+        },
+        ..LogsOutputSection::default()
+    }
 }
 
 pub(crate) fn rfc3339_before_now(seconds: i64) -> String {
