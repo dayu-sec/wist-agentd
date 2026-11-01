@@ -741,6 +741,9 @@ pub async fn run(
 /// **不在这里回传**：数据面的回传由 daemon 做（它才持有 sink / seq）。`outcome` 的语义
 /// （调查做成了没有）也由 daemon 组装 —— 本函数只回答「调查跑完了没有」。
 ///
+/// 守护进程路径下它跑在**独立任务**里（disk 默认 120s，不能占着主循环），
+/// 扫描完成后由主循环收尾回传 + 回 ack；CLI 路径则是直接 `await` 它。
+///
 /// 落盘失败**不当作失败**：盘满正是最需要调查的时候，报告还在内存里，能回传就够了。
 pub(crate) async fn run_for_command(
     config: &AgentConfig,

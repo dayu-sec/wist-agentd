@@ -649,6 +649,11 @@ wist-agentd investigate load --top 20 --json             # 列前 20 个进程
 （` IVSREP: ` 帧，正文带 `command_id`，网关靠它把报告接回那次命令），本机另留一份
 `state/investigations/<topic>.json`。`outcome` 只表示「调查做成了没有」，磁盘紧张/负载高是 `detail`
 里的结论；回传失败也不改 `outcome`（查清了就是查清了，通道问题单独说）。需要数据面认识 `IVSREP` 才能入库。
+
+命令被取走后，扫描在**独立任务**里跑（3s 心跳、其它命令认领、采集不受影响）；但 ack 仍是**扫完之后**
+才回的 —— 页面上「等待认领」会持续到扫描结束（`disk` 默认 120s、封顶 300s），这是扫描时长的
+正常表现，不是命令丢了。日志里看 `event=CommandAccepted`（已接）与
+`event=CommandHandled`（已完）两条。
 设计取舍见 [`../design/agentd-investigation.md`](../design/agentd-investigation.md)。
 
 ## 8. 验收清单

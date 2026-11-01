@@ -50,6 +50,19 @@
   结果随 `AgentStatusReport.command_acks` 回传，见 `wist-design` 的 `api-seam-inventory.md`）。
   执行完把完整报告落到 `state/investigations/<topic>.json`，ack 的 `detail` 里给结论摘要 + 报告路径。
 
+**扫描独立跑，收尾回主循环**（`daemon::run_forever_async` 的命令处理）：
+
+* 命令被拿到后只丢一个任务出去（`investigate::run_for_command`），主循环**不等**它 ——
+  `disk` 默认扫 120s、封顶 300s，钉在主循环里会让 3s 心跳、命令认领、采集一起停摆，
+  现场表现就是「一直等认领」（而命令其实早被取走了）。
+* 扫描完成后由主循环收尾（回传 `IVSREP` 帧 + 回 ack）：数据面的 `seq` 只有一处分配者，
+  报告帧才不会和日志/指标帧在同一段里撞号（撞号的那帧会被数据面当重复丢掉）。
+* 同一 `command_id` 在跑时，网关每 3s 重发的同一条**不会再起第二个任务**；结果只有一份。
+* 不同题目可以同时在跑（各自落各自的 `<topic>.json`）。
+* 连点导致网关把旧命令标 `superseded` 时，旧扫描**不会被打断**（阻塞遍历停不下来），
+  它跑完后回的 ack 会被网关按 `acked_at IS NULL` 条件更新丢掉；本机 `<topic>.json`
+  则是“后写完的那份为准”（只在机上调试时相关，页面看到的是数据面逐条回传的报告）。
+
 两条入口共用 `investigate::execute`，所以**「人在机器上跑出来的」与「网关拿到的」不会两套口径**
 （与 `diagnose` 复用守护进程判定同一条理由）。
 

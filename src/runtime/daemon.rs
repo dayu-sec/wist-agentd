@@ -1012,6 +1012,36 @@ enum CommandSource {
     Remote,
 }
 
+impl CommandSource {
+    /// 日志字段用的稳定取值（`gateway` / `local`）。
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Remote => "gateway",
+            Self::Local => "local",
+        }
+    }
+}
+
+/// 一次正在跑的调查：扫描在自己的任务里，跑完由主循环收尾（落盘 / 回传 / ack）。
+///
+/// 为什么不在任务里一口气做完：数据面的 `seq` 只由主循环取号（见
+/// [`deliver_investigation`]）；扫描跑多久都不影响取号，但回传必须回到主循环。
+struct InflightInvestigation {
+    command: AgentCommand,
+    source: CommandSource,
+    task: tokio::task::JoinHandle<Result<(crate::investigate::Report, PathBuf), String>>,
+}
+
+/// 这条调查是否**已经在跑**。
+///
+/// 网关在收到 ack 之前每 3s 都会重发同一条（回执里 `acked_at` 还是 null）：正在跑就不再起第二个，
+/// 也不再回一个“假完成”的 ack —— 结果只能有一份，由那个任务完成时统一回。
+fn investigation_already_running(inflight: &[InflightInvestigation], command_id: &str) -> bool {
+    inflight
+        .iter()
+        .any(|entry| entry.command.command_id == command_id)
+}
+
 /// 一条命令的判定：执行，或直接回一个结果（不执行）。
 #[derive(Debug)]
 enum CommandVerdict {
@@ -1030,7 +1060,11 @@ enum CommandVerdict {
     AcceptProbe(Vec<String>),
     /// 执行一次一次性调查（见 [`crate::investigate`]）。
     ///
-    /// 与重采同样**不受节流**：它只读、有界（默认 5s），而且网关侧同 kind 的命令会被覆盖。
+    /// 与重采同样**不受节流**：它只读、有界（disk 默认 120s，`--max-seconds` 封顶 300s），
+    /// 而且网关侧同 kind 的命令会被覆盖。
+    ///
+    /// 参数看不懂时回 `failed`（由 `BadInvestigateParams` 分支处理）——
+    /// **不要**猜一个题目去扫盘。
     AcceptInvestigate(crate::investigate::InvestigateRequest),
     /// 调查参数读不懂：立刻回 `failed`，而不是猜一个题目去扫盘。
     BadInvestigateParams(String),
@@ -1103,30 +1137,34 @@ fn record_command(
     ack_from_record(&record)
 }
 
-/// 跑一次调查并把证据送到它能去的地方，返回要回传的 `(outcome, detail)`。
+/// 调查的**收尾**：把跑出来的报告送到它能去的地方，返回要回传的 `(outcome, detail)`。
 ///
-/// 三件事，都在这里收口：
+/// 为什么收尾留在主循环、扫描却要独立跑：数据面 `seq` 只有**一处**分配者（这里用的是
+/// 主循环持有的 `state/logs/seq.json` 高水位，`(agent, seq)` 是数据面的去重键）。
+/// 如果报告帧由后台任务自己取号，就会和日志/指标帧在同一段里撞号，撞号的那一帧
+/// 会被数据面当重复丢掉。所以：
 ///
-/// 1. **执行**（[`crate::investigate::run_for_command`]）：跑完并把完整报告落本机
-///    `state/investigations/<topic>.json`；落盘失败不算失败（盘满正是要查的时候）。
-/// 2. **回传**：走**数据面通用通道**，帧标记 ` IVSREP: `（与 `OBSFACT` / `DSNAP` 同协议、同 `seq` 空间；
+/// * **扫描**（[`crate::investigate::run_for_command`]）丢进独立任务 —— disk 题默认要 120s，
+///   钉在主循环里等于让心跳 / 命令认领 / 采集一起停两分钟（现场表现就是「一直等认领」）；
+/// * **收尾**留在这里（主循环），`seq` 仍然只有一处分配。
+///
+/// 收尾做两件事：
+///
+/// 1. **回传**：走**数据面通用通道**，帧标记 ` IVSREP: `（与 `OBSFACT` / `DSNAP` 同协议、同 `seq` 空间；
 ///    连接是本次临时建的 —— 一次性命令不值得为它养一条常连接）。
 ///    闸跟事实帧一致：**只有 tcp 能承载控制类帧**；待命（`enabled = false`）也发 ——
 ///    调查是诊断元数据，不是主机内容（见 `wist-agentd/docs/design/agentd-investigation.md` §4）。
-/// 3. **ack**：`outcome` 只表达「调查做成了没有」；报告去了哪里写在 `detail` 里
+/// 2. **ack**：`outcome` 只表达「调查做成了没有」；报告去了哪里写在 `detail` 里
 ///    （回传失败也是 `succeeded`：查清了就是查清了，通道问题单独说）。
-async fn run_investigation(
+async fn deliver_investigation(
     config: &AgentConfig,
     command: &AgentCommand,
-    request: &crate::investigate::InvestigateRequest,
+    report: &crate::investigate::Report,
+    path: &Path,
     work: &AppliedWorkGrant,
     uplink: &AppliedUplink,
     state_dir: &Path,
 ) -> (&'static str, String) {
-    let (report, path) = match crate::investigate::run_for_command(config, request).await {
-        Ok(done) => done,
-        Err(detail) => return (command_outcome::FAILED, detail),
-    };
     let mut detail = report.summary();
     let stored = format!("；完整报告：{}", path.display());
 
@@ -1142,7 +1180,7 @@ async fn run_investigation(
                 &mut sink,
                 config,
                 &command.command_id,
-                &report,
+                report,
                 &mut next_seq,
                 &seq_path,
             )
@@ -1169,6 +1207,208 @@ async fn run_investigation(
         (command_outcome::SUCCEEDED),
         crate::investigate::truncate_chars(detail, 900),
     )
+}
+
+/// 扫描 + 收尾，顺序执行。
+///
+/// 生产路径把扫描丢进独立任务、只调 [`deliver_investigation`] 收尾（见 `run_forever_async`
+/// 的命令处理）；这个组合留给单测 —— 它钉的是「报告走数据面、ack 只带结论」这条端到端形状。
+#[cfg(test)]
+async fn run_investigation(
+    config: &AgentConfig,
+    command: &AgentCommand,
+    request: &crate::investigate::InvestigateRequest,
+    work: &AppliedWorkGrant,
+    uplink: &AppliedUplink,
+    state_dir: &Path,
+) -> (&'static str, String) {
+    match crate::investigate::run_for_command(config, request).await {
+        Ok((report, path)) => {
+            deliver_investigation(config, command, &report, &path, work, uplink, state_dir).await
+        }
+        Err(detail) => (command_outcome::FAILED, detail),
+    }
+}
+
+/// 收走**已经跑完**的调查：收尾（回传 + 记账）并产出要回传的 ack。
+///
+/// 只在这里 `await`，而且只 await `is_finished()` 的句柄 —— 主循环**不能等**扫描，
+/// 否则就又回到「一次调查把心跳停 120s」。
+///
+/// 返回 `(要回传的 ack, 台账有没有变)`；台账变了调用方就要落盘。
+async fn drain_finished_investigations(
+    inflight: &mut Vec<InflightInvestigation>,
+    config: &AgentConfig,
+    work: &AppliedWorkGrant,
+    uplink: &AppliedUplink,
+    state_dir: &Path,
+    history: &mut commands::CommandHistory,
+) -> (Vec<AgentCommandAck>, bool) {
+    let mut acks = Vec::new();
+    let mut recorded = false;
+    let mut index = 0;
+    while index < inflight.len() {
+        if !inflight[index].task.is_finished() {
+            index += 1;
+            continue;
+        }
+        let done = inflight.remove(index);
+        let (outcome, detail) = match done.task.await {
+            Ok(Ok((report, path))) => {
+                deliver_investigation(
+                    config,
+                    &done.command,
+                    &report,
+                    &path,
+                    work,
+                    uplink,
+                    state_dir,
+                )
+                .await
+            }
+            Ok(Err(detail)) => (command_outcome::FAILED, detail),
+            // 任务被 abort / panic：如实回一条失败，而不是让网关等到 1h TTL 的
+            // `expired`（那个终态对“为什么没结果”毫无解释力）。
+            Err(err) => (command_outcome::FAILED, format!("调查任务中断：{err}")),
+        };
+        let ack = record_command(history, &done.command, outcome, detail, now_ts_ms());
+        recorded = true;
+        if done.source == CommandSource::Remote {
+            acks.push(ack);
+        }
+    }
+    (acks, recorded)
+}
+
+/// 一轮命令处理的结果：调用方要接住的三样东西。
+struct CommandTurn {
+    /// 本轮接受的重采（`run_once` 要用它强制全量刷新，结果在 tick 之后才回）。
+    accepted_refresh: Option<(AgentCommand, CommandSource)>,
+    /// 要回传给网关的 ack（本机命令不进这里：结果从台账读）。
+    acks: Vec<AgentCommandAck>,
+    /// 台账有没有变（变了调用方要落盘）。
+    history_dirty: bool,
+}
+
+/// 处理本轮的待执行命令。
+///
+/// **抽成函数是为了可测**：这里最容易犯的错就是把调查的扫描 `await` 回来 ——
+/// 一次 `disk` 调查默认 120s，等于让心跳、命令认领、采集一起停两分钟（现场表现正是
+/// 「一直等认领」）。单测只要断言「这一轮立刻返回、没有 ack、扫描被交给独立任务」，
+/// 这个错就再也改不回来。
+async fn handle_command_queue(
+    queue: Vec<(AgentCommand, CommandSource)>,
+    config: &AgentConfig,
+    inflight: &mut Vec<InflightInvestigation>,
+    history: &mut commands::CommandHistory,
+    last_refresh_facts: &mut Option<Instant>,
+    refresh_facts_interval: Duration,
+    now_ms: i64,
+) -> CommandTurn {
+    let mut turn = CommandTurn {
+        accepted_refresh: None,
+        acks: Vec::new(),
+        history_dirty: false,
+    };
+    for (command, source) in queue {
+        // 已处理过（网关重发 / 重启后重发）：只补结果，不再执行。
+        if let Some(record) = history.find(&command.command_id) {
+            log::info!(
+                "event=CommandDuplicate command_id={} outcome={} detail=\"已处理过，只补结果\"",
+                record.command_id,
+                record.outcome
+            );
+            if source == CommandSource::Remote {
+                turn.acks.push(ack_from_record(record));
+            }
+            continue;
+        }
+        let verdict = evaluate_command(
+            &command,
+            turn.accepted_refresh.is_some(),
+            *last_refresh_facts,
+            refresh_facts_interval,
+            now_ms,
+        );
+        let (outcome, detail) = match verdict {
+            CommandVerdict::AcceptRefresh => {
+                *last_refresh_facts = Some(Instant::now());
+                log::info!(
+                    "event=CommandAccepted command_id={} kind={} source={}",
+                    command.command_id,
+                    command.kind,
+                    source.as_str()
+                );
+                turn.accepted_refresh = Some((command, source));
+                continue;
+            }
+            CommandVerdict::AcceptProbe(paths) => {
+                // 只探路径并把实测回传网关 —— 不跑整轮采集。
+                // 这一步失败不该阻塞后续 tick：结果记进台账，网关那一侧会看到一个
+                // `failed` 并保持 `probe.pending`，页面重试即可。
+                let (outcome, detail) =
+                    crate::control::preflight::report_path_probe(config, &paths).await;
+                let ack = record_command(history, &command, outcome, detail, now_ts_ms());
+                turn.history_dirty = true;
+                if source == CommandSource::Remote {
+                    turn.acks.push(ack);
+                }
+                continue;
+            }
+            CommandVerdict::AcceptInvestigate(request) => {
+                // 调查**独立跑**：扫描（目录遍历）交给一个自己的任务，这里不 `await` 它。
+                // 为什么：disk 题默认 120s、封顶 300s —— 钉在主循环里会让心跳（3s）与
+                // 命令认领一起停两分钟，页面上就是「一直等认领」，别人排队的命令也全跟着抵迟。
+                // 扫描跑完后由主循环的 drain 收尾（落盘 / 回传 / ack）。
+                if investigation_already_running(inflight, &command.command_id) {
+                    // 网关在收到 ack 之前每 3s 都会重发同一条：正在跑就不再起第二个。
+                    // 这里**不**回 ack（结果只能有一份，由那个任务完成时统一回）。
+                    continue;
+                }
+                log::info!(
+                    "event=CommandAccepted command_id={} kind={} source={}",
+                    command.command_id,
+                    command.kind,
+                    source.as_str()
+                );
+                let config_for_task = AgentConfig::clone(config);
+                let task = tokio::spawn(async move {
+                    crate::investigate::run_for_command(&config_for_task, &request).await
+                });
+                inflight.push(InflightInvestigation {
+                    command,
+                    source,
+                    task,
+                });
+                continue;
+            }
+            CommandVerdict::BadInvestigateParams(detail) => (command_outcome::FAILED, detail),
+            CommandVerdict::Unsupported => (
+                command_outcome::UNSUPPORTED,
+                format!("agentd 尚未实现命令 kind={}", command.kind),
+            ),
+            CommandVerdict::Stale => (
+                command_outcome::STALE,
+                format!(
+                    "命令超过 {} 分钟未被处理（守护进程当时没在跑 / 被阻塞）",
+                    COMMAND_STALE_MS / 60_000
+                ),
+            ),
+            CommandVerdict::Throttled => (
+                command_outcome::THROTTLED,
+                format!(
+                    "距上一次重采不足最小间隔（{}s）或本 tick 已接受一条",
+                    refresh_facts_interval.as_secs()
+                ),
+            ),
+        };
+        let ack = record_command(history, &command, outcome, detail, now_ms);
+        turn.history_dirty = true;
+        if source == CommandSource::Remote {
+            turn.acks.push(ack);
+        }
+    }
+    turn
 }
 
 /// 发一帧调查报告（` IVSREP: `）。
@@ -1570,6 +1810,9 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     // 下一个 tick 要处理的（来自网关回执）与待回传的结果（下一次上报带上）。
     let mut pending_commands: Vec<AgentCommand> = Vec::new();
     let mut pending_command_acks: Vec<AgentCommandAck> = Vec::new();
+    // 正在跑的调查（扫描在自己的任务里）。主循环每轮收一次结果，
+    // 所以扫描跑 120s 也不会把心跳 / 命令认领 / 采集钉住。
+    let mut inflight_investigations: Vec<InflightInvestigation> = Vec::new();
     // 出口健康的跨 tick 记忆（只在「失败 → 恢复」时补一行）。
     let mut uplink_health = UplinkHealth::default();
     let mut last_metrics_uplink: Option<Instant> = None;
@@ -1727,115 +1970,34 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
             queue.push((local, CommandSource::Local));
         }
         let now_ms = now_ts_ms();
-        let mut accepted_refresh: Option<(AgentCommand, CommandSource)> = None;
-        let mut history_dirty = false;
-        for (command, source) in queue {
-            // 已处理过（网关重发 / 重启后重发）：只补结果，不再执行。
-            if let Some(record) = command_history.find(&command.command_id) {
-                log::info!(
-                    "event=CommandDuplicate command_id={} outcome={} detail=\"已处理过，只补结果\"",
-                    record.command_id,
-                    record.outcome
-                );
-                if source == CommandSource::Remote {
-                    pending_command_acks.push(ack_from_record(record));
-                }
-                continue;
-            }
-            let verdict = evaluate_command(
-                &command,
-                accepted_refresh.is_some(),
-                last_refresh_facts,
-                refresh_facts_interval,
-                now_ms,
-            );
-            let (outcome, detail) = match verdict {
-                CommandVerdict::AcceptRefresh => {
-                    last_refresh_facts = Some(Instant::now());
-                    log::info!(
-                        "event=CommandAccepted command_id={} kind={} source={}",
-                        command.command_id,
-                        command.kind,
-                        if source == CommandSource::Remote {
-                            "gateway"
-                        } else {
-                            "local"
-                        }
-                    );
-                    accepted_refresh = Some((command, source));
-                    continue;
-                }
-                CommandVerdict::AcceptProbe(paths) => {
-                    // 只探路径并把实测回传网关 —— 不跑整轮采集。
-                    // 这一步失败不该阻塞后续 tick：结果记进台账，网关那一侧会看到一个
-                    // `failed` 并保持 `probe.pending`，页面重试即可。
-                    let (outcome, detail) =
-                        crate::control::preflight::report_path_probe(loop_ctx.config, &paths).await;
-                    let ack = record_command(
-                        &mut command_history,
-                        &command,
-                        outcome,
-                        detail,
-                        now_ts_ms(),
-                    );
-                    history_dirty = true;
-                    if source == CommandSource::Remote {
-                        pending_command_acks.push(ack);
-                    }
-                    continue;
-                }
-                CommandVerdict::AcceptInvestigate(request) => {
-                    // 调查本身（目录遍历）在 `execute` 里已丢到 blocking 池；这里只负责
-                    // 「跑完了没有」与「证据送到哪里」。回传失败**不**改变 outcome：
-                    // 磁盘紧张是结论、回传失败是通道问题，两者都不等于“命令没执行”。
-                    let (outcome, detail) = run_investigation(
-                        loop_ctx.config,
-                        &command,
-                        &request,
-                        &work_runtime,
-                        &uplink_runtime,
-                        &command_state_dir,
-                    )
-                    .await;
-                    let ack = record_command(
-                        &mut command_history,
-                        &command,
-                        outcome,
-                        detail,
-                        now_ts_ms(),
-                    );
-                    history_dirty = true;
-                    if source == CommandSource::Remote {
-                        pending_command_acks.push(ack);
-                    }
-                    continue;
-                }
-                CommandVerdict::BadInvestigateParams(detail) => (command_outcome::FAILED, detail),
-                CommandVerdict::Unsupported => (
-                    command_outcome::UNSUPPORTED,
-                    format!("agentd 尚未实现命令 kind={}", command.kind),
-                ),
-                CommandVerdict::Stale => (
-                    command_outcome::STALE,
-                    format!(
-                        "命令超过 {} 分钟未被处理（守护进程当时没在跑 / 被阻塞）",
-                        COMMAND_STALE_MS / 60_000
-                    ),
-                ),
-                CommandVerdict::Throttled => (
-                    command_outcome::THROTTLED,
-                    format!(
-                        "距上一次重采不足最小间隔（{}s）或本 tick 已接受一条",
-                        refresh_facts_interval.as_secs()
-                    ),
-                ),
-            };
-            let ack = record_command(&mut command_history, &command, outcome, detail, now_ms);
-            history_dirty = true;
-            if source == CommandSource::Remote {
-                pending_command_acks.push(ack);
-            }
-        }
+        // 调查：扫描是独立任务，跑完了在这里收尾（落盘 / 回传 / ack）。
+        // 放在命令队列与 tick 之前 —— 本轮就能把 ack 搭上本轮的状态上报，
+        // 也不用等到下一个 3s 节拍。
+        let (investigation_acks, investigation_recorded) = drain_finished_investigations(
+            &mut inflight_investigations,
+            loop_ctx.config,
+            &work_runtime,
+            &uplink_runtime,
+            &command_state_dir,
+            &mut command_history,
+        )
+        .await;
+        pending_command_acks.extend(investigation_acks);
+        let mut history_dirty = investigation_recorded;
+        // 命令队列在 `handle_command_queue` 里单独一层：它不允许 `await` 扫描（见那个函数的注释）。
+        let turn = handle_command_queue(
+            queue,
+            loop_ctx.config,
+            &mut inflight_investigations,
+            &mut command_history,
+            &mut last_refresh_facts,
+            refresh_facts_interval,
+            now_ms,
+        )
+        .await;
+        pending_command_acks.extend(turn.acks);
+        history_dirty |= turn.history_dirty;
+        let mut accepted_refresh = turn.accepted_refresh;
         let force_refresh = accepted_refresh.is_some();
         // 到达拉取间隔就拉一次策略表并应用（启动首轮即拉）。必须在 refresh_due 之前，
         // 这样本轮采集就用上新周期。
@@ -5741,6 +5903,590 @@ mod tests {
         assert_eq!(outcome, command_outcome::SUCCEEDED, "调查本身做完了");
         assert!(detail.contains("报告回传失败"), "{detail}");
         assert!(detail.contains("not enrolled"), "{detail}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 两个调查**各自独立跑**：互不等待，报告也各落各的题目文件（`<topic>.json`）。
+    ///
+    /// 为什么钉住：磁盘题默认要扫 120s，之前它是在主循环里 `.await` 的 —— 一次调查
+    /// 就能把心跳（3s）与命令认领一起停两分钟。现在扫描交给了独立任务，这条测试
+    /// 钉住“两个题可以同时在跑、结果不互相覆盖”。
+    #[tokio::test]
+    async fn two_investigations_run_independently_and_keep_their_own_reports() {
+        let root = local_state_dir("investigate-parallel");
+        let mut config = test_config();
+        config.paths.state_dir = root.join("state").display().to_string();
+        // 扫一个**小目录**（而不是仓库根）：用例要钉的是「两个题各自独立跑、各落各的文件」，
+        // 不该把仓库体积涨成用例的运行时，也不该靠 `max_seconds` 兜底。
+        let scan_root = root.join("scan");
+        std::fs::create_dir_all(&scan_root).expect("create scan dir");
+        std::fs::write(scan_root.join("sample.log"), b"line\n").expect("write sample");
+
+        let disk = crate::investigate::InvestigateRequest {
+            path: Some(scan_root),
+            top: 2,
+            max_seconds: 2,
+            ..crate::investigate::InvestigateRequest::default()
+        };
+        let load =
+            crate::investigate::InvestigateRequest::for_topic(crate::investigate::TOPIC_LOAD)
+                .expect("load topic");
+
+        let (disk_done, load_done) = tokio::join!(
+            tokio::spawn({
+                let config = config.clone();
+                async move { crate::investigate::run_for_command(&config, &disk).await }
+            }),
+            tokio::spawn({
+                let config = config.clone();
+                async move { crate::investigate::run_for_command(&config, &load).await }
+            }),
+        );
+        let (disk_report, disk_path) = disk_done.expect("disk join").expect("disk scan");
+        let (load_report, load_path) = load_done.expect("load join").expect("load scan");
+
+        assert_eq!(disk_report.topic, crate::investigate::TOPIC_DISK);
+        assert_eq!(load_report.topic, crate::investigate::TOPIC_LOAD);
+        assert_ne!(disk_path, load_path, "每个题目一份报告，不能互相覆盖");
+        assert!(disk_path.exists(), "disk 报告要落盘");
+        assert!(load_path.exists(), "load 报告要落盘");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 跑完的调查只收一次：已完成的那条被收走并回 ack，还在跑的**不能被动**。
+    ///
+    /// 为什么钉住：收尾发生在主循环，如果把未完成的任务也 `await` 了，就等于又把心跳
+    /// 交给扫描时长（就是这次要修的毛病）。同时要确认「完成 → 记账 → 回 ack」只有一次。
+    #[tokio::test]
+    async fn a_finished_investigation_is_drained_once_and_a_running_one_is_left_alone() {
+        let root = local_state_dir("investigate-drain");
+        let mut config = test_config();
+        config.paths.state_dir = root.join("state").display().to_string();
+        let mut history = commands::CommandHistory::default();
+        let mut inflight = Vec::new();
+
+        // ① 已完成 + 网关来源：要产出 ack。
+        inflight.push(InflightInvestigation {
+            command: sample_command("cmd-done", crate::investigate::COMMAND_KIND, now_ts_ms()),
+            source: CommandSource::Remote,
+            task: tokio::spawn(async {
+                Err::<(crate::investigate::Report, PathBuf), String>("scan failed".to_string())
+            }),
+        });
+        // ② 已完成 + 本机来源：只进台账，**不能**回 ack（否则本机请求会被当网关命令回传）。
+        inflight.push(InflightInvestigation {
+            command: sample_command("cmd-local", crate::investigate::COMMAND_KIND, now_ts_ms()),
+            source: CommandSource::Local,
+            task: tokio::spawn(async {
+                Err::<(crate::investigate::Report, PathBuf), String>(
+                    "local scan failed".to_string(),
+                )
+            }),
+        });
+        // ③ 任务被 abort（等价于 panic / 外部取消）：要如实回 failed，不能沉默。
+        let aborted = tokio::spawn(async {
+            std::future::pending::<Result<(crate::investigate::Report, PathBuf), String>>().await
+        });
+        aborted.abort();
+        inflight.push(InflightInvestigation {
+            command: sample_command("cmd-aborted", crate::investigate::COMMAND_KIND, now_ts_ms()),
+            source: CommandSource::Remote,
+            task: aborted,
+        });
+        // ④ 还在跑：任务挂在 oneshot 上，永远不完成。
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        inflight.push(InflightInvestigation {
+            command: sample_command("cmd-running", crate::investigate::COMMAND_KIND, now_ts_ms()),
+            source: CommandSource::Remote,
+            task: tokio::spawn(async move {
+                let _ = wait.await;
+                Err::<(crate::investigate::Report, PathBuf), String>("never".to_string())
+            }),
+        });
+
+        // spawn / abort 之后要等 runtime 真的 poll 过，`is_finished()` 才会为真。
+        for _ in 0..100 {
+            if inflight[..3].iter().all(|entry| entry.task.is_finished()) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            inflight[..3].iter().all(|entry| entry.task.is_finished()),
+            "测试前提：前三条应已结束"
+        );
+
+        // 收尾**不能等**还没跑完的扫描：等下去就是又让心跳被扫描按住（这次要修的毛病）。
+        let (acks, recorded) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            drain_finished_investigations(
+                &mut inflight,
+                &config,
+                &AppliedWorkGrant::default(),
+                &AppliedUplink::default(),
+                Path::new(&config.paths.state_dir),
+                &mut history,
+            ),
+        )
+        .await
+        .expect("收尾不能阻塞在未完成的扫描上");
+
+        assert!(recorded, "台账要因为这些结果而变脏");
+        assert_eq!(acks.len(), 2, "只有「已完成 + 网关来源」的两条能产出 ack");
+        let done = acks
+            .iter()
+            .find(|ack| ack.command_id == "cmd-done")
+            .expect("cmd-done 的 ack");
+        assert_eq!(done.outcome, command_outcome::FAILED, "扫描失败如实回报");
+        let aborted_ack = acks
+            .iter()
+            .find(|ack| ack.command_id == "cmd-aborted")
+            .expect("cmd-aborted 的 ack");
+        assert_eq!(
+            aborted_ack.outcome,
+            command_outcome::FAILED,
+            "中断也要回终态"
+        );
+        assert!(
+            aborted_ack.detail.contains("调查任务中断"),
+            "{}",
+            aborted_ack.detail
+        );
+        assert!(
+            acks.iter().all(|ack| ack.command_id != "cmd-local"),
+            "本机命令不回 ack"
+        );
+        assert!(history.find("cmd-done").is_some(), "完成的那条要进台账");
+        assert!(
+            history.find("cmd-local").is_some(),
+            "本机命令也要进台账（CLI 从台账读结果）"
+        );
+        assert!(history.find("cmd-aborted").is_some());
+        assert_eq!(inflight.len(), 1, "还在跑的任务不能被收走");
+        assert_eq!(inflight[0].command.command_id, "cmd-running");
+
+        // 再收一次：同一条结果不能产出第二条 ack（结果只有一份）。
+        let (again, recorded_again) = drain_finished_investigations(
+            &mut inflight,
+            &config,
+            &AppliedWorkGrant::default(),
+            &AppliedUplink::default(),
+            Path::new(&config.paths.state_dir),
+            &mut history,
+        )
+        .await;
+        assert!(again.is_empty(), "收过的结果不能再产出 ack");
+        assert!(!recorded_again, "收过的结果不该再把台账弄脏");
+
+        drop(release);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 网关在 ack 之前每 3s 重发同一条：正在跑就不能起第二个，也不能回假 ack。
+    #[tokio::test]
+    async fn a_redelivered_investigation_is_not_started_twice() {
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let running = InflightInvestigation {
+            command: sample_command("cmd-1", crate::investigate::COMMAND_KIND, now_ts_ms()),
+            source: CommandSource::Remote,
+            task: tokio::spawn(async move {
+                let _ = wait.await;
+                Err::<(crate::investigate::Report, PathBuf), String>("never".to_string())
+            }),
+        };
+        let inflight = vec![running];
+
+        assert!(
+            investigation_already_running(&inflight, "cmd-1"),
+            "同一条重发应被认成「已在跑」"
+        );
+        assert!(
+            !investigation_already_running(&inflight, "cmd-2"),
+            "另一条命令应照常起任务（不同题目可以并存）"
+        );
+
+        drop(release);
+    }
+
+    /// **命令处理不能等扫描。**
+    ///
+    /// 这是本次修复的核心约束：如果哪天有人把 `run_investigation(...).await` 再写回命令循环，
+    /// 这一轮就会变成「扫描多久、这一轮就多久」（disk 默认 120s），心跳/命令认领/采集全停。
+    /// 断言是结构性的（不靠计时）：
+    ///   * `inflight` 里必须有那一条 —— 说明是 **spawn** 出去的；
+    ///   * 本轮 `acks` 必须为空 —— 扫描没跑完就不能回 ack。
+    #[tokio::test]
+    async fn the_command_turn_hands_the_scan_to_a_task_instead_of_waiting() {
+        let root = local_state_dir("investigate-turn");
+        let mut config = test_config();
+        config.paths.state_dir = root.join("state").display().to_string();
+        let scan_root = root.join("scan");
+        std::fs::create_dir_all(&scan_root).expect("create scan dir");
+        std::fs::write(scan_root.join("sample.log"), b"line\n").expect("write sample");
+
+        let command = AgentCommand {
+            command_id: "cmd-turn".to_string(),
+            requested_at_ms: now_ts_ms(),
+            kind: crate::investigate::COMMAND_KIND.to_string(),
+            params: serde_json::json!({
+                "topic": "disk",
+                "path": scan_root.display().to_string(),
+                "max_seconds": 1,
+            })
+            .to_string(),
+        };
+        let mut history = commands::CommandHistory::default();
+        let mut inflight = Vec::new();
+        let mut last_refresh: Option<Instant> = None;
+
+        let turn = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handle_command_queue(
+                vec![(command, CommandSource::Remote)],
+                &config,
+                &mut inflight,
+                &mut history,
+                &mut last_refresh,
+                std::time::Duration::from_secs(60),
+                now_ts_ms(),
+            ),
+        )
+        .await
+        .expect("命令处理不能被扫描按住");
+
+        assert!(turn.accepted_refresh.is_none(), "调查不是重采");
+        assert!(turn.acks.is_empty(), "扫描没跑完就不能回 ack");
+        assert!(!turn.history_dirty, "扫描没跑完不该改台账");
+        assert_eq!(
+            inflight.len(),
+            1,
+            "调查要交给独立任务（inline 执行会没有 inflight）"
+        );
+        assert_eq!(inflight[0].command.command_id, "cmd-turn");
+
+        for entry in inflight.drain(..) {
+            entry.task.abort();
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 网关重发一条**已处理过**的命令：只从台账补发 ack，不重跑、不改台账。
+    #[tokio::test]
+    async fn a_redelivered_command_only_re_acks_from_the_ledger() {
+        let config = test_config();
+        let mut history = commands::CommandHistory::default();
+        history.record(commands::CommandRecord {
+            command_id: "cmd-dup".to_string(),
+            kind: crate::investigate::COMMAND_KIND.to_string(),
+            outcome: command_outcome::SUCCEEDED.to_string(),
+            detail: "已经查过".to_string(),
+            completed_at_ms: 1,
+        });
+        let mut inflight = Vec::new();
+        let mut last_refresh: Option<Instant> = None;
+
+        let turn = handle_command_queue(
+            vec![(
+                sample_command("cmd-dup", crate::investigate::COMMAND_KIND, now_ts_ms()),
+                CommandSource::Remote,
+            )],
+            &config,
+            &mut inflight,
+            &mut history,
+            &mut last_refresh,
+            std::time::Duration::from_secs(60),
+            now_ts_ms(),
+        )
+        .await;
+
+        assert_eq!(turn.acks.len(), 1, "重发要补 ack，否则网关会一直等");
+        assert_eq!(turn.acks[0].command_id, "cmd-dup");
+        assert_eq!(turn.acks[0].outcome, command_outcome::SUCCEEDED);
+        assert!(!turn.history_dirty, "重发不该再动台账");
+        assert!(inflight.is_empty(), "已处理过的命令不能再起扫描");
+    }
+
+    /// 不认识的 kind：立刻回 `unsupported`，不猜、不执行。
+    #[tokio::test]
+    async fn an_unknown_command_kind_is_acked_unsupported() {
+        let config = test_config();
+        let mut history = commands::CommandHistory::default();
+        let mut inflight = Vec::new();
+        let mut last_refresh: Option<Instant> = None;
+
+        let turn = handle_command_queue(
+            vec![(
+                sample_command("cmd-new", "some-future-kind", now_ts_ms()),
+                CommandSource::Remote,
+            )],
+            &config,
+            &mut inflight,
+            &mut history,
+            &mut last_refresh,
+            std::time::Duration::from_secs(60),
+            now_ts_ms(),
+        )
+        .await;
+
+        assert_eq!(turn.acks.len(), 1);
+        assert_eq!(turn.acks[0].outcome, command_outcome::UNSUPPORTED);
+        assert!(
+            turn.history_dirty,
+            "未知 kind 也要记账（否则重发会再回一遍）"
+        );
+        assert!(inflight.is_empty());
+    }
+
+    /// 收尾的结果要能**跨重启**读回：网关重发靠的就是这份台账。
+    #[tokio::test]
+    async fn a_drained_result_survives_a_restart() {
+        let root = local_state_dir("investigate-ledger");
+        let mut config = test_config();
+        config.paths.state_dir = root.join("state").display().to_string();
+        let state_dir = PathBuf::from(&config.paths.state_dir);
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+
+        let mut history = commands::CommandHistory::default();
+        let mut inflight = vec![InflightInvestigation {
+            command: sample_command("cmd-persist", crate::investigate::COMMAND_KIND, now_ts_ms()),
+            source: CommandSource::Remote,
+            task: tokio::spawn(async {
+                Err::<(crate::investigate::Report, PathBuf), String>("scan failed".to_string())
+            }),
+        }];
+        for _ in 0..100 {
+            if inflight[0].task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let (acks, recorded) = drain_finished_investigations(
+            &mut inflight,
+            &config,
+            &AppliedWorkGrant::default(),
+            &AppliedUplink::default(),
+            &state_dir,
+            &mut history,
+        )
+        .await;
+        assert_eq!(acks.len(), 1);
+        assert!(recorded);
+
+        commands::store_history_async(&state_dir, &history)
+            .await
+            .expect("store history");
+        let reloaded = commands::load_history_async(&state_dir)
+            .await
+            .expect("reload history");
+        let record = reloaded.find("cmd-persist").expect("结果要能从台账读回");
+        assert_eq!(record.outcome, command_outcome::FAILED);
+        assert!(!record.detail.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// **心跳不会因为调查在扫而停** —— 本次修复真正要保住的性质。
+    ///
+    /// 这是仓里唯一一条**跑真实主循环**的用例：假控制面在第一次状态上报的回执里下发一条
+    /// `investigate`，之后只数上报。断言的是**顺序**：
+    ///
+    /// * ack **不能**搭在紧接着的下一份上报上 —— 那正是「主循环在这一轮里把扫描 `await`
+    ///   完了」的形状（老实现，一次 disk 调查 120s 就是 120s 没有心跳）；
+    /// * 扫描期间必须至少有一次“纯心跳”（不带 ack 的上报）。
+    ///
+    /// 这条断言不依赖扫描真实耗时（扫描跑完再快，ack 也得等到下一轮 drain），所以不会因为
+    /// 机器快慢而抖。把 spawn 换回 inline `await` 会稳定报「交付 #0，ack 却在 #1」。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_heartbeat_keeps_beating_while_an_investigation_scans() {
+        use std::sync::{Arc, Mutex};
+
+        const COMMAND_ID: &str = "cmd-heartbeat";
+
+        #[derive(Clone)]
+        struct StatusHit {
+            /// 这次上报回传的 `(command_id, outcome)`。
+            acks: Vec<(String, String)>,
+        }
+
+        /// 宽容版请求读取器：假服务器**不能**因为一次连接重置就死掉（否则用例会变成超时）。
+        async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<String> {
+            let mut buffer = Vec::new();
+            loop {
+                let mut chunk = [0u8; 1024];
+                let read = socket.read(&mut chunk).await.ok()?;
+                if read == 0 {
+                    return None;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&buffer[..end]).to_string();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if buffer.len() >= end + 4 + content_length {
+                    return Some(String::from_utf8_lossy(&buffer).into_owned());
+                }
+            }
+        }
+
+        fn http_response(status: &str, body: &str) -> String {
+            format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        }
+
+        let root = local_state_dir("investigate-heartbeat");
+        let mut config = test_config();
+        config.paths.root_dir = root.display().to_string();
+        config.paths.run_dir = root.join("run").display().to_string();
+        config.paths.state_dir = root.join("state").display().to_string();
+        config.paths.log_dir = root.join("log").display().to_string();
+        // 文件出口：报告回传会写“无数据面上送通道”，调查本身仍算查成了，不依赖数据面。
+        config.telemetry.logs.output.kind = "file".to_string();
+        let scan_root = root.join("scan");
+        std::fs::create_dir_all(&scan_root).expect("create scan dir");
+        std::fs::write(scan_root.join("sample.log"), b"line\n").expect("write sample");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        config.control_plane.endpoint = Some(format!("http://127.0.0.1:{port}"));
+        config.control_plane.tls_mode = Some("http".to_string());
+
+        let params = serde_json::json!({
+            "topic": "disk",
+            "path": scan_root.display().to_string(),
+            "max_seconds": 6,
+        })
+        .to_string();
+        let hits: Arc<Mutex<Vec<StatusHit>>> = Arc::new(Mutex::new(Vec::new()));
+        let server_hits = Arc::clone(&hits);
+        // 假控制面：只认状态上报（第一条回执带调查命令），其余路径一律 404（循环容忍）。
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let Some(request) = read_request(&mut socket).await else {
+                    continue;
+                };
+                let response = if request.starts_with("POST /api/v1/agent/status") {
+                    let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+                    let reported: Vec<(String, String)> =
+                        serde_json::from_str::<serde_json::Value>(body)
+                            .ok()
+                            .and_then(|value| value.get("command_acks").cloned())
+                            .and_then(|acks| acks.as_array().cloned())
+                            .map(|acks| {
+                                acks.iter()
+                                    .map(|ack| {
+                                        (
+                                            ack.get("command_id")
+                                                .and_then(|id| id.as_str())
+                                                .unwrap_or_default()
+                                                .to_string(),
+                                            ack.get("outcome")
+                                                .and_then(|outcome| outcome.as_str())
+                                                .unwrap_or_default()
+                                                .to_string(),
+                                        )
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                    let deliver = {
+                        let mut hits = server_hits.lock().expect("hits");
+                        hits.push(StatusHit { acks: reported });
+                        hits.len() == 1
+                    };
+                    let ack = serde_json::json!({
+                        "agent_id": "agent-x",
+                        "instance_id": "instance-x",
+                        "acknowledged_at": "2026-11-01T00:00:00Z",
+                        "commands": if deliver {
+                            vec![serde_json::json!({
+                                "command_id": COMMAND_ID,
+                                "requested_at_ms": now_ts_ms(),
+                                "kind": crate::investigate::COMMAND_KIND,
+                                "params": params,
+                            })]
+                        } else {
+                            Vec::new()
+                        },
+                    })
+                    .to_string();
+                    http_response("202 Accepted", &ack)
+                } else {
+                    http_response("404 Not Found", "{}")
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let runner = {
+            let config = config.clone();
+            tokio::spawn(async move {
+                let loop_ctx = DaemonLoop {
+                    config: &config,
+                    exec_bin: ::std::path::Path::new(""),
+                    upgrader_bin: ::std::path::Path::new(""),
+                    config_dir: ::std::path::Path::new(""),
+                };
+                run_forever_async(loop_ctx).await
+            })
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let ack_index = loop {
+            if runner.is_finished() {
+                panic!("主循环提前退出：{:?}", runner.await);
+            }
+            let snapshot = hits.lock().expect("hits").clone();
+            if let Some(index) = snapshot
+                .iter()
+                .position(|hit| hit.acks.iter().any(|(id, _)| id == COMMAND_ID))
+            {
+                break index;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "等不到调查的 ack；已收到 {} 次状态上报",
+                snapshot.len()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+
+        let snapshot = hits.lock().expect("hits").clone();
+        // 交付在第 0 次上报里。若主循环在等扫描，ack 会紧接在第 1 次 —— 那正是要防的回归。
+        assert!(
+            ack_index >= 2,
+            "扫描期间必须还有心跳：交付 #0，ack 却在 #{ack_index}"
+        );
+        assert!(snapshot[0].acks.is_empty(), "交付那次还没有结果");
+        let outcome = snapshot[ack_index]
+            .acks
+            .iter()
+            .find(|(id, _)| id == COMMAND_ID)
+            .map(|(_, outcome)| outcome.clone())
+            .expect("调查的 ack");
+        assert_eq!(
+            outcome,
+            command_outcome::SUCCEEDED,
+            "文件出口下也算查成了（回传失败不影响 outcome）"
+        );
+
+        runner.abort();
+        server.abort();
         let _ = std::fs::remove_dir_all(root);
     }
 
