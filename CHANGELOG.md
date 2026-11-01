@@ -3,6 +3,21 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.18.6-alpha] - 2026-11-01
+
+### 修复（CI 日志验收脚本跟随 0.18.5 的废弃）
+
+- `dev/verify-log-acceptance.sh` 不再依赖已废弃的 `[[telemetry.logs.file_inputs]]`：
+  它现在把验收用的采集单元折算成 `state/work.json`（与现场同一条路径：网关派活 → 本机按
+  最后已知工作继续采）。
+- 授权采集一律 `tail`（不重放历史），而验收要求“启动时文件已在、一轮读完”：harness 在
+  启动前把 fixture **清零**（路径/inode 不变，不算轮转也不报 missing）、启动后写回，
+  对采集来说就是“同一文件新增了内容”。容器身份元数据 `config.v2.json` 不清零，
+  否则 `name_in` / `name_not_in` 会在启动瞬间把容器当成“身份未知”。
+- `WIST_ACCEPT_TICK_WAIT` 默认 7 → 10：多行题（`mysql_slow` / `postgres_csv`）的
+  EOF 提交要再等一个 tick。`name_in` / `name_not_in` 两个 phase 改用各自独立的 fixture
+  目录（共用一份会被第二个 phase 清掉）。
+
 ## [0.18.5-alpha] - 2026-11-01
 
 ### 变更（本机手工采集源废弃，采集只认网关派活）

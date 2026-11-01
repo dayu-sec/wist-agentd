@@ -19,7 +19,9 @@
 #   WIST_ACCEPT_KEEP=1        保留临时目录（失败时总是保留并打印路径）
 #   WIST_ACCEPT_SKIP_TORN=1   跳过"截断行 + 跨批恢复"两个用例（CI 快速通道）
 #   WIST_ACCEPT_ALLOW_SKIP=1  环境根本跑不了（无 python3 / 非 bash）时退 77 而不是 1
-#   WIST_ACCEPT_TICK_WAIT=7   每个阶段等待多少秒（默认 7，覆盖 ≥2 个 3s tick）
+#   WIST_ACCEPT_TICK_WAIT=10  每个阶段等待多少秒（默认 10，覆盖 ≥3 个 3s tick）
+#                             验收 harness 会在启动后把 fixture 写回（授权采集是 tail，不重放历史），
+#                             多行题（mysql_slow / postgres_csv）的 EOF 提交还要再等一个 tick。
 #
 # 退出码：0 = 通过（允许 SKIP）；1 = 有 FAIL；77 = 环境无法验证（仅 ALLOW_SKIP=1）。
 #
@@ -41,7 +43,7 @@ fi
 KEEP="${WIST_ACCEPT_KEEP:-0}"
 SKIP_TORN="${WIST_ACCEPT_SKIP_TORN:-0}"
 ALLOW_SKIP="${WIST_ACCEPT_ALLOW_SKIP:-0}"
-TICK_WAIT="${WIST_ACCEPT_TICK_WAIT:-7}"
+TICK_WAIT="${WIST_ACCEPT_TICK_WAIT:-10}"
 
 fail=0
 skipped=0
@@ -57,6 +59,17 @@ die_env() {
 }
 
 command -v python3 >/dev/null 2>&1 || die_env "需要 python3 做断言"
+# `write_config` 要把验收用的采集单元折算成工作授权（`state/work.json`），那一步用
+# `tomllib` 解析（Python 3.11+）。断言部分只要 3.9 即可，所以这里单独找一个够新的。
+TOML_PY=""
+for candidate in ${WIST_ACCEPT_PYTHON:-} python3 python3.13 python3.12 python3.11; do
+  if command -v "${candidate}" >/dev/null 2>&1 \
+    && "${candidate}" -c 'import tomllib' >/dev/null 2>&1; then
+    TOML_PY="${candidate}"
+    break
+  fi
+done
+[[ -n "${TOML_PY}" ]] || die_env "需要 python3.11+（tomllib）把验收 fixture 折算成工作授权（或设 WIST_ACCEPT_PYTHON）"
 if [[ -z "${BIN}" || ! -x "${BIN}" ]]; then
   echo "FAIL  找不到 wist-agentd（先 cargo build --release，或设 WIST_AGENTD_BIN）" >&2
   exit 1
@@ -110,8 +123,13 @@ def log(phase):
         return fh.read()
 
 
+# 采集只认网关派活，折算出的 input_id 带 `work-<family>-<unit>` 前缀；
+# 验收 fixture 统一用 family=Acceptance、unit=input_id，所以这里退一个前缀即可。
+WORK_INPUT_PREFIX = "work-Acceptance-"
+
+
 def by_input(recs, name):
-    return [r for r in recs if r.get("input_id") == name]
+    return [r for r in recs if r.get("input_id") == WORK_INPUT_PREFIX + name]
 
 
 def info(msg):
@@ -214,7 +232,7 @@ def static(phase, auth_path, csv_path, slow_path, needles_csv):
     seqs = [r["seq"] for r in auth]
     if seqs != sorted(seqs) or len(set(seqs)) != len(seqs):
         ok = fail("auth seq 不是严格递增：%s" % seqs)
-    dropped = magnitude(text, r"telemetry noise dropped input_id=auth .*records=(\d+)")
+    dropped = magnitude(text, r"telemetry noise dropped input_id=work-Acceptance-auth .*records=(\d+)")
     if dropped != noise:
         ok = fail("auth 丢弃数 self-observability = %s，期望 %s" % (dropped, noise))
     else:
@@ -303,7 +321,7 @@ def torn_recovery(phase):
     ok = True
     if recs:
         ok = fail("残缺记录不该下发，实际有 %d 条：%r" % (len(recs), [r["body"] for r in recs]))
-    withheld = magnitude(text, r"telemetry record withheld input_id=torn .*records=(\d+)")
+    withheld = magnitude(text, r"telemetry record withheld input_id=work-Acceptance-torn .*records=(\d+)")
     if withheld != 1:
         ok = fail("torn recovery 的 withheld 计数 = %s（期望 1）" % withheld)
     return ok
@@ -373,8 +391,8 @@ if __name__ == "__main__":
     sys.exit(0 if ok else 1)
 PY
 
-write_config() { # $1 = phase dir, $2 = file_inputs TOML
-  mkdir -p "$1/home"
+write_config() { # $1 = phase dir, $2 = 采集单元 TOML（仍写 `[[telemetry.logs.file_inputs]]` 形状）
+  mkdir -p "$1/home/state"
   cat > "$1/home/agentd.toml" <<EOF
 schema_version = "v1"
 
@@ -394,9 +412,59 @@ kind = "file"
 
 [telemetry.logs.output.file]
 path = "$1/out.ndjson"
-
-$2
 EOF
+  # 采集**只认网关派活**（本机 `file_inputs` 已废弃）。把这份“单元清单”折算成
+  # `state/work.json`：agentd 启动时按“最后已知的工作”继续采 —— 这与真实现场同一条路径
+  # （断网/重启后靠它续干），不绕开授权、也不需要网关。
+  printf '%s\n' "$2" >"$1/.inputs.toml"
+  "${TOML_PY}" - "$1" <<'PY'
+import json, pathlib, sys, tomllib
+
+phase = pathlib.Path(sys.argv[1])
+raw = tomllib.loads((phase / ".inputs.toml").read_text(encoding="utf-8"))
+items = raw.get("telemetry", {}).get("logs", {}).get("file_inputs", [])
+units = []
+for item in items:
+    units.append(
+        {
+            "unit_id": item["input_id"],
+            "capability": "collect_logs",
+            "rule_ref": "acceptance",
+            "requires_privilege": "none",
+            "sources": [
+                {
+                    "kind": "FileGlob",
+                    "target": item["path"],
+                    "multiline": item.get("multiline_mode", "none"),
+                    "exclude_globs": item.get("exclude_globs", []),
+                    "filters": item.get("filters", {}),
+                    "drop_if_contains": item.get("drop_if_contains", []),
+                }
+            ],
+        }
+    )
+record = {
+    "schema_version": "v1",
+    "recorded_at": "2026-01-01T00:00:00Z",
+    "gateway_sequence": 1,
+    "standing": [
+        {
+            "work_id": "work-acceptance",
+            "family": "Acceptance",
+            "status": "active",
+            "plan_version": 1,
+            "acknowledged_version": 1,
+            "effective_from": "2026-01-01T00:00:00Z",
+            "units": units,
+        }
+    ],
+    "one_shot": [],
+    "metrics_interval_seconds": None,
+}
+state = phase / "home" / "state"
+state.mkdir(parents=True, exist_ok=True)
+(state / "work.json").write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+PY
 }
 
 AGENTD_PID=""
@@ -442,9 +510,66 @@ stop_agentd() {
   AGENTD_PID=""
 }
 
+seed_fixtures() { # $1 = fixtures dir, $2 = backup dir
+  [[ -d "$1" ]] || return 0
+  mkdir -p "$2"
+  python3 - "$1" "$2" <<'PY'
+import os, shutil, sys
+
+src, dst = sys.argv[1], sys.argv[2]
+for root, _dirs, files in os.walk(src):
+    rel = os.path.relpath(root, src)
+    target = os.path.join(dst, rel)
+    os.makedirs(target, exist_ok=True)
+    for name in files:
+        path = os.path.join(root, name)
+        if os.path.islink(path):
+            # 符号链接本身不动：内容在它指向的真实文件里（那个会被备份并清零）。
+            continue
+        if name == "config.v2.json":
+            # 容器身份元数据不是采集目标：清了会让 agentd 在启动瞬间把容器当“身份未知”，
+            # 而 `name_in` / `name_not_in` 正好建立在那个身份上。
+            continue
+        shutil.copy2(path, os.path.join(target, name))
+        # 清零而不是删除：路径与 inode 不变 → 不会报 "input missing"，
+        # 也不会被当成轮转（文件变小）而重置位点。
+        with open(path, "w"):
+            pass
+PY
+}
+
+restore_fixtures() { # $1 = fixtures dir, $2 = backup dir
+  [[ -d "$2" ]] || return 0
+  python3 - "$1" "$2" <<'PY'
+import os, shutil, sys
+
+src, dst = sys.argv[1], sys.argv[2]
+for root, _dirs, files in os.walk(dst):
+    rel = os.path.relpath(root, dst)
+    target = os.path.join(src, rel)
+    os.makedirs(target, exist_ok=True)
+    for name in files:
+        shutil.copy2(os.path.join(root, name), os.path.join(target, name))
+shutil.rmtree(dst)
+PY
+}
+
 run_phase() { # $1 = phase dir（已写好 config）；启动、等待、停止
   local dir="$1"
-  start_agentd "${dir}" || return 1
+  # 采集只认授权，而授权采集**一律 tail**（不重放历史）。验收的期望是“启动时文件已经
+  # 在那儿、一轮读完”，所以：先备份并把 fixture 文件**清零**（路径/inode 不变），启动后
+  # 再写回 —— 对采集来说这就是“同一文件新增了内容”，tail 会从头整份读一遍。
+  # 只清一次：同一个 phase 的第二轮（轮转 / 重启 / 追加）必须看到真实增量。
+  local seed="${dir}/.seed"
+  if [[ ! -e "${dir}/.seeded" ]]; then
+    seed_fixtures "${dir}/fixtures" "${seed}"
+    : >"${dir}/.seeded"
+  fi
+  start_agentd "${dir}" || {
+    restore_fixtures "${dir}/fixtures" "${seed}"
+    return 1
+  }
+  restore_fixtures "${dir}/fixtures" "${seed}"
   sleep "${TICK_WAIT}"
   stop_agentd
   return 0
@@ -648,22 +773,29 @@ NF_ROOT="${WORK}/nf/fixtures/dockerroot/containers"
 ID_MYSQL="1111111111111111111111111111111111111111111111111111111111111111"
 ID_FLUENT="2222222222222222222222222222222222222222222222222222222222222222"
 ID_UNKNOWN="3333333333333333333333333333333333333333333333333333333333333333"
-mkdir -p "${NF_ROOT}/${ID_MYSQL}" "${NF_ROOT}/${ID_FLUENT}" "${NF_ROOT}/${ID_UNKNOWN}"
-printf '{"log":"NF mysql\\n","stream":"stdout","time":"2026-10-24T00:00:00.000000000Z"}\n' > "${NF_ROOT}/${ID_MYSQL}/${ID_MYSQL}-json.log"
-printf '{"log":"NF fluent\\n","stream":"stdout","time":"2026-10-24T00:00:00.000000000Z"}\n' > "${NF_ROOT}/${ID_FLUENT}/${ID_FLUENT}-json.log"
-printf '{"log":"NF unknown\\n","stream":"stdout","time":"2026-10-24T00:00:00.000000000Z"}\n' > "${NF_ROOT}/${ID_UNKNOWN}/${ID_UNKNOWN}-json.log"
-cat > "${NF_ROOT}/${ID_MYSQL}/config.v2.json" <<EOF
+# 每个 phase 要一份**独立的** fixture 目录：验收 harness 会在启动前清零、启动后写回，
+# 两个 phase 共用一份会让第二个 phase 什么都采不到。
+make_namefilter_fixtures() { # $1 = containers 目录
+  local root="$1"
+  mkdir -p "${root}/${ID_MYSQL}" "${root}/${ID_FLUENT}" "${root}/${ID_UNKNOWN}"
+  printf '{"log":"NF mysql\\n","stream":"stdout","time":"2026-10-24T00:00:00.000000000Z"}\n' > "${root}/${ID_MYSQL}/${ID_MYSQL}-json.log"
+  printf '{"log":"NF fluent\\n","stream":"stdout","time":"2026-10-24T00:00:00.000000000Z"}\n' > "${root}/${ID_FLUENT}/${ID_FLUENT}-json.log"
+  printf '{"log":"NF unknown\\n","stream":"stdout","time":"2026-10-24T00:00:00.000000000Z"}\n' > "${root}/${ID_UNKNOWN}/${ID_UNKNOWN}-json.log"
+  cat > "${root}/${ID_MYSQL}/config.v2.json" <<EOF
 {"ID":"${ID_MYSQL}","Name":"/mysql","Config":{"Image":"bitnami/mysql:8.0"}}
 EOF
-cat > "${NF_ROOT}/${ID_FLUENT}/config.v2.json" <<EOF
+  cat > "${root}/${ID_FLUENT}/config.v2.json" <<EOF
 {"ID":"${ID_FLUENT}","Name":"/fluent-bit","Config":{"Image":"fluent/fluent-bit:4.0.3"}}
 EOF
+}
 
 P8="${WORK}/p8"
+NF8="${P8}/fixtures/dockerroot/containers"
+make_namefilter_fixtures "${NF8}"
 write_config "${P8}" "$(cat <<EOF
 [[telemetry.logs.file_inputs]]
 input_id = "namefilters"
-path = "${NF_ROOT}/*/*-json.log*"
+path = "${NF8}/*/*-json.log*"
 startup_position = "head"
 multiline_mode = "none"
 filters = { name_in = ["mysql"] }
@@ -676,10 +808,12 @@ else
 fi
 
 P9="${WORK}/p9"
+NF9="${P9}/fixtures/dockerroot/containers"
+make_namefilter_fixtures "${NF9}"
 write_config "${P9}" "$(cat <<EOF
 [[telemetry.logs.file_inputs]]
 input_id = "namefilters"
-path = "${NF_ROOT}/*/*-json.log*"
+path = "${NF9}/*/*-json.log*"
 startup_position = "head"
 multiline_mode = "none"
 filters = { name_not_in = ["fluent-bit"] }
