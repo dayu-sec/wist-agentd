@@ -737,8 +737,127 @@ async fn process_input_with_sink<S: RecordSink>(
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{CatchupBudget, UplinkHealth, len_framing_required};
+    use super::{CatchupBudget, InputTickReports, UplinkHealth, len_framing_required};
     use crate::config::agent_config::LogsSection;
+    use crate::telemetry::logs::files::file::{FamilyCapacity, ProcessOutcome, ProcessOutcomeKind};
+    use crate::telemetry::logs::gate::Withheld;
+
+    /// 一个“本批读了 N 行”的来源批次；其余字段默认空，用例按需覆盖。
+    fn outcome(read_lines: usize) -> ProcessOutcome {
+        ProcessOutcome {
+            kind: ProcessOutcomeKind::SourceBatch,
+            records_processed: read_lines,
+            emitted_directly: 0,
+            spooled: 0,
+            sink_error: None,
+            checkpoint_offset: 0,
+            replayed_spool: 0,
+            truncated: false,
+            truncated_lines: 0,
+            read_lines,
+            withheld: Withheld::default(),
+            dropped_noise: 0,
+            selection_filtered: 0,
+            identity_unknown: 0,
+            rotated: false,
+            paused: false,
+            spool_bytes: 0,
+            capacity: None,
+        }
+    }
+
+    /// 追平会把同一条输入的失败/计数拆到多批上；聚合必须“加起来只报一次”。
+    #[test]
+    fn input_tick_reports_aggregate_across_batches() {
+        let mut reports = InputTickReports::default();
+
+        let mut first = outcome(10);
+        first.withheld = Withheld {
+            records: 2,
+            bytes: 100,
+        };
+        first.dropped_noise = 1;
+        first.truncated_lines = 3;
+        first.spooled = 5;
+        first.selection_filtered = 2;
+        first.identity_unknown = 1;
+        first.paused = true;
+        first.spool_bytes = 1234;
+        first.capacity = Some(FamilyCapacity {
+            tracked: 512,
+            max_files: 512,
+            refused: 4,
+        });
+        reports.observe(&first);
+
+        let mut second = outcome(7);
+        second.withheld = Withheld {
+            records: 1,
+            bytes: 50,
+        };
+        second.dropped_noise = 2;
+        second.truncated_lines = 4;
+        second.spooled = 6;
+        second.selection_filtered = 1;
+        second.identity_unknown = 2;
+        // 第二批又报了一次暂停：只记第一次（暂停后本来就会跳出，这里只是钉住汇总口径）。
+        second.paused = true;
+        second.spool_bytes = 9999;
+        // 触顶与出口失败都取“最后一次看到的”，量由各自签名去重后只报一行。
+        second.capacity = Some(FamilyCapacity {
+            tracked: 512,
+            max_files: 512,
+            refused: 1,
+        });
+        second.sink_error = Some("tcp 10.0.0.1:9000 refused".to_string());
+        reports.observe(&second);
+
+        assert_eq!(reports.withheld.records, 3);
+        assert_eq!(reports.withheld.bytes, 150);
+        assert_eq!(reports.dropped_noise, 3);
+        assert_eq!(reports.truncated_lines, 7, "截断数是跨批累加的");
+        assert_eq!(reports.spooled, 11);
+        assert_eq!(reports.selection_filtered, 3);
+        assert_eq!(reports.identity_unknown, 3);
+        assert_eq!(reports.paused_spool_bytes, Some(1234), "暂停只记第一次");
+        assert_eq!(
+            reports.capacity.as_ref().map(|capacity| capacity.refused),
+            Some(1),
+            "触顶取最后一次"
+        );
+        assert_eq!(
+            reports.sink_error.as_deref(),
+            Some("tcp 10.0.0.1:9000 refused"),
+            "出口失败取最后一次（目标/原因会变）"
+        );
+    }
+
+    /// 追平的唯一进度判据是「本批读到了行」。
+    ///
+    /// 用 `records_processed` 会漏：噪音全丢 / 多行未封口时它可以是 0；
+    /// 用 `checkpoint_offset` 也会漏：未封口块下它不前进。
+    #[test]
+    fn made_progress_means_lines_were_read_and_nothing_is_stuck() {
+        assert!(InputTickReports::made_progress(&outcome(1)));
+        assert!(
+            !InputTickReports::made_progress(&outcome(0)),
+            "已追平就不再循环"
+        );
+
+        let mut paused = outcome(10);
+        paused.paused = true;
+        assert!(
+            !InputTickReports::made_progress(&paused),
+            "spool 暂停时继续读只会把积压堆高"
+        );
+
+        let mut failed = outcome(10);
+        failed.sink_error = Some("refused".to_string());
+        assert!(
+            !InputTickReports::made_progress(&failed),
+            "出口写失败时继续读只会把 spool 堆得更高"
+        );
+    }
 
     #[test]
     fn catchup_can_be_disabled_by_either_zero() {

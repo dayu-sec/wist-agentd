@@ -1406,6 +1406,193 @@ fn catchup_can_be_disabled_and_checkpoint_resumes_across_ticks() {
     assert_eq!(records[4096].body, "line-4096\n");
 }
 
+/// 「Suricata 实现」的**契约形状**：网关派下 `TrafficInspection / linux-suricata-eve`，
+/// agentd 按**显式单路径**跟尾，帧里带 `family` / `unit`，正文逐字不动。
+///
+/// 为什么要这条：面名、单元名、路径是三处数据（知识库 / 派活 / 本机文件），任何一处写岔，
+/// 现场表现都是「看起来在采，但下游归不了类 / 对不上账」—— 单测它们必须一起断。
+#[test]
+fn a_granted_traffic_inspection_work_collects_suricata_eve_json() {
+    let root = temp_dir("daemon-suricata-eve");
+    let run_dir = root.join("run");
+    let state_dir = root.join("state");
+    let log_dir = root.join("log");
+    bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
+    let eve = root
+        .join("opt")
+        .join("suricata")
+        .join("logs")
+        .join("eve.json");
+    fs::create_dir_all(eve.parent().expect("log dir")).expect("create log dir");
+    // 授权采集**恒为 tail**（不重放历史）：先建空文件跑一轮定位点，再写事件才采得到。
+    fs::write(&eve, "").expect("create eve.json");
+
+    let config = standalone_config_with_file_output(&root);
+    let work = granted_log_work(
+        "TrafficInspection",
+        vec![log_unit(
+            "linux-suricata-eve",
+            eve.to_str().expect("utf8 path"),
+        )],
+    );
+    let _ = run_once_with(&root, &config, &work);
+
+    let alert = r#"{"timestamp":"2026-10-31T10:00:00Z","event_type":"alert","alert":{"signature":"ET DEMO"}}"#;
+    let flow =
+        r#"{"timestamp":"2026-10-31T10:00:01Z","event_type":"flow","flow":{"pkts_toserver":3}}"#;
+    let body = format!("{alert}\n{flow}\n");
+    fs::write(&eve, &body).expect("write events");
+
+    let _ = run_once_with(&root, &config, &work);
+    let records = read_output_records(&root);
+    assert_eq!(records.len(), 2, "两条事件各成一条记录");
+    // 正文逐字：JSON 行不能被重排 / 裁剪 / 加前缀（数据面按原样解析）。
+    assert_eq!(records[0].body, format!("{alert}\n"));
+    assert_eq!(records[1].body, format!("{flow}\n"));
+    // 归属：面 + 单元 + 派活 input_id（checkpoint / spool 也用它命名）。
+    assert_eq!(records[0].family, "TrafficInspection");
+    assert_eq!(records[0].unit, "linux-suricata-eve");
+    assert_eq!(
+        records[0].input_id,
+        "work-TrafficInspection-linux-suricata-eve"
+    );
+    assert_eq!(records[0].source_path, eve.display().to_string());
+    assert_eq!(records[1].seq, records[0].seq + 1, "seq 连续");
+
+    let checkpoint: TestLogCheckpointState =
+        read_json(&wist_agentd::state_store::log_checkpoints::path_for(
+            &state_dir,
+            "work-TrafficInspection-linux-suricata-eve",
+        ))
+        .expect("read checkpoint");
+    assert_eq!(
+        checkpoint.files[0].checkpoint_offset,
+        body.len() as u64,
+        "跟到文件尾"
+    );
+}
+
+/// 追平到**本轮预算耗尽**也不能丢数据：下一拍从已提交的 offset 接着读，不重不漏。
+///
+/// 为什么单靠“关追平 + 两轮”不够：那条路每轮读一批就**主动**停；这里要断的是
+/// “追平跑到一半被预算打断”—— 中断点必须正好落在已提交的 offset 上，否则会重复或跳行。
+#[test]
+fn catchup_resumes_from_the_committed_offset_when_the_tick_budget_runs_out() {
+    let root = temp_dir("daemon-catchup-budget");
+    let run_dir = root.join("run");
+    let state_dir = root.join("state");
+    let log_dir = root.join("log");
+    let input_path = root.join("app.log");
+    bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
+    fs::write(&input_path, "").expect("create input");
+
+    let mut config = standalone_config_with_file_output(&root);
+    // 小批量 + 1ms 预算：一拍只跑得完一批（10 行）。20 行 = 两拍，够验“跨拍续读”。
+    config.telemetry.logs.max_lines_per_tick = 10;
+    config.telemetry.logs.catchup_slice_ms = 1;
+    config.telemetry.logs.catchup_budget_ms = 1;
+    let work = granted_log_work(
+        "Test",
+        vec![log_unit(
+            "unit-budget",
+            input_path.to_str().expect("utf8 path"),
+        )],
+    );
+    let _ = run_once_with(&root, &config, &work);
+
+    let total = 20usize;
+    let mut body = String::new();
+    for index in 0..total {
+        body.push_str(&format!("line-{index}\n"));
+    }
+    fs::write(&input_path, &body).expect("write input log");
+
+    let _ = run_once_with(&root, &config, &work);
+    let first = read_output_records(&root).len();
+    assert!(first > 0, "预算再小，一拍也至少要读一批");
+    assert!(
+        first < total,
+        "1ms 预算跑不完三批；读到 {first}/{total} 说明预算没生效"
+    );
+
+    // 1ms 预算下**每拍只跑得完一批**（10 行），所以后面要很多拍；循环到读完为止，
+    // 实际上验的是“每一拍都从上次提交的 offset 接着读”—— 重一行/跳一行都会在总行数或顺序上露。
+    let mut rounds = 1usize;
+    let mut previous = first;
+    loop {
+        let _ = run_once_with(&root, &config, &work);
+        let count = read_output_records(&root).len();
+        assert!(count >= previous, "记录数不应回退：{previous} → {count}");
+        rounds += 1;
+        previous = count;
+        if count == total {
+            break;
+        }
+        assert!(
+            rounds < 10,
+            "每拍至少读一批（10 行）；{rounds} 拍只读到 {count}/{total} 说明卡住了"
+        );
+    }
+    assert!(rounds >= 2, "应该跨了两拍才读完（实际上 {rounds} 拍）");
+
+    let records = read_output_records(&root);
+    assert_eq!(records.len(), total, "最终不重不漏");
+    for (index, record) in records.iter().enumerate() {
+        assert_eq!(
+            record.body,
+            format!("line-{index}\n"),
+            "第 {index} 行乱序或串行"
+        );
+    }
+}
+
+/// 超长行被截断时，**追平不能提前停**：截断行也是「读进来的一行」。
+///
+/// 历史包袱：如果把进度判据写成 `records_processed` 或 `checkpoint_offset`，多行折叠 /
+/// 噪音丢弃 / 未封口块下会是 0 → 追平在第一批后就 break，剩下的事件要等下一拍。
+/// 这里用 `max_line_bytes = 32` 逼每行都被截断，断言**一拍内**读完 12 行。
+#[test]
+fn catchup_keeps_reading_long_lines_that_get_truncated() {
+    let root = temp_dir("daemon-catchup-truncated");
+    let run_dir = root.join("run");
+    let state_dir = root.join("state");
+    let log_dir = root.join("log");
+    let input_path = root.join("app.log");
+    bootstrap::initialize(&root, &run_dir, &state_dir, &log_dir).expect("bootstrap");
+    fs::write(&input_path, "").expect("create input");
+
+    let mut config = standalone_config_with_file_output(&root);
+    config.telemetry.logs.max_line_bytes = 32;
+    config.telemetry.logs.max_lines_per_tick = 2;
+    let work = granted_log_work(
+        "Test",
+        vec![log_unit(
+            "unit-long",
+            input_path.to_str().expect("utf8 path"),
+        )],
+    );
+    let _ = run_once_with(&root, &config, &work);
+
+    let line_count = 12usize;
+    let mut body = String::new();
+    for _ in 0..line_count {
+        body.push_str(&"x".repeat(100));
+        body.push('\n');
+    }
+    fs::write(&input_path, &body).expect("write long lines");
+
+    let _ = run_once_with(&root, &config, &work);
+    let records = read_output_records(&root);
+    assert_eq!(
+        records.len(),
+        line_count,
+        "一拍内必须跨多批读完（截断行同样是进度）"
+    );
+    for record in &records {
+        assert_eq!(record.body.len(), 32, "每条都被截到 max_line_bytes");
+    }
+}
+
 /// 读本地文件输出的全部记录（`run_once` 多轮时是追加写的）。
 fn read_output_records(root: &std::path::Path) -> Vec<TelemetryRecord> {
     let output =

@@ -341,7 +341,7 @@ mod tests {
     use super::{
         InputOrigin, TelemetryFailureKind, Withheld, build_file_input_config, capacity_failure,
         effective_output, multiline_mode_for, selection_filtered_failure, startup_position_for,
-        unsupported_target, uplink_failure, withheld_failure,
+        truncated_failure, unsupported_target, uplink_failure, withheld_failure,
     };
     use crate::config::agent_config::{
         AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, LogFileInputSection,
@@ -476,6 +476,24 @@ mod tests {
             },
         );
         assert_eq!(failure.detail, again.detail, "签名不含量");
+    }
+
+    /// 超长行截断的失败**身份必须稳定**：去重按 `kind|input_id|path|detail`，
+    /// 量（本次截了几行）只能放 `magnitude` —— 否则每拍一个新签名、每拍多一行。
+    #[test]
+    fn a_truncation_report_becomes_a_stable_failure() {
+        let entry = input();
+        let first = truncated_failure(&entry, 1);
+        let second = truncated_failure(&entry, 9);
+        assert_eq!(first.kind, TelemetryFailureKind::TruncatedLine);
+        assert_eq!(first.input_id, "app");
+        assert_eq!(first.path, "/var/log/app.log");
+        assert_eq!(
+            first.detail, second.detail,
+            "detail 参与去重，不能带会变的计数"
+        );
+        assert_eq!(first.magnitude.as_deref(), Some("lines=1"));
+        assert_eq!(second.magnitude.as_deref(), Some("lines=9"));
     }
 
     #[test]

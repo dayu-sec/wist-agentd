@@ -3,6 +3,23 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.18.7-alpha] - 2026-11-01
+
+### 变更（流量检测落点固定为 `/opt/suricata/logs/eve.json`）
+
+- 设计文档与 `doctor` 示例路径统一到**自定义安装**位置 `/opt/suricata/logs/eve.json`
+  （发行版包默认的 `/var/log/suricata` 不是现场形态）：采集只按这一条显式路径跟尾，
+  部署契约（Suricata `eve-log.filename`、logrotate、目录权限）同步改到该目录。
+- 采集接法只保留**网关派活**这一条；本机 `[[telemetry.logs.file_inputs]]` 自 0.18.5 起已废弃。
+  `doctor` 不再把这份废弃配置当成采集目标（之前会对着一条根本不会被采的路径报 FAIL）。
+
+### 测试（+6）
+
+- 采集链路：授权工作采 `eve.json`、追平从已提交 offset 续读（本拍预算用尽即停）、
+  长行被截断后仍继续读。
+- tick 汇总：跨批聚合只报一次、只有 `read_lines` 才算「有进展」、截断行转为稳定失败。
+- `doctor`：已废弃的本机输入不参与检查。
+
 ## [0.18.6-alpha] - 2026-11-01
 
 ### 修复（CI 日志验收脚本跟随 0.18.5 的废弃）

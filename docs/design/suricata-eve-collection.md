@@ -15,9 +15,9 @@
 
 ## 1. 结论（先看这段）
 
-1. **`wist-agentd` 今天就能采 `/var/log/suricata/eve.json`**，不需要新读法：
+1. **`wist-agentd` 今天就能采 `/opt/suricata/logs/eve.json`**，不需要新读法：
    `eve.json` 是**一行一条 JSON**，正好是文件输入器的默认形态（`multiline = none`），
-   目标是一条**显式绝对路径**，`is_executable_source("FileGlob", "/var/log/suricata/eve.json")` 为真。
+   目标是一条**显式绝对路径**，`is_executable_source("FileGlob", "/opt/suricata/logs/eve.json")` 为真。
 2. **不能在 agentd 里解析 JSON**（D1「只搬原文」）。归类/抽字段在数据面（wparse 的 WPL/OML），
    目录里 `rule_ref` 为空只代表「解析未就绪」，不影响采集。
 3. **真正的缺口不是「能不能采」，是「跟不跟得上」**：agentd 原本每 tick（3s）对每条输入只读
@@ -40,7 +40,7 @@
 | 段 | 负责者 | 产出 | 不属于本方案 |
 |---|---|---|---|
 | ① 流量镜像 | 网络设备 / 主机网络配置 | 目标网卡上有全量副本流量 | agentd 常驻配镜 |
-| ② 检测与落盘 | Suricata | `/var/log/suricata/eve.json`（JSON Lines） | agentd 跑 IDS 引擎 |
+| ② 检测与落盘 | Suricata | `/opt/suricata/logs/eve.json`（JSON Lines） | agentd 跑 IDS 引擎 |
 | ③ 采集与上送 | **wist-agentd** | `TelemetryRecord` → spool → 数据面 | agentd 解析 eve 字段 |
 | ④ 解析与归类 | 数据面（wparse） | 结构化事件 / 告警 / 资产关联 | — |
 
@@ -64,7 +64,7 @@
                                      └────────┬─────────┘
                                               │ 追加写（一行一条 JSON）
                                      ┌────────▼──────────────────┐
-                                     │ /var/log/suricata/eve.json│
+                                     │ /opt/suricata/logs/eve.json│
                                      └────────┬──────────────────┘
                                               │ tail（inode 跟踪 + checkpoint）
                          ┌────────────────────▼─────────────────────┐
@@ -82,7 +82,7 @@
 | 字段 | 取值 | 用途 |
 |---|---|---|
 | `body` | **原始整行**（逐字，不裁剪不重排） | 数据面解析的唯一输入 |
-| `source_path` | `/var/log/suricata/eve.json` | 来源定位 |
+| `source_path` | `/opt/suricata/logs/eve.json` | 来源定位 |
 | `input_id` | `work-TrafficInspection-linux-suricata-eve` | 按输入排障 |
 | `file_offset` / `file_offset_end` | 该行在文件中的字节区间 | 精确定位 / 对账 |
 | `seq` | per-agent 全局单调 | 去重、断链判断（at-least-once） |
@@ -105,7 +105,7 @@
 | **指定**（显式绝对路径） | 采集来源（`sources.target`） | 策展（知识库） | 一条 `FileGlob` 来源 | `FileInputProcessor`：单文件 + inode 轮转跟踪 |
 | **搜索**（单层 glob / 目录） | 采集来源（`sources.target`） | 策展（知识库） | 一条 `FileGlob` 来源 | `FileFamilyProcessor`：文件族，新文件从 head |
 | **候选发现 / 受限搜索** | **发现**（`search_roots`） | 知识库 ∩ 网关授权 | **候选**（上报给网关） | **不采**：采不采由网关判定 |
-| **输入**（本机配置） | `[telemetry.logs.file_inputs]` | 本机 root | 一条本机输入 | 同上，但 `InputOrigin` 为空 = 手工配置 |
+| **输入**（本机配置） | ~~`[telemetry.logs.file_inputs]`~~ | — | **已废弃（0.18.5+）**：字段保留只为旧 toml 能启动，启动时打 `DeprecatedConfigIgnored`，**不读** |
 
 四条纪律：
 
@@ -118,9 +118,9 @@
 2. **glob 展开不是运行时发现**，它是一段**写死的 pattern**：`*` 不跨目录、`**` 拒绝、
    `max_files = 512`、`max_new_files_per_tick = 32`、`rescan_interval = 15s`。
    pattern 写错的后果是「多采/少采」，不是「自适应」。
-3. **本机 `file_inputs` 与平台派活是两条独立输入**：`run_tick` 先跑本机配置，再跑
-   `work.log_inputs()`。同一个路径两边都写 = **同一个文件被读两遍**（`input_id` 不同、
-   `seq` 都取号），下游看到的是重复记录。本机配置只能用于「平台没派这个面」的联调/兜底。
+3. **采集只认网关派活**。本机 `[[telemetry.logs.file_inputs]]` 从 0.18.5 起不再被读取（规模部署里不可能一台台手配路径，而网关按「面 + 平台单元」已经能把同几条来源派下去）。
+   要临时盯一个文件，办法是把来源写进**采集单元**（知识库）再派活，或者用 `diagnose` / `investigate` 这类只读工具——
+   不要指望改本机 toml。
 4. **路径是知识，不是偏好**。`source_path` 进数据帧、进历史、进对账，换一种写法就是换
    一类数据。所以它跟采集面一起版本化（知识库），不由页面手填。
 
@@ -131,11 +131,11 @@
 
 | Suricata 配置 | 落盘形态 | agentd 该写什么 | 后果 |
 |---|---|---|---|
-| `filename: eve.json`（默认） | 单文件，持续追加 | `/var/log/suricata/eve.json` | ✅ 推荐 |
-| `filename: eve.json` + 外部 logrotate（`create`/rename） | 改名 + 新建同名文件 | 同上 | ✅ 按 inode 跟到改名后的文件，尾巴读完再跟新文件 |
-| `filename: eve.json` + `rotate-interval: day` | 同上（间隔内单文件） | 同上 | ✅ 同 logrotate |
-| `filename: eve-%Y-%m-%d.json`（strftime） | **每个周期换新文件名**，不 rename | `/var/log/suricata/eve-*.json` | ⚠️ 必须用 glob；新文件从 head 读（W1），归档要 `exclude_globs` |
-| `threaded: on` | **每个输出线程一个文件**（`eve.7.json`） | `/var/log/suricata/eve.*.json` | ⚠️ 必须用 glob；「多个文件的合集才是完整事件流」 |
+| `filename: /opt/suricata/logs/eve.json`（绝对路径） | 单文件，持续追加 | `/opt/suricata/logs/eve.json` | ✅ **推荐**（相对名会落到 Suricata 自己的默认日志目录） |
+| 同上 + 外部 logrotate（`create`/rename） | 改名 + 新建同名文件 | 同上 | ✅ 按 inode 跟到改名后的文件，尾巴读完再跟新文件 |
+| 同上 + `rotate-interval: day` | 同上（间隔内单文件） | 同上 | ✅ 同 logrotate |
+| `filename: /opt/suricata/logs/eve-%Y-%m-%d.json`（strftime） | **每个周期换新文件名**，不 rename | `/opt/suricata/logs/eve-*.json` | ⚠️ 必须用 glob；新文件从 head 读（W1），归档要 `exclude_globs` |
+| `threaded: on` | **每个输出线程一个文件**（`eve.7.json`） | `/opt/suricata/logs/eve.*.json` | ⚠️ 必须用 glob；「多个文件的合集才是完整事件流」 |
 | 两个 eve-log 实例（`eve-ips.json` + `eve-nsm.json`） | 两个独立文件 | 配置**两条** input | ✅ 推荐按用途拆分（告警量小、NSM 量大） |
 
 **红线**：
@@ -151,29 +151,18 @@
 
 ## 5. agentd 侧
 
-### 5.1 两种接法（不要同时用）
+### 5.1 唯一接法：网关派活
 
 | 部署 | 写法 | 说明 |
 |---|---|---|
-| **平台下发（managed）** | 目录里的单元（§6），网关派活 | 推荐；机器换人配不用改 |
-| **单机（managed + 本机配置）** | `[[telemetry.logs.file_inputs]]` | 仅用于「平台还没派这个面」的联调 / 兜底 |
+| **平台下发（managed）** | 知识库里的单元（§6），网关派活 | **唯一**接法；机器换人配不用改 |
+| 本机配置 | ~~`[[telemetry.logs.file_inputs]]`~~ | **已废弃（0.18.5+）**：不采集、不上报 `local_inputs`；字段保留只为旧 toml 还能启动 |
 
-> ⚠️ **同一个路径不要两边都写**。本机 `file_inputs` 与 `work.log_inputs()` 是两条独立输入
-> （`run_tick` 两段各跑一遍），同一个文件会被读两遍、各取一套 `seq` —— 下游看到重复记录，
-> 而且两边的 checkpoint 互不相干。
+所以一台机器上**看不到** Suricata 的数据时，第一件事不是去改 `/etc/wist-agentd/agentd.toml`，而是：
 
-```toml
-# /etc/wist-agentd/agentd.toml（单机联调用；平台下发时不需要写）
-[[telemetry.logs.file_inputs]]
-input_id = "suricata-eve"
-path = "/var/log/suricata/eve.json"
-# 默认就是 tail：只采新增。要回放历史是**一次性运维动作**，显式写 head。
-# startup_position = "tail"
-multiline_mode = "none"     # 一行一条 JSON
-
-# 噪音减法（可选）：例如只在告警面采集时丢掉 stats 事件
-# drop_if_contains = ['"event_type":"stats"']
-```
+1. `wist-agentd diagnose` —— 看 `telemetry.inputs`（采的是 `state/work.json` 里派下来的任务）与 `work.local`；
+2. 到管理面确认这台机器被授权了 `TrafficInspection`（面就绪 + `path_exists` 事实门都成立）；
+3. 再看 `[telemetry.logs]` 的 `catchup_*` / `max_line_bytes` / `spool_max_bytes` 是不是传感器档位（§5.4 / §5.6）。
 
 > **`standalone` 模式不采集**（`[control_plane] enabled = false` 时整段 telemetry 停用）。
 > 想「纯本地采集」，今天没有这条路 —— 必须是 `managed`（有网关）。这条限制先写在最前面，
@@ -295,12 +284,16 @@ tick:
 
 ### 5.7 权限
 
-- 系统级部署的 agentd 是 **root**（systemd unit），读 `/var/log/suricata/eve.json` 无障碍；
+- 系统级部署的 agentd 是 **root**（systemd unit），读 `/opt/suricata/logs/eve.json` 无障碍；
   目录里的单元写 `requires_privilege = "root"`，缺权限时如实进 `unsupported`，不静默少采。
 - Suricata 侧建议 `filemode: 0640`（属主 suricata、属组 suricata）。不要 `0600`：
   那样只有非-root 的调试路径会踩坑。
 - 开发机前台跑（非 root）：把用户加进 suricata 组，或临时放宽到 `0644`（仅联调）。
-- SELinux enforcing 的机器若拒绝读取，按 `semanage fcontext -a -t var_log_t '/var/log/suricata(/.*)?'` 处理。
+- **目录要先建好**：`install -d -o suricata -g suricata -m 0755 /opt/suricata/logs`。自定义安装时
+  安装包不会替你建，目录不存就会让 Suricata 写日志失败（agentd 这边只会看到 `MissingInput`）。
+- SELinux enforcing 的机器若拒绝读取，给这个目录打日志类型并重新打标签：
+  `semanage fcontext -a -t var_log_t '/opt/suricata/logs(/.*)?'` + `restorecon -R /opt/suricata/logs`
+  （`/opt` 下的内容默认不是 `var_log_t`；实在不能改类型，就把 agentd 加进允许读该类型的域）。
 
 ---
 
@@ -336,7 +329,7 @@ family = "TrafficInspection"
 capability = "collect_logs"
 platform = "linux"
 # 事实门：文件在才采。没装 Suricata 的机器不该被派这一面。
-match = "path_exists:/var/log/suricata/eve.json"
+match = "path_exists:/opt/suricata/logs/eve.json"
 rule_ref = ""            # 解析未就绪：原文照进，归类等数据面规则
 requires_privilege = "root"
 # 显式绝对路径 = 今天所有 agentd 都能执行的形态，可以直接 active。
@@ -344,7 +337,7 @@ status = "active"
 
 [[units.sources]]
 kind = "FileGlob"
-target = "/var/log/suricata/eve.json"
+target = "/opt/suricata/logs/eve.json"
 multiline = "none"
 ```
 
@@ -353,8 +346,8 @@ multiline = "none"
 - `match` 用 **`path_exists`**（`;` 是 AND、`|` 是 OR、`any:` 前缀可包多条件）。
   不用 `installed:suricata`：容器化 / 静态编译装法的机器会判成「没装」，而文件才是真前置条件。
   网关的路径探测白名单是**从目录里的 `path_exists` 推导**的（`agent_ops.rs`），加了条件就自动探。
-- 若采用 §4 的 strftime / threaded 形态，`target` 换成 `/var/log/suricata/eve-*.json`
-  （或 `eve.*.json`），并加 `exclude_globs = ["/var/log/suricata/*.gz"]`。
+- 若采用 §4 的 strftime / threaded 形态，`target` 换成 `/opt/suricata/logs/eve-*.json`
+  （或 `eve.*.json`），并加 `exclude_globs = ["/opt/suricata/logs/*.gz"]`。
 - 采集范围拆分建议（**单元层，不是面层**）：告警与 NSM 拆成两个单元
   （`eve-ips.json` / `eve-nsm.json` 两条 input、两个 `unit_id`），因为两者的量级、保留期、
   下游规则完全不同；合成一条会让「告警掉数据」淹没在 flow 日志里。
@@ -362,7 +355,7 @@ multiline = "none"
 - **不开 `search_roots`**：那个字段是给「服务装在非标准目录、进程证据也说不清」的兜底（目前只有
   `linux-db-service` 预留）。Suricata 的输出路径由它自己的 yaml 决定，**是已知的**；
   开搜索只是把 root 枚举面变大、换不到覆盖。真遇到非标准安装，先用 `path_exists` 加一个候选，
-  或在本机 `file_inputs` 里覆盖（§5.1 的重复采集警告仍适用）。
+  或把来源写进采集单元再派活（本机 `file_inputs` 已废弃，改 toml 不生效）。
 - **模型侧同批改**：`wist-design/jumo/model/static/control/module/agent/content/families.mju`
   的面词表要加上同一个 `TrafficInspection`（CI 会校目录与模型的一致性）。
 
@@ -373,7 +366,7 @@ MVP 的形状是 **1 面 : 1 单元 : 1 来源**：
 ```text
 TrafficInspection                      ← 面：数据归属（进帧 family）
   └─ linux-suricata-eve                ← 单元：可派活粒度（进帧 unit）
-       └─ FileGlob /var/log/suricata/eve.json   ← 来源：真读什么
+       └─ FileGlob /opt/suricata/logs/eve.json   ← 来源：真读什么
 ```
 
 对应的 `input_id` 是 `work-TrafficInspection-linux-suricata-eve`（`work-{family}-{unit}`），
@@ -475,7 +468,9 @@ outputs:
   - eve-log:
       enabled: yes
       filetype: regular
-      filename: eve.json          # 固定名（不要 strftime，否则要改采集为 glob）
+      # **绝对路径**，不是裸 `eve.json`：相对名会落到 Suricata 自己的默认日志目录，
+      # 而 agentd 跟的是 `/opt/suricata/logs/eve.json` 这一条显式路径。
+      filename: /opt/suricata/logs/eve.json
       #threaded: off              # 一定保持 off：开了就是每线程一个文件
       #buffer-size: 0             # 默认 0 = 同步写；非 0 会有「写了但没落盘」的窗口
       filemode: 0640              # 0640 而不是 0600
@@ -484,6 +479,12 @@ outputs:
         # - flow                  # 量最大的一项；先确认容量再开
         # - stats
         # - dns / http / tls ...  # 按需
+```
+
+目录本身要先存在且可写（自定义安装时 Suricata 的包不会帮你建）：
+
+```bash
+install -d -o suricata -g suricata -m 0755 /opt/suricata/logs
 ```
 
 四个开关的后果（写在这里，避免上线后被当成 agentd 的 bug）：
@@ -498,7 +499,7 @@ outputs:
 logrotate（若用外部轮转）：
 
 ```text
-/var/log/suricata/eve.json {
+/opt/suricata/logs/eve.json {
     daily
     rotate 7
     missingok
@@ -520,7 +521,7 @@ logrotate（若用外部轮转）：
 
 | # | 场景 | 命令 / 动作 | 判定 |
 |---|---|---|---|
-| 1 | 端到端 | `echo '{"event_type":"test","n":1}' >> /var/log/suricata/eve.json` | 数据面收到 `body` **逐字相同**、`source_path` 正确、`seq` 连续 |
+| 1 | 端到端 | `echo '{"event_type":"test","n":1}' >> /opt/suricata/logs/eve.json` | 数据面收到 `body` **逐字相同**、`source_path` 正确、`seq` 连续 |
 | 2 | 轮转不丢 | `mv eve.json eve.json.1 && touch eve.json` | 改名文件尾部被读完，再跟新文件；无重复、无缺口（按 offset 对账） |
 | 3 | 截断 | `truncate -s 0 eve.json` | 从 0 重读，不重复 |
 | 4 | 追赶 | 生成 10 万行再启动 | 一段时间后 `file_offset` 追上 `stat -c %s`（方案 A/B 的差别在这里看） |

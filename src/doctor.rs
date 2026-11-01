@@ -1491,7 +1491,7 @@ async fn check_log_target(target: &str) -> Result<(), String> {
 
 /// glob 的**固定前缀目录**：第一个元字符之前的路径去掉文件名。
 ///
-/// `/var/log/suricata/eve-*.json` → `/var/log/suricata`；
+/// `/opt/suricata/logs/eve-*.json` → `/opt/suricata/logs`；
 /// `/var/log/*/*.log` → `/var/log`；`/*.log` → `/`。
 fn glob_base_dir(target: &str) -> PathBuf {
     let prefix = match target.find(['*', '?', '[']) {
@@ -2534,6 +2534,45 @@ mod tests {
         let empty = log_inputs_check(&config, None).await;
         assert_eq!(empty.status, Status::Ok, "{empty:?}");
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 本机 `[[telemetry.logs.file_inputs]]` 已废弃（0.18.5+）：诊断**不能**再把它当成采集目标。
+    ///
+    /// 否则运维会看到一条“路径不存在”的 FAIL，而那条配置根本不会被采集 —— 把人引去修
+    /// 一份不生效的文件，真正的问题（没派活 / 派了但路径写错）反而看不到。
+    #[tokio::test]
+    async fn log_inputs_check_ignores_deprecated_local_file_inputs() {
+        let root =
+            std::env::temp_dir().join(format!("doctor-inputs-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("state")).expect("state dir");
+        let mut config: AgentConfig =
+            toml::from_str(&crate::config_runtime::default_config_template())
+                .expect("default config parses");
+        config.paths.state_dir = root.join("state").to_string_lossy().to_string();
+        config.telemetry.logs.file_inputs =
+            vec![crate::config::agent_config::LogFileInputSection {
+                input_id: "legacy-local-input".to_string(),
+                // 这个路径**不存在**：如果诊断还认本机输入，就会报 FAIL —— 而那是不该报的。
+                path: root
+                    .join("gone")
+                    .join("eve.json")
+                    .to_string_lossy()
+                    .to_string(),
+                startup_position: "tail".to_string(),
+                multiline_mode: "none".to_string(),
+                exclude_globs: Vec::new(),
+                filters: Default::default(),
+                drop_if_contains: Vec::new(),
+            }];
+
+        let check = log_inputs_check(&config, None).await;
+        assert_eq!(check.status, Status::Ok, "{check:?}");
+        assert!(
+            check.title.contains("没有文件采集输入"),
+            "本机输入已废弃，不该被当成采集目标：{check:?}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
