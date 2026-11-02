@@ -64,7 +64,7 @@
 ```text
 name    = ns "_" subject { "_" field } [ unit_suffix ] [ "_total" ]
 ns      = "system" | "process" | "container" | "agent"      // 可扩展，须先入规范
-segment = 1*( %x61-7A / %x30-39 )                          // [a-z0-9]，首字符必须是字母
+segment = 1*( %x61-7A / %x30-39 )                          // [a-z0-9]；首段必须字母开头，窗口段（如 `1m`）允许数字开头
 ```
 
 - 全小写；分隔符只有 `_`；**不得**出现 `.` / `-` / `:` / 空格 / 驼峰；**不得**以 `_` 开头或结尾；**不得**出现连续 `__`。
@@ -570,10 +570,10 @@ process_state{state="running"} 1
 | 命名空间 | 名字第一段 ∈ 命名空间闭集；label **不得**重复表达域（由名字首段承载） |
 | 单位后缀 | §2.3 的映射双向成立：`unit=By` ⇔ 名字以 `_bytes` 结尾，`unit=s` ⇔ 以 `_seconds` 结尾，比例 ⇔ `_ratio`；计数器允许在单位后缀后再接 `_total`；窗口后缀（`_1m`/`_5m`/`_15m`）不参与判定 |
 | fact 契约 | `fact_key` 单位中立；fact 值的单位等于注册表 `unit`；常量 label 与注册表声明一致 |
-| 单位闭集 | `unit` ∈ {`By`,`s`,`1`}；比例指标的取值范围必须是 `[0,1]` |
+| 单位闭集 | `unit` ∈ {`By`,`s`,`1`}；比例指标取值恒在 `[0,1]`，唯一例外是**单核口径**（分母声明为“一个核”）的 `agent_cpu_ratio`，可 >1 |
 | 类型闭集 | `type` ∈ {`gauge_i64`,`gauge_f64`,`counter_i64`,`counter_f64`} |
 | 数值 | 不得出现字符串值；不得出现 `NaN` / `±Inf`；容量类非负；`available ≤ total` |
-| 注册表唯一性 | `(采集域, fact_key)` 唯一；`name` 全局唯一 |
+| 注册表唯一性 | `(采集域, fact_key)` 唯一；`(name, 常量 label)` 唯一（同名可按 `disk_role` 分行） |
 | label 白名单 | 样本 label 键 ⊆ §3 闭集；未登记键必须被丢弃并记事件 |
 | 身份唯一性 | 同一批次内 `(name, agent, instance, 按需 label)` 无重复 |
 | 身份稳定性 | 目标类指标的 `instance` 不得含 PID；进程/容器身份必须由稳定标识构成，连续批次取值不变 |
