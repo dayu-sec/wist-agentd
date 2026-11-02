@@ -16,10 +16,15 @@ wist-agentd（edge daemon）实现时最重要的设计文档。
 7. [self-observability.md](./self-observability.md) — 自观测（配合 `src/runtime/self_observability.rs`）
 8. [agentd-service-deployment.md](./agentd-service-deployment.md) — 后台长期运行方案（设计说明；配合 `src/service/`）
 9. [agentd-investigation.md](./agentd-investigation.md) — 一次性调查 `investigate`（题目模型 / 磁盘证据 / 扫描边界 / 命令 seam；配合 `src/investigate*.rs`）
+10. [metrics-data-spec.md](./metrics-data-spec.md) — 指标数据规范（草案；配合 `src/telemetry/metrics/`）
 
 > 面向运维的安装/使用/排障手册不在本目录，在 [`../usage/`](../usage/README.md)：
 > [agentd-install-and-usage.md](../usage/agentd-install-and-usage.md)（安装与使用手册）、
 > [README.md](../usage/README.md)（使用帮助：常见问题处理）。
+
+## 指标采集（配合 `src/telemetry/metrics/`）
+
+- [metrics-data-spec.md](./metrics-data-spec.md) — 指标数据规范（v1 草案：命名/单位/类型/身份/选择类 label/常见系统取值/投递语义与决策记录）
 
 ## 日志 / telemetry 采集（配合 `src/telemetry/logs/files/`）
 
@@ -41,4 +46,4 @@ wist-agentd（edge daemon）实现时最重要的设计文档。
 | `src/investigate*` | agentd-investigation |
 | `src/runtime` | agentd-architecture、self-observability |
 | `src/service` | agentd-service-deployment（设计）＋ `../usage/agentd-install-and-usage`（安装/运维） |
-| `src/telemetry` | log-file-input-spec、log-file-state-schema、macos-*、linux-* |
+| `src/telemetry` | metrics-data-spec、log-file-input-spec、log-file-state-schema、macos-*、linux-* |
