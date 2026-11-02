@@ -952,14 +952,16 @@ mod tests {
         let envelope = DataFrame::new("agent-001", "2026-04-14T00:00:00Z", 42);
         let metrics = VmMetricLine {
             metric: VmMetricLabels {
-                name: "system.load_average.1m".to_string(),
+                name: "system_load_average_1m".to_string(),
                 agent: "agent-001".to_string(),
-                kind: "host_metrics".to_string(),
-                target_ref: "host-1:host".to_string(),
-                resource_ref: Some("host-1".to_string()),
-                unit: "1".to_string(),
-                mount: None,
+                instance: "host-1".to_string(),
+                disk_role: None,
+                mountpoint: None,
                 fstype: None,
+                device: None,
+                cpu: None,
+                mode: None,
+                state: None,
             },
             values: vec![0.25],
             timestamps: vec![1_234_567_890_000],
@@ -978,9 +980,9 @@ mod tests {
         );
 
         let parsed_body: serde_json::Value = serde_json::from_str(body).expect("valid metrics");
-        assert_eq!(parsed_body["metric"]["__name__"], "system.load_average.1m");
+        assert_eq!(parsed_body["metric"]["__name__"], "system_load_average_1m");
         assert_eq!(parsed_body["metric"]["agent"], "agent-001");
-        assert_eq!(parsed_body["metric"]["kind"], "host_metrics");
+        assert_eq!(parsed_body["metric"]["instance"], "host-1");
         assert_eq!(parsed_body["values"][0], 0.25);
         assert_eq!(parsed_body["timestamps"][0], 1_234_567_890_000_i64);
     }
@@ -1185,14 +1187,16 @@ mod tests {
         let envelope = DataFrame::new("agent-001", "2026-04-14T00:00:00Z", 7);
         let metrics = VmMetricLine {
             metric: VmMetricLabels {
-                name: "system.load_average.1m".to_string(),
+                name: "system_load_average_1m".to_string(),
                 agent: "agent-001".to_string(),
-                kind: "host_metrics".to_string(),
-                target_ref: "host-1:host".to_string(),
-                resource_ref: Some("host-1".to_string()),
-                unit: "1".to_string(),
-                mount: None,
+                instance: "host-1".to_string(),
+                disk_role: None,
+                mountpoint: None,
                 fstype: None,
+                device: None,
+                cpu: None,
+                mode: None,
+                state: None,
             },
             values: vec![0.25],
             timestamps: vec![1_234_567_890_000],
@@ -1206,7 +1210,7 @@ mod tests {
         assert!(body.contains(" METRICS: "), "frame: {body}");
         assert!(body.contains("\"agent\":\"agent-001\""), "frame: {body}");
         assert!(
-            body.contains("\"__name__\":\"system.load_average.1m\""),
+            body.contains("\"__name__\":\"system_load_average_1m\""),
             "frame: {body}"
         );
     }

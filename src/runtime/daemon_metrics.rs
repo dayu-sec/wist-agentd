@@ -4,7 +4,7 @@ use std::path::Path;
 
 use wist_contracts::telemetry_record::DataFrame;
 use wist_shared::fs::read_json;
-use wist_shared::time::{now_rfc3339, now_ts_ms};
+use wist_shared::time::now_rfc3339;
 
 use crate::self_observability::MetricsHealthSnapshot;
 use crate::state_store::log_seq_state;
@@ -113,7 +113,7 @@ pub(super) async fn write_metrics_uplink(
     global_seq_path: &Path,
 ) -> io::Result<()> {
     let samples = samples::build_samples_snapshot(snapshot);
-    let lines = samples::build_vm_metric_lines(&samples, agent_id, now_ts_ms());
+    let lines = samples::build_vm_metric_lines(&samples, agent_id);
     if lines.is_empty() {
         return Ok(());
     }
@@ -473,7 +473,7 @@ mod tests {
         assert!(body.contains(" METRICS: "), "frame: {body}");
         assert!(body.contains("\"agent\":\"agent-001\""), "frame: {body}");
         assert!(
-            body.contains("system.load_average.1m"),
+            body.contains("system_load_average_1m"),
             "normalized sample: {body}"
         );
     }

@@ -381,40 +381,20 @@ async fn export_process_classified_async(
     Ok(())
 }
 
-/// Reads current metrics runtime snapshot and writes one sample per JSONL line.
+/// Reads current metrics runtime snapshot and writes one VM JSON line per sample.
+///
+/// 本地落盘与线格式同构（`metric` / `values` / `timestamps`），不得存在第二套字段定义。
 pub async fn export_metrics_async(state_dir: &Path, source: &ExporterSource) -> RuntimeResult<()> {
     let runtime_path = metrics_runtime::path_for(state_dir);
 
     match read_json_async::<MetricsRuntimeSnapshot>(&runtime_path).await {
         Ok(snapshot) => {
             let samples_snapshot = samples::build_samples_snapshot(&snapshot);
-            let seq = EXPORT_SEQ.fetch_add(1, Ordering::Relaxed);
-            let output_id = format!("metrics_{seq}");
-            let generated_at = now_rfc3339();
-            let mut rows = Vec::new();
-
-            for group in &samples_snapshot.groups {
-                for sample in &group.samples {
-                    rows.push(serde_json::json!({
-                        "api_version": "wist/v1",
-                        "kind": "metrics_sample",
-                        "output_id": output_id,
-                        "seq": seq,
-                        "generated_at": generated_at,
-                        "source": source,
-                        "batch_seq": samples_snapshot.batch_seq,
-                        "collected_at": samples_snapshot.collected_at,
-                        "collection_kind": group.kind,
-                        "target_ref": group.target_ref,
-                        "resource_ref": group.resource_ref,
-                        "name": sample.name,
-                        "type": sample.value_type,
-                        "unit": sample.unit,
-                        "value": sample.value,
-                        "status": sample.status,
-                    }));
-                }
-            }
+            let lines = samples::build_vm_metric_lines(&samples_snapshot, &source.agent_id);
+            let rows: Vec<serde_json::Value> = lines
+                .into_iter()
+                .filter_map(|line| serde_json::to_value(line).ok())
+                .collect();
 
             let out_path = state_dir.join("export").join("metrics.jsonl");
             write_jsonl_async(&out_path, &rows).await

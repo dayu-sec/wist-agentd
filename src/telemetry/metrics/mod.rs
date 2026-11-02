@@ -1,5 +1,6 @@
 //! Metrics runtime scaffolding.
 
+pub mod cpu;
 pub mod runtime;
 pub mod samples;
 pub mod spec;

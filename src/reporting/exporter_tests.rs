@@ -261,12 +261,11 @@ fn export_metrics_writes_flattened_samples() {
 
     let rows = read_jsonl(&state_dir.join("export").join("metrics.jsonl"));
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["kind"], "metrics_sample");
-    assert_eq!(rows[0]["collected_at"], "2026-04-19T00:00:00Z");
-    assert_eq!(rows[0]["target_ref"], "host-1:host");
-    assert_eq!(rows[0]["name"], "system.uptime");
-    assert_eq!(rows[0]["value"], 42.0);
-    assert_eq!(rows[0]["source"]["agent_id"], "test-agent");
+    assert_eq!(rows[0]["metric"]["__name__"], "system_uptime_seconds");
+    assert_eq!(rows[0]["metric"]["agent"], "test-agent");
+    assert_eq!(rows[0]["metric"]["instance"], "host-1");
+    assert_eq!(rows[0]["values"][0], 42.0);
+    assert_eq!(rows[0]["timestamps"][0], 1_776_556_800_000i64);
 }
 
 #[test]
