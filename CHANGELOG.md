@@ -3,6 +3,27 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.20.0-alpha] - 2026-11-03
+
+### 新增
+
+- **agent 自身的指标**：`agent_cpu_ratio`（单核口径，窗口 = 相邻两批间隔）、`agent_cpu_cores`、
+  `agent_memory_bytes`、`agent_admin_latency_seconds`、`agent_discovery_policy_version`、
+  `agent_uplink_metrics_failed_total`。它们与主机指标走同一条上送链路，
+  看机器负载时能同时看到「是不是 agent 自己吃掉了 CPU / 内存」。
+- **macOS 磁盘 I/O**：上报整盘的读写累计字节（`system_disk_{read,written}_bytes_total`）；
+  APFS 多卷按整盘去重，不会把 I/O 按卷数放大。
+- **本地导出带上选择类 label**：`export/metrics.jsonl` 与上送线同构，
+  `[metrics.labels]` 在离线文件里也能按集群 / 环境筛。
+
+### 变更
+
+- 指标运行时按采集域拆分为 `host` / `process` / `container`，对外指标与配置行为不变。
+
+### 兼容性
+
+- 旧配置可直接启动；自观测指标在平台拿不到读数时**不发**，不补 0。
+
 ## [0.19.0-alpha] - 2026-11-03
 
 ### 新增（指标数据规范 v1）
