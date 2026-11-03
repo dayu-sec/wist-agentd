@@ -86,8 +86,31 @@
 
 ### WP7 双写收尾
 
-- 删除 `deprecated` 注册表条目、采集侧旧名、网关旧名回退；
+- 删除 `LEGACY_METRIC_SPECS` 注册表条目、采集侧旧名 fact（`legacy.*`）、网关旧名回退；
 - 删除前确认：旧名在 VM 中 7 天无新写入。
+
+判定用 [`dev/verify-metrics-legacy-drop.py`](../../dev/verify-metrics-legacy-drop.py)（只依赖 Python 3，不需要 curl/jq）：
+
+```bash
+# 正式判定：窗口必须 ≥ 7d
+dev/verify-metrics-legacy-drop.py --vm-url http://vm.example:8428
+
+# 机器可读输出（CI / 发布流水线判断）
+dev/verify-metrics-legacy-drop.py --vm-url http://vm.example:8428 --json
+
+# 改脚本本身时先跑自检（内置假 VM，覆盖三种判定）
+dev/verify-metrics-legacy-drop.py --self-test
+```
+
+退出码：`0` 可删；`1` 仍有旧名在写（列出名字、点数、最后写入时间、还在写的 agent）；
+`2` 查询失败 / 参数错误；`3` 保留期自检不通过（窗口内连**新名**都没数据，结论不可信）。
+
+> **注意名字层次**：`legacy.*` 是 agent 内部的 `fact_key` 前缀，不会出现在 VM 里。
+> VM 里要检查的是它们规范化后的**旧指标名**（如 `system.memory.total`、
+> `process.memory.rss_kb`）。脚本按「名字含 `.` 且属于 `system.` / `process.` /
+> `container.` / `agent.` 命名空间」识别旧名——规范名不允许含 `.`，所以这个判据不依赖手写清单。
+
+删除分支：`chore/metrics-drop-legacy`（三仓同一批提交），必须在脚本退 `0` 后才能合入。
 
 ## 4. 顺序与并行
 
