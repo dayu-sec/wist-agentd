@@ -22,9 +22,24 @@
 
 优先级（逐键）：**手工 > 推断 > 部署默认**；三者都没有 → **不发**该 label，不猜、不补默认。
 
-`env` / `cluster` **不由事实推断**：事实里没有部署单元。`app` 的证据必须来自白名单
-（k8s label、容器镜像名、systemd / launchd unit），可执行名 / 端口 / cmdline 只能作发现证据，
-不得直接作为取值（规范 §3.4）。
+`env` / `cluster` **不由事实推断**：事实里没有部署单元。`app` 的证据必须来自白名单，
+可执行名 / 端口 / cmdline 只能作发现证据，不得直接作为取值（规范 §3.4）。
+
+### 2.1 推断（P2）
+
+| 项 | 口径 |
+|---|---|
+| 证据来源 | `service_units`（systemd 单元，含 `@实例`）、`container_names`（k8s 下即 pod spec 的容器名）。两者随事实摘要上送，**进内容摘要**（`fact-v4`） |
+| 取值闭集 | 注册表 `wist-knowledge/metrics-app-registry.toml`（网关 `[metrics] registry_file`） |
+| `app` | 证据命中**唯一**一个已登记的 app → 写；零个 → 留空；≥2 个（混跑）→ 留空并记事件 |
+| `role` | 在命中的证据串里按 `-` `_` `.` `@` 切词，命中该 app 登记的 role 才写；两个不同角色词 → 有歧义，不写 |
+| 单元模板 | `kafka@broker-1` 按模板名 `kafka` 命中 app；报出去的实例名里的 `broker` 用来定 role |
+| 注册表变更 | 按文件 mtime 缓存，**改完即生效**（补登记不必重启网关）；读坏沿用上一份 |
+| 采集缺口 | macOS 的 launchd label 需要 `launchctl` 子进程，本阶段不采 → macOS 上 `app` 留空 |
+
+为什么 `role` 词表是闭集而不是「每 app 自由扩展」：`role` 会出现在查询与告警表达式里，
+让一份策展文件引入任意词等于让 `{role=…}` 静默分裂。新增角色 = 改规范 + 改实现（一次发布），
+登记表只决定某个 app 允许哪几个已有的词。
 
 ## 3. 接口
 
@@ -129,10 +144,11 @@ agentd 配置中的 `[metrics.labels]` **停止生效**，但保留解析一个�
 | 阶段 | 内容 | 依赖 |
 |---|---|---|
 | P1 | 网关接口 + 部署默认（`env`/`cluster`）+ 手工覆盖；agent 拉取 / 缓存 / 三个子命令；`refresh` 命令面；`[metrics.labels]` 废弃 | 无 |
-| P2 | 事实补 `systemd_unit` / `launchd_label` / `container_image` / `k8s.*`；注册表；`app` / `role` 推断 | agentd 发现层 |
+| P2 | 注册表 + `app` / `role` 推断（**已完成**：systemd 单元 / 容器名）；launchd label 与容器镜像名待补 | agentd 发现层 |
 | P3 | 批量编辑 / 管理页面 | 网关前端 |
 
-P1 期间 `app` 留空是符合规范的（`{app=""}` 可查）。
+P1 期间 `app` 留空是符合规范的（`{app=""}` 可查）。P2 起 `app` 由注册表推断；
+**macOS 与未登记的系统仍然留空** —— 那不是缺陷，是「判不出就不写」。
 
 ## 9. 验收
 
@@ -143,3 +159,7 @@ P1 期间 `app` 留空是符合规范的（`{app=""}` 可查）。
 5. `wist-agentd refresh --all` 在台账里逐项列出 `updated/unchanged/failed`；
 6. VM：`count by (env, cluster)` 与 `{app="…"}` 可查；
 7. 网关不可用重启 agent：使用缓存标签；清缓存后重启 → 不带标签，不猜。
+8. Linux 上跑 `kafka@broker-1.service`：`metrics-labels show` 能看到 `app=kafka`、
+   `role=broker`，来源均为 `inferred`；
+9. 同一台机器同时跑 kafka 与 postgres（都已登记）：`app` 留空，`env` / `cluster` 照常；
+10. 在注册表里补登记一个新的 unit 名后，**不重启网关**，5 分钟内该机器的 `app` 出现。

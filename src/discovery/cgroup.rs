@@ -31,6 +31,32 @@ fn cgroup_path_from_proc_content(content: &str) -> Option<String> {
         .map(|path| (*path).to_string())
 }
 
+/// 进程所属的 **systemd 单元**（已归一：去掉 `.service` 等类型后缀、小写）。
+///
+/// **保留 `@实例`**（`kafka@broker-1`）：实例名里带的是部署者写的角色词（`broker`），
+/// 那是 `role` 推断的输入；抹掉它，网关就再也分不出 broker 与 controller。
+/// 「哪个 app」由网关按模板名比对（`kafka@broker-1` → `kafka`），两边各取所需。
+///
+/// 为什么不 fork `systemctl`：每个进程的 cgroup 路径里就有单元名
+/// （`/system.slice/kafka.service`、`/user.slice/.../app.slice/foo.service`），
+/// 而进程探针本来就在读 `/proc/<pid>`。一次 `systemctl` 子进程既慢又要额外权限，
+/// 还会在每次发现 tick 里起一个进程。
+///
+/// 只认 `.service` / `.socket` / `.timer` 三类：`*.slice` 是分组（`system.slice` 本身
+/// 不是服务），`.scope` 是会话/容器作用域（它的名字是容器 id，不是用途）。
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn unit_from_cgroup_path(path: &str) -> Option<String> {
+    path.split('/').rev().find_map(|segment| {
+        // 先小写再拆：cgroup 里偶尔出现大写（`Kafka.Service`），按原样比类型后缀会漏。
+        let segment = segment.trim().to_ascii_lowercase();
+        let (name, kind) = segment.rsplit_once('.')?;
+        if !matches!(kind, "service" | "socket" | "timer") || name.is_empty() {
+            return None;
+        }
+        Some(name.to_string())
+    })
+}
+
 /// 进程所属的容器 id。拿不到（不在容器里 / 读不到 cgroup）时返回 `None`。
 #[cfg(target_os = "linux")]
 pub(crate) fn process_container_id(pid: u32) -> Option<String> {
@@ -79,7 +105,9 @@ fn valid_container_id(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cgroup_path_from_proc_content, container_id_from_cgroup_path};
+    use super::{
+        cgroup_path_from_proc_content, container_id_from_cgroup_path, unit_from_cgroup_path,
+    };
 
     #[test]
     fn containerd_scope_yields_the_container_id() {
@@ -136,6 +164,45 @@ mod tests {
         assert_eq!(
             container_id_from_cgroup_path("/system.slice/docker-ABCDEF123456.scope"),
             Some("abcdef123456".to_string())
+        );
+    }
+
+    #[test]
+    fn service_units_are_read_off_the_cgroup_path() {
+        // 系统服务：`/system.slice/kafka.service` → `kafka`。
+        assert_eq!(
+            unit_from_cgroup_path("/system.slice/kafka.service").as_deref(),
+            Some("kafka")
+        );
+        // 用户级服务：路径更深，取最后一段。
+        assert_eq!(
+            unit_from_cgroup_path(
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/orders.service"
+            )
+            .as_deref(),
+            Some("orders")
+        );
+        // 实例名**保留** `@实例`：里面的 `broker` 是 `role` 推断的输入。
+        assert_eq!(
+            unit_from_cgroup_path("/system.slice/kafka@broker-1.service").as_deref(),
+            Some("kafka@broker-1")
+        );
+        // socket / timer 也是「部署者命名的单元」。
+        assert_eq!(
+            unit_from_cgroup_path("/system.slice/backup.timer").as_deref(),
+            Some("backup")
+        );
+        // slice 是分组、scope 是会话/容器作用域 —— 都不是用途。
+        assert_eq!(unit_from_cgroup_path("/system.slice"), None);
+        assert_eq!(
+            unit_from_cgroup_path("/system.slice/docker-abc123.scope"),
+            None
+        );
+        assert_eq!(unit_from_cgroup_path(""), None);
+        // 大写归一（cgroup 里偶尔有）。
+        assert_eq!(
+            unit_from_cgroup_path("/system.slice/Kafka.Service").as_deref(),
+            Some("kafka")
         );
     }
 

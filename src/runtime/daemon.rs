@@ -803,6 +803,11 @@ async fn report_fact_summary_with(
     )
     // 路径探测结果：参与内容摘要（它决定 `path_exists` 求值）。
     .with_probe_paths(summary.probed_paths.clone(), summary.present_paths.clone())
+    // 推断证据（服务管理器单元 / 容器名）：**参与内容摘要** —— 它决定指标带不带 `app`。
+    .with_evidence(
+        summary.service_units.clone(),
+        summary.container_names.clone(),
+    )
     // 主机标识与网卡地址：**留痕/展示**，不进内容摘要（见 `ReportAgentFactSummary` 的注释）。
     .with_display(
         summary.host_id.clone(),
@@ -4152,6 +4157,8 @@ mod tests {
             host_id: "machine-id".to_string(),
             host_name: "demo-host".to_string(),
             network_addresses: vec!["en0 192.168.1.5/24".to_string()],
+            service_units: Vec::new(),
+            container_names: Vec::new(),
         }
     }
 
@@ -4267,7 +4274,7 @@ mod tests {
         assert!(frame.contains("\"instance_id\":\"instance-x\""));
         assert!(frame.contains("\"kind\":\"report_agent_fact_summary\""));
         // 声明用的是与网关同源的实现（版本前缀 fact-v3）。
-        assert!(frame.contains("\"content_digest\":\"fact-v3:sha256:"));
+        assert!(frame.contains("\"content_digest\":\"fact-v4:sha256:"));
         assert!(frame.contains("\"process_executables\":[\"/usr/bin/xcodebuild\"]"));
         assert!(frame.contains("\"process_count\":1"));
         // 路径探测结果随摘要上送（参与内容摘要，与「没探测」区分开）。
@@ -4284,7 +4291,7 @@ mod tests {
         assert!(!frame.contains("/api/v1/agent/facts"));
 
         assert!(loaded_attempt(&state_dir).await > 0);
-        assert!(summary.content_digest().starts_with("fact-v3:sha256:"));
+        assert!(summary.content_digest().starts_with("fact-v4:sha256:"));
     }
 
     #[tokio::test]

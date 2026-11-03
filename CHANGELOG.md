@@ -3,6 +3,25 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.23.0-alpha] - 2026-11-03
+
+### 新增
+
+- **事实摘要携带 `app` 推断的高置信度证据**（`service_units` / `container_names`）：
+  - `service_units` 从进程的 `/proc/<pid>/cgroup` 里取 systemd 单元（**不 fork `systemctl`**），
+    归一为小写、去掉 `.service`/`.socket`/`.timer` 后缀，**保留 `@实例`**
+    （`kafka@broker-1` 里的 `broker` 是 `role` 推断的输入）。
+  - `container_names` 取自容器探针已有的 `container.name`（k8s 下即 pod spec 的容器名）。
+  - 两者都**进内容摘要**（`fact-v4`）：证据变了却不改摘要，会让指标永远带着旧用途，
+    且没有任何一层能发现。升级后每台机器会强制重报一次。
+  - 清单**有界**（各 ≤ 64 条，字典序截断）：一台跑几百个容器的机器不该把摘要顶成 MB 级。
+- 依赖 `wist-contracts 0.10` / `wist-metrics 0.8` / `wist-validate 0.8`（同一批必须一起升）。
+
+### 已知缺口
+
+- macOS 的 launchd label 需要 `launchctl` 子进程，本阶段不采 → **macOS 上 `app` 留空**
+  （符合规范：判不出就留空，`{app=""}` 可查）。
+
 ## [0.22.1-alpha] - 2026-11-03
 
 ### 修复

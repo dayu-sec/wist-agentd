@@ -21,6 +21,8 @@ const ENDPOINT_KIND: &str = "service_endpoint";
 const HOST_KIND: &str = "host";
 /// `DiscoveredResource::kind`：网卡地址（与 `NetworkDiscoveryProbe` 写入的值一致）。
 const IP_ADDRESS_KIND: &str = "ip_address";
+/// `DiscoveredResource::kind`：容器（与 `ContainerDiscoveryProbe` 写入的值一致）。
+const CONTAINER_KIND: &str = "container";
 
 /// 进程可执行标识的属性名。
 ///
@@ -37,6 +39,10 @@ const HOST_ID: &str = "host.id";
 const HOST_NAME: &str = "host.name";
 /// 网卡地址的属性名（`ip_address` 方向）。cidr 比裸地址更能说明「在哪个网段」。
 const ADDR_IFACE: &str = "net.if.name";
+/// 服务管理器单元（进程探针从 `/proc/<pid>/cgroup` 推出，已归一）。
+const SERVICE_UNIT: &str = "service.unit";
+/// 容器名（k8s 下就是 pod spec 里的容器名）。
+const CONTAINER_NAME: &str = "container.name";
 const ADDR_CIDR: &str = "net.if.cidr";
 const ADDR_IP: &str = "net.if.addr";
 
@@ -70,6 +76,11 @@ pub struct FactSummaryDraft {
     /// 网卡地址（每块网卡一条，形如 `en0 192.168.1.5/24`）。
     /// 已滤掉链路本地（`fe80::/10`）/ 回环 / IPv4 自分配 —— 展示口径与机器画像一致。
     pub network_addresses: Vec<String>,
+    // ── 以下是**推断证据**：进内容摘要（决定指标带不带 `app`）──
+    /// 服务管理器单元（已归一：去掉类型后缀、`@实例` 归到模板名、小写）。
+    pub service_units: Vec<String>,
+    /// 容器名（小写）。k8s 下就是 pod spec 里的容器名。
+    pub container_names: Vec<String>,
 }
 
 impl FactSummaryDraft {
@@ -84,6 +95,10 @@ impl FactSummaryDraft {
             self.probed_paths.clone(),
             self.present_paths.clone(),
         )
+        .with_evidence(wist_contracts::fact_summary::FactEvidence {
+            service_units: self.service_units.clone(),
+            container_names: self.container_names.clone(),
+        })
     }
 
     /// 内容摘要（`fact-v3:sha256:<hex>`）。
@@ -107,6 +122,8 @@ pub fn build_summary(snapshot: &DiscoverySnapshot, probe_paths: &[String]) -> Fa
     let mut executables = BTreeSet::new();
     let mut ports = BTreeSet::new();
     let mut addresses = BTreeSet::new();
+    let mut service_units = BTreeSet::new();
+    let mut container_names = BTreeSet::new();
     let mut process_count: i64 = 0;
     let mut host_id = String::new();
     let mut host_name = String::new();
@@ -117,6 +134,14 @@ pub fn build_summary(snapshot: &DiscoverySnapshot, probe_paths: &[String]) -> Fa
                 process_count += 1;
                 if let Some(value) = attribute(resource, PROCESS_EXECUTABLE) {
                     executables.insert(value.to_string());
+                }
+                if let Some(value) = attribute(resource, SERVICE_UNIT) {
+                    service_units.insert(value.to_string());
+                }
+            }
+            CONTAINER_KIND => {
+                if let Some(value) = attribute(resource, CONTAINER_NAME) {
+                    container_names.insert(value.to_string());
                 }
             }
             ENDPOINT_KIND => {
@@ -188,7 +213,19 @@ pub fn build_summary(snapshot: &DiscoverySnapshot, probe_paths: &[String]) -> Fa
         host_id,
         host_name,
         network_addresses: addresses.into_iter().collect(),
+        // 两者都必须**有界**：摘要走控制面（10~30 KB 的量级），
+        // 一台跑几百个容器的机器能把报文顶成 MB 级。截断时保留字典序最小的那批，
+        // 保证同一台机器的多次上报截断结果一致（否则摘要会自己抖）。
+        service_units: bounded(service_units),
+        container_names: bounded(container_names),
     }
+}
+
+/// 证据清单的上限。超过就截断 —— 见 `build_summary` 里的说明。
+const MAX_EVIDENCE_ITEMS: usize = 64;
+
+fn bounded(values: BTreeSet<String>) -> Vec<String> {
+    values.into_iter().take(MAX_EVIDENCE_ITEMS).collect()
 }
 
 /// 一次路径探测的结果。
@@ -418,8 +455,60 @@ mod tests {
         assert_ne!(base.content_digest(), more.content_digest());
         // 版本前缀是契约的一部分：网关用同一实现重算，两侧算法/字段集必须对齐。
         let digest = base.content_digest();
-        assert!(digest.starts_with("fact-v3:sha256:"), "{digest}");
-        assert_eq!(digest.len(), "fact-v3:sha256:".len() + 64);
+        assert!(digest.starts_with("fact-v4:sha256:"), "{digest}");
+        assert_eq!(digest.len(), "fact-v4:sha256:".len() + 64);
+    }
+
+    #[test]
+    fn service_units_and_container_names_become_inference_evidence() {
+        // 进程带 `service.unit`（systemd 单元的归一值）→ 收进证据；容器名同理。
+        let with_evidence = summary(&snapshot(vec![
+            resource(
+                "process",
+                &[("process.pid", "42"), (PROCESS_EXECUTABLE, "/usr/bin/java")],
+            ),
+            resource(
+                "process",
+                &[
+                    ("process.pid", "43"),
+                    (PROCESS_EXECUTABLE, "/usr/bin/java"),
+                    (SERVICE_UNIT, "kafka"),
+                ],
+            ),
+            resource(
+                CONTAINER_KIND,
+                &[("container.id", "abc"), (CONTAINER_NAME, "orders-api")],
+            ),
+        ]));
+        assert_eq!(with_evidence.service_units, vec!["kafka".to_string()]);
+        assert_eq!(
+            with_evidence.container_names,
+            vec!["orders-api".to_string()]
+        );
+
+        // 证据进内容摘要：服务管理器里换了单元必须触发重报，否则指标会一直带着旧用途。
+        let without = summary(&snapshot(vec![process("/usr/bin/java")]));
+        assert_ne!(without.content_digest(), with_evidence.content_digest());
+    }
+
+    #[test]
+    fn evidence_is_bounded_so_a_busy_host_cannot_blow_up_the_report() {
+        // 上限是协议的一部分：摘要在 10~30 KB 量级，一台跑几百个容器的机器不该把它顶成 MB。
+        let resources: Vec<_> = (0..(super::MAX_EVIDENCE_ITEMS + 20))
+            .map(|index| {
+                resource(
+                    CONTAINER_KIND,
+                    &[
+                        ("container.id", "abc"),
+                        (CONTAINER_NAME, &format!("svc-{index:03}")),
+                    ],
+                )
+            })
+            .collect();
+        let bounded = summary(&snapshot(resources));
+        assert_eq!(bounded.container_names.len(), super::MAX_EVIDENCE_ITEMS);
+        // 截断要可复现：同一台机器多次上报必须截出同一批（BTreeSet 定序）。
+        assert_eq!(bounded.container_names[0], "svc-000");
     }
 
     #[test]

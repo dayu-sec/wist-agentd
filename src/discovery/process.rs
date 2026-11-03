@@ -120,6 +120,9 @@ struct ObservedProcess {
     identity_unavailable: bool,
     /// `/proc/<pid>/cgroup` 推出来的容器 id。非 Linux / 不在容器里时是 `None`。
     container_id: Option<String>,
+    /// `/proc/<pid>/cgroup` 推出来的 systemd 单元（已归一，如 `kafka`）。
+    /// 非 Linux / 不在 systemd 单元里时是 `None`。
+    service_unit: Option<String>,
 }
 
 impl ObservedProcess {
@@ -154,6 +157,11 @@ fn process_attributes(process: &ObservedProcess) -> BTreeMap<String, String> {
         attributes.insert("container.id".to_string(), container_id.clone());
         // 与端点探针保持同一组 key：消费方习惯先找 `*.ref` 当引用字段。
         attributes.insert("container.ref".to_string(), container_id.clone());
+    }
+    // 服务管理器单元：选择类 label `app` 的**高置信度证据**（部署者命名的，
+    // 不是从可执行名/端口猜的）。只在真有 systemd 单元时出现。
+    if let Some(unit) = &process.service_unit {
+        attributes.insert("service.unit".to_string(), unit.clone());
     }
     attributes
 }
@@ -191,6 +199,9 @@ fn list_processes() -> io::Result<Vec<ObservedProcess>> {
             name: Some(name),
             identity_unavailable,
             container_id: crate::discovery::cgroup::process_container_id(pid),
+            service_unit: crate::discovery::cgroup::process_cgroup_path(pid)
+                .as_deref()
+                .and_then(crate::discovery::cgroup::unit_from_cgroup_path),
         });
     }
     Ok(processes)
@@ -273,6 +284,9 @@ fn list_processes() -> io::Result<Vec<ObservedProcess>> {
             identity_unavailable,
             // macOS 的容器跑在虚拟机里，宿主 `ps` 看不到它们的归属。
             container_id: None,
+            // macOS 没有 systemd；launchd 的 label 需要 `launchctl` 子进程，
+            // 本阶段不采（`app` 在 macOS 上留空，符合规范 §3.4「判不出就留空」）。
+            service_unit: None,
         });
     }
     Ok(processes)
@@ -336,6 +350,7 @@ mod tests {
             name: Some("/usr/bin/worker".to_string()),
             identity_unavailable: false,
             container_id: Some("3f2c9f3c1b8e".to_string()),
+            service_unit: None,
         };
 
         let attributes = process_attributes(&observed);
@@ -364,6 +379,7 @@ mod tests {
             name: Some("/usr/sbin/sshd".to_string()),
             identity_unavailable: false,
             container_id: None,
+            service_unit: Some("ssh".to_string()),
         };
 
         let attributes = process_attributes(&observed);
@@ -373,6 +389,11 @@ mod tests {
         assert_eq!(
             attributes.get("process.pid").map(String::as_str),
             Some("4200")
+        );
+        // 服务管理器单元是 `app` 推断的高置信度证据：有就带上，没有就不出现。
+        assert_eq!(
+            attributes.get("service.unit").map(String::as_str),
+            Some("ssh")
         );
     }
 
@@ -384,6 +405,7 @@ mod tests {
             name: Some("demo".to_string()),
             identity_unavailable: false,
             container_id: Some("3f2c9f3c1b8e".to_string()),
+            service_unit: None,
         };
 
         assert_eq!(
@@ -404,6 +426,7 @@ mod tests {
             name: Some("demo".to_string()),
             identity_unavailable: false,
             container_id: None,
+            service_unit: None,
         };
 
         assert_eq!(observed.resource_id("host-1"), "host-1:pid:42");

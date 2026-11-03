@@ -166,20 +166,31 @@ agent 自身 →  不适用（自观测指标没有 instance）
 | `tier` | 场景 | 存储层 | `hot` / `warm` / `cold`；仅分层存储 |
 | `region` / `zone` | 场景 | 机房 | 短标识 |
 
-`role` 词表（可扩展，扩展须按 `app` 登记）：`broker` / `controller` / `primary` / `replica` / `coordinator` / `data` / `ingest` / `proxy` / `worker`。
+`role` 词表（**闭集**）：`arbiter` / `broker` / `config` / `control-plane` / `controller` / `coordinator` /
+`data` / `ingest` / `keeper` / `learner` / `mongos` / `observer` / `pd` / `primary` / `proxy` / `replica` /
+`sentinel` / `tidb` / `tikv` / `worker`。新增角色 = 改规范 + 改实现（见规则 6）。
 
 规则：
 
 1. **能由其他字段唯一推导的维度不设**：域已由名字首段承载，不再用 label 重复；`cluster` 在单机取值与机器名相同时仍是登记事实，不属于重复。
 2. **跨域选择例外**：`app` 在 `<app>_*` 域指标上与名字首段重合，但它的作用是**跨域选择**（一次选出同一台机器的 `system_*`、`process_*`、`kafka_*`），名字做不到——因此保留，不属于冗余。
 3. **取值来源**：`env` / `cluster` 由控制面下发并继承 agent；`app` 优先用控制面指定，缺失时按高置信度来源本地判定，判不出就**留空**。`app` 在主机指标上表示机器用途，在进程/容器指标上表示目标自身用途。
-   - **可自动判定（白名单）**：k8s `app.kubernetes.io/name`、容器镜像名、systemd / launchd unit 名——且必须先把值规范化并**命中注册表闭集**，否则视为判不出。
+   - **可自动判定（白名单）**：systemd unit 名（含模板实例，如 `kafka@broker-1`）、容器名
+     （k8s 下即 pod spec 的容器名）、k8s `app.kubernetes.io/name`、容器镜像名 —— 且必须先把值
+     规范化并**命中注册表闭集**，否则视为判不出。
+   - **为什么当前以「容器名」为主而不是「镜像名」**：镜像名要读运行时的私有元数据
+     （docker `config.v2.json` / containerd content store），权限与格式随运行时和版本漂移；
+     而容器名在 k8s 下来自 pod spec、由部署者显式命名，稳定性与可读性等价且零额外权限。
+     镜像名保留为白名单来源之一，等有稳定的采集源再接入。
    - **不得用于填写**：可执行名、cmdline、监听端口、日志路径——这些只能作发现证据，不能作 label 取值。
    - **留空的写法**：不写该 label（不是空串、不是 `unknown`）；控制面可随时补登记并下发，写入后以控制面值为准。
    - **补登记的后果**：该机器的序列从补登记时点才开始带 `app`，历史不回填；按 `{app=…}` 查询在这之前为空，不带 `app` 的查询不受影响。
 4. **禁止动态**：选举结果（leader/follower）、切换后的实际主从、版本、归属团队均**不得**进入选择类 label。动态角色用 one-hot 指标（§4.3），版本用 `*_info` 指标，归属放控制面注册表。
 5. **单值限制**：一机多用途无法用选择类 label 表达；此时机器级选择不可用，改用进程/容器口径。
 6. **每 app 登记允许键集**：`shard` 只允许出现在分片系统、`tier` 只允许出现在分层存储；未登记的键组合校验失败。`app` 缺失时**不得**写 `role` / `shard` / `tier`（无登记表可校验），只能带 `env` / `cluster` / `region` / `zone`。
+   - `role` 的**词表**仍是闭集（规则 4 的上一行）：让一份策展文件引入任意词，等于让
+     `{role=…}` 静默分裂（`broker` / `brokers` 各成一条线），所以新增角色走「改规范 + 改实现」，
+     登记表只决定**某个 app 允许哪几个**已存在的词。
 7. **数量上限**：一条序列上同时出现的选择类 label 不得超过 6 对。
 8. **不使用 `job`**：Prometheus 里 `job` 标识抓取任务，推送模型没有对应物；用途与归属由 `app` / `cluster` 表达。
 9. **校验归属**：agent 只校验“写出去的值合法”（键闭集、值文法、`env` 闭集、≤ 6 对）；`env` / `cluster` 是否齐全由控制面注册校验。
