@@ -3,6 +3,19 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.23.4-alpha] - 2026-11-03
+
+### 变更（内部：规范名收口）
+
+- 自观测指标名与序列 label 键改为引用 `wist-metrics::names`（与网关 / 中心同一份常量），
+  agentd 不再自己写字符串；依赖升到 `wist-metrics 0.10`。
+- 新增两条**闭合断言**（都在 `samples.rs`）：
+  - 产出的每个 `agent_*` 指标名必须属于 `names::agent::ALL_SELF_METRICS`；
+  - VM 行 `metric` 对象里的每个 label 键必须属于 `names::label::ALL_LABELS`。
+  新增一条「只存在于写侧」的名字/维度时，测试会先变红 —— 而不是上线后多出一堆没人读的序列。
+
+无行为变化：上送的名字、label、单位与 0.23.3 一致。
+
 ## [0.23.3-alpha] - 2026-11-03
 
 ### 修复（label 机制 review 第二轮）

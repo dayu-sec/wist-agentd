@@ -14,6 +14,8 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use wist_contracts::discovery::StringKeyValue;
+// 规范名 / label 键的唯一来源：写侧与读侧（gateway / center）引用同一份常量。
+use wist_metrics::names::{agent as agent_metric, label};
 use wist_shared::time::now_ts_ms;
 
 use super::runtime::{
@@ -128,15 +130,17 @@ pub fn build_vm_metric_lines_with(
                     name: sample.name.clone(),
                     agent: agent_id.to_string(),
                     instance: group.instance.clone(),
-                    disk_role: label_value(&sample.const_labels, "disk_role").map(str::to_string),
-                    mountpoint: label_value(&sample.labels, "mountpoint").map(str::to_string),
-                    fstype: label_value(&sample.labels, "fstype").map(str::to_string),
-                    device: label_value(&sample.labels, "device").map(str::to_string),
-                    cpu: label_value(&sample.labels, "cpu").map(str::to_string),
-                    mode: label_value(&sample.labels, "mode").map(str::to_string),
-                    state: label_value(&sample.labels, "state").map(str::to_string),
-                    target_kind: label_value(&sample.labels, "target_kind").map(str::to_string),
-                    outcome: label_value(&sample.labels, "outcome").map(str::to_string),
+                    disk_role: label_value(&sample.const_labels, label::DISK_ROLE)
+                        .map(str::to_string),
+                    mountpoint: label_value(&sample.labels, label::MOUNTPOINT).map(str::to_string),
+                    fstype: label_value(&sample.labels, label::FSTYPE).map(str::to_string),
+                    device: label_value(&sample.labels, label::DEVICE).map(str::to_string),
+                    cpu: label_value(&sample.labels, label::CPU).map(str::to_string),
+                    mode: label_value(&sample.labels, label::MODE).map(str::to_string),
+                    state: label_value(&sample.labels, label::STATE).map(str::to_string),
+                    target_kind: label_value(&sample.labels, label::TARGET_KIND)
+                        .map(str::to_string),
+                    outcome: label_value(&sample.labels, label::OUTCOME).map(str::to_string),
                     selection: selection.clone(),
                 },
                 values: vec![value],
@@ -238,13 +242,13 @@ fn build_collect_target_samples(runtime: &MetricsRuntimeSnapshot) -> Vec<Metrics
                 continue;
             }
             samples.push(MetricsSampleRecord {
-                name: "agent_collect_targets".to_string(),
+                name: agent_metric::COLLECT_TARGETS.to_string(),
                 value: Value::Number(count.into()),
                 value_type: "gauge_i64".to_string(),
                 const_labels: Vec::new(),
                 labels: vec![
-                    StringKeyValue::new("target_kind", kind),
-                    StringKeyValue::new("outcome", result),
+                    StringKeyValue::new(label::TARGET_KIND, kind),
+                    StringKeyValue::new(label::OUTCOME, result),
                 ],
             });
         }
@@ -267,37 +271,41 @@ fn build_self_observation_samples(obs: &self_obs::SelfObservation) -> Vec<Metric
 
     if let Some(bytes) = obs.memory_bytes {
         push(
-            "agent_memory_bytes",
+            agent_metric::MEMORY_BYTES,
             Value::Number(bytes.into()),
             "gauge_i64",
         );
     }
     if let Some(cores) = obs.cpu_cores {
-        push("agent_cpu_cores", Value::Number(cores.into()), "gauge_i64");
+        push(
+            agent_metric::CPU_CORES,
+            Value::Number(cores.into()),
+            "gauge_i64",
+        );
     }
     if let Some(ratio) = obs.cpu_ratio
         && let Some(number) = serde_json::Number::from_f64(ratio)
     {
-        push("agent_cpu_ratio", Value::Number(number), "gauge_f64");
+        push(agent_metric::CPU_RATIO, Value::Number(number), "gauge_f64");
     }
     if let Some(seconds) = obs.admin_latency_seconds
         && let Some(number) = serde_json::Number::from_f64(seconds)
     {
         push(
-            "agent_admin_latency_seconds",
+            agent_metric::ADMIN_LATENCY_SECONDS,
             Value::Number(number),
             "gauge_f64",
         );
     }
     if let Some(version) = obs.discovery_policy_version {
         push(
-            "agent_discovery_policy_version",
+            agent_metric::DISCOVERY_POLICY_VERSION,
             Value::Number(version.into()),
             "gauge_i64",
         );
     }
     push(
-        "agent_uplink_metrics_failed_total",
+        agent_metric::UPLINK_METRICS_FAILED_TOTAL,
         Value::Number(obs.uplink_metrics_failed_total.into()),
         "counter_i64",
     );
@@ -444,6 +452,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use wist_contracts::discovery::StringKeyValue;
+    // 与生产代码引用同一份常量（闭合断言就是在验它们）。
+    use wist_metrics::names::{agent as agent_metric, label};
 
     use super::{
         MetricsSampleGroup, MetricsSampleRecord, MetricsSamplesSnapshot, build_samples_snapshot,
@@ -742,6 +752,70 @@ mod tests {
             })
         );
         assert!(json.get("unit").is_none());
+    }
+
+    /// 写侧闭合：产出的每个 `agent_*` 名字都必须在 `names::agent::ALL_SELF_METRICS` 里。
+    ///
+    /// 这是「写侧偷偷加一个只有它自己知道的名字」的唯一防线 —— 那种名字不会被 gateway /
+    /// center 的任何查询认领，最后只是一堆没人读的序列（`agent_collect_targets` 就漏过一次）。
+    #[test]
+    fn every_self_metric_name_is_in_the_shared_closed_set() {
+        let mut sample_target = target("succeeded", "host-1");
+        sample_target.runtime_facts = vec![StringKeyValue::new("host.loadavg.1m", "0.25")];
+        let snapshot = build_samples_snapshot(&snapshot("host_metrics", vec![sample_target]));
+
+        let self_metrics: Vec<&str> = snapshot
+            .groups
+            .iter()
+            .flat_map(|group| group.samples.iter())
+            .map(|sample| sample.name.as_str())
+            .filter(|name| name.starts_with("agent_"))
+            .collect();
+
+        // 至少要看到采集记账与上送失败计数这两条（它们每批都会产出）。
+        assert!(!self_metrics.is_empty(), "没有产出任何自观测指标");
+        for name in self_metrics {
+            assert!(
+                agent_metric::ALL_SELF_METRICS.contains(&name),
+                "{name} 不在 names::agent::ALL_SELF_METRICS 里（写侧又加了没登记的名字）"
+            );
+        }
+    }
+
+    /// 序列 label 闭合：VM 行 `metric` 对象里的键（除 `__name__` 与选择类键）必须在
+    /// `names::label::ALL_LABELS` 里。数据面（WPL/OML）也要对照这张表 ——
+    /// 少一个字段就意味着那个维度在线上静默丢失（`mountpoint` 踩过）。
+    #[test]
+    fn every_serialized_label_key_is_in_the_shared_closed_set() {
+        let mut sample_target = target("succeeded", "host-1");
+        sample_target.labeled_facts = vec![MetricsLabeledFact {
+            key: "host.filesystem.available_bytes".to_string(),
+            value: "1024".to_string(),
+            labels: vec![
+                StringKeyValue::new(label::MOUNTPOINT, "/data"),
+                StringKeyValue::new(label::FSTYPE, "xfs"),
+            ],
+        }];
+        let snapshot = build_samples_snapshot(&snapshot("host_metrics", vec![sample_target]));
+        let selection = BTreeMap::from([("env".to_string(), "prod".to_string())]);
+        let lines = build_vm_metric_lines_with(&snapshot, "agent-1", &selection);
+
+        let mut checked = 0;
+        for line in &lines {
+            let json = serde_json::to_value(line).expect("serialize line");
+            let metric = json["metric"].as_object().expect("metric object");
+            for key in metric.keys() {
+                if key == "__name__" || selection.contains_key(key.as_str()) {
+                    continue;
+                }
+                assert!(
+                    label::ALL_LABELS.contains(&key.as_str()),
+                    "{key} 不在 names::label::ALL_LABELS 里（新增了未登记的 label）"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "没有校验到任何 label（夹具没带上 label？）");
     }
 
     #[test]

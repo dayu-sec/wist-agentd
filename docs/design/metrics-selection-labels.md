@@ -96,7 +96,7 @@ DELETE /api/v1/admin/agents/{agent_id}/metrics-labels   # 清除手工覆盖
 - `PUT` 写前校验，非法直接 400；成功后 `revision += 1` 并给该 agent 排一条
   `refresh`（`what=["metrics-labels"]`）命令，下一次状态上报即送达（≤3s）。
 - 每 agent 的手工覆盖可单独清除，清除后回落到推断 / 部署默认。
-- **手工补发刷新（P4，待实现）**：
+- **手工补发刷新（P4）**：
 
 ```http
 POST /api/v1/admin/agents/{agent_id}/refresh
@@ -163,7 +163,7 @@ wist-agentd metrics-labels show|refresh|clear-cache
 `metrics-labels clear-cache` 只删本机缓存文件；**运行中的守护进程内存里那份要到重启或下一次
 拉取才变**（下一次拉取会重新写回同一份值），所以它的用途是「让下次启动从干净状态开始」。
 
-### 5.1 从网页触发（P4，待实现）
+### 5.1 从网页触发（P4）
 
 同一套词表也要能从管理面用，否则运维只能在 agentd 那台机器上敲 CLI：
 
@@ -197,7 +197,7 @@ agentd 配置中的 `[metrics.labels]` **停止生效**，但保留解析一个�
 | P1 | 网关接口 + 部署默认（`env`/`cluster`）+ 手工覆盖；agent 拉取 / 缓存 / 三个子命令；`refresh` 命令面；`[metrics.labels]` 废弃 | 无 |
 | P2 | 注册表 + `app` / `role` 推断（**已完成**：systemd 单元 / 容器名）；launchd label 与容器镜像名待补 | agentd 发现层 |
 | P3 | 管理页面：单机逐键编辑（`/agents/:agentId/labels`）(**已完成**) | 网关前端 |
-| P4 | 手工刷新入口：`POST /api/v1/admin/agents/{id}/refresh` + 标签页「重新下发」（见 §10） | 网关 + 前端 |
+| P4 | 手工刷新入口：`POST /api/v1/admin/agents/{id}/refresh` + 标签页「重新下发」（见 §10）(**已完成**) | 网关 + 前端 |
 | P5 | 批量编辑 / 批量下发（一组机器一次改同一个键） | 网关前端 |
 
 P1 期间 `app` 留空是符合规范的（`{app=""}` 可查）。P2 起 `app` 由注册表推断；
@@ -234,22 +234,30 @@ P1 期间 `app` 留空是符合规范的（`{app=""}` 可查）。P2 起 `app` �
 
 ### 10.2 wist-gateway
 
-- [ ] `POST /api/v1/admin/agents/{agent_id}/refresh`，body `{"what":["metrics-labels"]}`
-- [ ] 鉴权与 429 沿用 `require_admin_bearer`；未知 agent → 404（与 metrics-labels 三接口一致）
-- [ ] 校验：`what` 非空、逐项 ∈ `refresh_what::ALL`；失败给稳定原因码（`empty_refresh_what` /
+- [x] `POST /api/v1/admin/agents/{agent_id}/refresh`，body `{"what":["metrics-labels"]}`
+- [x] 鉴权与 429 沿用 `require_admin_bearer`；未知 agent → 404（与 metrics-labels 三接口一致）
+- [x] 校验：`what` 非空、逐项 ∈ `refresh_what::ALL`；失败给稳定原因码（`empty_refresh_what` /
       `unknown_refresh_source`）
-- [ ] 排 `kind = command_kind::REFRESH`，`params = serde_json(RefreshParams{ what })`
-- [ ] 响应与 `fact-refresh` 同形状（命令回执），便于前端复用现有渲染
-- [ ] 测试：正常排单 / 空表 400 且未排单 / 未知来源 400 / 未知 agent 404 / 连按两次 = 两条命令
-- [ ] `wist-design/doc/design/foundation/api-seam-inventory.md` 补这条 seam
+- [x] 排 `kind = command_kind::REFRESH`，`params = serde_json(RefreshParams{ what })`
+- [x] 响应与 `fact-refresh` 同形状（命令回执），便于前端复用现有渲染
+- [x] 测试：正常排单 / 空表 400 且未排单 / 未知来源 400 / 未知 agent 404 / 连按两次 = 两条命令
+- [x] `wist-design/doc/design/foundation/api-seam-inventory.md` 补这条 seam
+
+实现补充（清单里没写死、落地时定下的两条）：
+
+- **入队是追加语义，不按 kind 覆盖**：本端点的 kind 恒为 `refresh`，但 `params.what` 可以不同；
+  沿用 `replace_pending_same_kind = true` 会让「先刷 policies 再刷 metrics-labels」静默丢掉前者。
+  同一个 `what` 连点两次就是两条命令（agent 侧重复刷新幂等）。
+- **失败渲染**：`400` 在页面上显示 `ApiError.code` 原文（`empty_refresh_what` /
+  `unknown_refresh_source`），不翻成泛化的“请求不合法”。
 
 ### 10.3 wist-gateway-web
 
-- [ ] `src/api/admin.ts`：`dispatchAgentRefresh(agentId, what)` + 归一化（缺 `command_id` 即抛错）
-- [ ] `src/hooks`：`useAgentRefresh(agentId)`；成功后只回填提示，不轮询
-- [ ] 标签页生效表旁「重新下发」：固定 `what=["metrics-labels"]`，成功后提示「已排队，≤3s 送达」
-- [ ] 失败：400 显示原因码，429 走 `RateLimitNotice`
-- [ ] 测试：contract（路径 / 方法 / body / 400 原因码 / 429 退避）
+- [x] `src/api/admin.ts`：`dispatchAgentRefresh(agentId, what)` + 归一化（缺 `command_id` 即抛错）
+- [x] `src/hooks`：`useAgentRefresh(agentId)`；成功后只回填提示，不轮询
+- [x] 标签页生效表旁「重新下发」：固定 `what=["metrics-labels"]`，成功后提示「已排队，≤3s 送达」
+- [x] 失败：400 显示原因码，429 走 `RateLimitNotice`
+- [x] 测试：contract（路径 / 方法 / body / 400 原因码 / 429 退避）
 
 ### 10.4 验收
 
