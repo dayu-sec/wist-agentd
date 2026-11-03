@@ -3,6 +3,14 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.23.1-alpha] - 2026-11-03
+
+### 修复
+
+- **发现 tick 不再重复读 `/proc/<pid>/cgroup`**：容器归属与 systemd 单元现在从**
+  同一次读取**推出（两处各读一次会让每轮发现的 `/proc` 读取量翻倍）。
+  顺带删掉已无调用方的 `process_container_id`。
+
 ## [0.23.0-alpha] - 2026-11-03
 
 ### 新增

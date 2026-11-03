@@ -57,14 +57,6 @@ pub(crate) fn unit_from_cgroup_path(path: &str) -> Option<String> {
     })
 }
 
-/// 进程所属的容器 id。拿不到（不在容器里 / 读不到 cgroup）时返回 `None`。
-#[cfg(target_os = "linux")]
-pub(crate) fn process_container_id(pid: u32) -> Option<String> {
-    process_cgroup_path(pid)
-        .as_deref()
-        .and_then(container_id_from_cgroup_path)
-}
-
 /// 从 cgroup 路径里认出容器 id。
 ///
 /// 从后往前找第一段像容器 id 的：`cri-containerd-<id>.scope` / `docker-<id>.scope` /

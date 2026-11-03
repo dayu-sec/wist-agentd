@@ -193,13 +193,18 @@ fn list_processes() -> io::Result<Vec<ObservedProcess>> {
             }
             Err(err) => return Err(err),
         };
+        // cgroup 只读一次：容器归属与 systemd 单元都从同一条路径推出来
+        // （两次读会让发现 tick 的 `/proc` 读取量翻倍）。
+        let cgroup_path = crate::discovery::cgroup::process_cgroup_path(pid);
         processes.push(ObservedProcess {
             pid,
             identity,
             name: Some(name),
             identity_unavailable,
-            container_id: crate::discovery::cgroup::process_container_id(pid),
-            service_unit: crate::discovery::cgroup::process_cgroup_path(pid)
+            container_id: cgroup_path
+                .as_deref()
+                .and_then(crate::discovery::cgroup::container_id_from_cgroup_path),
+            service_unit: cgroup_path
                 .as_deref()
                 .and_then(crate::discovery::cgroup::unit_from_cgroup_path),
         });
