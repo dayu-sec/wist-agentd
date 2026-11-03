@@ -35,6 +35,9 @@ impl CpuSample {
 
 /// 本进程上一次 CPU 计数（自观测自己的差分基线，与状态上报互不影响）。
 static LAST_CPU: Mutex<Option<CpuSample>> = Mutex::new(None);
+/// 最近一次成功算出的单核占用率。同一 tick 内重复取数时复用它，
+/// 否则后一次会把窗口压到几毫秒以下而永远拿不到读数。
+static LAST_CPU_RATIO: Mutex<Option<f64>> = Mutex::new(None);
 /// 最近一次管理面交互延迟（毫秒）；`u64::MAX` 表示还没有成功读数。
 static ADMIN_LATENCY_MS: AtomicU64 = AtomicU64::new(u64::MAX);
 /// 已生效的发现策略版本；`i64::MIN` 表示还没收到过策略。
@@ -96,19 +99,51 @@ fn discovery_policy_version() -> Option<i64> {
 
 fn take_cpu_ratio() -> Option<f64> {
     let now = CpuSample::now()?;
-    let mut guard = LAST_CPU.lock().unwrap_or_else(|err| err.into_inner());
-    let previous = guard.replace(now);
-    let previous = previous?;
+    let mut baseline = LAST_CPU.lock().unwrap_or_else(|err| err.into_inner());
+    let mut last_ratio = LAST_CPU_RATIO.lock().unwrap_or_else(|err| err.into_inner());
+    let step = step_cpu_ratio(*baseline, now, *last_ratio, ticks_per_sec());
+    *baseline = step.baseline;
+    *last_ratio = step.last_ratio;
+    step.ratio
+}
+
+/// 一次采样推进（纯函数，便于测试）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RatioStep {
+    ratio: Option<f64>,
+    baseline: Option<CpuSample>,
+    last_ratio: Option<f64>,
+}
+
+/// 窗口太短时**不推进基线**，直接复用上一次的读数：
+/// 同一 tick 里本地导出与上送各取一次，第二次不应当把窗口重置成毫秒级。
+fn step_cpu_ratio(
+    previous: Option<CpuSample>,
+    now: CpuSample,
+    last_ratio: Option<f64>,
+    ticks_per_sec: u64,
+) -> RatioStep {
+    let Some(previous) = previous else {
+        return RatioStep {
+            ratio: None,
+            baseline: Some(now),
+            last_ratio,
+        };
+    };
     let wall = now.at.duration_since(previous.at);
     if wall < MIN_CPU_WINDOW {
-        return None;
+        return RatioStep {
+            ratio: last_ratio,
+            baseline: Some(previous),
+            last_ratio,
+        };
     }
-    cpu_ratio_between(
-        previous.ticks,
-        now.ticks,
-        wall.as_secs_f64(),
-        ticks_per_sec(),
-    )
+    let ratio = cpu_ratio_between(previous.ticks, now.ticks, wall.as_secs_f64(), ticks_per_sec);
+    RatioStep {
+        ratio,
+        baseline: Some(now),
+        last_ratio: ratio.or(last_ratio),
+    }
 }
 
 /// 单核占用率：`ΔCPU秒 / Δ墙钟秒`，`1.0` = 占满一个核（可 > 1，多核并行时）。
@@ -251,6 +286,29 @@ mod tests {
     fn ratio_is_none_without_a_usable_window() {
         assert_eq!(cpu_ratio_between(0, 100, 0.0, 100), None);
         assert_eq!(cpu_ratio_between(0, 100, 3.0, 0), None);
+    }
+
+    #[test]
+    fn repeated_reads_in_one_tick_reuse_the_last_ratio() {
+        let base = Instant::now();
+        let first = CpuSample { ticks: 0, at: base };
+        let after_window = CpuSample {
+            ticks: 300,
+            at: base + std::time::Duration::from_secs(3),
+        };
+        let step = step_cpu_ratio(Some(first), after_window, None, 100);
+        assert_eq!(step.ratio, Some(1.0));
+        assert_eq!(step.baseline, Some(after_window));
+
+        // 同一 tick 里紧接着再取一次：窗口很短，不发新值，但**基线不后退**。
+        let immediately = CpuSample {
+            ticks: 301,
+            at: after_window.at + std::time::Duration::from_millis(1),
+        };
+        let step = step_cpu_ratio(step.baseline, immediately, step.last_ratio, 100);
+        assert_eq!(step.ratio, Some(1.0));
+        assert_eq!(step.baseline, Some(after_window));
+        assert_eq!(step.last_ratio, Some(1.0));
     }
 
     #[test]
