@@ -3,6 +3,33 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.19.0-alpha] - 2026-11-03
+
+### 新增（指标数据规范 v1）
+
+- **指标名与单位统一**：线上序列改用 `system_cpu_seconds_total`、
+  `system_memory_total_bytes`、`system_filesystem_usage_ratio` 这类
+  “`snake_case` + 单位后缀”的名字，字节一律用 `By`、时间用 `s`、比例用 0–1。
+  双写期内旧名（`host.disk.system.usage_percent` 等）按旧单位同时上送，
+  老看板不改也能看，新看板直接读新名。
+- **主机容量与压力指标**：逐核逐 mode 的 CPU 累计时间、内存总量/可用/使用比例、
+  磁盘按 `system` / `data` 角色分行、逐挂载点文件系统容量与 inodes。
+- **`[metrics.labels]` 选择类 label**：`app` / `env` / `cluster` / `role` / `shard` /
+  `tier` / `region` / `zone`（最多 6 对）。填一次就能用
+  `{cluster="kafka-prod"}` 一次选出整个部署单元的机器，不用逐台拼 `agent`。
+- **`agent_collect_targets{target_kind,outcome}`**：每批上报成功 / 失败 / 未采样
+  （超出每域上限 3）的目标数，采样截断从数据侧可见。
+
+### 变更
+
+- **失败目标不再上送样本**：不补 0、不沿用上次读数；缺失比伪造更安全。
+- **样本时间取采集完成时刻**：同一批次共用一个时间戳，不再用发送时刻。
+- **进程/容器内存按字节归一**：页数、`ps` 的 KiB 都在采集侧换算成 `By`。
+
+### 兼容性
+
+- `wist-metrics` 依赖升到 `0.6`。旧配置可直接启动，`[metrics.labels]` 不写则不加选择类 label。
+
 ## [0.18.7-alpha] - 2026-11-01
 
 ### 变更（流量检测落点固定为 `/opt/suricata/logs/eve.json`）
