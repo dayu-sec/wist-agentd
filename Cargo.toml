@@ -1,6 +1,6 @@
 [package]
 name = "wist-agentd"
-version = "0.21.2" #@gxl:set(version)
+version = "0.22.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -38,7 +38,7 @@ toml = "1.1"
 tokio = { version = "1.48", features = ["full"] }
 wist-contracts = "0.9.9"
 # 跨进程 seam 报文（enrollment / agent_status / gateway / work / agent_uplink）。CI/发布走 registry；本地联调可临时切 path。
-wist-api = "0.9.5"
+wist-api = "0.10"
 wist-metrics = "0.7"
 # 本地联调：按 rust-gx 约定切 path 指向本地 registry；发布前切回 registry（见 docs/design/metrics-spec-rollout.md）。
 wist-shared = { version = "0.2" }
@@ -47,7 +47,7 @@ wist-shared = { version = "0.2" }
 log = "0.4"
 wist-log = { version = "0.1" }
 #wist-log = { version = "0.1", path = "../wist-log" }
-wist-validate = { version = "0.6" }
+wist-validate = { version = "0.7" }
 #wist-validate = { version = "0.5", path = "../wist-validate" }
 
 [lib]

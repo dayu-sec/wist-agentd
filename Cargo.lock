@@ -2471,9 +2471,9 @@ dependencies = [
 
 [[package]]
 name = "wist-api"
-version = "0.9.5"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c629a5c7a75a9bfad5fa9f0eef4bed7b3db922c90c8d726f576e792be73a063e"
+checksum = "0a00e7312227629fcafbe2e3279c3d0e027058e16962aec7e62cd5173f06dcf0"
 dependencies = [
  "serde",
  "wist-contracts",
@@ -2538,9 +2538,9 @@ dependencies = [
 
 [[package]]
 name = "wist-validate"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b72f1fb132e3822d2f5ea5ef5a908c6597aa3da53368e2bdf9d352092f648cf"
+checksum = "474d86420012633b9eb2475dc5bf67520570a4b2212d31d6e15d38a9ce31e209"
 dependencies = [
  "time",
  "wist-api",

@@ -49,12 +49,48 @@ enum Command {
     RefreshFacts {
         wait_secs: u64,
     },
+    /// 手工刷新一组「知识 / 期望状态」（`--all` 或 `--only <kinds>`）。
+    ///
+    /// 与 `refresh-facts` 的区别：后者只重采事实；这里可以点名任一来源，且**结果逐项**
+    /// 记进命令台账（`policies=updated work=unchanged`）。
+    Refresh {
+        what: Vec<String>,
+        wait_secs: u64,
+    },
+    /// 选择类 label 的本机视图与缓存操作（`show` / `refresh` / `clear-cache`）。
+    MetricsLabels {
+        action: MetricsLabelsAction,
+    },
     /// 一次性调查（只读）：当场查一个问题并给证据表（见 [`crate::investigate`]）。
     Investigate {
         request: crate::investigate::InvestigateRequest,
         json: bool,
     },
 }
+
+/// `metrics-labels` 子命令的动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetricsLabelsAction {
+    /// 打印本机缓存（生效值 + 每键来源）。
+    Show,
+    /// 让守护进程立刻拉一次（走命令队列，结果进台账）。
+    Refresh,
+    /// 删掉本机缓存文件。守护进程内存里的那份要到重启 / 下一次拉取才变。
+    ClearCache,
+}
+
+impl MetricsLabelsAction {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "show" => Some(Self::Show),
+            "refresh" => Some(Self::Refresh),
+            "clear-cache" => Some(Self::ClearCache),
+            _ => None,
+        }
+    }
+}
+
+const METRICS_LABELS_ACTIONS: &str = "show | refresh | clear-cache";
 
 /// `service` 子命令的动作。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +189,12 @@ where
         }
         Command::RefreshFacts { wait_secs } => {
             run_refresh_facts(root, parsed.config_dir.as_deref(), wait_secs).await
+        }
+        Command::Refresh { what, wait_secs } => {
+            run_refresh(root, parsed.config_dir.as_deref(), what, wait_secs).await
+        }
+        Command::MetricsLabels { action } => {
+            run_metrics_labels(root, parsed.config_dir.as_deref(), action).await
         }
         Command::Investigate { request, json } => {
             // 配置是可选的：磁盘调查不依赖 agentd 配置（读不到只是少了一节「agent 自己占多少」）。
@@ -305,6 +347,83 @@ where
             index += 1;
             continue;
         }
+        if arg == "refresh" {
+            if command_explicit {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "multiple commands are not supported",
+                ));
+            }
+            // `--all` 是默认？不：**必须显式**指定范围。一次把 6 个来源全刷一遍代价不小，
+            // 手滑敲一个 `refresh` 不该悄悄触发它。
+            command = Command::Refresh {
+                what: Vec::new(),
+                wait_secs: REFRESH_FACTS_DEFAULT_WAIT_SECS,
+            };
+            command_explicit = true;
+            index += 1;
+            continue;
+        }
+        if arg == "--all" {
+            match &mut command {
+                Command::Refresh { what, .. } => {
+                    *what = refresh_all_sources();
+                    index += 1;
+                    continue;
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--all is only supported with refresh",
+                    ));
+                }
+            }
+        }
+        if arg == "--only" {
+            match &mut command {
+                Command::Refresh { what, .. } => {
+                    let value = option_value(&args, index + 1, "--only")?;
+                    let text = value.to_string_lossy();
+                    *what = parse_refresh_sources(&text)?;
+                    index += 2;
+                    continue;
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--only is only supported with refresh",
+                    ));
+                }
+            }
+        }
+        if arg == "metrics-labels" {
+            if command_explicit {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "multiple commands are not supported",
+                ));
+            }
+            index += 1;
+            let Some(candidate) = args.get(index) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("metrics-labels needs an action: {METRICS_LABELS_ACTIONS}"),
+                ));
+            };
+            let text = candidate.to_string_lossy();
+            let Some(action) = MetricsLabelsAction::parse(&text) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "unknown metrics-labels action {text:?} (supported: {METRICS_LABELS_ACTIONS})"
+                    ),
+                ));
+            };
+            command = Command::MetricsLabels { action };
+            command_explicit = true;
+            index += 1;
+            continue;
+        }
         if arg == "investigate" {
             if command_explicit {
                 return Err(io::Error::new(
@@ -332,7 +451,7 @@ where
         }
         if arg == "--no-wait" {
             match &mut command {
-                Command::RefreshFacts { wait_secs } => {
+                Command::RefreshFacts { wait_secs } | Command::Refresh { wait_secs, .. } => {
                     *wait_secs = 0;
                     index += 1;
                     continue;
@@ -340,14 +459,14 @@ where
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "--no-wait is only supported with refresh-facts",
+                        "--no-wait is only supported with refresh / refresh-facts",
                     ));
                 }
             }
         }
         if arg == "--wait" {
             match &mut command {
-                Command::RefreshFacts { wait_secs } => {
+                Command::RefreshFacts { wait_secs } | Command::Refresh { wait_secs, .. } => {
                     let value = option_value(&args, index + 1, "--wait")?;
                     let parsed = value.to_str().and_then(|text| text.parse::<u64>().ok());
                     let Some(seconds) = parsed else {
@@ -363,7 +482,7 @@ where
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "--wait is only supported with refresh-facts",
+                        "--wait is only supported with refresh / refresh-facts",
                     ));
                 }
             }
@@ -429,8 +548,18 @@ where
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "unknown argument or command: {display}{suggestion} (supported: help | version | init-config [--stdout] | service <print|install|uninstall|status> | enroll | diagnose [--json] [--offline] | refresh-facts [--wait <secs> | --no-wait] | investigate [topic] [--path <dir>] [--top <n>] [--min-size <size>] [--depth <n>] [--max-seconds <n>] [--json] | --config-dir <path>)",
+                "unknown argument or command: {display}{suggestion} (supported: help | version | init-config [--stdout] | service <print|install|uninstall|status> | enroll | diagnose [--json] [--offline] | refresh-facts [--wait <secs> | --no-wait] | refresh <--all | --only policies,work,facts,metrics-labels[,credentials[,uplink]]> [--wait <secs> | --no-wait] | metrics-labels <show|refresh|clear-cache> | investigate [topic] [--path <dir>] [--top <n>] [--min-size <size>] [--depth <n>] [--max-seconds <n>] [--json] | --config-dir <path>)",
             ),
+        ));
+    }
+
+    // `refresh` 必须显式给范围：一次刷 4 个来源代价不小，手滑敲一个 `refresh` 不该触发它。
+    if let Command::Refresh { what, .. } = &command
+        && what.is_empty()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refresh needs a scope: --all or --only <sources>",
         ));
     }
 
@@ -453,6 +582,8 @@ const KNOWN_COMMANDS: &[&str] = &[
     "enroll",
     "diagnose",
     "refresh-facts",
+    "refresh",
+    "metrics-labels",
     "investigate",
 ];
 
@@ -890,30 +1021,58 @@ async fn run_refresh_facts(
     config_dir: Option<&Path>,
     wait_secs: u64,
 ) -> AgentdResult<i32> {
-    let config_root = match config_dir {
-        Some(path) => resolve_config_dir_arg(&root, path),
-        None => default_config_root(),
-    };
-    // 与守护进程读同一份配置：state 目录必须一致，否则请求落在一个没人看的目录里。
-    // 这里**不**顺手初始化配置：一个「投递请求」的命令不该在 /etc 下凭空建文件。
-    let config_path = crate::config_runtime::resolve_config_path(&config_root);
-    if tokio::fs::metadata(&config_path).await.is_err() {
-        return Err(AgentdReason::InvalidArgs.to_err().with_detail(format!(
-            "no agentd config at {} (run `wist-agentd init-config --config-dir <path>` first)",
-            config_path.display()
-        )));
-    }
-    let config = crate::config_runtime::load_from_path_async(&config_path)
-        .await
-        .conv_err()?;
-    let state_dir = PathBuf::from(&config.paths.state_dir);
+    run_refresh_command(
+        root,
+        config_dir,
+        wist_api::status::command_kind::REFRESH_FACTS,
+        String::new(),
+        wait_secs,
+        "fact refresh",
+    )
+    .await
+}
+
+/// `refresh --all | --only <kinds>`：投递一条刷新命令。
+async fn run_refresh(
+    root: PathBuf,
+    config_dir: Option<&Path>,
+    what: Vec<String>,
+    wait_secs: u64,
+) -> AgentdResult<i32> {
+    let params =
+        serde_json::to_string(&wist_api::status::RefreshParams { what }).map_err(|err| {
+            AgentdReason::InvalidArgs
+                .to_err()
+                .with_detail(err.to_string())
+        })?;
+    run_refresh_command(
+        root,
+        config_dir,
+        wist_api::status::command_kind::REFRESH,
+        params,
+        wait_secs,
+        "refresh",
+    )
+    .await
+}
+
+/// 投递一条命令并（按需）等守护进程写出结果。`refresh` 与 `refresh-facts` 共用。
+async fn run_refresh_command(
+    root: PathBuf,
+    config_dir: Option<&Path>,
+    kind: &str,
+    params: String,
+    wait_secs: u64,
+    noun: &str,
+) -> AgentdResult<i32> {
+    let (_config, state_dir) = load_config_and_state_dir(root, config_dir).await?;
 
     let now_ms = now_ts_ms();
     let command = wist_api::status::AgentCommand {
         command_id: format!("local_refresh_{now_ms}"),
         requested_at_ms: now_ms,
-        kind: wist_api::status::command_kind::REFRESH_FACTS.to_string(),
-        params: String::new(),
+        kind: kind.to_string(),
+        params,
     };
     let command = match state_store::commands::submit_request_async(&state_dir, &command)
         .await
@@ -949,7 +1108,7 @@ async fn run_refresh_facts(
         match state_store::commands::load_history_async(&state_dir).await {
             Ok(history) => {
                 if let Some(record) = history.find(&command.command_id) {
-                    print_command_result(record);
+                    print_command_result(record, noun);
                     return Ok(command_exit_code(&record.outcome));
                 }
             }
@@ -966,21 +1125,152 @@ async fn run_refresh_facts(
     }
 }
 
-fn print_command_result(result: &state_store::commands::CommandRecord) {
+/// 读配置与 state 目录。投递类子命令共用。
+///
+/// 这里**不**顺手初始化配置：一个「投递请求」的命令不该在 /etc 下凭空建文件。
+async fn load_config_and_state_dir(
+    root: PathBuf,
+    config_dir: Option<&Path>,
+) -> AgentdResult<(crate::config::agent_config::AgentConfig, PathBuf)> {
+    let config_root = match config_dir {
+        Some(path) => resolve_config_dir_arg(&root, path),
+        None => default_config_root(),
+    };
+    // 与守护进程读同一份配置：state 目录必须一致，否则请求落在一个没人看的目录里。
+    let config_path = crate::config_runtime::resolve_config_path(&config_root);
+    if tokio::fs::metadata(&config_path).await.is_err() {
+        return Err(AgentdReason::InvalidArgs.to_err().with_detail(format!(
+            "no agentd config at {} (run `wist-agentd init-config --config-dir <path>` first)",
+            config_path.display()
+        )));
+    }
+    let config = crate::config_runtime::load_from_path_async(&config_path)
+        .await
+        .conv_err()?;
+    let state_dir = PathBuf::from(&config.paths.state_dir);
+    Ok((config, state_dir))
+}
+
+/// `refresh --all` 的范围：**不含** `uplink` 与 `credentials`。
+///
+/// * `uplink` 直接决定“发不发、发到哪”，静默批量改它等于让一批本该上送的机器停下来；
+/// * `credentials` 是排障动作（提前续期），放进来只会让每次 `--all` 都多打一次控制面。
+fn refresh_all_sources() -> Vec<String> {
+    [
+        wist_api::status::refresh_what::FACTS,
+        wist_api::status::refresh_what::POLICIES,
+        wist_api::status::refresh_what::WORK,
+        wist_api::status::refresh_what::METRICS_LABELS,
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+/// 解析 `--only a,b,c`。词表外的值直接拒（打错一个词等于少刷一项，静默更糟）。
+fn parse_refresh_sources(text: &str) -> io::Result<Vec<String>> {
+    let mut sources: Vec<String> = Vec::new();
+    for raw in text.split(',') {
+        let value = raw.trim();
+        if value.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--only needs a comma-separated list of sources",
+            ));
+        }
+        if !wist_api::status::refresh_what::ALL.contains(&value) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unknown refresh source {value:?} (supported: {})",
+                    wist_api::status::refresh_what::ALL.join(" / ")
+                ),
+            ));
+        }
+        let value = value.to_string();
+        if !sources.contains(&value) {
+            sources.push(value);
+        }
+    }
+    Ok(sources)
+}
+
+/// `metrics-labels show | refresh | clear-cache`
+async fn run_metrics_labels(
+    root: PathBuf,
+    config_dir: Option<&Path>,
+    action: MetricsLabelsAction,
+) -> AgentdResult<i32> {
+    let (config, state_dir) = load_config_and_state_dir(root.clone(), config_dir).await?;
+    match action {
+        MetricsLabelsAction::Show => {
+            let cached = crate::control::metrics_labels::load(&state_dir);
+            print!("{}", cached.render());
+            if crate::control::metrics_labels::has_manual(&cached) {
+                println!("(至少有一个值来自网关侧的手工覆盖；要改请到网关管理面)");
+            }
+            if !cached.is_empty() && config.metrics.labels != cached.labels {
+                // 配置文件里那一段已废弃：如实说明它不生效，免得人以为改它有用。
+                println!(
+                    "note: [metrics.labels] is deprecated and ignored — the values above come from the gateway"
+                );
+            }
+            Ok(0)
+        }
+        MetricsLabelsAction::Refresh => {
+            let params = serde_json::to_string(&wist_api::status::RefreshParams {
+                what: vec![wist_api::status::refresh_what::METRICS_LABELS.to_string()],
+            })
+            .map_err(|err| {
+                AgentdReason::InvalidArgs
+                    .to_err()
+                    .with_detail(err.to_string())
+            })?;
+            let code = run_refresh_command(
+                root,
+                config_dir,
+                wist_api::status::command_kind::REFRESH,
+                params,
+                REFRESH_FACTS_DEFAULT_WAIT_SECS,
+                "metrics-labels refresh",
+            )
+            .await?;
+            // 顺手把新值打出来：刷新命令的全部意义就是“看到最新的那份”。
+            let cached = crate::control::metrics_labels::load(&state_dir);
+            print!("{}", cached.render());
+            Ok(code)
+        }
+        MetricsLabelsAction::ClearCache => {
+            match crate::control::metrics_labels::clear_cache(&state_dir) {
+                Ok(true) => println!(
+                    "cache cleared: {} (a running daemon keeps its in-memory copy until it restarts or fetches again)",
+                    crate::control::metrics_labels::path_for(&state_dir).display()
+                ),
+                Ok(false) => println!("no cache to clear"),
+                Err(err) => {
+                    return Err(AgentdReason::system_error()
+                        .to_err()
+                        .with_detail(format!("failed to remove the labels cache: {err}")));
+                }
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn print_command_result(result: &state_store::commands::CommandRecord, noun: &str) {
     let detail = if result.detail.is_empty() {
         String::new()
     } else {
         format!(" detail={}", result.detail)
     };
     match result.outcome.as_str() {
-        wist_api::status::command_outcome::SUCCEEDED => {
-            println!("fact refresh done: fact summary reported to the data plane{detail}")
-        }
+        wist_api::status::command_outcome::SUCCEEDED => println!("{noun}: done{detail}"),
         wist_api::status::command_outcome::FAILED => {
-            println!("fact refresh done, but the fact summary was NOT reported{detail}")
+            println!("{noun}: done, but at least one source failed{detail}")
         }
         wist_api::status::command_outcome::NO_UPLINK => println!(
-            "fact refresh done, but facts cannot be sent: no TCP data-plane uplink \
+            "{noun}: done, but facts cannot be sent: no TCP data-plane uplink \
              (check [telemetry.logs.output] / the uplink address){detail}"
         ),
         wist_api::status::command_outcome::THROTTLED => {
@@ -1428,6 +1718,8 @@ fn usage_message() -> &'static str {
         "  wist-agentd enroll [--token <token> | --token-stdin] [--config-dir <path>]\n",
         "  wist-agentd diagnose [--json] [--offline] [--config-dir <path>]\n",
         "  wist-agentd refresh-facts [--wait <secs> | --no-wait] [--config-dir <path>]\n",
+        "  wist-agentd refresh <--all | --only <kinds>> [--wait <secs> | --no-wait] [--config-dir <path>]\n",
+        "  wist-agentd metrics-labels <show|refresh|clear-cache> [--config-dir <path>]\n",
         "  wist-agentd investigate [disk|load|accounts|persistence|exposure] [--path <dir>]\n",
         "                                 [--top <n>] [--min-size <size>] [--depth <n>]\n",
         "                                 [--max-seconds <n>] [--json] [--config-dir <path>]\n",
@@ -1446,13 +1738,23 @@ fn usage_message() -> &'static str {
         "                       Exits nonzero when anything FAILs, so scripts can gate on it.\n",
         "  refresh-facts        Force a full discovery refresh and report the fact summary now\n",
         "                       (the daemon normally reports it at most once per 5 minutes).\n",
+        "  refresh --all        Force the repeatable knowledge/desired-state pulls now:\n",
+        "                       facts, policies, work, metrics-labels. Never uplink/credentials.\n",
+        "  refresh --only ...   Same, for the named sources only (comma-separated).\n",
+        "                       `uplink` is allowed here but never in --all: it decides whether\n",
+        "                       this host sends at all. `credentials` renews now (troubleshooting).\n",
+        "  metrics-labels show  Print the selection labels this host will attach (env/cluster/app...)\n",
+        "                       and where each value came from (gateway default/inferred/manual).\n",
+        "  metrics-labels refresh  Ask the daemon to re-fetch them now (goes through the ledger).\n",
+        "  metrics-labels clear-cache  Remove the local cache file. A running daemon keeps its\n",
+        "                       in-memory copy until it restarts or fetches again.\n",
         "  investigate [topic]  One-shot, read-only investigation of this host; prints evidence\n",
         "                       (paths + sizes), not just a verdict.\n",
         "                       Topics: disk (default) | load | accounts | persistence | exposure\n",
         "                       (the last three are Linux-only for now).\n",
         "                       Exits nonzero when anything FAILs.\n",
         "\n",
-        "Refresh-facts options:\n",
+        "Refresh options (refresh / refresh-facts):\n",
         "  --wait <secs>        Wait up to <secs> for the daemon to finish (default 15, max 120).\n",
         "  --no-wait            Only queue the request; print where it was written and exit.\n",
         "\n",

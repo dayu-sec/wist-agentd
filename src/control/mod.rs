@@ -15,6 +15,9 @@ pub mod log_sources;
 // L3 搜索范围（知识库 ∩ 网关 roots 的**交集**，由网关下发；本机无配置）。
 // 拿不到 = 不搜索，行为与 L2b 一致。
 pub mod source_search_policy;
+// 选择类 label（env / cluster / app / …）：网关下发、本机只缓存。
+// 合并与准入都在网关，agentd 复核后贴到指标上（[metrics.labels] 已废弃）。
+pub mod metrics_labels;
 pub mod work;
 
 pub(crate) use runtime_entry::run;

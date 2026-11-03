@@ -39,7 +39,7 @@
 | WP6 | `wist-gateway` | `feat/metrics-wp6-query` | `src/api/host_metrics.rs`、`src/api/agent_ops.rs` | WP1 | M | 已合入 `alpha`（`0.35.0-alpha`） |
 | WP7 | 三仓 | `chore/metrics-drop-legacy` | `wist-metrics/src/spec.rs`、`runtime/host.rs`、`runtime/process.rs`、`wist-gateway/src/api/host_metrics.rs` | WP2…WP6 | S | 已完成（断点式下线） |
 | WP8 | `wist-agentd` | `docs/metrics-rollout-close` | 本文、`docs/design/README.md`、各仓 `CHANGELOG.md` | WP7 | S | 未开始 |
-| WP9 | 三仓 | `feat/metrics-selection-labels` | 网关接口/存储、`wist-api` 类型、agent 拉取与命令 | WP6 | L | 未开始（P1） |
+| WP9 | 三仓 | `feat/metrics-selection-labels` | 网关接口/存储、`wist-api` 类型、agent 拉取与命令 | WP6 | L | 已完成（`wist-api` 0.10.x / `wist-validate` 0.7.0） |
 | WP10 | `wist-agentd` + `wist-gateway` | `feat/metrics-label-inference` | 事实补 unit/镜像/k8s；注册表；`app`/`role` 推断 | WP9 | M | 未开始（P2） |
 | WP11 | `wist-gateway` | `feat/metrics-label-admin` | 批量编辑 / 管理页面 | WP10 | S | 未开始（P3） |
 

@@ -1,7 +1,7 @@
 use super::{
-    enrollment_report_lines, init_config_message, initialize_runtime_state_async, parse_command,
-    refresh_runtime_version, resolve_config_dir_arg, resolve_exec_bin_from, run_from_args,
-    run_refresh_facts, sync_runtime_identity, usage_message,
+    Command, MetricsLabelsAction, enrollment_report_lines, init_config_message,
+    initialize_runtime_state_async, parse_command, refresh_runtime_version, resolve_config_dir_arg,
+    resolve_exec_bin_from, run_from_args, run_refresh_facts, sync_runtime_identity, usage_message,
 };
 use crate::config::agent_config::{
     AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, PathsSection,
@@ -1201,8 +1201,7 @@ fn parse_command_rejects_invalid_refresh_facts_arguments() {
     for flag in ["--wait", "--no-wait"] {
         let err = parse_command([flag]).expect_err("flag without refresh-facts");
         assert!(
-            err.to_string()
-                .contains("only supported with refresh-facts"),
+            err.to_string().contains("only supported with refresh"),
             "{flag}: {err}"
         );
     }
@@ -1401,4 +1400,78 @@ fn enrollment_report_labels_each_decision() {
     );
     assert_eq!(label(EnrollmentDecision::Disabled), "enrollment disabled");
     let _ = fs::remove_dir_all(root);
+}
+
+// ── `refresh`（手工刷新来源）与 `metrics-labels` ─────────────────────────────
+
+#[test]
+fn refresh_all_covers_the_repeatable_sources_only() {
+    let parsed = parse_command(["refresh", "--all"]).expect("parse");
+    let Command::Refresh { what, .. } = parsed.command else {
+        panic!("expected refresh");
+    };
+    assert_eq!(
+        what,
+        vec![
+            "facts".to_string(),
+            "policies".to_string(),
+            "work".to_string(),
+            "metrics-labels".to_string(),
+        ],
+        "--all 不能带上 uplink / credentials：前者决定发不发，后者是排障动作"
+    );
+}
+
+#[test]
+fn refresh_only_parses_a_comma_separated_list_and_dedupes() {
+    let parsed = parse_command(["refresh", "--only", "work, metrics-labels,work"]).expect("parse");
+    let Command::Refresh { what, .. } = parsed.command else {
+        panic!("expected refresh");
+    };
+    assert_eq!(what, vec!["work".to_string(), "metrics-labels".to_string()]);
+}
+
+#[test]
+fn refresh_only_accepts_uplink_when_it_is_explicitly_named() {
+    // `uplink` 不在 `--all` 里，但**允许**被点名 —— 这是它与“永不刷新”的区别。
+    let parsed = parse_command(["refresh", "--only", "uplink"]).expect("parse");
+    let Command::Refresh { what, .. } = parsed.command else {
+        panic!("expected refresh");
+    };
+    assert_eq!(what, vec!["uplink".to_string()]);
+}
+
+#[test]
+fn refresh_rejects_an_unknown_source_and_an_empty_scope() {
+    let err = parse_command(["refresh", "--only", "everything"]).expect_err("unknown source");
+    assert!(err.to_string().contains("unknown refresh source"), "{err}");
+
+    // 不给范围就报错，而不是默认全刷。
+    let err = parse_command(["refresh"]).expect_err("scope is mandatory");
+    assert!(err.to_string().contains("--all or --only"), "{err}");
+
+    // 空列表同样不成立。
+    let err = parse_command(["refresh", "--only", " , "]).expect_err("empty list");
+    assert!(err.to_string().contains("comma-separated"), "{err}");
+}
+
+#[test]
+fn metrics_labels_subcommands_parse_and_misparses_are_explained() {
+    for (text, expected) in [
+        ("show", MetricsLabelsAction::Show),
+        ("refresh", MetricsLabelsAction::Refresh),
+        ("clear-cache", MetricsLabelsAction::ClearCache),
+    ] {
+        let parsed = parse_command(["metrics-labels", text]).expect("parse");
+        assert_eq!(parsed.command, Command::MetricsLabels { action: expected });
+    }
+
+    let err = parse_command(["metrics-labels"]).expect_err("missing action");
+    assert!(err.to_string().contains("needs an action"), "{err}");
+
+    let err = parse_command(["metrics-labels", "delete"]).expect_err("unknown action");
+    assert!(
+        err.to_string().contains("unknown metrics-labels action"),
+        "{err}"
+    );
 }

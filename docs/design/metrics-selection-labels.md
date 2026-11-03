@@ -31,13 +31,23 @@
 ### 3.1 agent 拉取
 
 ```http
-GET /api/v1/agent/metrics-labels        # mTLS，身份取客户端证书
-200 {"revision":7,"labels":{"env":"prod","cluster":"kafka-prod","app":"kafka"},
+POST /api/v1/agent/metrics-labels:poll      # mTLS，身份取客户端证书
+{"api_version":"v1","kind":"poll_agent_metrics_labels",
+ "agent_id":"…","instance_id":"…","requested_at":"…"}
+
+200 {"api_version":"v1","kind":"agent_metrics_labels","agent_id":"…","revision":7,
+     "labels":{"env":"prod","cluster":"kafka-prod","app":"kafka"},
      "sources":{"env":"default","cluster":"default","app":"manual"},"updated_at":"…"}
-200 {"revision":0,"labels":{},"sources":{},"updated_at":"…"}   # 当前无可用值
+200 {…"revision":0,"labels":{},"sources":{}}   # 当前无可用值（合法，不是错误）
 ```
 
-- `revision` 单调递增；agent 只在 revision 变大时替换缓存。
+**为什么是 `POST` + `:poll` 而不是 `GET`**：与 agent 面其余拉取端点（`work:poll` /
+`uplink:poll` / `discovery-policies:poll`）同一形状 —— 身份（`agent_id`）在**请求体**里，
+不进出 URL（不落访问日志、不落代理日志）；`:poll` 明确它是幂等拉取而不是一次汇报。
+
+- `revision` 是网关侧该 agent 这份值的版本（手工覆盖每次写入 +1）。agent 在
+  **版本变化或内容变化**时替换缓存 —— 只比版本会让「改了部署默认、各 agent 没有手工覆盖
+  （版本仍是 0）」这种变更永远推不下去。
 - 响应非法（键不在闭集、值不合法、`env` 越界、合并后 > 6 对）→ **整包拒绝**，保留旧缓存并告警。
 
 ### 3.2 管理面
@@ -56,18 +66,24 @@ DELETE /api/v1/admin/agents/{agent_id}/metrics-labels   # 清除手工覆盖
 
 - **不写配置文件**：拉到的值只存运行时状态 `state/metrics/labels.json`
   （`{revision, labels, sources, fetched_at}`）；删掉该文件等于回到“无选择类 label”。
-- 拉取时机：启动、周期（约 5 min）、手工刷新。失败保留缓存；无缓存 → 指标不带 label。
+- 拉取时机：启动（首拍）、周期（5 min）、手工刷新。失败保留缓存；无缓存 → 指标不带 label。
+- 缓存文件被写坏 / 值越界 → 当作「没有缓存」（不带着越界值贴标），下一次拉取自动重建。
 - 合并与上限在网关侧完成；agent 只做合法性复核，不做业务推断。
 - 可观测：`metrics-labels show` 打印生效值与来源；变更（revision 或内容变化）打一行日志，不逐 tick 刷。
 
 ## 5. 手工刷新
 
 ```bash
-wist-agentd refresh --all
+wist-agentd refresh --all                    # facts, policies, work, metrics-labels
 wist-agentd refresh --only policies,work,facts,metrics-labels
 wist-agentd refresh --only uplink            # 只能显式指定
+wist-agentd refresh --only credentials       # 排障：立刻尝试续期
+wist-agentd refresh --all --wait 30          # 等结果（默认 15s，最长 120s）
 wist-agentd metrics-labels show|refresh|clear-cache
 ```
+
+范围**必须显式给**（`--all` 或 `--only`）：一次刷四个来源代价不小，手滑敲一个 `refresh`
+不该悄悄触发它。
 
 覆盖范围：
 
@@ -83,9 +99,14 @@ wist-agentd metrics-labels show|refresh|clear-cache
 不纳入：`discovery-snapshot`、`source-search-policy`（跟随各自节奏）、`enroll`（身份，用 `enroll --force`）、
 各上传接口与安装期接口。
 
-实现：命令走现有的本地命令队列（`state_store::commands`），守护进程收到后清零对应来源的节流计时器，
-下一 tick 强制拉取；每个来源独立记 `updated` / `unchanged` / `failed(reason)` 到命令台账。
-整次刷新有最小间隔（10s）防连点。
+实现：命令走现有的本地命令队列（`state_store::commands`），守护进程收到后把对应来源的
+节流计时器清零（或置强制位），**本拍**的常规拉取立即执行一遍；拉取逻辑只有一处，
+命令只负责说「这一次别等节流」。每个来源独立记 `updated` / `unchanged` / `failed`
+到命令台账的一行 `detail`（如 `work=unchanged policies=updated`），**只要有来源失败就整体
+`failed`** —— 点了四项只成三项不叫刷新成功。
+
+`metrics-labels clear-cache` 只删本机缓存文件；**运行中的守护进程内存里那份要到重启或下一次
+拉取才变**（下一次拉取会重新写回同一份值），所以它的用途是「让下次启动从干净状态开始」。
 
 ## 6. 生效与断档
 

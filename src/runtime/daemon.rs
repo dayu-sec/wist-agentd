@@ -13,7 +13,7 @@ use wist_api::discovery_policies::{
 use wist_api::facts::ReportAgentFactSummary;
 use wist_api::status::{
     AgentCommand, AgentCommandAck, AgentStatusAck, AgentStatusReport, AgentWorkState,
-    AgentWorkStateChange, command_kind, command_outcome,
+    AgentWorkStateChange, command_kind, command_outcome, refresh_what,
 };
 use wist_contracts::agent_uplink::AgentUplinkState;
 use wist_contracts::capability_report::LogsCapabilities;
@@ -38,6 +38,7 @@ use crate::control::discovery_snapshot::{
     AppliedSnapshotPolicy, SnapshotEvent, effective_policy, fetch_discovery_snapshot,
 };
 use crate::control::enrollment::terminal_auth_advice;
+use crate::control::metrics_labels::{self as labels_runtime, CachedMetricsLabels, RefreshOutcome};
 use crate::control::uplink::{AppliedUplink, UplinkFetch, fetch_uplink_grant};
 use crate::control::work::{AppliedWorkGrant, ack_work, fetch_work_grant, report_work_result};
 use crate::discovery::DiscoveryProbe;
@@ -144,6 +145,12 @@ const DISCOVERY_SNAPSHOT_MIN_INTERVAL_SECS: u64 = 60;
 /// 策略表拉取的到期判定用 `Duration`；值只有一个来源（上面的毫秒常量）。
 const DISCOVERY_POLICY_FETCH_MIN_INTERVAL: Duration =
     Duration::from_millis(DISCOVERY_POLICY_FETCH_MIN_INTERVAL_MS as u64);
+
+/// 选择类 label 的拉取间隔（5 分钟）。
+///
+/// 与策略表同一档：label 是**部署期稳定**的值（变更会断开指标序列，规范 §3.4），
+/// 5 分钟足够让一次手工调整在“感觉不到等”的时间里生效；手工刷新（`refresh`）另有强拉口。
+const METRICS_LABELS_FETCH_INTERVAL: Duration = Duration::from_secs(300);
 
 /// 策略表拉取单次请求的超时。
 ///
@@ -954,6 +961,40 @@ enum CommandVerdict {
     AcceptInvestigate(crate::investigate::InvestigateRequest),
     /// 调查参数读不懂：立刻回 `failed`，而不是猜一个题目去扫盘。
     BadInvestigateParams(String),
+    /// 手工刷新一组来源（`kind = refresh`）。不在这里执行：主循环拿到来源清单后，
+    /// 把对应节流计时清掉，让本拍**常规拉取**立即跑一遍 —— 拉取逻辑只有一处。
+    AcceptRefreshSources(Vec<String>),
+    /// `refresh` 的参数读不懂（空表 / 未知来源 / 把 `uplink` 塞进 `--all` 之类的越权组合）。
+    BadRefreshParams(String),
+}
+
+/// `refresh` 命令可接受的来源词表（与 [`refresh_what`] 同值）。
+///
+/// `uplink` **不在 `--all` 里**：它直接决定“发不发、发到哪”，静默改这个等于让一台
+/// 本该上送的机器停下来。所以它只能被**显式**点名。
+fn parse_refresh_sources(params: &str) -> Result<Vec<String>, String> {
+    let parsed: wist_api::status::RefreshParams = if params.trim().is_empty() {
+        return Err("refresh 命令缺少参数".to_string());
+    } else {
+        serde_json::from_str(params).map_err(|err| format!("refresh 参数不是合法 JSON：{err}"))?
+    };
+    let mut sources: Vec<String> = Vec::new();
+    for source in parsed.what {
+        if sources.contains(&source) {
+            continue;
+        }
+        if !refresh_what::ALL.contains(&source.as_str()) {
+            return Err(format!(
+                "未知的刷新来源 {source:?}（可用：{}）",
+                refresh_what::ALL.join(" / ")
+            ));
+        }
+        sources.push(source);
+    }
+    if sources.is_empty() {
+        return Err("refresh 命令没有指定任何来源".to_string());
+    }
+    Ok(sources)
 }
 
 fn evaluate_command(
@@ -973,6 +1014,15 @@ fn evaluate_command(
             Err(detail) => CommandVerdict::BadInvestigateParams(detail),
         };
     }
+    if command.kind == command_kind::REFRESH {
+        if now_ms.saturating_sub(command.requested_at_ms) > COMMAND_STALE_MS {
+            return CommandVerdict::Stale;
+        }
+        return match parse_refresh_sources(&command.params) {
+            Ok(sources) => CommandVerdict::AcceptRefreshSources(sources),
+            Err(detail) => CommandVerdict::BadRefreshParams(detail),
+        };
+    }
     if command.kind != command_kind::REFRESH_FACTS {
         return CommandVerdict::Unsupported;
     }
@@ -987,6 +1037,42 @@ fn evaluate_command(
         return CommandVerdict::Throttled;
     }
     CommandVerdict::AcceptRefresh
+}
+
+/// 把逐来源结果折成一条命令结论 + 一行台账文案。
+///
+/// 结论口径：**只要有来源失败就整体 `failed`**（运维点的是“刷新”，缺了一项就不是刷新成功）；
+/// 全部成功则 `succeeded`，即使其中几项是 `unchanged`（那不是失败）。
+fn source_refresh_verdict(
+    requested: &[String],
+    results: &[(&'static str, SourceRefresh)],
+) -> (&'static str, String) {
+    let mut parts = Vec::new();
+    let mut any_failed = false;
+    for source in requested {
+        match results
+            .iter()
+            .find(|(name, _)| name == source)
+            .map(|(_, result)| *result)
+        {
+            Some(result) => {
+                any_failed |= result == SourceRefresh::Failed;
+                parts.push(format!("{source}={}", result.as_str()));
+            }
+            // 点了名却没跑：只可能是节流（`refresh` 会清计时，正常不会发生）或
+            // 该来源在本进程里没有拉取路径。如实写出来，不要假装成功。
+            None => {
+                any_failed = true;
+                parts.push(format!("{source}=skipped"));
+            }
+        }
+    }
+    let outcome = if any_failed {
+        command_outcome::FAILED
+    } else {
+        command_outcome::SUCCEEDED
+    };
+    (outcome, parts.join(" "))
 }
 
 fn ack_from_record(record: &commands::CommandRecord) -> AgentCommandAck {
@@ -1166,10 +1252,50 @@ async fn drain_finished_investigations(
     (acks, recorded)
 }
 
+/// 一个来源的刷新结果（命令台账逐项记账用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceRefresh {
+    /// 拉到了，且与上一份不同。
+    Updated,
+    /// 拉到了，但与上一份相同。
+    Unchanged,
+    /// 没拉到（网络 / 旧网关 / 响应非法）。已有状态原样保留。
+    Failed,
+}
+
+impl SourceRefresh {
+    fn as_str(self) -> &'static str {
+        match self {
+            SourceRefresh::Updated => "updated",
+            SourceRefresh::Unchanged => "unchanged",
+            SourceRefresh::Failed => "failed",
+        }
+    }
+}
+
+impl From<&RefreshOutcome> for SourceRefresh {
+    fn from(outcome: &RefreshOutcome) -> Self {
+        match outcome {
+            RefreshOutcome::Updated => SourceRefresh::Updated,
+            RefreshOutcome::Unchanged => SourceRefresh::Unchanged,
+            RefreshOutcome::Failed(_) => SourceRefresh::Failed,
+        }
+    }
+}
+
+/// 一条待执行的 `refresh` 命令 + 它点名的来源。
+struct SourceRefreshRequest {
+    command: AgentCommand,
+    source: CommandSource,
+    what: Vec<String>,
+}
+
 /// 一轮命令处理的结果：调用方要接住的三样东西。
 struct CommandTurn {
     /// 本轮接受的重采（`run_once` 要用它强制全量刷新，结果在 tick 之后才回）。
     accepted_refresh: Option<(AgentCommand, CommandSource)>,
+    /// 本轮的 `refresh` 请求：主循环清掉对应节流计时，并在 tick 之后按来源记账。
+    refresh: Option<SourceRefreshRequest>,
     /// 要回传给网关的 ack（本机命令不进这里：结果从台账读）。
     acks: Vec<AgentCommandAck>,
     /// 台账有没有变（变了调用方要落盘）。
@@ -1193,6 +1319,7 @@ async fn handle_command_queue(
 ) -> CommandTurn {
     let mut turn = CommandTurn {
         accepted_refresh: None,
+        refresh: None,
         acks: Vec::new(),
         history_dirty: false,
     };
@@ -1287,6 +1414,30 @@ async fn handle_command_queue(
                 });
                 continue;
             }
+            CommandVerdict::AcceptRefreshSources(what) => {
+                // 同一 tick 只执行一条 `refresh`：两条各自持有一半来源会让「刷新了什么」
+                // 在台账里分成两行，而运维刚才只点了一次。后到的那条如实回 `throttled`。
+                if turn.refresh.is_some() {
+                    (
+                        command_outcome::THROTTLED,
+                        "本拍已接受一条刷新命令".to_string(),
+                    )
+                } else {
+                    log::info!(
+                        "event=CommandAccepted command_id={} kind={} source={}",
+                        command.command_id,
+                        command.kind,
+                        source.as_str()
+                    );
+                    turn.refresh = Some(SourceRefreshRequest {
+                        command: command.clone(),
+                        source,
+                        what,
+                    });
+                    continue;
+                }
+            }
+            CommandVerdict::BadRefreshParams(detail) => (command_outcome::FAILED, detail),
             CommandVerdict::BadInvestigateParams(detail) => (command_outcome::FAILED, detail),
             CommandVerdict::Unsupported => (
                 command_outcome::UNSUPPORTED,
@@ -1752,6 +1903,20 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     let upgrader_bin = loop_ctx.upgrader_bin;
     let config_dir = loop_ctx.config_dir;
     let mut runtime_config: AgentConfig = loop_ctx.config.clone();
+    // 选择类 label：本机 `[metrics.labels]`（若有）已废弃 —— 仍可解析（旧 toml 必须还能启动），
+    // 但**不再生效**：值一律来自网关。启动时如实提醒一次，否则现场会以为“我配了却没贴上”。
+    let deprecated_labels = runtime_config.metrics.labels.len();
+    if deprecated_labels > 0 {
+        log::warn!(
+            "event=DeprecatedConfigIgnored section=metrics.labels count={deprecated_labels} \
+             detail=\"[metrics.labels] 已废弃：选择类 label 改由网关下发，本机配置不再生效\""
+        );
+    }
+    // 缓存是“上次网关给的那份”。重启时先用它，断网也照样贴标（值没变，序列不断）。
+    let mut labels_cache =
+        labels_runtime::load(std::path::Path::new(&runtime_config.paths.state_dir));
+    labels_runtime::apply(&mut runtime_config, &labels_cache);
+    let mut last_labels_fetch: Option<Instant> = None;
     let mut last_renewal_check: Option<Instant> = None;
     // 终态（§5.4）：一旦认出网关的终态 code（被吊销 / 证书身份对不上），就不再向控制面
     // 发任何请求。
@@ -1832,8 +1997,75 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                 continue;
             }
         }
+        // 一次性命令：先把本机请求并入队列，再统一判定。
+        //   放在策略拉取之前：重采命令要连**探测白名单**一起刷新，否则新路径根本不在列表里；
+        //   放在续期检查与建 loop_ctx **之前**：`refresh` 命令可能点名 `credentials` 与
+        //   `metrics-labels`，两者都要可变借用 `runtime_config`。
+        let mut queue: Vec<(AgentCommand, CommandSource)> = pending_commands
+            .drain(..)
+            .map(|command| (command, CommandSource::Remote))
+            .collect();
+        if let Some(local) = take_local_command(&command_state_dir).await {
+            queue.push((local, CommandSource::Local));
+        }
+        let now_ms = now_ts_ms();
+        // 调查：扫描是独立任务，跑完了在这里收尾（落盘 / 回传 / ack）。
+        // 放在命令队列与 tick 之前 —— 本轮就能把 ack 搭上本轮的状态上报，
+        // 也不用等到下一个 3s 节拍。
+        let (investigation_acks, investigation_recorded) = drain_finished_investigations(
+            &mut inflight_investigations,
+            &runtime_config,
+            &work_runtime,
+            &uplink_runtime,
+            &command_state_dir,
+            &mut command_history,
+        )
+        .await;
+        pending_command_acks.extend(investigation_acks);
+        let mut history_dirty = investigation_recorded;
+        // 命令队列在 `handle_command_queue` 里单独一层：它不允许 `await` 扫描（见那个函数的注释）。
+        let turn = handle_command_queue(
+            queue,
+            &runtime_config,
+            &mut inflight_investigations,
+            &mut command_history,
+            &mut last_refresh_facts,
+            refresh_facts_interval,
+            now_ms,
+        )
+        .await;
+        pending_command_acks.extend(turn.acks);
+        history_dirty |= turn.history_dirty;
+        let mut accepted_refresh = turn.accepted_refresh;
+        // ── `refresh` 命令：只打「强制位」，真正的拉取仍在下面各自的常规路径上跑 ──
+        //
+        // 为什么不在命令处理里直接拉：节流 / 落盘 / 应用 / 日志只有一处实现，
+        // 两套必然漂移；命令只负责说「这一次别等节流」。
+        let mut source_refresh = turn.refresh;
+        let mut source_results: Vec<(&'static str, SourceRefresh)> = Vec::new();
+        let mut force_policies = false;
+        let mut force_credentials = false;
+        let mut force_facts = false;
+        if let Some(request) = source_refresh.as_ref() {
+            for source in &request.what {
+                match source.as_str() {
+                    refresh_what::FACTS => force_facts = true,
+                    refresh_what::POLICIES => force_policies = true,
+                    refresh_what::WORK => last_work_fetch = None,
+                    refresh_what::UPLINK => last_uplink_fetch = None,
+                    refresh_what::METRICS_LABELS => last_labels_fetch = None,
+                    refresh_what::CREDENTIALS => force_credentials = true,
+                    // 词表外的值在 `parse_refresh_sources` 里已经拒了。
+                    _ => {}
+                }
+            }
+        }
         // 续期检查**放在建本轮 loop_ctx 之前**：要可变借用 `runtime_config`。
-        if last_renewal_check.is_none_or(|at| at.elapsed() >= RENEWAL_CHECK_INTERVAL) {
+        // `refresh --only credentials` 只是把这一拍提前（不改任何持久状态）。
+        let mut credential_refresh: Option<SourceRefresh> = None;
+        if force_credentials
+            || last_renewal_check.is_none_or(|at| at.elapsed() >= RENEWAL_CHECK_INTERVAL)
+        {
             last_renewal_check = Some(Instant::now());
             let state_dir = std::path::PathBuf::from(&runtime_config.paths.state_dir);
             let decision =
@@ -1867,6 +2099,27 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                     force_standby(&mut uplink_runtime, "certificate_revoked");
                 }
             }
+            if force_credentials {
+                credential_refresh = Some(match &decision {
+                    crate::enrollment::RenewalDecision::NotDue => SourceRefresh::Unchanged,
+                    crate::enrollment::RenewalDecision::Renewed => SourceRefresh::Updated,
+                    _ => SourceRefresh::Failed,
+                });
+            }
+        }
+        if let Some(result) = credential_refresh {
+            source_results.push((refresh_what::CREDENTIALS, result));
+        }
+        // 选择类 label：同样要在建 loop_ctx 之前应用 —— 采集与上送读的都是
+        // `config.metrics.labels`（运行时快照，配置文件一个字节都不改）。
+        if let Some(result) = refresh_metrics_labels(
+            &mut runtime_config,
+            &mut labels_cache,
+            &mut last_labels_fetch,
+        )
+        .await
+        {
+            source_results.push((refresh_what::METRICS_LABELS, result));
         }
         let loop_ctx = DaemonLoop {
             config: &runtime_config,
@@ -1874,48 +2127,18 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
             upgrader_bin,
             config_dir,
         };
-        // 一次性命令：先把本机请求并入队列，再统一判定。
-        // 放在策略拉取之前：重采命令要连**探测白名单**一起刷新，否则新路径根本不在列表里。
-        let mut queue: Vec<(AgentCommand, CommandSource)> = pending_commands
-            .drain(..)
-            .map(|command| (command, CommandSource::Remote))
-            .collect();
-        if let Some(local) = take_local_command(&command_state_dir).await {
-            queue.push((local, CommandSource::Local));
-        }
-        let now_ms = now_ts_ms();
-        // 调查：扫描是独立任务，跑完了在这里收尾（落盘 / 回传 / ack）。
-        // 放在命令队列与 tick 之前 —— 本轮就能把 ack 搭上本轮的状态上报，
-        // 也不用等到下一个 3s 节拍。
-        let (investigation_acks, investigation_recorded) = drain_finished_investigations(
-            &mut inflight_investigations,
-            loop_ctx.config,
-            &work_runtime,
-            &uplink_runtime,
-            &command_state_dir,
-            &mut command_history,
-        )
-        .await;
-        pending_command_acks.extend(investigation_acks);
-        let mut history_dirty = investigation_recorded;
-        // 命令队列在 `handle_command_queue` 里单独一层：它不允许 `await` 扫描（见那个函数的注释）。
-        let turn = handle_command_queue(
-            queue,
-            loop_ctx.config,
-            &mut inflight_investigations,
-            &mut command_history,
-            &mut last_refresh_facts,
-            refresh_facts_interval,
-            now_ms,
-        )
-        .await;
-        pending_command_acks.extend(turn.acks);
-        history_dirty |= turn.history_dirty;
-        let mut accepted_refresh = turn.accepted_refresh;
-        let force_refresh = accepted_refresh.is_some();
+        let force_refresh = accepted_refresh.is_some() || force_facts;
         // 到达拉取间隔就拉一次策略表并应用（启动首轮即拉）。必须在 refresh_due 之前，
         // 这样本轮采集就用上新周期。
-        refresh_discovery_policy(loop_ctx.config, &mut discovery_runtime, force_refresh).await;
+        if let Some(result) = refresh_discovery_policy(
+            loop_ctx.config,
+            &mut discovery_runtime,
+            force_refresh || force_policies,
+        )
+        .await
+        {
+            source_results.push((refresh_what::POLICIES, result));
+        }
         // L3 搜索范围：与发现策略同一节奏拉（知识库 ∩ 网关 roots 的交集，本机无配置）。
         // 拿不到就沿用落盘那份 —— 断网不该让已定位的日志突然消失。
         refresh_source_search_policy(
@@ -1926,7 +2149,11 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
         .await;
         // 上送启用要**先于**工作授权与采集：否则会出现「工作已应用、上送还关着」的一个 tick
         // —— 派活后第一轮采到了却发不出去。上送开关是采集的前置条件。
-        refresh_uplink_grant(loop_ctx.config, &mut uplink_runtime, &mut last_uplink_fetch).await;
+        if let Some(result) =
+            refresh_uplink_grant(loop_ctx.config, &mut uplink_runtime, &mut last_uplink_fetch).await
+        {
+            source_results.push((refresh_what::UPLINK, result));
+        }
         // 快照周期紧跟在上送授权之后（它比采集更"慢"，排在任何采集与计算之前）。
         refresh_discovery_snapshot_policy(
             loop_ctx.config,
@@ -1935,13 +2162,16 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
         )
         .await;
         // 工作授权同样在采集之前应用：本轮就按新的授权采（或停）。
-        refresh_work_grant(
+        if let Some(result) = refresh_work_grant(
             &loop_ctx,
             &mut work_runtime,
             &mut last_work_fetch,
             &work_record_path,
         )
-        .await;
+        .await
+        {
+            source_results.push((refresh_what::WORK, result));
+        }
         // 指标上送要不要发生在**这里**决定（而不是深入采集内部）：
         //   没授权 = 不上送（不做任务工作的 Agent 不该顺手送指标）；
         //   授权了但没到周期 = 本轮跳过，不算失败。
@@ -2039,6 +2269,32 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
             history_dirty = true;
             // 只有网关下发的命令需要回传；本机命令从台账读结果。
             if source == CommandSource::Remote {
+                pending_command_acks.push(ack);
+            }
+        }
+        // `refresh` 命令的台账结果：各来源在**这一拍**里跑完了，现在才有话可说。
+        // 放在落盘之前 —— 否则这条命令要等到下一秒的下一批命令才被记下来。
+        if let Some(request) = source_refresh.take() {
+            // 事实只有跑完这一拍才知道结果。
+            if request.what.iter().any(|what| what == refresh_what::FACTS) {
+                let (outcome, _) = refresh_facts_outcome(&snapshot, &fact_attempt);
+                let result = if outcome == command_outcome::SUCCEEDED {
+                    SourceRefresh::Updated
+                } else {
+                    SourceRefresh::Failed
+                };
+                source_results.push((refresh_what::FACTS, result));
+            }
+            let (outcome, detail) = source_refresh_verdict(&request.what, &source_results);
+            let ack = record_command(
+                &mut command_history,
+                &request.command,
+                outcome,
+                detail,
+                now_ts_ms(),
+            );
+            history_dirty = true;
+            if request.source == CommandSource::Remote {
                 pending_command_acks.push(ack);
             }
         }
@@ -2449,26 +2705,66 @@ async fn refresh_source_search_policy(
     let _ = crate::control::source_search_policy::refresh(config, state_dir).await;
 }
 
+/// 拉取并应用选择类 label（`env` / `cluster` / `app` / …）。
+///
+/// 值只在**运行时快照**里生效：`config.metrics.labels` 是采集与上送唯一读取点，
+/// 而配置文件（`agentd.toml`）一个字节都不动 —— `[metrics.labels]` 已废弃，不再生效。
+///
+/// 返回 `None` = 这一拍没到间隔（被节流），不是失败。
+async fn refresh_metrics_labels(
+    config: &mut AgentConfig,
+    cached: &mut CachedMetricsLabels,
+    last_fetch: &mut Option<Instant>,
+) -> Option<SourceRefresh> {
+    let now = Instant::now();
+    if let Some(at) = *last_fetch
+        && at.elapsed() < METRICS_LABELS_FETCH_INTERVAL
+    {
+        return None;
+    }
+    // 先记「尝试」再发：失败也要被节流，否则网关宕机时会每 tick（3s）重试并刷日志。
+    *last_fetch = Some(now);
+    let state_dir = PathBuf::from(&config.paths.state_dir);
+    let outcome = labels_runtime::refresh(config, &state_dir, cached).await;
+    match &outcome {
+        RefreshOutcome::Updated => {
+            // `refresh` 自己落盘；把内存这份也对齐（下次比较的基线）。
+            *cached = labels_runtime::load(&state_dir);
+            labels_runtime::apply(config, cached);
+        }
+        RefreshOutcome::Unchanged => {}
+        RefreshOutcome::Failed(detail) => {
+            // 沿用上一份：清空会让这台机器的指标序列在时间轴上凭空断成两段。
+            log::warn!("event=MetricsLabelsFetchFailed detail=\"{detail}\"（沿用上一份）");
+        }
+    }
+    Some(SourceRefresh::from(&outcome))
+}
+
 async fn refresh_discovery_policy(
     config: &AgentConfig,
     runtime: &mut DiscoveryRuntime,
     force: bool,
-) {
+) -> Option<SourceRefresh> {
     let now = Instant::now();
     if !force && !runtime.policy_fetch_due(now, DISCOVERY_POLICY_FETCH_MIN_INTERVAL) {
-        return;
+        return None;
     }
     // 先记「尝试」再发：失败也要被最小间隔节流，否则网关宕机时会每 tick（3s）重试。
     // 与事实摘要同一取舍（记尝试，不记成功）。
     runtime.record_policy_fetch_attempt(now);
     // 拿到就应用；没拿到（未入网 / 网关联 503 / 出错）则**保留上次应用的表**，什么都不改 ——
     // 失败清空已应用表会让 agent 从「有策略」倒退成「无策略」，与「失败不致命」相悖。
-    if let Some(set) = fetch_discovery_policies(config).await {
+    let Some(set) = fetch_discovery_policies(config).await else {
+        return Some(SourceRefresh::Failed);
+    };
+    {
         let policy_version = set.policy_version;
         let aspects = set.policies.len();
         // 版本没变就不吭声：策略是慢变量，每 5 分钟都会重新拉到同一版，
         // 每次都打日志就是每 5 分钟一行噪声。
-        if runtime.apply_discovery_policy(set) {
+        let changed = runtime.apply_discovery_policy(set);
+        if changed {
             // 夹取/弃用过的周期一并带出来：这不是错误，但静默夹取会把
             // 「网关发布了一份坏表」伪装成一切正常。
             let adjustments = runtime.policy_adjustments_summary();
@@ -2481,6 +2777,11 @@ async fn refresh_discovery_policy(
                 "event=DiscoveryPolicyApplied policy_version={policy_version} aspects={aspects}{adjustments}"
             );
         }
+        Some(if changed {
+            SourceRefresh::Updated
+        } else {
+            SourceRefresh::Unchanged
+        })
     }
 }
 
@@ -2492,21 +2793,31 @@ async fn refresh_uplink_grant(
     config: &AgentConfig,
     runtime: &mut AppliedUplink,
     last_fetch: &mut Option<Instant>,
-) {
+) -> Option<SourceRefresh> {
     let now = Instant::now();
     if let Some(at) = *last_fetch
         && at.elapsed() < Duration::from_millis(WORK_FETCH_MIN_INTERVAL_MS as u64)
     {
-        return;
+        return None;
     }
     // 先记“尝试”再发：失败也要被节流，否则网关宕机时会每 tick（3s）重试。
     *last_fetch = Some(now);
     // 拿不到（未入网 / 旧网关 404 / 网络失败）就**保留上次已应用的 grant**：
     // 与工作授权同一取舍 —— 失败清空会把一次网络抖动放大成采集中断。
     // 「该不该打日志」交给 `observe`：预期内（未入网 / 404）静默，异常按签名去重。
-    if let Some(line) = runtime.observe(fetch_uplink_grant(config).await) {
+    // 「这次拉取有没有改变什么」用生效状态的指纹判断：`observe` 只在**需要人看**的时候
+    // 返回一行日志（失败 / 被拒 / 应用了新 grant），不能拿它当“变没变”的判据。
+    let before = runtime.effective_fingerprint();
+    let line = runtime.observe(fetch_uplink_grant(config).await);
+    let changed = before != runtime.effective_fingerprint();
+    if let Some(line) = line {
         log::warn!("{line}");
     }
+    Some(if changed {
+        SourceRefresh::Updated
+    } else {
+        SourceRefresh::Unchanged
+    })
 }
 
 /// 拉取并应用原文快照上送设置（启动首轮即拉，之后按与工作授权相同的 30s 节流）。
@@ -2545,22 +2856,23 @@ async fn refresh_work_grant(
     runtime: &mut AppliedWorkGrant,
     last_fetch: &mut Option<Instant>,
     record_path: &Path,
-) {
+) -> Option<SourceRefresh> {
     let config = loop_ctx.config;
     let now = Instant::now();
     if let Some(at) = *last_fetch
         && at.elapsed() < Duration::from_millis(WORK_FETCH_MIN_INTERVAL_MS as u64)
     {
-        return;
+        return None;
     }
     // 先记“尝试”再发：失败也要被节流，否则网关宕机时会每 tick（3s）重试。
     *last_fetch = Some(now);
     let Some(grant) = fetch_work_grant(config, runtime.sequence()).await else {
         // 拿不到就**保留上次应用的工作**：与策略表同理，失败清空会让 agent 从
         // 「有活干」倒退成「什么都没授权」—— 那是把网络抖动放大成采集中断。
-        return;
+        return Some(SourceRefresh::Failed);
     };
     let outcome = runtime.apply(&grant);
+    let changed = outcome.changed;
     if outcome.changed {
         log::info!(
             "event=WorkGrantApplied sequence={} {}",
@@ -2663,6 +2975,11 @@ async fn refresh_work_grant(
             record_path.display()
         );
     }
+    Some(if changed {
+        SourceRefresh::Updated
+    } else {
+        SourceRefresh::Unchanged
+    })
 }
 
 /// 把一件升级的**工作参数**（`entry.spec`）加上本机现状凑成一次升级请求。
@@ -6601,5 +6918,153 @@ mod tests {
             history.find("c-1").map(|record| record.outcome.as_str()),
             Some(command_outcome::FAILED)
         );
+    }
+}
+
+#[cfg(test)]
+mod source_refresh_tests {
+    use super::*;
+
+    fn sample(id: &str, kind: &str, params: &str, at: i64) -> AgentCommand {
+        AgentCommand {
+            command_id: id.to_string(),
+            requested_at_ms: at,
+            kind: kind.to_string(),
+            params: params.to_string(),
+        }
+    }
+
+    #[test]
+    fn parse_refresh_sources_accepts_the_documented_vocabulary() {
+        let params = r#"{"what":["work","metrics-labels","work"]}"#;
+        assert_eq!(
+            parse_refresh_sources(params).expect("valid"),
+            vec!["work".to_string(), "metrics-labels".to_string()],
+            "重复的来源只出现一次（同一来源刷两遍没有意义）"
+        );
+    }
+
+    #[test]
+    fn parse_refresh_sources_rejects_empty_unknown_and_garbage() {
+        for (params, needle) in [
+            ("", "缺少参数"),
+            ("{}", "不是合法 JSON"),
+            (r#"{"what":[]}"#, "没有指定任何来源"),
+            (r#"{"what":["everything"]}"#, "未知的刷新来源"),
+        ] {
+            let err = parse_refresh_sources(params).expect_err("must be rejected");
+            assert!(err.contains(needle), "{params}: {err}");
+        }
+    }
+
+    #[test]
+    fn evaluate_command_routes_refresh_to_the_source_list() {
+        let now = now_ts_ms();
+        let interval = Duration::from_secs(60);
+        match evaluate_command(
+            &sample(
+                "c-refresh",
+                command_kind::REFRESH,
+                r#"{"what":["policies"]}"#,
+                now,
+            ),
+            false,
+            None,
+            interval,
+            now,
+        ) {
+            CommandVerdict::AcceptRefreshSources(what) => {
+                assert_eq!(what, vec!["policies".to_string()])
+            }
+            other => panic!("expected AcceptRefreshSources, got {other:?}"),
+        }
+
+        // 参数坏了如实回 failed（而不是猜一个来源去刷）。
+        assert!(matches!(
+            evaluate_command(
+                &sample("c-bad", command_kind::REFRESH, "{}", now),
+                false,
+                None,
+                interval,
+                now
+            ),
+            CommandVerdict::BadRefreshParams(_)
+        ));
+
+        // 过了命令窗口同样不执行。
+        assert!(matches!(
+            evaluate_command(
+                &sample(
+                    "c-stale",
+                    command_kind::REFRESH,
+                    r#"{"what":["work"]}"#,
+                    now - COMMAND_STALE_MS - 1
+                ),
+                false,
+                None,
+                interval,
+                now
+            ),
+            CommandVerdict::Stale
+        ));
+    }
+
+    #[test]
+    fn source_refresh_verdict_fails_the_whole_command_when_one_source_fails() {
+        let requested = vec!["work".to_string(), "policies".to_string()];
+        let (outcome, detail) = source_refresh_verdict(
+            &requested,
+            &[
+                ("work", SourceRefresh::Unchanged),
+                ("policies", SourceRefresh::Updated),
+            ],
+        );
+        assert_eq!(outcome, command_outcome::SUCCEEDED);
+        assert_eq!(detail, "work=unchanged policies=updated");
+
+        let (outcome, detail) = source_refresh_verdict(
+            &requested,
+            &[
+                ("work", SourceRefresh::Updated),
+                ("policies", SourceRefresh::Failed),
+            ],
+        );
+        assert_eq!(
+            outcome,
+            command_outcome::FAILED,
+            "点了三项只成两项不是“刷新成功”"
+        );
+        assert_eq!(detail, "work=updated policies=failed");
+    }
+
+    #[test]
+    fn source_refresh_verdict_reports_a_source_that_never_ran() {
+        // 点了名却没有结果：如实写 skipped 并整体失败，不假装成功。
+        let (outcome, detail) = source_refresh_verdict(
+            &["metrics-labels".to_string()],
+            &[("work", SourceRefresh::Updated)],
+        );
+        assert_eq!(outcome, command_outcome::FAILED);
+        assert_eq!(detail, "metrics-labels=skipped");
+    }
+
+    #[test]
+    fn a_refresh_command_does_not_take_the_refresh_facts_throttle() {
+        // `refresh` 与 `refresh_facts` 是两条独立的通道：前者不该被后者 60s 的节流挡住，
+        // 否则「刚点过重采、想再刷一次 label」要白等一分钟。
+        let now = now_ts_ms();
+        let verdict = evaluate_command(
+            &sample(
+                "c-labels",
+                command_kind::REFRESH,
+                r#"{"what":["metrics-labels"]}"#,
+                now,
+            ),
+            true,
+            Some(Instant::now()),
+            Duration::from_secs(60),
+            now,
+        );
+        assert!(matches!(verdict, CommandVerdict::AcceptRefreshSources(_)));
     }
 }

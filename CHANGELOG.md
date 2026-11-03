@@ -3,6 +3,29 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.22.0-alpha] - 2026-11-03
+
+### 新增
+
+- **选择类 label 改由网关下发**：`env` / `cluster` / `app` / `role` … 不再来自本机配置。
+  agentd 从 `POST /api/v1/agent/metrics-labels:poll` 拉取，缓存在
+  `state/metrics/labels.json`；启动、每 5 分钟、手工刷新时更新。拿不到就沿用缓存，
+  连缓存也没有 → 指标不带这些 label（不猜、不补默认值）。
+- **`wist-agentd metrics-labels show | refresh | clear-cache`**：查看本机将贴哪些值、
+  每键来源（`default` / `inferred` / `manual`），并可就地重拉 / 清缓存。
+- **`wist-agentd refresh --all | --only <kinds>`**：一次强制拉取一组“知识 / 期望状态”
+  （`facts` / `policies` / `work` / `metrics-labels` / `credentials` / `uplink`）。
+  结果逐项记进命令台账（`work=unchanged policies=updated`）。`uplink` 只能显式点名 ——
+  它直接决定“发不发、发到哪”。范围必须显式给，手滑敲一个 `refresh` 不会触发任何拉取。
+- **`refresh` 命令 kind**：网关改完某台机器的 label 后可让它立刻重拉（下一次状态上报即送达）。
+
+### 变更（兼容）
+
+- **`agentd.toml` 的 `[metrics.labels]` 废弃**：仍可解析（旧配置必须还能启动），但**不再生效**，
+  启动时告警一次。取值一律以网关为准 —— 本机配置文件不再是“谁能改标签”的旁路。
+- 本机改选 label 的入口统一到网关管理面；`refresh --all` **不含** `uplink` 与 `credentials`。
+- 依赖 `wist-api 0.10` / `wist-validate 0.7`。
+
 ## [0.21.2-alpha] - 2026-11-03
 
 ### 修复

@@ -164,6 +164,23 @@ impl AppliedUplink {
     ///   * `NotDispatched`：预期内，静默；同时清掉失败记忆（下次真出故障要能再报一次）。
     ///   * `Failed(sig)`：同一签名只报一次；故障形态变了再报。**保留**上次 grant。
     ///   * `CredentialRejected(sig)`：同一签名只报一次；并**强制**把生效状态压成待命。
+    ///
+    /// ---
+    ///
+    /// 当前**生效状态**的指纹（判定“这次拉取有没有改变什么”用）。
+    ///
+    /// 为什么不拿 [`Self::observe`] 的返回值当判据：它只在**需要人看**的时候给一行
+    /// （失败 / 被拒 / 应用了新 grant），“拉到了同一份”和“什么都没拉到”都会是 `None`。
+    pub(crate) fn effective_fingerprint(&self) -> (bool, Option<String>, Option<u16>) {
+        match self.grant.as_ref() {
+            Some(grant) => {
+                let (enabled, addr, port) = effective_state(grant);
+                (enabled, addr.map(str::to_string), port)
+            }
+            None => (STANDBY_STATE.0, None, STANDBY_STATE.2),
+        }
+    }
+
     pub(crate) fn observe(&mut self, outcome: UplinkFetch) -> Option<String> {
         match outcome {
             UplinkFetch::NotDispatched => {
