@@ -53,12 +53,13 @@
   `MetricsLabelsEffectiveInvalid`，便于追「为什么某个 label 没出现」。
 - `sources` 逐键标注来源（`default` / `inferred` / `manual`），只用于展示与排障，不参与取值。
 
-### 已知偏差（待 P3）
+### 已知偏差（待 P3 —— [issue #2](https://github.com/dayu-sec/wist-gateway-stack/issues/2)）
 
 选择层当前贴在**该 agent 的全部序列**上（含 `process_*` / `container_*`）。规范 §3.4 规则 3 要求
 进程/容器指标上的 `app` 表示**目标自身**用途；要按目标贴标，需要把证据按 cgroup / 容器归属
 下沉到 target 层。在那之前，主机口径的 `app` 对进程/容器序列同样生效 —— 查询时若关心
 「某个进程是不是 kafka」，请用进程/容器口径的 `instance`，不要依赖 `app`。
+范围与验收标准见 [issue #2](https://github.com/dayu-sec/wist-gateway-stack/issues/2)。
 
 ## 3. 接口
 
