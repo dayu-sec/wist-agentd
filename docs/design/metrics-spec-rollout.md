@@ -37,8 +37,9 @@
 | WP4 | `wist-agentd` | `feat/metrics-runtime-v1` | `src/telemetry/metrics/runtime/process.rs`（进程/容器 CPU） | WP2 | M | 已合入 `alpha`（`0.19.0-alpha`，Linux） |
 | WP5 | `wist-agentd` | `feat/metrics-self-obs` | `src/runtime/daemon_metrics.rs`、`src/telemetry/metrics/self_obs.rs` | WP3 | S | 已合入 `alpha`（`0.20.0-alpha`；时间戳 + 自观测指标） |
 | WP6 | `wist-gateway` | `feat/metrics-wp6-query` | `src/api/host_metrics.rs`、`src/api/agent_ops.rs` | WP1 | M | 已合入 `alpha`（`0.35.0-alpha`） |
-| WP7 | 三仓 | `chore/metrics-drop-legacy` | 各仓被 WP1/WP2/WP3/WP6 改过的文件 | WP2…WP6 上线 ≥ 7 天 | S | 未开始 |
-| WP8 | `wist-agentd` | `docs/metrics-rollout-close` | 本文、`docs/design/README.md`、各仓 `CHANGELOG.md` | WP7 | S | 未开始 |
+| WP7a | `wist-agentd` | `chore/metrics-wp7a-stop-dual-write` | `runtime/host.rs`、`runtime/process.rs`（`legacy.*` fact） | WP2…WP6 上线 ≥ 7 天 | S | 未开始 |
+| WP7b | 三仓 | `chore/metrics-drop-legacy` | 各仓被 WP1/WP2/WP3/WP6 改过的文件 | WP7a 上线 ≥ 7 天且脚本退 `0` | S | 未开始 |
+| WP8 | `wist-agentd` | `docs/metrics-rollout-close` | 本文、`docs/design/README.md`、各仓 `CHANGELOG.md` | WP7b | S | 未开始 |
 
 ### WP1 注册表 v1（`wist-metrics`）
 
@@ -86,10 +87,15 @@
 
 ### WP7 双写收尾
 
-- 删除 `LEGACY_METRIC_SPECS` 注册表条目、采集侧旧名 fact（`legacy.*`）、网关旧名回退；
-- 删除前确认：旧名在 VM 中 7 天无新写入。
+双写不能“到期一次性删”：只要 agent 还在写旧名，`7 天无新写入` 永远不会成立。收尾必须分两步：
 
-判定用 [`dev/verify-metrics-legacy-drop.py`](../../dev/verify-metrics-legacy-drop.py)（只依赖 Python 3，不需要 curl/jq）：
+| 步骤 | 内容 | 进入条件 |
+|---|---|---|
+| **WP7a 停写** | agentd 停止产出旧名 fact（`legacy.*`）；网关**保留**旧名回退，保证历史区间仍可查 | 双写已运行 ≥ 7 天 |
+| **观察期** | 每周期跑脚本；旧名不再新增 | WP7a 发布后 ≥ 7 天 |
+| **WP7b 删除** | 删除 `LEGACY_METRIC_SPECS`、网关旧名回退、文档双写说明 | 脚本退 `0` |
+
+判定用 [`dev/verify-metrics-legacy-drop.py`](../../dev/verify-metrics-legacy-drop.py)（只依赖 Python 3；查询依赖 MetricsQL 的 `tlast_over_time`）：
 
 ```bash
 # 正式判定：窗口必须 ≥ 7d
@@ -109,8 +115,12 @@ dev/verify-metrics-legacy-drop.py --self-test
 > VM 里要检查的是它们规范化后的**旧指标名**（如 `system.memory.total`、
 > `process.memory.rss_kb`）。脚本按「名字含 `.` 且属于 `system.` / `process.` /
 > `container.` / `agent.` 命名空间」识别旧名——规范名不允许含 `.`，所以这个判据不依赖手写清单。
+>
+> 为什么不用 `timestamp(last_over_time(...))`：MetricsQL 里它返回的是上卷时间，不是原始样本时间；
+> 要用 `tlast_over_time(...)` 才能拿到真正的最后写入时刻。
 
-删除分支：`chore/metrics-drop-legacy`（三仓同一批提交），必须在脚本退 `0` 后才能合入。
+分支：`chore/metrics-wp7a-stop-dual-write`（停写）、`chore/metrics-drop-legacy`（删除），
+两者都必须三仓同一批提交。
 
 ## 4. 顺序与并行
 
@@ -123,16 +133,17 @@ flowchart LR
     WP1b --> WP2[WP2 主机采集]
     WP2 --> WP4[WP4 进程/容器 CPU]
     WP3 --> WP5[WP5 时间/自观测]
-    WP2 --> WP7[WP7 双写收尾]
-    WP3 --> WP7
-    WP6 --> WP7
-    WP7 --> WP8[WP8 收口]
+    WP2 --> WP7a[WP7a 停写]
+    WP3 --> WP7a
+    WP6 --> WP7a
+    WP7a --> WP7b[WP7b 删除]
+    WP7b --> WP8[WP8 收口]
 ```
 
 - **串行**：WP1 → WP1b（两者决定后续文件边界，必须先落）。
 - **并行**：WP2 / WP3 / WP6 三条线同时开（文件互不重叠）。
 - **必须串行**：WP4 依赖 WP2（同属采集侧）；WP5 依赖 WP3。
-- WP7 必须在 WP2/WP3/WP6 全部上线后 ≥ 7 天。
+- WP7a 必须在 WP2/WP3/WP6 全部上线后 ≥ 7 天；WP7b 必须在 WP7a 上线后 ≥ 7 天且脚本退 `0`。
 
 ## 5. 双写与切换策略
 

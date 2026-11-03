@@ -193,17 +193,18 @@ def main() -> int:
     )
 
     # 保留期自检：窗口内必须有新名数据，否则“旧名为 0”可能只是因为 VM 只留了 3 天。
+    # 注意 `count_over_time` 会丢掉 `__name__`，所以这里不按名字分组，只看总量。
     retention_ok = True
-    probe_counts: dict[str, float] = {}
+    probe_total: float | None = None
     if not args.skip_retention_guard:
-        probe_expr = " or ".join(
-            f'count_over_time({{__name__="{probe}"}}[{args.window}])' for probe in RETENTION_PROBES
+        probes_regex = "|".join(RETENTION_PROBES)
+        probe_result = query_vector(
+            base,
+            f'sum(count_over_time({{__name__=~"{probes_regex}"}}[{args.window}]))',
+            args.timeout,
         )
-        probe_result = query_vector(base, probe_expr, args.timeout)
-        for series in probe_result:
-            name = series.get("metric", {}).get("__name__", "")
-            probe_counts[name] = sum_values([series])
-        retention_ok = any(count > 0 for count in probe_counts.values())
+        probe_total = sum_values(probe_result)
+        retention_ok = probe_total > 0
 
     report: dict = {
         "vm_url": base,
@@ -211,54 +212,51 @@ def main() -> int:
         "retention_guard": {
             "ok": retention_ok,
             "skipped": args.skip_retention_guard,
-            "probes": probe_counts,
+            "samples": probe_total,
         },
         "legacy_names_seen": legacy,
         "still_writing": [],
     }
 
     if legacy:
-        # 一次查询拿全部旧名的窗口内点数，再取最后写入时间，避免按名字发几十个请求。
-        # 旧名只含 [a-z0-9._]，直接拼接即可；PromQL 字符串里 `\.` 不是合法转义，
-        # 点按正则通配符看待不影响匹配（窗口内不存在同名近似序列）。
-        names_regex = "|".join(legacy)
+        # 每个旧名单独查：`count_over_time` / `tlast_over_time` 都会丢掉 `__name__`，
+        # 用 `sum by (__name__)` 分组拿不到名字；旧名数量是个位数到几十，逐个查最简单可靠。
+        #
+        # `tlast_over_time` 是 MetricsQL 函数，返回**原始样本时间戳**；
+        # PromQL 的 `timestamp(last_over_time(...))` 返回的是上卷时间，会把“最后写入”算错。
         counts: dict[str, float] = {}
-        counts_result = query_vector(
-            base,
-            f'sum by (__name__) (count_over_time({{__name__=~"{names_regex}"}}[{args.window}]))',
-            args.timeout,
-        )
-        for series in counts_result:
-            name = series.get("metric", {}).get("__name__", "")
-            counts[name] = sum_values([series])
-
         last_seen: dict[str, float] = {}
-        last_result = query_vector(
-            base,
-            f'max by (__name__) (timestamp(last_over_time({{__name__=~"{names_regex}"}}[{args.window}])))',
-            args.timeout,
-        )
-        for series in last_result:
-            name = series.get("metric", {}).get("__name__", "")
-            try:
-                last_seen[name] = float(series["value"][1])
-            except (KeyError, TypeError, ValueError, IndexError):
-                continue
+        for name in legacy:
+            selector = f'{{__name__="{name}"}}[{args.window}]'
+            counts[name] = sum_values(
+                query_vector(
+                    base, f"sum(count_over_time({selector}))", args.timeout
+                )
+            )
+            if counts[name] > 0:
+                last_points = query_vector(
+                    base, f"max(tlast_over_time({selector}))", args.timeout
+                )
+                if last_points:
+                    try:
+                        # `tlast_over_time` 返回秒（带毫秒小数），不是毫秒。
+                        last_seen[name] = float(last_points[0]["value"][1])
+                    except (KeyError, TypeError, ValueError, IndexError):
+                        pass
 
         offenders = [name for name in legacy if counts.get(name, 0) > 0]
         agents: dict[str, list[str]] = {}
         if offenders and not args.no_agents:
-            offenders_regex = "|".join(offenders)
-            agents_result = query_vector(
-                base,
-                f'max by (__name__, agent) (timestamp(last_over_time({{__name__=~"{offenders_regex}"}}[{args.window}])))',
-                args.timeout,
-            )
-            for series in agents_result:
-                metric = series.get("metric", {})
-                agents.setdefault(metric.get("__name__", ""), []).append(
-                    metric.get("agent", "")
-                )
+            for name in offenders:
+                selector = f'{{__name__="{name}"}}[{args.window}]'
+                for series in query_vector(
+                    base,
+                    f"max by (agent) (tlast_over_time({selector}))",
+                    args.timeout,
+                ):
+                    agent = series.get("metric", {}).get("agent", "")
+                    if agent:
+                        agents.setdefault(name, []).append(agent)
 
         for name in offenders:
             report["still_writing"].append(
@@ -277,10 +275,9 @@ def main() -> int:
         if args.skip_retention_guard:
             print("保留期自检: 已跳过（结论不可作为 WP7 依据）")
         elif retention_ok:
-            probes = ", ".join(
-                f"{name}={int(count)}" for name, count in sorted(probe_counts.items())
+            print(
+                f"保留期自检: OK（窗口内新名有 {int(probe_total or 0)} 个样本）"
             )
-            print(f"保留期自检: OK（窗口内新名有数据：{probes}）")
         else:
             print(
                 "保留期自检: FAIL —— 窗口内新名也没有数据；"
@@ -362,36 +359,24 @@ class FakeVmHandler(http.server.BaseHTTPRequestHandler):
 
     @classmethod
     def answer(cls, query: str) -> list[dict]:
-        if "max by (__name__, agent)" in query:
+        if query.startswith("max by (agent)"):
             return [
                 {
-                    "metric": {"__name__": "system.memory.total", "agent": "agent-1"},
+                    "metric": {"agent": "agent-1"},
                     "value": [1_700_000_000, "1700000000"],
                 }
             ]
-        if query.startswith("max by (__name__)"):
-            return [
-                {
-                    "metric": {"__name__": name},
-                    "value": [1_700_000_000, "1700000000"],
-                }
-                for name in LEGACY_SAMPLES
-            ]
-        if query.startswith("sum by (__name__)"):
-            return [
-                {
-                    "metric": {"__name__": name},
-                    "value": [1_700_000_000, "12"],
-                }
-                for name in LEGACY_SAMPLES
-            ]
-        # 保留期探针：`A or B or C` 形式的 count_over_time。
-        if cls.case == "retention-fail":
-            return []
-        return [
-            {"metric": {"__name__": probe}, "value": [1_700_000_000, "5"]}
-            for probe in RETENTION_PROBES
-        ]
+        if query.startswith("max(tlast_over_time"):
+            return [{"metric": {}, "value": [1_700_000_000, "1700000000"]}]
+        # 保留期探针：`sum(count_over_time({__name__=~"..."}[W]))`。
+        if "__name__=~" in query:
+            if cls.case == "retention-fail":
+                return []
+            return [{"metric": {}, "value": [1_700_000_000, "5"]}]
+        # 逐个旧名的窗口内点数。
+        if query.startswith("sum(count_over_time"):
+            return [{"metric": {}, "value": [1_700_000_000, "12"]}]
+        return []
 
 
 def run_self_test() -> int:
