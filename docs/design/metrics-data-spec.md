@@ -179,6 +179,8 @@ agent 自身 →  不适用（自观测指标没有 instance）
 6. **每 app 登记允许键集**：`shard` 只允许出现在分片系统、`tier` 只允许出现在分层存储；未登记的键组合校验失败。`app` 缺失时**不得**写 `role` / `shard` / `tier`（无登记表可校验），只能带 `env` / `cluster` / `region` / `zone`。
 7. **数量上限**：一条序列上同时出现的选择类 label 不得超过 6 对。
 8. **不使用 `job`**：Prometheus 里 `job` 标识抓取任务，推送模型没有对应物；用途与归属由 `app` / `cluster` 表达。
+9. **校验归属**：agent 只校验“写出去的值合法”（键闭集、值文法、`env` 闭集、≤ 6 对）；`env` / `cluster` 是否齐全由控制面注册校验。
+   - 理由：部署单元只有控制面知道，agent 本地拿机器名或路径猜一个 `cluster` 会让不同部署单元静默合流；缺失会在查询侧表现为 `{cluster=""}`，可见且可补。
 
 ```toml
 [metrics.labels]
@@ -324,11 +326,12 @@ process_state{state="running"} 1
 | `succeeded` | 目标全部字段采集成功 | 发 |
 | `partial` | 目标部分字段采集成功 | 只发成功字段 |
 | `failed` | 目标无可信读数 | **不发** |
-| `dropped` | 超出采样上限未采 | 不发 |
+| `dropped` | 超出采样上限、本批次未保留样本 | 不发 |
 
 - 失败目标**不得**发送任何样本，也**不得**用 0、上次值或默认值填充。
-- 失败与部分成功必须计入 `agent_collect_targets{target_kind,outcome}`。
-- 批次级状态取最差：有任一 `failed` 即批次 `partial`；全部 `failed` 即批次 `failed`。
+- 目标级记账 `agent_collect_targets{target_kind,outcome}` 的 `outcome` 只取 `succeeded` / `failed` / `dropped`；
+  `partial` 目标已经产出了可用字段，计入 `succeeded`，不单独立账（否则三项之和会超过目标数）。
+- 批次级状态 `status` 取最差：有任一 `failed` 即 `partial`；全部 `failed` 即 `failed`。
 
 理由：旧值与新鲜值无法区分，会把故障伪装成正常；缺失本身可识别，补 0 则会伪造 0 读数。
 
@@ -514,7 +517,7 @@ process_state{state="running"} 1
 | `agent_cpu_cores` | gauge_i64 | 1 | — | 逻辑核数，用于把单核口径换算成整机占比 |
 | `agent_admin_latency_seconds` | gauge_f64 | s | — | 管理面交互延迟 |
 | `agent_discovery_policy_version` | gauge_i64 | 1 | — | 已生效的发现策略版本 |
-| `agent_collect_targets` | gauge_i64 | 1 | `target_kind`,`outcome` | 本批次各结果的目标计数 |
+| `agent_collect_targets` | gauge_i64 | 1 | `target_kind`,`outcome` | 本批次各结果的目标计数；`target_kind` ∈ {`host`,`process`,`container`}，`outcome` ∈ {`succeeded`,`failed`,`dropped`} |
 | `agent_uplink_metrics_failed_total` | counter_i64 | 1 | — | 指标上送失败累计次数 |
 
 ### 10.5 ignore 表（登记但不产出指标）
@@ -577,7 +580,7 @@ process_state{state="running"} 1
 | label 白名单 | 样本 label 键 ⊆ §3 闭集；未登记键必须被丢弃并记事件 |
 | 身份唯一性 | 同一批次内 `(name, agent, instance, 按需 label)` 无重复 |
 | 身份稳定性 | 目标类指标的 `instance` 不得含 PID；进程/容器身份必须由稳定标识构成，连续批次取值不变 |
-| 选择类 label | 键 ⊆ §3.4 闭集；`env` / `cluster` 必须存在；`app` 允许缺失，若存在则必须来自白名单来源且命中注册表；每 app 的允许键集校验通过（`shard` / `tier` 不得出现在未登记的系统上） |
+| 选择类 label | 键 ⊆ §3.4 闭集；值合法（小写、≤ 32 字符、`env` ∈ 闭集）；`env` / `cluster` 的存在性与每 app 允许键集由控制面注册校验保证（agent 不猜部署单元）；`app` 允许缺失，若存在则必须来自白名单来源且命中注册表 |
 | 选择类取值 | 值小写、无空格；`env` ∈ 闭集；值不得编码其他维度（不含环境名、应用名）；不得含动态状态、版本、归属、IP/PID |
 | 覆盖完整性 | 每个采集域的 fact 产出集合 ⊆ 注册表 ∪ ignore 表 |
 | 投递可观测 | 每批次失败必须反映在 `agent_uplink_metrics_failed_total` |

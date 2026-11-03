@@ -50,7 +50,39 @@ pub fn validate_config(contract: &AgentConfig) -> Result<(), ValidationError> {
     }
 
     validate_logs_section(&contract.telemetry.logs)?;
+    validate_metric_labels(&contract.metrics.labels)?;
 
+    Ok(())
+}
+
+/// 选择类 label 的准入：键闭集、值小写无空白且长度受限、`env` 取自闭集。
+fn validate_metric_labels(
+    labels: &std::collections::BTreeMap<String, String>,
+) -> Result<(), ValidationError> {
+    const KEYS: &[&str] = &[
+        "app", "env", "cluster", "role", "shard", "tier", "region", "zone",
+    ];
+    const ENVS: &[&str] = &["prod", "staging", "dev", "test"];
+
+    if labels.len() > 6 {
+        return Err(ValidationError::new("too_many_metric_labels"));
+    }
+    for (key, value) in labels {
+        if !KEYS.contains(&key.as_str()) {
+            return Err(ValidationError::new("unknown_metric_label"));
+        }
+        let valid_value = !value.is_empty()
+            && value.len() <= 32
+            && value.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.')
+            });
+        if !valid_value {
+            return Err(ValidationError::new("invalid_metric_label_value"));
+        }
+        if key == "env" && !ENVS.contains(&value.as_str()) {
+            return Err(ValidationError::new("invalid_metric_env"));
+        }
+    }
     Ok(())
 }
 
@@ -238,6 +270,66 @@ mod tests {
     fn a_config_with_explicit_logs_passes() {
         let config = base_config().with_telemetry(TelemetrySection { logs: valid_logs() });
         validate_config(&config).expect("valid explicit logs config");
+    }
+
+    fn with_labels(pairs: &[(&str, &str)]) -> AgentConfig {
+        let mut config = base_config();
+        config.metrics.labels = pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        config
+    }
+
+    #[test]
+    fn selection_labels_accept_the_documented_keys() {
+        let config = with_labels(&[
+            ("app", "kafka"),
+            ("env", "prod"),
+            ("cluster", "kafka-prod"),
+            ("role", "broker"),
+            ("tier", "hot"),
+            ("region", "cn-north-1"),
+        ]);
+        validate_config(&config).expect("valid selection labels");
+    }
+
+    #[test]
+    fn selection_labels_reject_keys_outside_the_closed_set() {
+        let config = with_labels(&[("service", "kafka")]);
+        assert_code(validate_config(&config), "unknown_metric_label");
+    }
+
+    #[test]
+    fn selection_label_values_must_be_lowercase_and_bounded() {
+        for value in ["Kafka", "kafka prod", "kafka/prod", ""] {
+            let config = with_labels(&[("cluster", value)]);
+            assert_code(validate_config(&config), "invalid_metric_label_value");
+        }
+
+        let too_long = "a".repeat(33);
+        let config = with_labels(&[("cluster", &too_long)]);
+        assert_code(validate_config(&config), "invalid_metric_label_value");
+    }
+
+    #[test]
+    fn selection_label_env_is_a_closed_set() {
+        let config = with_labels(&[("env", "production")]);
+        assert_code(validate_config(&config), "invalid_metric_env");
+    }
+
+    #[test]
+    fn selection_labels_cap_at_six_pairs() {
+        let config = with_labels(&[
+            ("app", "kafka"),
+            ("env", "prod"),
+            ("cluster", "kafka-prod"),
+            ("role", "broker"),
+            ("tier", "hot"),
+            ("region", "cn-north-1"),
+            ("zone", "cn-north-1a"),
+        ]);
+        assert_code(validate_config(&config), "too_many_metric_labels");
     }
 
     #[test]

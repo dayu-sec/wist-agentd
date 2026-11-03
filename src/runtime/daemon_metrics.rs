@@ -109,11 +109,12 @@ pub(super) async fn write_metrics_uplink(
     sink: &mut TelemetryRecordSink,
     agent_id: &str,
     snapshot: &MetricsRuntimeSnapshot,
+    selection: &std::collections::BTreeMap<String, String>,
     next_seq: &mut u64,
     global_seq_path: &Path,
 ) -> io::Result<()> {
     let samples = samples::build_samples_snapshot(snapshot);
-    let lines = samples::build_vm_metric_lines(&samples, agent_id);
+    let lines = samples::build_vm_metric_lines_with(&samples, agent_id, selection);
     if lines.is_empty() {
         return Ok(());
     }
@@ -359,6 +360,7 @@ mod tests {
                     attempted_targets: 1,
                     succeeded_targets: 1,
                     failed_targets: 0,
+                    dropped_targets: 0,
                     last_error: None,
                     runtime_facts: vec![StringKeyValue::new("host.loadavg.1m", "0.10")],
                     labeled_facts: Vec::new(),
@@ -370,6 +372,7 @@ mod tests {
                     attempted_targets: 1,
                     succeeded_targets: 1,
                     failed_targets: 0,
+                    dropped_targets: 0,
                     last_error: None,
                     runtime_facts: vec![StringKeyValue::new("process.pid", "42")],
                     labeled_facts: Vec::new(),
@@ -381,6 +384,7 @@ mod tests {
                     attempted_targets: 1,
                     succeeded_targets: 1,
                     failed_targets: 0,
+                    dropped_targets: 0,
                     last_error: None,
                     runtime_facts: vec![StringKeyValue::new("container.runtime", "containerd")],
                     labeled_facts: Vec::new(),
@@ -439,6 +443,7 @@ mod tests {
                 attempted_targets: 1,
                 succeeded_targets: 1,
                 failed_targets: 0,
+                dropped_targets: 0,
                 last_error: None,
                 runtime_facts: vec![StringKeyValue::new("host.loadavg.1m", "0.25")],
                 labeled_facts: Vec::new(),
@@ -462,6 +467,7 @@ mod tests {
             &mut sink,
             "agent-001",
             &snapshot,
+            &Default::default(),
             &mut next_seq,
             &global_seq_path,
         )
@@ -520,6 +526,7 @@ mod tests {
                 attempted_targets: 1,
                 succeeded_targets: 1,
                 failed_targets: 0,
+                dropped_targets: 0,
                 last_error: None,
                 runtime_facts: vec![],
                 labeled_facts: Vec::new(),
@@ -544,6 +551,7 @@ mod tests {
             &mut sink,
             "agent-001",
             &snapshot,
+            &Default::default(),
             &mut next_seq,
             &global_seq_path,
         )
@@ -552,13 +560,14 @@ mod tests {
         drop(sink);
 
         // 取号递增 + 高水位持久化到独立全局 seq 文件。
-        assert_eq!(next_seq, 7);
+        // 两个数值样本各一行，外加一行采集记账（`agent_collect_targets`）。
+        assert_eq!(next_seq, 8);
         let persisted = crate::state_store::log_seq_state::load_or_default_async(&global_seq_path)
             .await
             .expect("load global seq");
-        assert_eq!(persisted, 7);
+        assert_eq!(persisted, 8);
 
-        // 帧信封 seq 来自全局计数器（5、6），而非 batch_seq。
+        // 帧信封 seq 来自全局计数器（5、6、7），而非 batch_seq。
         let body = server.await.expect("join");
         let seqs: Vec<u64> = body
             .lines()
@@ -569,6 +578,6 @@ mod tests {
                 parsed["seq"].as_u64().expect("seq")
             })
             .collect();
-        assert_eq!(seqs, vec![5, 6]);
+        assert_eq!(seqs, vec![5, 6, 7]);
     }
 }

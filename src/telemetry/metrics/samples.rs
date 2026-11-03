@@ -6,6 +6,7 @@
 //! - 指标通道只收数值；解析失败丢弃样本，不降级为字符串。
 //! - 失败目标不上送样本。
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -72,6 +73,7 @@ pub struct VmMetricLabels {
     #[serde(rename = "__name__")]
     pub name: String,
     pub agent: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub instance: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_role: Option<String>,
@@ -87,12 +89,28 @@ pub struct VmMetricLabels {
     pub mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    /// 选择类 label（`app` / `env` / `cluster` …）：由配置下发，不参与身份。
+    #[serde(flatten)]
+    pub selection: BTreeMap<String, String>,
 }
 
 /// 把样本快照拍平成 VM JSON lines（一 sample 一行）。
 pub fn build_vm_metric_lines(
     snapshot: &MetricsSamplesSnapshot,
     agent_id: &str,
+) -> Vec<VmMetricLine> {
+    build_vm_metric_lines_with(snapshot, agent_id, &BTreeMap::new())
+}
+
+/// 同 [`build_vm_metric_lines`]，额外把选择类 label 贴到每条序列上。
+pub fn build_vm_metric_lines_with(
+    snapshot: &MetricsSamplesSnapshot,
+    agent_id: &str,
+    selection: &BTreeMap<String, String>,
 ) -> Vec<VmMetricLine> {
     let timestamp_ms = timestamp_ms(&snapshot.collected_at).unwrap_or_else(now_ts_ms);
     let mut lines = Vec::new();
@@ -116,6 +134,9 @@ pub fn build_vm_metric_lines(
                     cpu: label_value(&sample.labels, "cpu").map(str::to_string),
                     mode: label_value(&sample.labels, "mode").map(str::to_string),
                     state: label_value(&sample.labels, "state").map(str::to_string),
+                    target_kind: label_value(&sample.labels, "target_kind").map(str::to_string),
+                    outcome: label_value(&sample.labels, "outcome").map(str::to_string),
+                    selection: selection.clone(),
                 },
                 values: vec![value],
                 timestamps: vec![timestamp_ms],
@@ -144,12 +165,52 @@ pub fn build_samples_snapshot(runtime: &MetricsRuntimeSnapshot) -> MetricsSample
     for outcome in &runtime.outcomes {
         build_outcome_groups(outcome, &mut groups);
     }
+    if let Some(group) = build_collect_targets_group(runtime) {
+        groups.push(group);
+    }
 
     MetricsSamplesSnapshot {
         batch_seq: seq,
         collected_at: runtime.generated_at.clone(),
         groups,
     }
+}
+
+/// 采集记账：每批按 `target_kind × outcome` 报目标数（`dropped` 必须有账）。
+fn build_collect_targets_group(runtime: &MetricsRuntimeSnapshot) -> Option<MetricsSampleGroup> {
+    let mut samples = Vec::new();
+    for outcome in &runtime.outcomes {
+        let kind = match outcome.collection_kind.as_str() {
+            "host_metrics" => "host",
+            "process_metrics" => "process",
+            "container_metrics" => "container",
+            _ => continue,
+        };
+        // 部分成功（partial）计入 succeeded：outcome 只给了 succeeded/failed 两个计数。
+        for (result, count) in [
+            ("succeeded", outcome.succeeded_targets),
+            ("failed", outcome.failed_targets),
+            ("dropped", outcome.dropped_targets),
+        ] {
+            if count == 0 {
+                continue;
+            }
+            samples.push(MetricsSampleRecord {
+                name: "agent_collect_targets".to_string(),
+                value: Value::Number(count.into()),
+                value_type: "gauge_i64".to_string(),
+                const_labels: Vec::new(),
+                labels: vec![
+                    StringKeyValue::new("target_kind", kind),
+                    StringKeyValue::new("outcome", result),
+                ],
+            });
+        }
+    }
+    (!samples.is_empty()).then(|| MetricsSampleGroup {
+        instance: String::new(),
+        samples,
+    })
 }
 
 fn build_outcome_groups(outcome: &MetricsCollectionOutcome, groups: &mut Vec<MetricsSampleGroup>) {
@@ -288,11 +349,13 @@ fn sample_value(value_type: &str, raw: &str) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use wist_contracts::discovery::StringKeyValue;
 
     use super::{
         MetricsSampleGroup, MetricsSampleRecord, MetricsSamplesSnapshot, build_samples_snapshot,
-        build_vm_metric_lines,
+        build_vm_metric_lines, build_vm_metric_lines_with,
     };
     use crate::telemetry::metrics::runtime::{
         MetricsCollectionOutcome, MetricsCollectionTargetSample, MetricsLabeledFact,
@@ -315,6 +378,17 @@ mod tests {
         }
     }
 
+    fn group_of<'a>(
+        snapshot: &'a MetricsSamplesSnapshot,
+        instance: &str,
+    ) -> &'a MetricsSampleGroup {
+        snapshot
+            .groups
+            .iter()
+            .find(|group| group.instance == instance)
+            .unwrap_or_else(|| panic!("missing group {instance}"))
+    }
+
     fn snapshot(kind: &str, targets: Vec<MetricsCollectionTargetSample>) -> MetricsRuntimeSnapshot {
         MetricsRuntimeSnapshot {
             generated_at: "2026-04-19T00:00:00Z".to_string(),
@@ -328,6 +402,7 @@ mod tests {
                 attempted_targets: targets.len(),
                 succeeded_targets: targets.len(),
                 failed_targets: 0,
+                dropped_targets: 0,
                 last_error: None,
                 runtime_facts: Vec::new(),
                 labeled_facts: Vec::new(),
@@ -346,9 +421,9 @@ mod tests {
 
         let snapshot = build_samples_snapshot(&snapshot("host_metrics", vec![sample_target]));
 
-        assert_eq!(snapshot.groups.len(), 1);
-        assert_eq!(snapshot.groups[0].instance, "host-1");
-        let names: Vec<&str> = snapshot.groups[0]
+        let group = group_of(&snapshot, "host-1");
+        assert_eq!(group.instance, "host-1");
+        let names: Vec<&str> = group
             .samples
             .iter()
             .map(|sample| sample.name.as_str())
@@ -362,7 +437,13 @@ mod tests {
         let mut sample_target = target("failed", "host-1");
         sample_target.runtime_facts = vec![StringKeyValue::new("host.loadavg.1m", "0.5")];
         let snapshot = build_samples_snapshot(&snapshot("host_metrics", vec![sample_target]));
-        assert!(snapshot.groups.is_empty());
+        assert!(
+            snapshot
+                .groups
+                .iter()
+                .all(|group| group.instance.is_empty()),
+            "failed targets must not produce sample groups"
+        );
     }
 
     #[test]
@@ -392,16 +473,20 @@ mod tests {
             ],
         }];
         let snapshot = build_samples_snapshot(&snapshot("host_metrics", vec![sample_target]));
-        let sample = &snapshot.groups[0].samples[0];
+        let group = group_of(&snapshot, "host-1");
+        let sample = &group.samples[0];
         assert_eq!(sample.name, "system_filesystem_available_bytes");
         assert_eq!(sample.labels.len(), 2, "unknown label must be dropped");
         assert!(sample.const_labels.is_empty());
 
         let lines = build_vm_metric_lines(&snapshot, "agent-1");
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].metric.mountpoint.as_deref(), Some("/data"));
-        assert_eq!(lines[0].metric.fstype.as_deref(), Some("xfs"));
-        assert_eq!(lines[0].timestamps[0], 1_776_556_800_000);
+        let line = lines
+            .iter()
+            .find(|line| line.metric.name == "system_filesystem_available_bytes")
+            .expect("filesystem line");
+        assert_eq!(line.metric.mountpoint.as_deref(), Some("/data"));
+        assert_eq!(line.metric.fstype.as_deref(), Some("xfs"));
+        assert_eq!(line.timestamps[0], 1_776_556_800_000);
     }
 
     #[test]
@@ -409,7 +494,7 @@ mod tests {
         let mut sample_target = target("succeeded", "host-1:pid:42");
         sample_target.runtime_facts = vec![StringKeyValue::new("process.state", "running")];
         let snapshot = build_samples_snapshot(&snapshot("process_metrics", vec![sample_target]));
-        let sample = &snapshot.groups[0].samples[0];
+        let sample = &group_of(&snapshot, "host-1:proc:linux_proc_start:7").samples[0];
         assert_eq!(sample.name, "process_state");
         assert_eq!(sample.value.as_i64(), Some(1));
         assert_eq!(sample.labels[0].key, "state");
@@ -421,7 +506,10 @@ mod tests {
         let mut sample_target = target("succeeded", "host-1:pid:42");
         sample_target.runtime_facts = vec![StringKeyValue::new("process.state", "weird")];
         let snapshot = build_samples_snapshot(&snapshot("process_metrics", vec![sample_target]));
-        assert_eq!(snapshot.groups[0].samples[0].labels[0].value, "unknown");
+        assert_eq!(
+            group_of(&snapshot, "host-1:proc:linux_proc_start:7").samples[0].labels[0].value,
+            "unknown"
+        );
     }
 
     #[test]
@@ -431,7 +519,7 @@ mod tests {
         sample_target.runtime_facts = vec![StringKeyValue::new("process.cpu.seconds", "12.5")];
         let snapshot = build_samples_snapshot(&snapshot("process_metrics", vec![sample_target]));
         assert_eq!(
-            snapshot.groups[0].instance,
+            group_of(&snapshot, "host-1:proc:linux_proc_start:7").instance,
             "host-1:proc:linux_proc_start:7"
         );
     }
@@ -485,12 +573,70 @@ mod tests {
     }
 
     #[test]
+    fn collect_targets_are_reported_per_kind_and_outcome() {
+        let runtime = MetricsRuntimeSnapshot {
+            generated_at: "2026-04-19T00:00:00Z".to_string(),
+            total_targets: 10,
+            host_targets: 0,
+            process_targets: 10,
+            container_targets: 0,
+            outcomes: vec![MetricsCollectionOutcome {
+                collection_kind: "process_metrics".to_string(),
+                status: "partial".to_string(),
+                attempted_targets: 10,
+                succeeded_targets: 5,
+                failed_targets: 2,
+                dropped_targets: 3,
+                last_error: None,
+                runtime_facts: Vec::new(),
+                labeled_facts: Vec::new(),
+                sample_targets: Vec::new(),
+            }],
+        };
+        let snapshot = build_samples_snapshot(&runtime);
+
+        let group = group_of(&snapshot, "");
+        let value = |outcome: &str| {
+            group
+                .samples
+                .iter()
+                .find(|sample| {
+                    sample.name == "agent_collect_targets"
+                        && sample
+                            .labels
+                            .iter()
+                            .any(|label| label.key == "outcome" && label.value == outcome)
+                })
+                .and_then(|sample| sample.value.as_i64())
+        };
+        assert_eq!(value("succeeded"), Some(5));
+        assert_eq!(value("failed"), Some(2));
+        assert_eq!(
+            value("dropped"),
+            Some(3),
+            "dropped targets must be accounted"
+        );
+
+        let lines = build_vm_metric_lines(&snapshot, "agent-1");
+        let line = &lines[0];
+        assert_eq!(line.metric.name, "agent_collect_targets");
+        assert_eq!(line.metric.target_kind.as_deref(), Some("process"));
+        assert!(line.metric.instance.is_empty());
+        let json = serde_json::to_value(line).expect("serialize");
+        assert!(json["metric"].get("instance").is_none());
+    }
+
+    #[test]
     fn vm_line_json_has_no_null_labels() {
         let mut sample_target = target("succeeded", "host-1");
         sample_target.runtime_facts = vec![StringKeyValue::new("host.loadavg.1m", "0.25")];
         let snapshot = build_samples_snapshot(&snapshot("host_metrics", vec![sample_target]));
-        let line = build_vm_metric_lines(&snapshot, "agent-1");
-        let json = serde_json::to_value(&line[0]).expect("serialize line");
+        let lines = build_vm_metric_lines(&snapshot, "agent-1");
+        let line = lines
+            .iter()
+            .find(|line| line.metric.name == "system_load_average_1m")
+            .expect("load line");
+        let json = serde_json::to_value(line).expect("serialize line");
 
         assert_eq!(
             json["metric"],
@@ -501,6 +647,27 @@ mod tests {
             })
         );
         assert!(json.get("unit").is_none());
+    }
+
+    #[test]
+    fn selection_labels_are_plain_labels_on_every_line() {
+        let mut sample_target = target("succeeded", "host-1");
+        sample_target.runtime_facts = vec![StringKeyValue::new("host.loadavg.1m", "0.25")];
+        let snapshot = build_samples_snapshot(&snapshot("host_metrics", vec![sample_target]));
+        let selection = BTreeMap::from([
+            ("app".to_string(), "kafka".to_string()),
+            ("env".to_string(), "prod".to_string()),
+            ("cluster".to_string(), "kafka-prod".to_string()),
+        ]);
+
+        let lines = build_vm_metric_lines_with(&snapshot, "agent-1", &selection);
+        let json = serde_json::to_value(&lines[0]).expect("serialize line");
+
+        assert_eq!(json["metric"]["app"], "kafka");
+        assert_eq!(json["metric"]["env"], "prod");
+        assert_eq!(json["metric"]["cluster"], "kafka-prod");
+        // 选择类 label 不是身份的一部分：`instance` 仍是目标身份。
+        assert_eq!(json["metric"]["instance"], "host-1");
     }
 
     #[test]

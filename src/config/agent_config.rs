@@ -21,6 +21,9 @@ pub struct AgentConfig {
     pub telemetry: TelemetrySection,
     #[serde(default)]
     pub discovery: DiscoverySection,
+    /// 指标的选择类 label（`[metrics.labels]`）：用途 / 环境 / 部署单元。
+    #[serde(default)]
+    pub metrics: MetricsSection,
     /// 本进程**运行日志**的 `[log]` 段（与 `telemetry.logs` 的“被采集日志”不同）。
     ///
     /// 直接内嵌共享 crate 的单类型 [`wist_log::LogSection`]（同名同义，单一事实来源），
@@ -44,6 +47,7 @@ impl AgentConfig {
             execution,
             telemetry: TelemetrySection::default(),
             discovery: DiscoverySection::default(),
+            metrics: MetricsSection::default(),
             log: wist_log::LogSection::default(),
         }
     }
@@ -52,6 +56,16 @@ impl AgentConfig {
         self.telemetry = telemetry;
         self
     }
+}
+
+/// 指标的选择类 label：只圈定范围，不参与身份判定。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Discovery", module = "Discovery.Config")]
+#[serde(deny_unknown_fields)]
+pub struct MetricsSection {
+    /// 允许的键：`app` / `env` / `cluster` / `role` / `shard` / `tier` / `region` / `zone`。
+    #[serde(default)]
+    pub labels: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ::jumo_derive::Jumo)]

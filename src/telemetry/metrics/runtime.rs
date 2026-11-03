@@ -102,6 +102,7 @@ fn build_host_outcome(
             attempted_targets: 0,
             succeeded_targets: 0,
             failed_targets: 0,
+            dropped_targets: 0,
             last_error: None,
             runtime_facts: Vec::new(),
             labeled_facts: Vec::new(),
@@ -123,6 +124,7 @@ fn build_host_outcome(
             attempted_targets,
             succeeded_targets: 0,
             failed_targets: attempted_targets,
+            dropped_targets: 0,
             last_error: Some("host metrics probe produced no runtime facts".to_string()),
             runtime_facts: Vec::new(),
             labeled_facts: Vec::new(),
@@ -137,12 +139,14 @@ fn build_host_outcome(
                 sample.labeled_facts = labeled_facts.clone();
             }
         }
+        let dropped_targets = attempted_targets.saturating_sub(sample_targets.len());
         MetricsCollectionOutcome {
             collection_kind: "host_metrics".to_string(),
             status: "succeeded".to_string(),
             attempted_targets,
             succeeded_targets: attempted_targets,
             failed_targets: 0,
+            dropped_targets,
             last_error: None,
             runtime_facts,
             labeled_facts,
@@ -159,6 +163,7 @@ fn build_process_outcome(targets: Vec<&MetricsTargetViewEntry>) -> MetricsCollec
             attempted_targets: 0,
             succeeded_targets: 0,
             failed_targets: 0,
+            dropped_targets: 0,
             last_error: None,
             runtime_facts: Vec::new(),
             labeled_facts: Vec::new(),
@@ -168,6 +173,7 @@ fn build_process_outcome(targets: Vec<&MetricsTargetViewEntry>) -> MetricsCollec
 
     let mut succeeded_targets = 0usize;
     let mut failed_targets = 0usize;
+    let mut dropped_targets = 0usize;
     let mut sample_targets = Vec::new();
     let mut last_error = None;
 
@@ -181,8 +187,10 @@ fn build_process_outcome(targets: Vec<&MetricsTargetViewEntry>) -> MetricsCollec
                 last_error = probed.last_error.clone();
             }
         }
-        if sample_targets.len() < 3 {
+        if sample_targets.len() < SAMPLE_LIMIT {
             sample_targets.push(probed);
+        } else {
+            dropped_targets += 1;
         }
     }
 
@@ -200,6 +208,7 @@ fn build_process_outcome(targets: Vec<&MetricsTargetViewEntry>) -> MetricsCollec
         attempted_targets: targets.len(),
         succeeded_targets,
         failed_targets,
+        dropped_targets,
         last_error,
         runtime_facts: vec![
             StringKeyValue::new("process.probe.mode", process_probe_mode()),
@@ -219,6 +228,7 @@ fn build_container_outcome(targets: Vec<&MetricsTargetViewEntry>) -> MetricsColl
             attempted_targets: 0,
             succeeded_targets: 0,
             failed_targets: 0,
+            dropped_targets: 0,
             last_error: None,
             runtime_facts: Vec::new(),
             labeled_facts: Vec::new(),
@@ -228,6 +238,7 @@ fn build_container_outcome(targets: Vec<&MetricsTargetViewEntry>) -> MetricsColl
 
     let mut succeeded_targets = 0usize;
     let mut failed_targets = 0usize;
+    let mut dropped_targets = 0usize;
     let mut sample_targets = Vec::new();
     let mut last_error = None;
 
@@ -241,8 +252,10 @@ fn build_container_outcome(targets: Vec<&MetricsTargetViewEntry>) -> MetricsColl
         } else {
             succeeded_targets += 1;
         }
-        if sample_targets.len() < 3 {
+        if sample_targets.len() < SAMPLE_LIMIT {
             sample_targets.push(probed);
+        } else {
+            dropped_targets += 1;
         }
     }
 
@@ -260,6 +273,7 @@ fn build_container_outcome(targets: Vec<&MetricsTargetViewEntry>) -> MetricsColl
         attempted_targets: targets.len(),
         succeeded_targets,
         failed_targets,
+        dropped_targets,
         last_error,
         runtime_facts: vec![
             StringKeyValue::new("container.probe.mode", container_probe_mode()),
@@ -345,22 +359,31 @@ fn collect_host_runtime_facts(
     }
 
     let loadavg = System::load_average();
-    push_fact_if_absent(
-        &mut facts,
-        StringKeyValue::new("host.loadavg.1m", loadavg.one.to_string()),
-    );
-    push_fact_if_absent(
-        &mut facts,
-        StringKeyValue::new("host.loadavg.5m", loadavg.five.to_string()),
-    );
-    push_fact_if_absent(
-        &mut facts,
-        StringKeyValue::new("host.loadavg.15m", loadavg.fifteen.to_string()),
-    );
+    for (key, legacy_key, value) in [
+        ("host.loadavg.1m", "legacy.host.loadavg.1m", loadavg.one),
+        ("host.loadavg.5m", "legacy.host.loadavg.5m", loadavg.five),
+        (
+            "host.loadavg.15m",
+            "legacy.host.loadavg.15m",
+            loadavg.fifteen,
+        ),
+    ] {
+        push_fact_if_absent(&mut facts, StringKeyValue::new(key, value.to_string()));
+        // 双写期：同一读数按旧名再发一条，老看板不用改。
+        push_fact_if_absent(
+            &mut facts,
+            StringKeyValue::new(legacy_key, value.to_string()),
+        );
+    }
 
+    let uptime = System::uptime();
     push_fact_if_absent(
         &mut facts,
-        StringKeyValue::new("host.uptime.seconds", System::uptime().to_string()),
+        StringKeyValue::new("host.uptime.seconds", uptime.to_string()),
+    );
+    push_fact_if_absent(
+        &mut facts,
+        StringKeyValue::new("legacy.host.uptime.seconds", uptime.to_string()),
     );
 
     let mut system = System::new();
@@ -374,6 +397,20 @@ fn collect_host_runtime_facts(
     push_fact_if_absent(
         &mut facts,
         StringKeyValue::new("host.memory.available_bytes", available_memory.to_string()),
+    );
+    push_fact_if_absent(
+        &mut facts,
+        StringKeyValue::new(
+            "legacy.host.memory.total_kb",
+            (total_memory / 1024).to_string(),
+        ),
+    );
+    push_fact_if_absent(
+        &mut facts,
+        StringKeyValue::new(
+            "legacy.host.memory.available_kb",
+            (available_memory / 1024).to_string(),
+        ),
     );
     // 总量未知时不发比例：算出 0% 会伪造一个「内存很空」的读数。
     if let Some(ratio) = memory_usage_ratio(total_memory, available_memory) {
@@ -491,6 +528,10 @@ fn collect_linux_disk_usage(disks: &Disks, facts: &mut Vec<StringKeyValue>) {
             facts,
             StringKeyValue::new("host.disk.data.mounts", data_mounts.to_string()),
         );
+        push_fact_if_absent(
+            facts,
+            StringKeyValue::new("legacy.host.disk.data.mount_count", data_mounts.to_string()),
+        );
     }
 }
 
@@ -556,6 +597,28 @@ fn push_disk_capacity_facts(
         StringKeyValue::new(
             format!("host.disk.{role}.available_bytes"),
             available.to_string(),
+        ),
+    );
+    // 双写期：旧口径（percent / KiB）。
+    push_fact_if_absent(
+        facts,
+        StringKeyValue::new(
+            format!("legacy.host.disk.{role}.usage_percent"),
+            (usage_ratio * 100.0).to_string(),
+        ),
+    );
+    push_fact_if_absent(
+        facts,
+        StringKeyValue::new(
+            format!("legacy.host.disk.{role}.total_kb"),
+            (total / 1024).to_string(),
+        ),
+    );
+    push_fact_if_absent(
+        facts,
+        StringKeyValue::new(
+            format!("legacy.host.disk.{role}.available_kb"),
+            (available / 1024).to_string(),
         ),
     );
 }
@@ -802,6 +865,21 @@ fn filesystem_facts(
             labels: labels.clone(),
         },
     ];
+    facts.push(MetricsLabeledFact {
+        key: "legacy.host.filesystem.usage_percent".to_string(),
+        value: (usage_ratio * 100.0).to_string(),
+        labels: labels.clone(),
+    });
+    facts.push(MetricsLabeledFact {
+        key: "legacy.host.filesystem.total_kb".to_string(),
+        value: (total / 1024).to_string(),
+        labels: labels.clone(),
+    });
+    facts.push(MetricsLabeledFact {
+        key: "legacy.host.filesystem.available_kb".to_string(),
+        value: (available / 1024).to_string(),
+        labels: labels.clone(),
+    });
     if let Some((inodes, inodes_free)) = filesystem_inode_counts(mount) {
         facts.push(MetricsLabeledFact {
             key: "host.filesystem.inodes".to_string(),
@@ -933,12 +1011,13 @@ fn push_fact_if_absent(facts: &mut Vec<StringKeyValue>, candidate: StringKeyValu
     facts.push(candidate);
 }
 
+/// 每类采集每个批次最多保留的目标样本数；超出部分计入 `dropped_targets`。
+const SAMPLE_LIMIT: usize = 3;
+
 fn maybe_push_sample(
     samples: &mut Vec<MetricsCollectionTargetSample>,
     target: &MetricsTargetViewEntry,
 ) {
-    const SAMPLE_LIMIT: usize = 3;
-
     if samples.len() >= SAMPLE_LIMIT {
         return;
     }
@@ -1094,6 +1173,10 @@ fn collect_process_runtime_facts(
                 &mut facts,
                 StringKeyValue::new("process.memory.rss_bytes", bytes.to_string()),
             );
+            push_fact_if_absent(
+                &mut facts,
+                StringKeyValue::new("legacy.process.memory.rss_pages", rss_pages.to_string()),
+            );
         }
         if let Some((utime, stime)) = parse_linux_proc_cpu_ticks(&stat) {
             let seconds = (utime + stime) as f64 / clock_ticks();
@@ -1126,10 +1209,17 @@ fn collect_process_runtime_facts(
             push_fact_if_absent(&mut facts, StringKeyValue::new("process.state", label));
         }
         if let Some(rss_kb) = parts.next() {
-            let bytes = rss_kb.parse::<u64>().unwrap_or(0).saturating_mul(1024);
+            let kb = rss_kb.parse::<u64>().unwrap_or(0);
             push_fact_if_absent(
                 &mut facts,
-                StringKeyValue::new("process.memory.rss_bytes", bytes.to_string()),
+                StringKeyValue::new(
+                    "process.memory.rss_bytes",
+                    kb.saturating_mul(1024).to_string(),
+                ),
+            );
+            push_fact_if_absent(
+                &mut facts,
+                StringKeyValue::new("legacy.process.memory.rss_kb", kb.to_string()),
             );
         }
         if let Some(cputime) = parts.next()
@@ -1386,6 +1476,7 @@ mod tests {
                     attempted_targets: 0,
                     succeeded_targets: 0,
                     failed_targets: 0,
+                    dropped_targets: 0,
                     last_error: None,
                     runtime_facts: Vec::new(),
                     labeled_facts: Vec::new(),
@@ -1397,6 +1488,7 @@ mod tests {
                     attempted_targets: 0,
                     succeeded_targets: 0,
                     failed_targets: 0,
+                    dropped_targets: 0,
                     last_error: None,
                     runtime_facts: Vec::new(),
                     labeled_facts: Vec::new(),
@@ -1408,6 +1500,7 @@ mod tests {
                     attempted_targets: 0,
                     succeeded_targets: 0,
                     failed_targets: 0,
+                    dropped_targets: 0,
                     last_error: None,
                     runtime_facts: Vec::new(),
                     labeled_facts: Vec::new(),
@@ -1462,6 +1555,14 @@ mod tests {
             "succeeded" | "partial" | "failed"
         ));
         assert_eq!(process_outcome.sample_targets.len(), 3);
+        assert_eq!(
+            process_outcome.dropped_targets, 2,
+            "targets beyond the sample cap must be accounted, not silently dropped"
+        );
+        assert_eq!(
+            process_outcome.sample_targets.len() + process_outcome.dropped_targets,
+            process_outcome.attempted_targets
+        );
     }
 
     #[test]
@@ -1777,6 +1878,61 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 双写期：同一读数同时产出新名与旧名，旧名保持旧单位（KiBy / percent）。
+    #[test]
+    fn host_facts_are_dual_written_with_legacy_names_and_units() {
+        use super::MetricProvider;
+
+        let target = MetricsTargetViewEntry {
+            candidate_id: "host-1:metrics".to_string(),
+            collection_kind: "host_metrics".to_string(),
+            target_ref: "host-1:host".to_string(),
+            resource_ref: "host-1".to_string(),
+            execution_hints: Vec::new(),
+        };
+        let outcome = super::HostMetricsProvider.collect(vec![&target]);
+
+        let fact = |key: &str| {
+            outcome
+                .sample_targets
+                .first()
+                .and_then(|target| target.runtime_facts.iter().find(|fact| fact.key == key))
+                .map(|fact| fact.value.as_str())
+        };
+        let total_bytes: u64 = fact("host.memory.total_bytes")
+            .expect("total bytes")
+            .parse()
+            .unwrap();
+        let total_kb: u64 = fact("legacy.host.memory.total_kb")
+            .expect("legacy total kb")
+            .parse()
+            .unwrap();
+        assert_eq!(total_kb, total_bytes / 1024, "legacy unit must stay KiB");
+
+        let runtime = MetricsRuntimeSnapshot {
+            generated_at: "2026-04-19T00:00:00Z".to_string(),
+            total_targets: 1,
+            host_targets: 1,
+            process_targets: 0,
+            container_targets: 0,
+            outcomes: vec![outcome],
+        };
+        let samples = crate::telemetry::metrics::samples::build_samples_snapshot(&runtime);
+        let names: Vec<&str> = samples
+            .groups
+            .iter()
+            .flat_map(|group| group.samples.iter())
+            .map(|sample| sample.name.as_str())
+            .collect();
+        assert!(names.contains(&"system_load_average_1m"));
+        assert!(
+            names.contains(&"system.load_average.1m"),
+            "legacy name missing"
+        );
+        assert!(names.contains(&"system.memory.total"));
+        assert!(names.contains(&"system.filesystem.usage"));
     }
 
     /// 主机级指标每批只挂到一个目标上：多个 host 目标不得复制出重复序列。

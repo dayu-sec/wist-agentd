@@ -27,24 +27,25 @@
 
 ## 3. 工作包
 
-| ID | 仓库 | 分支 | 写范围（文件锁） | 依赖 | 规模 |
-|---|---|---|---|---|---|
-| WP0 | `wist-agentd` | `docs/metrics-spec-v1` | `docs/design/metrics-data-spec.md`、`docs/design/README.md` | — | ✅ 已合入 |
-| WP1 | `wist-metrics` | `feat/metrics-wp1-registry` | `src/spec.rs`、`src/lib.rs`（文档） | WP0 | M |
-| WP1b | `wist-agentd` | `refactor/metrics-split-runtime` | `src/telemetry/metrics/runtime.rs` → `mod host; mod process; mod container;`（**纯搬移**） | WP1 | S |
-| WP2 | `wist-agentd` | `feat/metrics-wp2-host` | `src/telemetry/metrics/host*.rs`、`Cargo.toml`（依赖版本） | WP1、WP1b | L |
-| WP3 | `wist-agentd` | `feat/metrics-wp3-normalize` | `src/telemetry/metrics/samples.rs`、`src/reporting/exporter.rs` | WP1 | L |
-| WP4 | `wist-agentd` | `feat/metrics-wp4-process-cpu` | `src/telemetry/metrics/process*.rs` | WP2 | M |
-| WP5 | `wist-agentd` | `feat/metrics-wp5-timestamp` | `src/runtime/daemon_metrics.rs`、`src/telemetry/metrics/snapshot*`（如拆出） | WP3 | S |
-| WP6 | `wist-gateway` | `feat/metrics-wp6-query` | `src/api/host_metrics.rs`、`src/api/agent_ops.rs` | WP1 | M |
-| WP7 | 三仓 | `chore/metrics-drop-legacy` | 各仓被 WP1/WP2/WP3/WP6 改过的文件 | WP2…WP6 上线 ≥ 7 天 | S |
-| WP8 | `wist-agentd` | `docs/metrics-rollout-close` | 本文、`docs/design/README.md`、各仓 `CHANGELOG.md` | WP7 | S |
+| ID | 仓库 | 分支 | 写范围（文件锁） | 依赖 | 规模 | 状态 |
+|---|---|---|---|---|---|---|
+| WP0 | `wist-agentd` | `docs/metrics-spec-v1` | `docs/design/metrics-data-spec.md`、`docs/design/README.md` | — | S | 已合入 `alpha` |
+| WP1 | `wist-metrics` | `feat/metrics-wp1-registry` | `src/spec.rs`、`src/provider.rs`（文档） | WP0 | M | 实现完成 |
+| WP1b | `wist-agentd` | `refactor/metrics-split-runtime` | `src/telemetry/metrics/runtime.rs` → `mod host; mod process; mod container;`（**纯搬移**） | WP1 | S | 未开始 |
+| WP2 | `wist-agentd` | `feat/metrics-runtime-v1` | `src/telemetry/metrics/runtime.rs`、`Cargo.toml`（依赖版本） | WP1 | L | 实现完成（Linux 主机/进程/容器；macOS 磁盘 I/O 待补） |
+| WP3 | `wist-agentd` | `feat/metrics-runtime-v1` | `src/telemetry/metrics/samples.rs`、`src/config/*`、`src/reporting/exporter.rs` | WP1 | L | 实现完成 |
+| WP4 | `wist-agentd` | `feat/metrics-runtime-v1` | `src/telemetry/metrics/runtime.rs`（进程/容器 CPU） | WP2 | M | 实现完成（Linux） |
+| WP5 | `wist-agentd` | `feat/metrics-runtime-v1` | `src/runtime/daemon_metrics.rs` | WP3 | S | 部分：时间戳已对齐；`agent_uplink_metrics_failed_total` 待补 |
+| WP6 | `wist-gateway` | `feat/metrics-wp6-query` | `src/api/host_metrics.rs`、`src/api/agent_ops.rs` | WP1 | M | 实现完成 |
+| WP7 | 三仓 | `chore/metrics-drop-legacy` | 各仓被 WP1/WP2/WP3/WP6 改过的文件 | WP2…WP6 上线 ≥ 7 天 | S | 未开始 |
+| WP8 | `wist-agentd` | `docs/metrics-rollout-close` | 本文、`docs/design/README.md`、各仓 `CHANGELOG.md` | WP7 | S | 未开始 |
 
 ### WP1 注册表 v1（`wist-metrics`）
 
 - `MetricSpec` 扩列：`name` / `unit` / `value_type` / `const_labels` / `dynamic_labels` / `semconv_ref` / `deprecated`；
 - `METRIC_SPECS` 全量换 snake_case，按规范 §10 表格逐列填写（fact_key / name / type / unit / 常量与动态 label / semconv_ref）；
-- 旧名保留并标 `deprecated`（双写期用，WP7 删除）；
+- 旧名集中放在独立的 `LEGACY_METRIC_SPECS` 表（`fact_key` 以 `legacy.` 前缀、保留旧单位），与 v1 表物理隔离，双写期结束整表删除；
+  理由：v1 表保持“只有规范名”，门禁测试不会因为混入旧拼写而放宽规则，删除时也不需要逐条摘标记。
 - 新增门禁测试：名字文法、单位后缀双向校验、单位/类型闭集、`(域, fact_key)` 与 `name` 唯一、比例取值范围。
 - 验收：`gx run lint`、`cargo test`；`gx adm v_feat` 后 `gx adm v_tag`。
 

@@ -2312,6 +2312,7 @@ async fn run_once_with_failure_cache(
                         &mut sink,
                         agent_id,
                         snapshot,
+                        &loop_ctx.config.metrics.labels,
                         &mut next_seq,
                         &global_seq_path,
                     )

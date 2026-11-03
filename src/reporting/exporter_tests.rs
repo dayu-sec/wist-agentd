@@ -231,6 +231,7 @@ fn export_metrics_writes_flattened_samples() {
         attempted_targets: 1,
         succeeded_targets: 1,
         failed_targets: 0,
+        dropped_targets: 0,
         last_error: None,
         runtime_facts: vec![],
         labeled_facts: Vec::new(),
@@ -260,12 +261,22 @@ fn export_metrics_writes_flattened_samples() {
     export_metrics(&state_dir, &source).expect("export metrics");
 
     let rows = read_jsonl(&state_dir.join("export").join("metrics.jsonl"));
-    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows.len(),
+        2,
+        "one uptime row plus the collect-targets ledger"
+    );
     assert_eq!(rows[0]["metric"]["__name__"], "system_uptime_seconds");
     assert_eq!(rows[0]["metric"]["agent"], "test-agent");
     assert_eq!(rows[0]["metric"]["instance"], "host-1");
     assert_eq!(rows[0]["values"][0], 42.0);
     assert_eq!(rows[0]["timestamps"][0], 1_776_556_800_000i64);
+
+    // 采样上限/失败记账也要落到导出文件，不得只存在于内存。
+    assert_eq!(rows[1]["metric"]["__name__"], "agent_collect_targets");
+    assert_eq!(rows[1]["metric"]["target_kind"], "host");
+    assert_eq!(rows[1]["metric"]["outcome"], "succeeded");
+    assert!(rows[1]["metric"].get("instance").is_none());
 }
 
 #[test]

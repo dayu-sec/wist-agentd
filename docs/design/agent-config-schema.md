@@ -31,6 +31,7 @@ AgentConfig {
   execution
   telemetry
   discovery
+  metrics
   log
 }
 ```
@@ -345,7 +346,37 @@ DiscoverySection {
 
 ---
 
-## 9. `log`
+## 9. `metrics`
+
+指标通道的**选择类 label**：只圈定“这台 agent 上报的数据属于谁”，不参与序列身份判定。
+
+```text
+MetricsSection {
+  labels   # 可选，BTreeMap<String, String>，最多 6 对
+}
+```
+
+```toml
+[metrics.labels]
+cluster = "kafka-prod"
+role = "broker"
+env = "prod"
+```
+
+约束（违反任一条启动失败）：
+
+- 键闭集：`app` / `env` / `cluster` / `role` / `shard` / `tier` / `region` / `zone`。
+- 值：非空、≤ 32 字符，只允许小写字母、数字、`-`、`_`、`.`。
+- `env` 只能取 `prod` / `staging` / `dev` / `test`。
+- 整段最多 6 对；`app` 只在能从本机配置/部署清单高置信度判断时填写，否则省略。
+
+这些 label 会原样贴到本 agent 上送的每条指标序列上，便于按集群 / 环境 / 用途聚合；
+它们**不进入** `(name, agent, instance, 实例 label)` 身份，因此不会和采集域 label 冲突。
+语义定稿见 [`metrics-data-spec.md`](./metrics-data-spec.md) §6。
+
+---
+
+## 10. `log`
 
 本进程**运行日志**（级别 / 格式 / 落点 / 轮转）。与 `telemetry.logs`（**被采集的日志**）不同：
 后者是 agentd 采集上送的"原料"，这里描述的是 agentd **自己**往哪里、以什么格式、记到什么级别。
@@ -375,7 +406,7 @@ LogSection {
 
 ---
 
-## 10. 当前决定
+## 11. 当前决定
 
 当前阶段固定以下结论：
 
