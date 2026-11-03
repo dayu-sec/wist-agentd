@@ -3,6 +3,13 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.22.1-alpha] - 2026-11-03
+
+### 修复
+
+- `metrics-labels show` 不再在配置里根本没有 `[metrics.labels]` 时提示“该段已废弃”
+  （只有真的写了这段才提示，否则每个默认安装都会看到一句无意义的说明）。
+
 ## [0.22.0-alpha] - 2026-11-03
 
 ### 新增

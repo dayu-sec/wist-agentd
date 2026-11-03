@@ -1209,7 +1209,7 @@ async fn run_metrics_labels(
             if crate::control::metrics_labels::has_manual(&cached) {
                 println!("(至少有一个值来自网关侧的手工覆盖；要改请到网关管理面)");
             }
-            if !cached.is_empty() && config.metrics.labels != cached.labels {
+            if !config.metrics.labels.is_empty() {
                 // 配置文件里那一段已废弃：如实说明它不生效，免得人以为改它有用。
                 println!(
                     "note: [metrics.labels] is deprecated and ignored — the values above come from the gateway"
