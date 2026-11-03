@@ -818,6 +818,68 @@ mod tests {
         assert!(checked > 0, "没有校验到任何 label（夹具没带上 label？）");
     }
 
+    /// 序列 label 不能**少**：`METRIC_SPECS` 声明的每个 `const_labels` / `dynamic_labels` 键，
+    /// 都必须真的出现在序列化后的 VM 行里，且取到夹具给的值。
+    ///
+    /// 上一条闭合断言只管「不许多」；这条管「不许少」—— 少一个键，那个维度就永远到不了读侧，
+    /// 而两侧单测都不会红。它盯的是 `build_vm_metric_lines_with` 里那张手写映射表：
+    /// 以后 spec 加一个维度而这个函数没跟着接，这里先变红（`mountpoint` 就是那么丢的，
+    /// 只是那一半丢在数据面）。
+    #[test]
+    fn every_declared_series_label_reaches_the_serialized_line() {
+        let mut checked = 0;
+        for spec in wist_metrics::spec::METRIC_SPECS {
+            if spec.const_labels.is_empty() && spec.dynamic_labels.is_empty() {
+                continue;
+            }
+            // `state` 是枚举类：取值来自事实本身（走 `normalize_state`），夹具要给合法取值。
+            let enum_state = spec.dynamic_labels.contains(&"state");
+            let mut sample_target = target("succeeded", "res-1");
+            sample_target.labeled_facts = vec![MetricsLabeledFact {
+                key: spec.fact_key.to_string(),
+                value: if enum_state { "running" } else { "1" }.to_string(),
+                labels: spec
+                    .dynamic_labels
+                    .iter()
+                    .map(|key| StringKeyValue::new(*key, "fed"))
+                    .collect(),
+            }];
+
+            let snapshot =
+                build_samples_snapshot(&snapshot(spec.collection_kind, vec![sample_target]));
+            let lines = build_vm_metric_lines_with(&snapshot, "agent-1", &BTreeMap::new());
+            let line = lines
+                .iter()
+                .find(|line| line.metric.name == spec.name)
+                .unwrap_or_else(|| panic!("{} 没有产出 VM 行", spec.name));
+            let metric = serde_json::to_value(line).expect("serialize line")["metric"].clone();
+
+            for (key, expected) in spec.const_labels {
+                assert_eq!(
+                    metric[*key].as_str(),
+                    Some(*expected),
+                    "{} 丢了常量 label {key}",
+                    spec.name
+                );
+                checked += 1;
+            }
+            for key in spec.dynamic_labels {
+                let expected = if *key == "state" { "running" } else { "fed" };
+                assert_eq!(
+                    metric[*key].as_str(),
+                    Some(expected),
+                    "{} 丢了动态 label {key}（写侧没搬），或取值被改写",
+                    spec.name
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 0,
+            "没有任何 spec 声明 label（spec 表或夹具变了？）"
+        );
+    }
+
     #[test]
     fn selection_labels_are_plain_labels_on_every_line() {
         let mut sample_target = target("succeeded", "host-1");
