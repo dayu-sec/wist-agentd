@@ -346,33 +346,27 @@ DiscoverySection {
 
 ---
 
-## 9. `metrics`
+## 9. `metrics`（已废弃）
 
-指标通道的**选择类 label**：只圈定“这台 agent 上报的数据属于谁”，不参与序列身份判定。
+> **废弃**：选择类 label 改由控制面下发，本段不再生效。为不打断旧配置，解析保留一个版本；
+> 非空时启动告警一次，下一版删除。语义与下发机制见
+> [`metrics-selection-labels.md`](./metrics-selection-labels.md) 与
+> [`metrics-data-spec.md`](./metrics-data-spec.md) §3.4。
+>
+> 下面保留原字段定义，仅供识别旧配置。
 
 ```text
 MetricsSection {
-  labels   # 可选，BTreeMap<String, String>，最多 6 对
+  labels   # 已废弃：不再校验、不再生效
 }
 ```
 
-```toml
-[metrics.labels]
-cluster = "kafka-prod"
-role = "broker"
-env = "prod"
-```
-
-约束（违反任一条启动失败）：
+约束（仅作旧字段清单，不再执行）：
 
 - 键闭集：`app` / `env` / `cluster` / `role` / `shard` / `tier` / `region` / `zone`。
 - 值：非空、≤ 32 字符，只允许小写字母、数字、`-`、`_`、`.`。
 - `env` 只能取 `prod` / `staging` / `dev` / `test`。
-- 整段最多 6 对；`app` 只在能从本机配置/部署清单高置信度判断时填写，否则省略。
-
-这些 label 会原样贴到本 agent 上送的每条指标序列上，便于按集群 / 环境 / 用途聚合；
-它们**不进入** `(name, agent, instance, 实例 label)` 身份，因此不会和采集域 label 冲突。
-语义定稿见 [`metrics-data-spec.md`](./metrics-data-spec.md) §6。
+- 整段最多 6 对。
 
 ---
 

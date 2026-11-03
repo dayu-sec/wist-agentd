@@ -184,6 +184,7 @@ agent 自身 →  不适用（自观测指标没有 instance）
 8. **不使用 `job`**：Prometheus 里 `job` 标识抓取任务，推送模型没有对应物；用途与归属由 `app` / `cluster` 表达。
 9. **校验归属**：agent 只校验“写出去的值合法”（键闭集、值文法、`env` 闭集、≤ 6 对）；`env` / `cluster` 是否齐全由控制面注册校验。
    - 理由：部署单元只有控制面知道，agent 本地拿机器名或路径猜一个 `cluster` 会让不同部署单元静默合流；缺失会在查询侧表现为 `{cluster=""}`，可见且可补。
+10. **值的来源**：全部由控制面下发，agent 不写配置。来源优先级（手工 > 推断 > 部署默认）、接口、agent 缓存与手工刷新见 [`metrics-selection-labels.md`](./metrics-selection-labels.md)。
 
 ```toml
 [metrics.labels]
