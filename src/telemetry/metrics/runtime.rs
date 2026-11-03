@@ -946,9 +946,9 @@ mod tests {
         }
     }
 
-    /// 双写期：同一读数同时产出新名与旧名，旧名保持旧单位（KiBy / percent）。
+    /// 旧名已下线：事实与样本里都不允许再出现 `legacy.*` 或点分名字。
     #[test]
-    fn host_facts_are_dual_written_with_legacy_names_and_units() {
+    fn no_legacy_facts_or_names_are_emitted() {
         use super::MetricProvider;
 
         let target = MetricsTargetViewEntry {
@@ -960,22 +960,22 @@ mod tests {
         };
         let outcome = super::HostMetricsProvider.collect(vec![&target]);
 
-        let fact = |key: &str| {
-            outcome
-                .sample_targets
-                .first()
-                .and_then(|target| target.runtime_facts.iter().find(|fact| fact.key == key))
-                .map(|fact| fact.value.as_str())
-        };
-        let total_bytes: u64 = fact("host.memory.total_bytes")
-            .expect("total bytes")
-            .parse()
-            .unwrap();
-        let total_kb: u64 = fact("legacy.host.memory.total_kb")
-            .expect("legacy total kb")
-            .parse()
-            .unwrap();
-        assert_eq!(total_kb, total_bytes / 1024, "legacy unit must stay KiB");
+        let fact_keys: Vec<&str> = outcome
+            .sample_targets
+            .iter()
+            .flat_map(|target| target.runtime_facts.iter().map(|fact| fact.key.as_str()))
+            .chain(
+                outcome
+                    .sample_targets
+                    .iter()
+                    .flat_map(|target| target.labeled_facts.iter().map(|fact| fact.key.as_str())),
+            )
+            .collect();
+        assert!(!fact_keys.is_empty());
+        assert!(
+            fact_keys.iter().all(|key| !key.starts_with("legacy.")),
+            "legacy fact emitted: {fact_keys:?}"
+        );
 
         let runtime = MetricsRuntimeSnapshot {
             generated_at: "2026-04-19T00:00:00Z".to_string(),
@@ -994,11 +994,9 @@ mod tests {
             .collect();
         assert!(names.contains(&"system_load_average_1m"));
         assert!(
-            names.contains(&"system.load_average.1m"),
-            "legacy name missing"
+            names.iter().all(|name| !name.contains('.')),
+            "legacy name emitted: {names:?}"
         );
-        assert!(names.contains(&"system.memory.total"));
-        assert!(names.contains(&"system.filesystem.usage"));
     }
 
     /// 主机级指标每批只挂到一个目标上：多个 host 目标不得复制出重复序列。

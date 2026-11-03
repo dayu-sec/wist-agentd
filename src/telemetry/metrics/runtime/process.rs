@@ -79,10 +79,6 @@ pub(super) fn collect_process_runtime_facts(
                 &mut facts,
                 StringKeyValue::new("process.memory.rss_bytes", bytes.to_string()),
             );
-            push_fact_if_absent(
-                &mut facts,
-                StringKeyValue::new("legacy.process.memory.rss_pages", rss_pages.to_string()),
-            );
         }
         if let Some((utime, stime)) = parse_linux_proc_cpu_ticks(&stat) {
             let seconds = (utime + stime) as f64 / clock_ticks();
@@ -122,10 +118,6 @@ pub(super) fn collect_process_runtime_facts(
                     "process.memory.rss_bytes",
                     kb.saturating_mul(1024).to_string(),
                 ),
-            );
-            push_fact_if_absent(
-                &mut facts,
-                StringKeyValue::new("legacy.process.memory.rss_kb", kb.to_string()),
             );
         }
         if let Some(cputime) = parts.next()

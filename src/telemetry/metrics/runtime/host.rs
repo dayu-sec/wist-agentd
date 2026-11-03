@@ -38,31 +38,18 @@ pub(super) fn collect_host_runtime_facts(
     }
 
     let loadavg = System::load_average();
-    for (key, legacy_key, value) in [
-        ("host.loadavg.1m", "legacy.host.loadavg.1m", loadavg.one),
-        ("host.loadavg.5m", "legacy.host.loadavg.5m", loadavg.five),
-        (
-            "host.loadavg.15m",
-            "legacy.host.loadavg.15m",
-            loadavg.fifteen,
-        ),
+    for (key, value) in [
+        ("host.loadavg.1m", loadavg.one),
+        ("host.loadavg.5m", loadavg.five),
+        ("host.loadavg.15m", loadavg.fifteen),
     ] {
         push_fact_if_absent(&mut facts, StringKeyValue::new(key, value.to_string()));
-        // 双写期：同一读数按旧名再发一条，老看板不用改。
-        push_fact_if_absent(
-            &mut facts,
-            StringKeyValue::new(legacy_key, value.to_string()),
-        );
     }
 
     let uptime = System::uptime();
     push_fact_if_absent(
         &mut facts,
         StringKeyValue::new("host.uptime.seconds", uptime.to_string()),
-    );
-    push_fact_if_absent(
-        &mut facts,
-        StringKeyValue::new("legacy.host.uptime.seconds", uptime.to_string()),
     );
 
     let mut system = System::new();
@@ -76,20 +63,6 @@ pub(super) fn collect_host_runtime_facts(
     push_fact_if_absent(
         &mut facts,
         StringKeyValue::new("host.memory.available_bytes", available_memory.to_string()),
-    );
-    push_fact_if_absent(
-        &mut facts,
-        StringKeyValue::new(
-            "legacy.host.memory.total_kb",
-            (total_memory / 1024).to_string(),
-        ),
-    );
-    push_fact_if_absent(
-        &mut facts,
-        StringKeyValue::new(
-            "legacy.host.memory.available_kb",
-            (available_memory / 1024).to_string(),
-        ),
     );
     // 总量未知时不发比例：算出 0% 会伪造一个「内存很空」的读数。
     if let Some(ratio) = memory_usage_ratio(total_memory, available_memory) {
@@ -207,10 +180,6 @@ pub(super) fn collect_linux_disk_usage(disks: &Disks, facts: &mut Vec<StringKeyV
             facts,
             StringKeyValue::new("host.disk.data.mounts", data_mounts.to_string()),
         );
-        push_fact_if_absent(
-            facts,
-            StringKeyValue::new("legacy.host.disk.data.mount_count", data_mounts.to_string()),
-        );
     }
 }
 
@@ -276,28 +245,6 @@ pub(super) fn push_disk_capacity_facts(
         StringKeyValue::new(
             format!("host.disk.{role}.available_bytes"),
             available.to_string(),
-        ),
-    );
-    // 双写期：旧口径（percent / KiB）。
-    push_fact_if_absent(
-        facts,
-        StringKeyValue::new(
-            format!("legacy.host.disk.{role}.usage_percent"),
-            (usage_ratio * 100.0).to_string(),
-        ),
-    );
-    push_fact_if_absent(
-        facts,
-        StringKeyValue::new(
-            format!("legacy.host.disk.{role}.total_kb"),
-            (total / 1024).to_string(),
-        ),
-    );
-    push_fact_if_absent(
-        facts,
-        StringKeyValue::new(
-            format!("legacy.host.disk.{role}.available_kb"),
-            (available / 1024).to_string(),
         ),
     );
 }
@@ -552,21 +499,6 @@ pub(super) fn filesystem_facts(
             labels: labels.clone(),
         },
     ];
-    facts.push(MetricsLabeledFact {
-        key: "legacy.host.filesystem.usage_percent".to_string(),
-        value: (usage_ratio * 100.0).to_string(),
-        labels: labels.clone(),
-    });
-    facts.push(MetricsLabeledFact {
-        key: "legacy.host.filesystem.total_kb".to_string(),
-        value: (total / 1024).to_string(),
-        labels: labels.clone(),
-    });
-    facts.push(MetricsLabeledFact {
-        key: "legacy.host.filesystem.available_kb".to_string(),
-        value: (available / 1024).to_string(),
-        labels: labels.clone(),
-    });
     if let Some((inodes, inodes_free)) = filesystem_inode_counts(mount) {
         facts.push(MetricsLabeledFact {
             key: "host.filesystem.inodes".to_string(),

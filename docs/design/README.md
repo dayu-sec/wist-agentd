@@ -25,7 +25,7 @@ wist-agentd（edge daemon）实现时最重要的设计文档。
 ## 指标采集（配合 `src/telemetry/metrics/`）
 
 - [metrics-data-spec.md](./metrics-data-spec.md) — 指标数据规范（v1 草案：命名/单位/类型/身份/选择类 label/常见系统取值/投递语义与决策记录）
-- [metrics-spec-rollout.md](./metrics-spec-rollout.md) — 上述规范的落地计划（工作包 / 分支策略 / 双写与切换 / 验收）
+- [metrics-spec-rollout.md](./metrics-spec-rollout.md) — 上述规范的落地计划（工作包 / 分支策略 / 切换策略 / 验收）
 
 ## 日志 / telemetry 采集（配合 `src/telemetry/logs/files/`）
 

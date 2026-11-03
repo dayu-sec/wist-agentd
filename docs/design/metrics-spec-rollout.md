@@ -7,7 +7,7 @@
 1. **一个工作包 = 一个分支 = 一个仓库**，不跨仓混提交。
 2. **写范围互斥**：同一时刻只有一个包改同一个文件（§3 给出文件归属表）。
 3. **先契约、后采集、再消费**：注册表是所有包的公共依赖，必须先合入并在下游锁版本。
-4. **破坏性变更按规范 §0.1**：指标名双写 7 天；label 改名不做双写（理由见 §5）。
+4. **破坏性变更按规范 §0.1**：同名不同口径不并存，采集侧与查询侧同一版本窗口直接切换。
 5. 每个包完成 = 代码 + 测试 + `CHANGELOG.md` 条目 + 文档同步。
 
 ## 2. 分支与合并
@@ -37,16 +37,15 @@
 | WP4 | `wist-agentd` | `feat/metrics-runtime-v1` | `src/telemetry/metrics/runtime/process.rs`（进程/容器 CPU） | WP2 | M | 已合入 `alpha`（`0.19.0-alpha`，Linux） |
 | WP5 | `wist-agentd` | `feat/metrics-self-obs` | `src/runtime/daemon_metrics.rs`、`src/telemetry/metrics/self_obs.rs` | WP3 | S | 已合入 `alpha`（`0.20.0-alpha`；时间戳 + 自观测指标） |
 | WP6 | `wist-gateway` | `feat/metrics-wp6-query` | `src/api/host_metrics.rs`、`src/api/agent_ops.rs` | WP1 | M | 已合入 `alpha`（`0.35.0-alpha`） |
-| WP7a | `wist-agentd` | `chore/metrics-wp7a-stop-dual-write` | `runtime/host.rs`、`runtime/process.rs`（`legacy.*` fact） | WP2…WP6 上线 ≥ 7 天 | S | 未开始 |
-| WP7b | 三仓 | `chore/metrics-drop-legacy` | 各仓被 WP1/WP2/WP3/WP6 改过的文件 | WP7a 上线 ≥ 7 天且脚本退 `0` | S | 未开始 |
+| WP7 | 三仓 | `chore/metrics-drop-legacy` | `wist-metrics/src/spec.rs`、`runtime/host.rs`、`runtime/process.rs`、`wist-gateway/src/api/host_metrics.rs` | WP2…WP6 | S | 已完成（断点式下线） |
 | WP8 | `wist-agentd` | `docs/metrics-rollout-close` | 本文、`docs/design/README.md`、各仓 `CHANGELOG.md` | WP7b | S | 未开始 |
 
 ### WP1 注册表 v1（`wist-metrics`）
 
-- `MetricSpec` 扩列：`name` / `unit` / `value_type` / `const_labels` / `dynamic_labels` / `semconv_ref` / `deprecated`；
+- `MetricSpec` 扩列：`name` / `unit` / `value_type` / `const_labels` / `dynamic_labels` / `semconv_ref`；
 - `METRIC_SPECS` 全量换 snake_case，按规范 §10 表格逐列填写（fact_key / name / type / unit / 常量与动态 label / semconv_ref）；
-- 旧名集中放在独立的 `LEGACY_METRIC_SPECS` 表（`fact_key` 以 `legacy.` 前缀、保留旧单位），与 v1 表物理隔离，双写期结束整表删除；
-  理由：v1 表保持“只有规范名”，门禁测试不会因为混入旧拼写而放宽规则，删除时也不需要逐条摘标记。
+- 注册表只保留规范名：旧名（点分写法）与 `legacy.` fact 已整体下线，`find_metric_spec` 不再回退；
+  理由：断点式切换后线上只允许一套口径，注册表里留旧名就等于留一条永远不会再被删除的分支。
 - 新增门禁测试：名字文法、单位后缀双向校验、单位/类型闭集、`(域, fact_key)` 与 `name` 唯一、比例取值范围。
 - 验收：`gx run lint`、`cargo test`；`gx adm v_feat` 后 `gx adm v_tag`。
 
@@ -81,46 +80,44 @@
 ### WP6 网关查询适配
 
 - 名称切到新规则，语义化 label（`instance` / `mountpoint` / `disk_role`）；
-- 双写期**先读新名、回退旧名**，保证看板不断；
+- 只读新名；旧名回退已删除（旧版本 agent 的旧名不再展示）；
 - `agent_ops` 的 `agent_*` 名称与单位口径同步；
 - 验收：旧数据（仅旧名）与新数据（双名）都能出图。
 
-### WP7 双写收尾
+### WP7 旧名下线（已完成）
 
-双写不能“到期一次性删”：只要 agent 还在写旧名，`7 天无新写入` 永远不会成立。收尾必须分两步：
+断点式切换：注册表删除旧名、采集侧停止产出 `legacy.*`、网关删除旧名回退，三仓同一批提交。
+不再安排双写期与观察期。
 
-| 步骤 | 内容 | 进入条件 |
-|---|---|---|
-| **WP7a 停写** | agentd 停止产出旧名 fact（`legacy.*`）；网关**保留**旧名回退，保证历史区间仍可查 | 双写已运行 ≥ 7 天 |
-| **观察期** | 每周期跑脚本；旧名不再新增 | WP7a 发布后 ≥ 7 天 |
-| **WP7b 删除** | 删除 `LEGACY_METRIC_SPECS`、网关旧名回退、文档双写说明 | 脚本退 `0` |
+下线后仍要确认两件事：
 
-判定用 [`dev/verify-metrics-legacy-drop.py`](../../dev/verify-metrics-legacy-drop.py)（只依赖 Python 3；查询依赖 MetricsQL 的 `tlast_over_time`）：
+1. **新名持续有数据**（采集与查询都正常）；
+2. **旧名不再新增**（除尚未升级的旧版本 agent）。
+
+用 [`dev/verify-metrics-legacy-drop.py`](../../dev/verify-metrics-legacy-drop.py) 检查（只依赖 Python 3；查询依赖 MetricsQL 的 `tlast_over_time`）：
 
 ```bash
-# 正式判定：窗口必须 ≥ 7d
-dev/verify-metrics-legacy-drop.py --vm-url http://vm.example:8428
+# 看窗口内是否还有旧名在写（退 0 表示已干净）
+dev/verify-metrics-legacy-drop.py --vm-url http://vm.example:8428 --window 1d --allow-short-window
 
 # 机器可读输出（CI / 发布流水线判断）
-dev/verify-metrics-legacy-drop.py --vm-url http://vm.example:8428 --json
+dev/verify-metrics-legacy-drop.py --vm-url http://vm.example:8428 --json --window 1d --allow-short-window
 
 # 改脚本本身时先跑自检（内置假 VM，覆盖三种判定）
 dev/verify-metrics-legacy-drop.py --self-test
 ```
 
-退出码：`0` 可删；`1` 仍有旧名在写（列出名字、点数、最后写入时间、还在写的 agent）；
-`2` 查询失败 / 参数错误；`3` 保留期自检不通过（窗口内连**新名**都没数据，结论不可信）。
+退出码：`0` 无旧名新增；`1` 仍有旧名在写（列出名字、点数、最后写入时间、还在写的 agent，
+据此定位漏升级的机器）；`2` 查询失败 / 参数错误；`3` 保留期自检不通过
+（窗口内连**新名**都没数据，结论不可信）。
 
 > **注意名字层次**：`legacy.*` 是 agent 内部的 `fact_key` 前缀，不会出现在 VM 里。
-> VM 里要检查的是它们规范化后的**旧指标名**（如 `system.memory.total`、
-> `process.memory.rss_kb`）。脚本按「名字含 `.` 且属于 `system.` / `process.` /
-> `container.` / `agent.` 命名空间」识别旧名——规范名不允许含 `.`，所以这个判据不依赖手写清单。
+> VM 里要检查的是它们规范化后的**旧指标名**（如 `system.memory.total`）。
+> 脚本按「名字含 `.` 且属于 `system.` / `process.` / `container.` / `agent.` 命名空间」识别旧名——
+> 规范名不允许含 `.`，所以这个判据不依赖手写清单。
 >
 > 为什么不用 `timestamp(last_over_time(...))`：MetricsQL 里它返回的是上卷时间，不是原始样本时间；
 > 要用 `tlast_over_time(...)` 才能拿到真正的最后写入时刻。
-
-分支：`chore/metrics-wp7a-stop-dual-write`（停写）、`chore/metrics-drop-legacy`（删除），
-两者都必须三仓同一批提交。
 
 ## 4. 顺序与并行
 
@@ -133,36 +130,36 @@ flowchart LR
     WP1b --> WP2[WP2 主机采集]
     WP2 --> WP4[WP4 进程/容器 CPU]
     WP3 --> WP5[WP5 时间/自观测]
-    WP2 --> WP7a[WP7a 停写]
-    WP3 --> WP7a
-    WP6 --> WP7a
-    WP7a --> WP7b[WP7b 删除]
-    WP7b --> WP8[WP8 收口]
+    WP2 --> WP7[WP7 旧名下线]
+    WP3 --> WP7
+    WP6 --> WP7
+    WP7 --> WP8[WP8 收口]
 ```
 
 - **串行**：WP1 → WP1b（两者决定后续文件边界，必须先落）。
 - **并行**：WP2 / WP3 / WP6 三条线同时开（文件互不重叠）。
 - **必须串行**：WP4 依赖 WP2（同属采集侧）；WP5 依赖 WP3。
-- WP7a 必须在 WP2/WP3/WP6 全部上线后 ≥ 7 天；WP7b 必须在 WP7a 上线后 ≥ 7 天且脚本退 `0`。
+- WP7 必须在 WP2/WP3/WP6 全部完成之后（否则会删掉还在依赖的旧名）。
 
-## 5. 双写与切换策略
+## 5. 切换策略
 
 | 变更类型 | 策略 | 理由 |
 |---|---|---|
-| 指标名（`system.memory.total` → `system_memory_total_bytes`） | 采集侧双写 7 天；网关先读新名、回退旧名 | 名称是历史连接键，双写让看板平滑迁移 |
-| 单位/数值换算（KiBy→By、percent→ratio） | 视为改名，随双写一起切 | 同名不同单位会裂序列，必须换名 |
-| label 改名（`kind`/`mount`/`target_ref` → `instance`/`mountpoint`/`disk_role`） | **不双写**，与网关同版本窗口切换 | 双写会让序列翻倍且查询双计；label 变更影响面局限在网关 API |
+| 指标名（`system.memory.total` → `system_memory_total_bytes`） | 采集侧与查询侧同一版本窗口直接切换，**不双写** | 双写让写入量翻倍、按名字求和时双计，且只是把迁移成本延后；接受历史断档后一次切干净 |
+| 单位/数值换算（KiBy→By、percent→ratio） | 随改名一起切，旧名整体删除 | 同名不同单位会裂序列，必须换名 |
+| label 改名（`kind`/`mount`/`target_ref` → `instance`/`mountpoint`/`disk_role`） | 与名字同版本窗口切换 | 两者同属查询面，分两次改让消费方付两次成本 |
 | 失败样本不上送、时间戳口径 | 直接生效 | 不改变序列身份 |
 | 选择类 label `app` 缺失 | 直接生效 | 用 `{app=""}` 可识别，无需过渡 |
 
-切换窗口内的验收口径：**同一台机器在 15 分钟内应同时能看到旧名与新名，且数值一致**；label 切换后旧名不再新增数据。
+停写后验收：**新名持续有数据，旧名不再新增**。旧版本 agent 在升级前仍会上送旧名，
+用 [`dev/verify-metrics-legacy-drop.py`](../../dev/verify-metrics-legacy-drop.py) 找出还没升级的机器。
 
 ## 6. 风险与回滚
 
 | 风险 | 触发点 | 处置 |
 |---|---|---|
-| 双写导致写入量翻倍 | WP2 上线后 VM 写放大 | 只对网关消费的名称双写，其余一次性切换 |
-| 网关读到混合口径 | label 切换窗口 | 网关同版本发布，回滚时连带 agentd 一起回滚 |
+| 旧版本 agent 仍在写旧名 | 升级未覆盖全量 | 用 `dev/verify-metrics-legacy-drop.py` 按 agent 找出漏升级的机器 |
+| 旧看板直接断线 | 断点式切换 | 已接受：旧名不再保留，看板改用新名 |
 | `app` 大面积留空 | 发现层未识别 | 用 `{app=""}` 统计比例；网关补登记，不回退到"猜一个" |
 | 采样上限更严导致丢目标 | WP3 | 先按当前上限（3）记账观察一周，再决定是否调大 |
 | `wist-metrics` 版本不一致出现两份 crate | 本地 path 联调忘记还原 | PR 前 `git diff` 检查 `[patch.crates-io]` 与依赖行 |
@@ -173,4 +170,4 @@ flowchart LR
 2. `gx run test -e debug` 通过；
 3. 新增/修改的规范条款已在 `metrics-data-spec.md` 有出处（不得出现"代码比文档多"）；
 4. `CHANGELOG.md` 有一条面向使用者的说明；
-5. 双写/切换类改动附一条验证记录（旧名与新名数值一致的时间段）。
+5. 改名/删名类改动附一条验证记录：新名持续有数据、旧名不再新增（用 `dev/verify-metrics-legacy-drop.py`）。
