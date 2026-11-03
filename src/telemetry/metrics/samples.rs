@@ -108,6 +108,11 @@ pub fn build_vm_metric_lines_with(
     agent_id: &str,
     selection: &BTreeMap<String, String>,
 ) -> Vec<VmMetricLine> {
+    // 贴标前先把选择层过一遍键闭集。`selection` 是 `#[serde(flatten)]` 的 map：
+    // 键一旦与身份 label（`agent` / `instance` / `__name__`）重名，序列里就会同时出现
+    // 两个同名键 —— JSON 允许、语义上是后者赢，等于一条配置就能**改写身份**。
+    // 正常路径上键闭集早已挡住它；这里是纵深防御（缓存文件可被手工改、网关也可能有 bug）。
+    let selection = sanitize_selection(selection);
     let timestamp_ms = timestamp_ms(&snapshot.collected_at).unwrap_or_else(now_ts_ms);
     let mut lines = Vec::new();
     for group in &snapshot.groups {
@@ -140,6 +145,26 @@ pub fn build_vm_metric_lines_with(
         }
     }
     lines
+}
+
+/// 过滤选择类 label：只保留键闭集内的，并把「与身份 label 重名」当作**安全事件**记一条。
+fn sanitize_selection(selection: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut kept = BTreeMap::new();
+    for (key, value) in selection {
+        if wist_api::metrics_labels::rules::KEYS.contains(&key.as_str()) {
+            kept.insert(key.clone(), value.clone());
+            continue;
+        }
+        if matches!(key.as_str(), "agent" | "instance" | "__name__") {
+            log::warn!(
+                "event=MetricsSelectionLabelRejected key={key} reason=identity_collision \
+                 detail=\"选择类 label 不得覆盖身份 label，已丢弃\""
+            );
+        } else {
+            log::debug!("event=MetricsSelectionLabelRejected key={key} reason=not_in_closed_set");
+        }
+    }
+    kept
 }
 
 fn timestamp_ms(collected_at: &str) -> Option<i64> {
@@ -738,6 +763,51 @@ mod tests {
         assert_eq!(json["metric"]["cluster"], "kafka-prod");
         // 选择类 label 不是身份的一部分：`instance` 仍是目标身份。
         assert_eq!(json["metric"]["instance"], "host-1");
+    }
+
+    #[test]
+    fn selection_labels_never_clobber_identity_labels() {
+        // `selection` 是 `#[serde(flatten)]` 的 map：键一旦与身份 label 重名，
+        // 序列里会出现**两个同名键**（JSON 允许、语义上却是最后一个赢），
+        // 于是 `agent` / `instance` 会被一条配置意外改写 —— 那是身份串台。
+        // 正常情况下文本层被键闭集挡住了，这里验的是「即使塞进来也不会赢」。
+        let mut sample_target = target("succeeded", "host-1");
+        sample_target.runtime_facts = vec![StringKeyValue::new("host.loadavg.1m", "0.25")];
+        let snapshot = build_samples_snapshot(&snapshot("host_metrics", vec![sample_target]));
+        let selection = BTreeMap::from([
+            ("env".to_string(), "prod".to_string()),
+            // 不该出现（键闭集里没有它们），但别让它们悄悄生效。
+            ("agent".to_string(), "spoofed".to_string()),
+            ("instance".to_string(), "spoofed".to_string()),
+        ]);
+
+        let lines = build_vm_metric_lines_with(&snapshot, "agent-1", &selection);
+        let json = serde_json::to_value(&lines[0]).expect("serialize line");
+        assert_eq!(json["metric"]["env"], "prod");
+        // 身份仍是参数给的，不是 selection 里那条。
+        assert_eq!(json["metric"]["agent"], "agent-1");
+        assert_eq!(json["metric"]["instance"], "host-1");
+    }
+
+    #[test]
+    fn unknown_selection_keys_are_dropped_before_the_wire() {
+        // 规范 §12.2：样本 label 键 ⊆ 闭集，未登记键必须被丢弃。
+        // 这条防线在 agent 侧也要有：缓存文件是本地可写的。
+        let mut sample_target = target("succeeded", "host-1");
+        sample_target.runtime_facts = vec![StringKeyValue::new("host.loadavg.1m", "0.25")];
+        let snapshot = build_samples_snapshot(&snapshot("host_metrics", vec![sample_target]));
+        let selection = BTreeMap::from([
+            ("env".to_string(), "prod".to_string()),
+            ("service".to_string(), "kafka".to_string()),
+        ]);
+
+        let lines = build_vm_metric_lines_with(&snapshot, "agent-1", &selection);
+        let json = serde_json::to_value(&lines[0]).expect("serialize line");
+        assert_eq!(json["metric"]["env"], "prod");
+        assert!(
+            json["metric"].get("service").is_none(),
+            "未登记的键不能出现在样本 label 上：{json}"
+        );
     }
 
     #[test]

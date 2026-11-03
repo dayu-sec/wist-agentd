@@ -271,6 +271,75 @@ pub fn has_manual(labels: &CachedMetricsLabels) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::agent_config::{
+        AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, PathsSection,
+    };
+
+    /// 一个只回一次响应的假网关：读到请求头 + body 后按给定状态码/正文回。
+    ///
+    /// 为什么不用真实网关：这条路径要验的是**agent 侧**的契约（请求形状 / 整包拒收 /
+    /// 缓存保留），拿一个真实网关会把失败面摊薄成集成问题。
+    async fn mock_gateway(status: u16, body: String) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 8192];
+            let read = tokio::io::AsyncReadExt::read(&mut socket, &mut buf)
+                .await
+                .expect("read");
+            let request = String::from_utf8_lossy(&buf[..read]).to_string();
+            let reason = if status == 200 { "OK" } else { "ERR" };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes())
+                .await
+                .expect("write");
+            request
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn config_for(endpoint: &str, state_dir: &Path) -> AgentConfig {
+        let mut config = AgentConfig::new(
+            AgentSection {
+                agent_id: Some("agent-1".to_string()),
+                environment_id: None,
+                instance_name: Some("inst-1".to_string()),
+            },
+            ControlPlaneSection {
+                enabled: true,
+                endpoint: Some(endpoint.to_string()),
+                tls_mode: Some("http".to_string()),
+                ..ControlPlaneSection::default()
+            },
+            PathsSection {
+                state_dir: state_dir.display().to_string(),
+                ..PathsSection::default()
+            },
+            ExecutionSection::default(),
+        );
+        config.control_plane.credential_id = None;
+        config
+    }
+
+    async fn state_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wist-metrics-labels-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("state dir");
+        dir
+    }
 
     fn cache(pairs: &[(&str, &str)]) -> CachedMetricsLabels {
         CachedMetricsLabels {
@@ -366,5 +435,156 @@ mod tests {
             config.metrics.labels,
             BTreeMap::from([("env".to_string(), "prod".to_string())])
         );
+    }
+
+    #[tokio::test]
+    async fn a_valid_response_is_applied_and_cached() {
+        let dir = state_dir("apply").await;
+        let body = r#"{"api_version":"v1","kind":"agent_metrics_labels","agent_id":"agent-1",
+            "revision":7,"labels":{"env":"prod","cluster":"kafka-prod","app":"kafka"},
+            "sources":{"env":"default","cluster":"default","app":"inferred"},
+            "updated_at":"2026-11-03T00:00:00Z"}"#;
+        let (endpoint, server) = mock_gateway(200, body.to_string()).await;
+
+        let config = config_for(&endpoint, &dir);
+        let outcome = refresh(&config, &dir, &CachedMetricsLabels::default()).await;
+        assert_eq!(outcome, RefreshOutcome::Updated);
+        assert_eq!(outcome.as_str(), "updated");
+
+        // 请求形状：这是与网关的契约（路径 + 两个身份字段都在请求体里）。
+        let request = server.await.expect("server");
+        assert!(
+            request.starts_with("POST /api/v1/agent/metrics-labels:poll "),
+            "{request}"
+        );
+        assert!(request.contains("\"agent_id\":\"agent-1\""), "{request}");
+        assert!(request.contains("\"instance_id\":\"inst-1\""), "{request}");
+
+        // 缓存已落盘，且与响应一致。
+        let cached = load(&dir);
+        assert_eq!(cached.revision, 7);
+        assert_eq!(cached.labels.get("app").map(String::as_str), Some("kafka"));
+        assert_eq!(
+            cached.sources.get("app").map(String::as_str),
+            Some("inferred")
+        );
+        assert!(!has_manual(&cached), "全是网关默认值，没有人手工覆盖");
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_response_does_not_rewrite_the_cache() {
+        let dir = state_dir("unchanged").await;
+        let previous = cache(&[("env", "prod")]);
+        let body = r#"{"api_version":"v1","kind":"agent_metrics_labels","agent_id":"agent-1",
+            "revision":3,"labels":{"env":"prod"},"sources":{"env":"default"},"updated_at":"t"}"#;
+        let (endpoint, server) = mock_gateway(200, body.to_string()).await;
+
+        let config = config_for(&endpoint, &dir);
+        let outcome = refresh(&config, &dir, &previous).await;
+        let _ = server.await;
+        // revision 与内容都没变 → 不重写文件（避免每 5 分钟一次无意义写盘）。
+        assert_eq!(outcome, RefreshOutcome::Unchanged);
+        assert!(!path_for(&dir).exists(), "内容没变就不该留下缓存文件");
+    }
+
+    #[tokio::test]
+    async fn an_illegal_response_is_rejected_as_a_whole_and_the_cache_survives() {
+        let dir = state_dir("illegal").await;
+        // 一个越界的值就够了：整包拒收，而不是贴一半（半套 label 会让序列按一半维度分段）。
+        let body = r#"{"api_version":"v1","kind":"agent_metrics_labels","agent_id":"agent-1",
+            "revision":9,"labels":{"env":"Prod"},"sources":{},"updated_at":"t"}"#;
+        let (endpoint, server) = mock_gateway(200, body.to_string()).await;
+
+        let config = config_for(&endpoint, &dir);
+        let outcome = refresh(&config, &dir, &cache(&[("env", "prod")])).await;
+        let _ = server.await;
+        match outcome {
+            RefreshOutcome::Failed(detail) => assert!(
+                detail.contains("invalid_metric_label_value"),
+                "失败原因要带稳定码：{detail}"
+            ),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(!path_for(&dir).exists(), "非法响应不能落盘");
+    }
+
+    #[tokio::test]
+    async fn a_response_for_another_agent_is_rejected() {
+        // 防串台：网关若回错人（缓存/代理串了），把这台机器标成别人的用途是最坏的结果。
+        let dir = state_dir("wrong-agent").await;
+        let body = r#"{"api_version":"v1","kind":"agent_metrics_labels","agent_id":"agent-2",
+            "revision":1,"labels":{"app":"kafka"},"sources":{},"updated_at":"t"}"#;
+        let (endpoint, server) = mock_gateway(200, body.to_string()).await;
+        let config = config_for(&endpoint, &dir);
+        let outcome = refresh(&config, &dir, &CachedMetricsLabels::default()).await;
+        let _ = server.await;
+        assert!(matches!(outcome, RefreshOutcome::Failed(_)), "{outcome:?}");
+        assert!(!path_for(&dir).exists());
+    }
+
+    #[tokio::test]
+    async fn an_old_gateway_without_the_endpoint_counts_as_no_change() {
+        // 旧网关没有这个端点：等同「这个部署还没有选择类 label」，
+        // 不能算失败（否则每 5 分钟一条告警）。
+        let dir = state_dir("old-gateway").await;
+        let (endpoint, server) = mock_gateway(404, "{}".to_string()).await;
+        let config = config_for(&endpoint, &dir);
+        let outcome = refresh(&config, &dir, &CachedMetricsLabels::default()).await;
+        let _ = server.await;
+        assert_eq!(outcome, RefreshOutcome::Unchanged);
+    }
+
+    #[tokio::test]
+    async fn an_empty_label_set_is_applied_as_a_real_change() {
+        // 网关把值清空（例如运维删掉了部署默认）→ 必须真的把缓存清空，
+        // 否则指标会一直带着已经不存在的 label。
+        let dir = state_dir("cleared").await;
+        let body = r#"{"api_version":"v1","kind":"agent_metrics_labels","agent_id":"agent-1",
+            "revision":4,"labels":{},"updated_at":"t"}"#;
+        let (endpoint, server) = mock_gateway(200, body.to_string()).await;
+        let config = config_for(&endpoint, &dir);
+        let outcome = refresh(&config, &dir, &cache(&[("env", "prod")])).await;
+        let _ = server.await;
+        assert_eq!(outcome, RefreshOutcome::Updated);
+        assert!(load(&dir).labels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_lower_revision_with_different_content_still_wins() {
+        // 版本号只是提示：网关库回滚/重建后 revision 会变小，内容才是事实。
+        // 只比版本会让这台机器永远停在「更大的那一版」上。
+        let dir = state_dir("lower-rev").await;
+        let body = r#"{"api_version":"v1","kind":"agent_metrics_labels","agent_id":"agent-1",
+            "revision":2,"labels":{"app":"redis"},"sources":{},"updated_at":"t"}"#;
+        let (endpoint, server) = mock_gateway(200, body.to_string()).await;
+        let config = config_for(&endpoint, &dir);
+        let previous = CachedMetricsLabels {
+            revision: 9,
+            labels: [("app".to_string(), "kafka".to_string())]
+                .into_iter()
+                .collect(),
+            ..CachedMetricsLabels::default()
+        };
+        let outcome = refresh(&config, &dir, &previous).await;
+        let _ = server.await;
+        assert_eq!(outcome, RefreshOutcome::Updated);
+        assert_eq!(
+            load(&dir).labels.get("app").map(String::as_str),
+            Some("redis")
+        );
+    }
+
+    #[tokio::test]
+    async fn without_an_endpoint_or_identity_the_fetch_fails_instead_of_panicking() {
+        let dir = state_dir("unconfigured").await;
+        let mut config = config_for("http://127.0.0.1:1", &dir);
+        config.agent.agent_id = None;
+        let outcome = refresh(&config, &dir, &CachedMetricsLabels::default()).await;
+        assert!(matches!(outcome, RefreshOutcome::Failed(_)), "{outcome:?}");
+
+        let mut config = config_for("http://127.0.0.1:1", &dir);
+        config.control_plane.endpoint = None;
+        let outcome = refresh(&config, &dir, &CachedMetricsLabels::default()).await;
+        assert!(matches!(outcome, RefreshOutcome::Failed(_)), "{outcome:?}");
     }
 }

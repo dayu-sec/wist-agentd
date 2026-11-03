@@ -7017,6 +7017,29 @@ mod source_refresh_tests {
     }
 
     #[test]
+    fn the_two_explicit_only_sources_are_accepted_by_the_daemon() {
+        // `uplink` / `credentials` 不进 `--all`，但被点名时**必须执行** ——
+        // 否则「只能显式指定」就变成了「永远刷不了」。
+        let now = now_ts_ms();
+        let interval = Duration::from_secs(60);
+        for what in ["uplink", "credentials"] {
+            let params = format!(r#"{{"what":["{what}"]}}"#);
+            match evaluate_command(
+                &sample("c-explicit", command_kind::REFRESH, &params, now),
+                false,
+                None,
+                interval,
+                now,
+            ) {
+                CommandVerdict::AcceptRefreshSources(sources) => {
+                    assert_eq!(sources, vec![what.to_string()])
+                }
+                other => panic!("{what}: expected AcceptRefreshSources, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn source_refresh_verdict_fails_the_whole_command_when_one_source_fails() {
         let requested = vec!["work".to_string(), "policies".to_string()];
         let (outcome, detail) = source_refresh_verdict(

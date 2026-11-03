@@ -678,3 +678,48 @@ container_enabled = false
     assert!(!config.discovery.container_enabled);
     assert_eq!(fs::read_to_string(&path).expect("read config"), text);
 }
+
+#[test]
+fn a_legacy_metrics_labels_section_still_loads_but_never_reaches_the_wire() {
+    // `[metrics.labels]` 已废弃：**必须还能解析**（否则旧 toml 升上来就起不来）。
+    // 但值不再生效 —— 运行时快照会被网关缓存整体替换。
+    let root = temp_dir("legacy-metrics-labels");
+    let config_path = root.join("agentd.toml");
+    fs::write(
+        &config_path,
+        r#"
+schema_version = "v1"
+
+[metrics.labels]
+app = "kafka"
+env = "prod"
+cluster = "kafka-prod"
+
+[telemetry.logs]
+spool_dir = "state/spool/logs"
+output = { kind = "file" }
+"#,
+    )
+    .expect("write config");
+
+    let mut config = load_from_path(&config_path).expect("旧配置必须还能启动");
+    // 解析保留（便于诊断「你配了但没生效」），且**不再校验**：值非法也照收。
+    assert_eq!(config.metrics.labels.len(), 3);
+
+    // 运行时用网关给的那份**整体替换**（不是合并）。
+    let cached = crate::control::metrics_labels::CachedMetricsLabels {
+        revision: 4,
+        labels: [("env".to_string(), "dev".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    crate::control::metrics_labels::apply(&mut config, &cached);
+    assert_eq!(
+        config.metrics.labels,
+        [("env".to_string(), "dev".to_string())]
+            .into_iter()
+            .collect(),
+        "本机配置里的 app/cluster 不得残留到指标上"
+    );
+}

@@ -3,6 +3,22 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.23.2-alpha] - 2026-11-03
+
+### 修复（label 机制专项 review）
+
+- **选择类 label 不得覆盖身份 label**：`selection` 是 `#[serde(flatten)]` 的 map，
+  键一旦与 `agent` / `instance` / `__name__` 重名，序列里会出现两个同名键、后者赢 ——
+  等于一份（可本地改写的）缓存文件就能改写身份。现在贴标前按**键闭集**过滤，
+  与身份重名的情况记一条 `MetricsSelectionLabelRejected` 事件；未登记的键一并丢弃（规范 §12.2）。
+- 依赖 `wist-api 0.10.4`（新增 `validate_shape`，写路径逐键校验用）。
+
+### 测试
+
+- 新增 10 条用例：拉取/落盘/缓存不重写、整包拒收（值越界）、串台（回的是别的 agent）、
+  旧网关 404、清空值、revision 回退但内容变了、未配置端点/身份、身份 label 不被覆盖、
+  未登记键被丢弃、`uplink`/`credentials` 显式刷新可用、旧 `[metrics.labels]` 仍能解析。
+
 ## [0.23.1-alpha] - 2026-11-03
 
 ### 修复
