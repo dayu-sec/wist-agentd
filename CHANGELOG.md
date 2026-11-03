@@ -3,10 +3,12 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [0.21.1-alpha] - 2026-11-03
+## [0.21.2-alpha] - 2026-11-03
 
 ### 修复
 
+- **Linux 制品恢复构建**：进程采集补上缺失的 `std::fs` 导入。该分支在 macOS 上被 `cfg` 掉，
+  导致 0.20.0 起 Linux/musl 制品构建失败。
 - **整数指标不再写成小数**：目标计数、上送失败累计这类整数指标（`*_i64` / `counter_i64`）
   在线上保持 JSON 整数（`2` 而不是 `2.0`）。避免下游丢掉类型信息，也避免超大计数器丢精度。
 
