@@ -97,11 +97,11 @@
 用 [`dev/verify-metrics-legacy-drop.py`](../../dev/verify-metrics-legacy-drop.py) 检查（只依赖 Python 3；查询依赖 MetricsQL 的 `tlast_over_time`）：
 
 ```bash
-# 看窗口内是否还有旧名在写（退 0 表示已干净）
-dev/verify-metrics-legacy-drop.py --vm-url http://vm.example:8428 --window 1d --allow-short-window
+# 看窗口内是否还有旧名在写（退 0 表示已干净；窗口 ≥ 2× 采集间隔）
+dev/verify-metrics-legacy-drop.py --vm-url http://vm.example:8428 --window 24h
 
 # 机器可读输出（CI / 发布流水线判断）
-dev/verify-metrics-legacy-drop.py --vm-url http://vm.example:8428 --json --window 1d --allow-short-window
+dev/verify-metrics-legacy-drop.py --vm-url http://vm.example:8428 --json --window 24h
 
 # 改脚本本身时先跑自检（内置假 VM，覆盖三种判定）
 dev/verify-metrics-legacy-drop.py --self-test

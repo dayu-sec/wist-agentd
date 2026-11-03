@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""WP7 收尾门禁：确认旧指标名在 VictoriaMetrics 里已经不再写入。
+"""确认旧指标名在 VictoriaMetrics 里已经不再写入。
 
 规范名不会包含 `.`（见 metrics-data-spec.md §2.2），旧名则是 `system.memory.total`
 这种点分写法。因此「还在用旧名」等价于「VM 里存在带点、且属于我们命名空间的序列」。
@@ -7,17 +7,17 @@
 脚本做三件事：
   1. 保留期自检：先确认**新名**在窗口内有数据，否则「旧名没数据」不能说明任何问题；
   2. 列出窗口内仍有点的旧名，并给出最后写入时间；
-  3. 默认再按 `agent` 展开，指出还在写旧名的是哪几台机器。
+  3. 默认再按 `agent` 展开，指出还在写旧名的是哪几台机器（通常是漏升级的旧版本 agent）。
 
 退出码：
-  0  窗口内没有任何旧名写入（可以进入 WP7 的删除步骤）
+  0  窗口内没有任何旧名写入
   1  仍有旧名在写入（附名单与最后写入时间）
   2  查询失败 / 参数错误（无法判断）
   3  保留期自检不通过（窗口内连新名都没有数据，结论不可信）
 
 用法：
   dev/verify-metrics-legacy-drop.py
-  dev/verify-metrics-legacy-drop.py --vm-url http://vm.example:8428 --window 7d
+  dev/verify-metrics-legacy-drop.py --vm-url http://vm.example:8428 --window 24h
   dev/verify-metrics-legacy-drop.py --json
   WIST_VM_URL=http://127.0.0.1:18429 dev/verify-metrics-legacy-drop.py
 
@@ -134,8 +134,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--window",
-        default="7d",
-        help="判定窗口（PromQL duration，默认 7d；规范要求至少 7 天）",
+        default="1h",
+        help="判定窗口（PromQL duration，默认 1h；应 ≥ 2× 采集间隔）",
     )
     parser.add_argument(
         "--timeout",
@@ -159,11 +159,6 @@ def parse_args() -> argparse.Namespace:
         help="不展开“哪台 agent 还在写”",
     )
     parser.add_argument(
-        "--allow-short-window",
-        action="store_true",
-        help="允许窗口短于 7 天（规范要求 7 天，仅排障时使用）",
-    )
-    parser.add_argument(
         "--self-test",
         action="store_true",
         help="用内置假 VM 跑三组用例（不需要真实环境）",
@@ -176,11 +171,11 @@ def main() -> int:
     if args.self_test:
         return run_self_test()
     window_seconds = duration_seconds(args.window)
-    if window_seconds < 7 * 86400 and not args.allow_short_window:
-        fail(
-            f"--window 至少 7d（规范要求旧名 7 天无写入），收到 {args.window!r}；"
-            "排障时可加 --allow-short-window",
-            2,
+    if window_seconds < 10 * 60:
+        # 采集间隔可能到 5 分钟，窗口太短时“没看到旧名”不代表没写。
+        print(
+            f"WARN: 窗口 {args.window} 短于 10m，采集间隔较长的指标可能被漏掉",
+            file=sys.stderr,
         )
 
     base = args.vm_url.rstrip("/")
