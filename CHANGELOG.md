@@ -3,6 +3,21 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.21.0-alpha] - 2026-11-03
+
+### 变更（不兼容）
+
+- **旧指标名停止上送**：不再产出 `system.memory.total`、`system.disk.usage`、
+  `process.memory.rss_kb` 这类点分旧名，只保留规范名。旧看板需改用新名；
+  旧名的历史曲线不再新增数据。
+- 依赖 `wist-metrics 0.7`（注册表不再包含旧名）。
+
+### 升级提示
+
+- 新旧名不再并存，网关与 agentd 应在同一个版本窗口内升级。
+- 未升级的旧版 agent 仍会上送旧名，可用
+  `dev/verify-metrics-legacy-drop.py` 按 agent 找出它们。
+
 ## [0.20.1-alpha] - 2026-11-03
 
 ### 修复
