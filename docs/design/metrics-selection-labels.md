@@ -96,6 +96,21 @@ DELETE /api/v1/admin/agents/{agent_id}/metrics-labels   # 清除手工覆盖
 - `PUT` 写前校验，非法直接 400；成功后 `revision += 1` 并给该 agent 排一条
   `refresh`（`what=["metrics-labels"]`）命令，下一次状态上报即送达（≤3s）。
 - 每 agent 的手工覆盖可单独清除，清除后回落到推断 / 部署默认。
+- **手工补发刷新（P4，待实现）**：
+
+```http
+POST /api/v1/admin/agents/{agent_id}/refresh
+{"what":["metrics-labels"]}
+200 {"command_id":"…","agent_id":"…","kind":"refresh","requested_at":"…"}   # 与 fact-refresh 同形状
+```
+
+  - **复用通用 `refresh` 命令面，不为 label 单开端点**（`command_kind::REFRESH` + `RefreshParams`）：
+    agent 能刷新的来源是一个闭集（`refresh_what::ALL`），运维在命令台账里读到的值必须能直接抄回
+    CLI 的 `--only`；再开一个 `metrics-labels:refresh` 就成了第二套词。
+  - `what` 必填，每项必须在 `refresh_what::ALL` 内；空表报 400 —— 不能让一个请求"什么都不说
+    就刷一堆"。
+  - 与写入路径的关系：`PUT` / `DELETE` **已经自动**排刷新，这个端点只是"重发一次"，用于
+    "改了但 agent 没拿到"的排障，不是正常生效路径。
 
 ## 4. agent 侧
 
@@ -148,6 +163,17 @@ wist-agentd metrics-labels show|refresh|clear-cache
 `metrics-labels clear-cache` 只删本机缓存文件；**运行中的守护进程内存里那份要到重启或下一次
 拉取才变**（下一次拉取会重新写回同一份值），所以它的用途是「让下次启动从干净状态开始」。
 
+### 5.1 从网页触发（P4，待实现）
+
+同一套词表也要能从管理面用，否则运维只能在 agentd 那台机器上敲 CLI：
+
+- **入口位置**：主机 → 指标标签页的「重新下发」，固定发 `what=["metrics-labels"]`。
+- **错误口径**：400 显示稳定原因码（`unknown_refresh_source` / `empty_refresh_what`）；
+  429 走既有的限流倒计时；未知 agent 404 与读写接口一致。
+- **不做的**：`uplink` / `credentials` 不给页面入口 —— 它们直接影响「发不发、发到哪」与凭据，
+  误点代价比少一个按钮大；两者只留 CLI。
+- **不做「等 ack」轮询**：命令台账页已经能看结果，标签页轮询只会多一份状态源。
+
 ## 6. 生效与断档
 
 选择类 label 的值变化会**断开序列**（规范 §3.4 / §9）。因此：
@@ -170,7 +196,9 @@ agentd 配置中的 `[metrics.labels]` **停止生效**，但保留解析一个�
 |---|---|---|
 | P1 | 网关接口 + 部署默认（`env`/`cluster`）+ 手工覆盖；agent 拉取 / 缓存 / 三个子命令；`refresh` 命令面；`[metrics.labels]` 废弃 | 无 |
 | P2 | 注册表 + `app` / `role` 推断（**已完成**：systemd 单元 / 容器名）；launchd label 与容器镜像名待补 | agentd 发现层 |
-| P3 | 批量编辑 / 管理页面 | 网关前端 |
+| P3 | 管理页面：单机逐键编辑（`/agents/:agentId/labels`）(**已完成**) | 网关前端 |
+| P4 | 手工刷新入口：`POST /api/v1/admin/agents/{id}/refresh` + 标签页「重新下发」（见 §10） | 网关 + 前端 |
+| P5 | 批量编辑 / 批量下发（一组机器一次改同一个键） | 网关前端 |
 
 P1 期间 `app` 留空是符合规范的（`{app=""}` 可查）。P2 起 `app` 由注册表推断；
 **macOS 与未登记的系统仍然留空** —— 那不是缺陷，是「判不出就不写」。
@@ -187,4 +215,43 @@ P1 期间 `app` 留空是符合规范的（`{app=""}` 可查）。P2 起 `app` �
 8. Linux 上跑 `kafka@broker-1.service`：`metrics-labels show` 能看到 `app=kafka`、
    `role=broker`，来源均为 `inferred`；
 9. 同一台机器同时跑 kafka 与 postgres（都已登记）：`app` 留空，`env` / `cluster` 照常；
-10. 在注册表里补登记一个新的 unit 名后，**不重启网关**，5 分钟内该机器的 `app` 出现。
+10. 在注册表里补登记一个新的 unit 名后，**不重启网关**，5 分钟内该机器的 `app` 出现；
+11. 标签页点「重新下发」后，命令台账出现一条 `refresh` / `["metrics-labels"]`，≤3s 该 agent 重新拉取；
+12. `POST …/refresh` 带 `what:[]` 或 `what:["bogus"]` → 400，且**不排任何命令**。
+
+## 10. P4 任务清单（手工刷新入口）
+
+目标：把已经存在的 `refresh` 命令面接到管理面与页面上，**不新增第二套刷新语义**。
+
+### 10.1 先确认的边界
+
+| 问题 | 结论 | 理由 |
+|---|---|---|
+| 是否为 label 单开 `metrics-labels:refresh`？ | 否 | 一个闭集、一套词；台账里的值要能直接抄回 `--only` |
+| 是否允许 `what: []`？ | 否（400） | 空表会被 agent 当"无效参数"，而页面会把它渲染成"刷新成功" |
+| 是否让页面等 ack？ | 否 | 台账页已有结果；两处状态源必然漂移 |
+| 是否给 `uplink` / `credentials` 入口？ | 否 | 直接影响发送目标与凭据，误点代价大 |
+
+### 10.2 wist-gateway
+
+- [ ] `POST /api/v1/admin/agents/{agent_id}/refresh`，body `{"what":["metrics-labels"]}`
+- [ ] 鉴权与 429 沿用 `require_admin_bearer`；未知 agent → 404（与 metrics-labels 三接口一致）
+- [ ] 校验：`what` 非空、逐项 ∈ `refresh_what::ALL`；失败给稳定原因码（`empty_refresh_what` /
+      `unknown_refresh_source`）
+- [ ] 排 `kind = command_kind::REFRESH`，`params = serde_json(RefreshParams{ what })`
+- [ ] 响应与 `fact-refresh` 同形状（命令回执），便于前端复用现有渲染
+- [ ] 测试：正常排单 / 空表 400 且未排单 / 未知来源 400 / 未知 agent 404 / 连按两次 = 两条命令
+- [ ] `wist-design/doc/design/foundation/api-seam-inventory.md` 补这条 seam
+
+### 10.3 wist-gateway-web
+
+- [ ] `src/api/admin.ts`：`dispatchAgentRefresh(agentId, what)` + 归一化（缺 `command_id` 即抛错）
+- [ ] `src/hooks`：`useAgentRefresh(agentId)`；成功后只回填提示，不轮询
+- [ ] 标签页生效表旁「重新下发」：固定 `what=["metrics-labels"]`，成功后提示「已排队，≤3s 送达」
+- [ ] 失败：400 显示原因码，429 走 `RateLimitNotice`
+- [ ] 测试：contract（路径 / 方法 / body / 400 原因码 / 429 退避）
+
+### 10.4 验收
+
+见 §9 第 11、12 条；另外确认命令台账里这一条与 CLI `refresh --only metrics-labels`
+产生的是**同一种命令**（kind 与 params 逐字一致）。
