@@ -182,11 +182,16 @@ pub(crate) async fn refresh(
     state_dir: &Path,
     previous: &CachedMetricsLabels,
 ) -> RefreshOutcome {
+    // 未配置 / 未入网 = 「这台机器现在没有选择类 label」，不是故障。
+    // 报 `failed` 会让一台长期脱管的机器每 5 分钟打一条告警，而它没有任何可修的东西
+    // （与 `fetch_work_grant` / `fetch_uplink_grant` 同一取舍：拿不到就不吭声）。
     let Some(endpoint) = config.control_plane.endpoint.as_deref() else {
-        return RefreshOutcome::Failed("control_plane.endpoint 未配置".to_string());
+        log::debug!("metrics labels: control_plane.endpoint is not configured; skipping");
+        return RefreshOutcome::Unchanged;
     };
     let Some(agent_id) = config.agent.agent_id.as_deref() else {
-        return RefreshOutcome::Failed("agent_id 未配置（尚未入网）".to_string());
+        log::debug!("metrics labels: agent is not enrolled yet; skipping");
+        return RefreshOutcome::Unchanged;
     };
     let instance_id = config.agent.instance_name.as_deref().unwrap_or_default();
     let client = match enrollment_http_client(config) {
@@ -236,7 +241,10 @@ pub(crate) async fn refresh(
         sources: returned.sources,
         fetched_at: now_rfc3339(),
     };
-    if next.labels == previous.labels && next.revision == previous.revision {
+    // 判「变没变」只看**生效值**，不看 `revision`：管理员把同一个值再写一次会让版本 +1，
+    // 但指标上的序列一点没变 —— 把它算成 `updated` 会让命令台账与日志充满假变更
+    // （运维据此以为“改上了”，其实改的是同一个值）。
+    if next.labels == previous.labels {
         return RefreshOutcome::Unchanged;
     }
     if let Err(err) = write_json_atomic_async(&path_for(state_dir), &next).await {
@@ -550,6 +558,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_revision_bump_with_identical_labels_is_not_an_update() {
+        // 同一个值被再写一次：版本会 +1，但生效值没变 —— 不该报 `updated`，
+        // 也不该重写缓存（每 5 分钟白写一次盘）。
+        let dir = state_dir("same-value").await;
+        let body = r#"{"api_version":"v1","kind":"agent_metrics_labels","agent_id":"agent-1",
+            "revision":8,"labels":{"env":"prod"},"sources":{"env":"default"},"updated_at":"t"}"#;
+        let (endpoint, server) = mock_gateway(200, body.to_string()).await;
+        let config = config_for(&endpoint, &dir);
+        let previous = CachedMetricsLabels {
+            revision: 3,
+            labels: [("env".to_string(), "prod".to_string())]
+                .into_iter()
+                .collect(),
+            ..CachedMetricsLabels::default()
+        };
+        let outcome = refresh(&config, &dir, &previous).await;
+        let _ = server.await;
+        assert_eq!(outcome, RefreshOutcome::Unchanged);
+        assert!(!path_for(&dir).exists(), "值没变就不写盘");
+    }
+
+    #[tokio::test]
     async fn a_lower_revision_with_different_content_still_wins() {
         // 版本号只是提示：网关库回滚/重建后 revision 会变小，内容才是事实。
         // 只比版本会让这台机器永远停在「更大的那一版」上。
@@ -575,16 +605,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn without_an_endpoint_or_identity_the_fetch_fails_instead_of_panicking() {
+    async fn an_unconfigured_agent_is_not_a_failure() {
+        // 未入网 / 没配控制面 = 没有选择类 label，**不是故障**：报 failed 会让一台长期脱管的
+        // 机器每 5 分钟打一条告警，而它没有任何可修的东西。
         let dir = state_dir("unconfigured").await;
         let mut config = config_for("http://127.0.0.1:1", &dir);
         config.agent.agent_id = None;
         let outcome = refresh(&config, &dir, &CachedMetricsLabels::default()).await;
-        assert!(matches!(outcome, RefreshOutcome::Failed(_)), "{outcome:?}");
+        assert_eq!(outcome, RefreshOutcome::Unchanged);
 
         let mut config = config_for("http://127.0.0.1:1", &dir);
         config.control_plane.endpoint = None;
         let outcome = refresh(&config, &dir, &CachedMetricsLabels::default()).await;
-        assert!(matches!(outcome, RefreshOutcome::Failed(_)), "{outcome:?}");
+        assert_eq!(outcome, RefreshOutcome::Unchanged);
+        assert!(!path_for(&dir).exists(), "没拉到东西就不该写缓存");
+    }
+
+    #[tokio::test]
+    async fn a_reachable_gateway_that_errors_is_a_real_failure() {
+        // 与上一条的分界：**配置齐全但请求失败**才是 `failed`（运维真的要去查）。
+        let dir = state_dir("http-500").await;
+        let (endpoint, server) = mock_gateway(500, "{}".to_string()).await;
+        let config = config_for(&endpoint, &dir);
+        let outcome = refresh(&config, &dir, &CachedMetricsLabels::default()).await;
+        let _ = server.await;
+        match outcome {
+            RefreshOutcome::Failed(detail) => assert!(detail.contains("HTTP 500"), "{detail}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 }

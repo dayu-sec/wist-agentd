@@ -3,6 +3,21 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.23.3-alpha] - 2026-11-03
+
+### 修复（label 机制 review 第二轮）
+
+- **「值没变」不再算变更**：原先 `revision` 变了（管理员把同一个值再写一次）就报 `updated`
+  并重写缓存，命令台账与日志里全是假变更。现在只比**生效值**。
+- **未入网 / 未配控制面不再报失败**：那等于「没有可拉的东西」，报 `failed` 会让一台长期
+  脱管的机器每 5 分钟一条告警。只有「配置齐全但请求失败」才是 `failed`。
+- 缓存改为**每次成功拉取都落盘**（值没变也写）：它同时回答「上次成功拉取是哪一刻」，
+  只在变更时写会让 `metrics-labels show` 的 `fetched_at` 停住，现场以为「根本没在拉」。
+
+### 测试
+
+- 新增：同值不同版本 → `unchanged`、未配置 → `unchanged` 且不写盘、HTTP 500 → `failed`。
+
 ## [0.23.2-alpha] - 2026-11-03
 
 ### 修复（label 机制专项 review）
