@@ -14,7 +14,7 @@
 
 | 仓库 | 类型 | 基线分支 | 工作分支 | 合并方式 | 发布 |
 |---|---|---|---|---|---|
-| `wist-metrics` | 组件（lib） | `main` | `feat/metrics-<wp>` | PR → `main` | `gx adm v_feat` + `gx adm v_tag` |
+| `wist-metrics` | 组件（lib） | `main` | `feat/metrics-<wp>` | PR → `main` | `gx adm v_feat` + `gx adm tag_stable` |
 | `wist-agentd` | 制品（bin） | `alpha` | `feat/metrics-<wp>` | PR → `alpha` | `gx adm v_feat` + `tag_alpha`（按需） |
 | `wist-gateway` | 制品（bin） | `alpha` | `feat/metrics-<wp>` | PR → `alpha` | 同上 |
 
@@ -38,7 +38,7 @@
 | WP5 | `wist-agentd` | `feat/metrics-self-obs` | `src/runtime/daemon_metrics.rs`、`src/telemetry/metrics/self_obs.rs` | WP3 | S | 已合入 `alpha`（`0.20.0-alpha`；时间戳 + 自观测指标） |
 | WP6 | `wist-gateway` | `feat/metrics-wp6-query` | `src/api/host_metrics.rs`、`src/api/agent_ops.rs` | WP1 | M | 已合入 `alpha`（`0.35.0-alpha`） |
 | WP7 | 三仓 | `chore/metrics-drop-legacy` | `wist-metrics/src/spec.rs`、`runtime/host.rs`、`runtime/process.rs`、`wist-gateway/src/api/host_metrics.rs` | WP2…WP6 | S | 已完成（断点式下线） |
-| WP8 | `wist-agentd` | `docs/metrics-rollout-close` | 本文、`docs/design/README.md`、各仓 `CHANGELOG.md` | WP7b | S | 未开始 |
+| WP8 | `wist-agentd` | `docs/metrics-rollout-close` | 本文、`docs/design/README.md`、各仓 `CHANGELOG.md` | WP7 | S | 未开始 |
 
 ### WP1 注册表 v1（`wist-metrics`）
 
@@ -47,7 +47,7 @@
 - 注册表只保留规范名：旧名（点分写法）与 `legacy.` fact 已整体下线，`find_metric_spec` 不再回退；
   理由：断点式切换后线上只允许一套口径，注册表里留旧名就等于留一条永远不会再被删除的分支。
 - 新增门禁测试：名字文法、单位后缀双向校验、单位/类型闭集、`(域, fact_key)` 与 `name` 唯一、比例取值范围。
-- 验收：`gx run lint`、`cargo test`；`gx adm v_feat` 后 `gx adm v_tag`。
+- 验收：`gx run lint`、`cargo test`；`gx adm v_feat` 后 `gx adm tag_stable`。
 
 ### WP2 主机采集（`wist-agentd`）
 

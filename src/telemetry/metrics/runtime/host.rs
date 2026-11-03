@@ -249,10 +249,10 @@ pub(super) fn push_disk_capacity_facts(
     );
 }
 
-/// 逐挂载点文件系统容量：同一 fact key 的多条实例用 `mount` / `fstype` 标签区分。
+/// 逐挂载点文件系统容量：同一 fact key 的多条实例用 `mountpoint` / `fstype` 标签区分。
 ///
-/// 这是 `system.filesystem.*` 的来源；过渡版的 `host.disk.*` 汇总仍由
-/// [`collect_host_disk_usage`] 产出，两者并存。
+/// 与 [`collect_host_disk_usage`] 的 `host.disk.*` 汇总不是重复：汇总是整盘（按 `disk_role`
+/// 分 system/data），这里是逐挂载点细粒度容量。
 pub(super) fn collect_host_filesystem_usage(disks: &Disks, facts: &mut Vec<MetricsLabeledFact>) {
     for filesystem in local_filesystems(disks) {
         facts.extend(filesystem_facts(

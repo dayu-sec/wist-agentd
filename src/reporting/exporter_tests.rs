@@ -297,6 +297,15 @@ fn export_metrics_writes_flattened_samples() {
         rows.iter()
             .any(|row| row["metric"]["__name__"] == "agent_memory_bytes")
     );
+
+    // 旧名已下线：本地导出也不得出现点分名字。
+    assert!(
+        rows.iter().all(|row| !row["metric"]["__name__"]
+            .as_str()
+            .unwrap_or("")
+            .contains('.')),
+        "legacy name leaked into export: {rows:#?}"
+    );
 }
 
 #[test]
