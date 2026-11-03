@@ -3,6 +3,13 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.20.1-alpha] - 2026-11-03
+
+### 修复
+
+- `agent_cpu_ratio` 在上送线一直缺失：本地导出与指标上送在同一 tick 内各取一次样本，
+  第二次取数把差分窗口压到毫秒级而跳过。现在窗口不足时复用最近一次读数，不再重置基线。
+
 ## [0.20.0-alpha] - 2026-11-03
 
 ### 新增
