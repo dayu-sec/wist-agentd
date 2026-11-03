@@ -966,7 +966,7 @@ mod tests {
                 outcome: None,
                 selection: Default::default(),
             },
-            values: vec![0.25],
+            values: vec![serde_json::Number::from_f64(0.25).expect("finite")],
             timestamps: vec![1_234_567_890_000],
         };
 
@@ -1204,7 +1204,7 @@ mod tests {
                 outcome: None,
                 selection: Default::default(),
             },
-            values: vec![0.25],
+            values: vec![serde_json::Number::from_f64(0.25).expect("finite")],
             timestamps: vec![1_234_567_890_000],
         };
 

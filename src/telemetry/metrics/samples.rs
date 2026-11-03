@@ -61,10 +61,13 @@ pub struct MetricsSampleRecord {
 }
 
 /// VM（VictoriaMetrics）`/api/v1/import` 的 JSON line 单条指标。
+///
+/// `values` 用 `Number` 而不是 `f64`：`gauge_i64` / `counter_i64` 必须保持 JSON
+/// 整数（规范 §4.1），浮点化会丢掉类型信息，且超过 2^53 的计数器会丢精度。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VmMetricLine {
     pub metric: VmMetricLabels,
-    pub values: Vec<f64>,
+    pub values: Vec<serde_json::Number>,
     pub timestamps: Vec<i64>,
 }
 
@@ -112,7 +115,7 @@ pub fn build_vm_metric_lines_with(
             if !is_numeric_sample(&sample.value_type) {
                 continue;
             }
-            let Some(value) = sample.value.as_f64() else {
+            let Some(value) = wire_number(&sample.value, &sample.value_type) else {
                 continue;
             };
             lines.push(VmMetricLine {
@@ -149,6 +152,15 @@ fn is_numeric_sample(value_type: &str) -> bool {
         value_type,
         "gauge_i64" | "counter_i64" | "gauge_f64" | "counter_f64"
     )
+}
+
+/// 按注册表类型选择 JSON 表示：整数类保持整数，浮点类保持浮点。
+fn wire_number(value: &Value, value_type: &str) -> Option<serde_json::Number> {
+    match value_type {
+        "gauge_i64" | "counter_i64" => value.as_i64().map(serde_json::Number::from),
+        "gauge_f64" | "counter_f64" => value.as_f64().and_then(serde_json::Number::from_f64),
+        _ => None,
+    }
 }
 
 pub fn build_samples_snapshot(runtime: &MetricsRuntimeSnapshot) -> MetricsSamplesSnapshot {
@@ -726,6 +738,38 @@ mod tests {
         assert_eq!(json["metric"]["cluster"], "kafka-prod");
         // 选择类 label 不是身份的一部分：`instance` 仍是目标身份。
         assert_eq!(json["metric"]["instance"], "host-1");
+    }
+
+    #[test]
+    fn integer_metrics_keep_integer_json_numbers() {
+        // 规范 §4.1：`gauge_i64` / `counter_i64` 的线上表示是 JSON 整数，浮点会丢类型与精度。
+        let mut sample_target = target("succeeded", "host-1");
+        sample_target.runtime_facts = vec![
+            StringKeyValue::new("host.memory.total_bytes", "1073741824"),
+            StringKeyValue::new("host.memory.usage_ratio", "0.5"),
+        ];
+        let snapshot = build_samples_snapshot(&snapshot("host_metrics", vec![sample_target]));
+        let lines = build_vm_metric_lines_with(&snapshot, "agent-1", &BTreeMap::new());
+
+        let integer = lines
+            .iter()
+            .find(|line| line.metric.name == "system_memory_total_bytes")
+            .expect("integer metric line");
+        let json = serde_json::to_value(integer).expect("serialize integer line");
+        assert!(
+            json["values"][0].is_i64(),
+            "gauge_i64 must stay a JSON integer: {json}"
+        );
+
+        let float = lines
+            .iter()
+            .find(|line| line.metric.name == "system_memory_usage_ratio")
+            .expect("float metric line");
+        let json = serde_json::to_value(float).expect("serialize float line");
+        assert!(
+            json["values"][0].is_f64(),
+            "gauge_f64 must stay a JSON float: {json}"
+        );
     }
 
     #[test]
