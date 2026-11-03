@@ -208,113 +208,10 @@ enum FactSendOutcome {
 const WORK_FETCH_MIN_INTERVAL_MS: i64 = 30_000;
 
 /// A sampled CPU-time reading used to compute a percentage across the report interval.
-struct CpuSample {
-    ticks: u64,
-    at: Instant,
-}
-
-/// 本机**逻辑核数**（`available_parallelism`）。
-///
-/// 为什么要跟 `cpu_percent` 一起报：那个数是**单核口径**（100% = 占满一个核），
-/// 而运维看图时要回答的往往是「这台机器被它占了百分之几」——那是 `cpu_percent / 核数`。
-/// 只报百分比不报核数，右侧那个数既算不出来、也无法复核（4 核上的 13% 与 64 核上的 13%
-/// 完全不是一回事）。换算留给网关做：agent 只交原始事实。
-fn local_cpu_cores() -> Option<u32> {
-    std::thread::available_parallelism()
-        .ok()
-        .map(|count| count.get() as u32)
-}
-
-/// Current resident set size in bytes, when the platform exposes it.
-fn current_rss_bytes() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let content = std::fs::read_to_string("/proc/self/statm").ok()?;
-        // statm: size, resident, shared, text, lib, data, dt (all in pages).
-        let resident_pages: u64 = content.split_whitespace().nth(1)?.parse().ok()?;
-        Some(resident_pages * 4096)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // proc_pidinfo(PROC_PIDTASKINFO) reports the current resident size in bytes.
-        let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
-        let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
-        let written = unsafe {
-            libc::proc_pidinfo(
-                std::process::id() as libc::c_int,
-                libc::PROC_PIDTASKINFO,
-                0,
-                &mut info as *mut libc::proc_taskinfo as *mut libc::c_void,
-                size,
-            )
-        };
-        if written != size {
-            return None;
-        }
-        Some(info.pti_resident_size)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        None
-    }
-}
-
-/// Total CPU time (user + system) of this process in clock ticks.
-fn cpu_ticks() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let content = std::fs::read_to_string("/proc/self/stat").ok()?;
-        // After the closing ')' of comm, fields are state(3), ppid(4), ...,
-        // utime(14) at index 11, stime(15) at index 12.
-        let fields: Vec<&str> = content.rsplit(')').next()?.split_whitespace().collect();
-        let utime: u64 = fields.get(11)?.parse().ok()?;
-        let stime: u64 = fields.get(12)?.parse().ok()?;
-        Some(utime + stime)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // getrusage reports user + system CPU time; both are timeval (seconds
-        // + microseconds). Total is expressed in microseconds so that
-        // ticks_per_sec() = 1_000_000 makes cpu_percent_since() linear in
-        // wall-clock seconds.
-        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
-            return None;
-        }
-        let user_us = usage.ru_utime.tv_sec as i64 * 1_000_000 + usage.ru_utime.tv_usec as i64;
-        let system_us = usage.ru_stime.tv_sec as i64 * 1_000_000 + usage.ru_stime.tv_usec as i64;
-        Some((user_us + system_us) as u64)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        None
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn ticks_per_sec() -> u64 {
-    unsafe { libc::sysconf(libc::_SC_CLK_TCK) as u64 }
-}
-
-#[cfg(target_os = "macos")]
-fn ticks_per_sec() -> u64 {
-    1_000_000
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn ticks_per_sec() -> u64 {
-    100
-}
-
-fn cpu_percent_since(previous: &CpuSample, now: Instant, ticks_per_sec: u64) -> Option<f64> {
-    let now_ticks = cpu_ticks()?;
-    let wall = now.duration_since(previous.at).as_secs_f64();
-    if wall <= 0.0 {
-        return Some(0.0);
-    }
-    let tick_delta = now_ticks.saturating_sub(previous.ticks);
-    Some(tick_delta as f64 / wall / ticks_per_sec as f64 * 100.0)
-}
+use crate::telemetry::metrics::self_obs::{
+    self as self_obs, CpuSample, cpu_percent_since, cpu_ticks, current_rss_bytes, local_cpu_cores,
+    ticks_per_sec,
+};
 
 /// 构造上报用的**本机工作内容视图**：`state/work.json` 的同形子集 + 本机配置里手工加的日志输入。
 ///
@@ -2174,7 +2071,14 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                 last_latency_ms,
                 changes,
                 // 还没拿到策略表时为 None（网关据此区分「在用内建默认周期」）。
-                discovery_runtime.policy_version(),
+                {
+                    let version = discovery_runtime.policy_version();
+                    // 同一个值也进 agent 自观测（无策略时不发）。
+                    if let Some(version) = version {
+                        self_obs::record_policy_version(version);
+                    }
+                    version
+                },
                 // 本机工作视图的来源：授权折算 + 配置里手工加的输入（见 `build_local_work`）。
                 &work_runtime,
                 // 上送状态的来源：已应用 grant + 本机配置合流（见 `build_uplink_state`）。
@@ -2207,6 +2111,8 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                 force_standby(&mut uplink_runtime, code);
             } else if let Some(latency) = report.latency_ms {
                 last_latency_ms = Some(latency);
+                // 同一个读数既上报网关，也作为 agent 自观测指标。
+                self_obs::record_admin_latency(latency);
             }
         }
         tokio::time::sleep(TICK_INTERVAL).await;
@@ -2324,7 +2230,11 @@ async fn run_once_with_failure_cache(
                             "event=MetricsUplinkSent agent_id={agent_id} targets={}",
                             snapshot.total_targets
                         ),
-                        Err(err) => log::warn!("wist-agentd metrics uplink failed: {err}"),
+                        Err(err) => {
+                            // 至多一次：本批丢弃，下个周期重采；失败必须可观测。
+                            self_obs::record_uplink_failure();
+                            log::warn!("wist-agentd metrics uplink failed: {err}")
+                        }
                     }
                 }
                 // 事实摘要在**指标之后**发：同样共用这条连接与全局 `seq`，只是帧标记不同。
@@ -2455,7 +2365,7 @@ async fn run_once_with_failure_cache(
 
     // Step 0: export unified-envelope output alongside existing cache files
     let export_source = ExporterSource::new(agent_id, &instance_id);
-    exporter::export_all_async(state_dir, &export_source).await;
+    exporter::export_all_async(state_dir, &export_source, &loop_ctx.config.metrics.labels).await;
 
     let drained = scheduler::drain_next_async(&scheduler::DrainRequest {
         run_dir: run_dir.to_path_buf(),

@@ -1,20 +1,22 @@
-//! Minimal metrics runtime tick built from target view.
+//! 指标运行时：把目标视图变成一批 `MetricsCollectionOutcome`。
+//!
+//! 采集按域拆在 [`host`] / [`process`] / [`container`]；本模块只负责
+//! 共享类型、provider 注册、批次记账与快照持久化。
 
-use std::collections::HashSet;
-#[cfg(target_os = "linux")]
-use std::fs;
+mod container;
+mod host;
+mod process;
+
 use std::io;
 use std::path::Path;
-#[cfg(all(unix, not(target_os = "linux")))]
-use std::process::Command;
 
 use serde::{Deserialize, Serialize};
-use sysinfo::{Disks, System};
 use wist_contracts::discovery::StringKeyValue;
 use wist_shared::fs::write_json_atomic;
 use wist_shared::time::now_rfc3339;
 
-use super::cpu;
+// `investigate disk` 与指标采集共用同一套文件系统过滤/去重规则。
+pub(crate) use host::local_filesystems;
 
 pub use wist_metrics::provider::{
     MetricProvider, MetricsCollectionOutcome, MetricsCollectionTargetSample, MetricsLabeledFact,
@@ -25,6 +27,11 @@ use super::target_view::path_for as target_view_path_for;
 use super::target_view::{MetricsTargetView, MetricsTargetViewEntry};
 #[cfg(test)]
 use wist_shared::fs::read_json;
+
+#[cfg(test)]
+use host::*;
+#[cfg(test)]
+use process::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ::jumo_derive::Jumo)]
 #[serde(deny_unknown_fields)]
@@ -110,7 +117,7 @@ fn build_host_outcome(
         };
     }
 
-    let collected = collect_host_runtime_facts(&sample_targets);
+    let collected = host::collect_host_runtime_facts(&sample_targets);
     let runtime_facts = collected.facts;
     let labeled_facts = collected.labeled_facts;
     if runtime_facts.is_empty() && labeled_facts.is_empty() {
@@ -178,7 +185,7 @@ fn build_process_outcome(targets: Vec<&MetricsTargetViewEntry>) -> MetricsCollec
     let mut last_error = None;
 
     for target in &targets {
-        let probed = probe_process_target(target);
+        let probed = process::probe_process_target(target);
         if probed.status == "succeeded" {
             succeeded_targets += 1;
         } else {
@@ -211,7 +218,7 @@ fn build_process_outcome(targets: Vec<&MetricsTargetViewEntry>) -> MetricsCollec
         dropped_targets,
         last_error,
         runtime_facts: vec![
-            StringKeyValue::new("process.probe.mode", process_probe_mode()),
+            StringKeyValue::new("process.probe.mode", process::process_probe_mode()),
             StringKeyValue::new("process.probe.success_count", succeeded_targets.to_string()),
             StringKeyValue::new("process.probe.failed_count", failed_targets.to_string()),
         ],
@@ -243,7 +250,7 @@ fn build_container_outcome(targets: Vec<&MetricsTargetViewEntry>) -> MetricsColl
     let mut last_error = None;
 
     for target in &targets {
-        let probed = probe_container_target(target);
+        let probed = container::probe_container_target(target);
         if probed.status == "failed" {
             failed_targets += 1;
             if last_error.is_none() {
@@ -276,7 +283,7 @@ fn build_container_outcome(targets: Vec<&MetricsTargetViewEntry>) -> MetricsColl
         dropped_targets,
         last_error,
         runtime_facts: vec![
-            StringKeyValue::new("container.probe.mode", container_probe_mode()),
+            StringKeyValue::new("container.probe.mode", container::container_probe_mode()),
             StringKeyValue::new(
                 "container.probe.success_count",
                 succeeded_targets.to_string(),
@@ -335,676 +342,7 @@ impl MetricProvider for ContainerMetricsProvider {
     }
 }
 
-struct HostRuntimeFacts {
-    facts: Vec<StringKeyValue>,
-    labeled_facts: Vec<MetricsLabeledFact>,
-}
-
-fn collect_host_runtime_facts(
-    _sample_targets: &[MetricsCollectionTargetSample],
-) -> HostRuntimeFacts {
-    let mut facts = Vec::new();
-    let mut labeled_facts = Vec::new();
-
-    // CPU：逐核逐 mode 的累计秒（不在这里求占用率）。
-    for time in cpu::host_cpu_times() {
-        labeled_facts.push(MetricsLabeledFact {
-            key: "host.cpu.seconds".to_string(),
-            value: format!("{:.3}", time.seconds),
-            labels: vec![
-                StringKeyValue::new("cpu", time.cpu),
-                StringKeyValue::new("mode", time.mode),
-            ],
-        });
-    }
-
-    let loadavg = System::load_average();
-    for (key, legacy_key, value) in [
-        ("host.loadavg.1m", "legacy.host.loadavg.1m", loadavg.one),
-        ("host.loadavg.5m", "legacy.host.loadavg.5m", loadavg.five),
-        (
-            "host.loadavg.15m",
-            "legacy.host.loadavg.15m",
-            loadavg.fifteen,
-        ),
-    ] {
-        push_fact_if_absent(&mut facts, StringKeyValue::new(key, value.to_string()));
-        // 双写期：同一读数按旧名再发一条，老看板不用改。
-        push_fact_if_absent(
-            &mut facts,
-            StringKeyValue::new(legacy_key, value.to_string()),
-        );
-    }
-
-    let uptime = System::uptime();
-    push_fact_if_absent(
-        &mut facts,
-        StringKeyValue::new("host.uptime.seconds", uptime.to_string()),
-    );
-    push_fact_if_absent(
-        &mut facts,
-        StringKeyValue::new("legacy.host.uptime.seconds", uptime.to_string()),
-    );
-
-    let mut system = System::new();
-    system.refresh_memory();
-    let total_memory = system.total_memory();
-    let available_memory = system.available_memory();
-    push_fact_if_absent(
-        &mut facts,
-        StringKeyValue::new("host.memory.total_bytes", total_memory.to_string()),
-    );
-    push_fact_if_absent(
-        &mut facts,
-        StringKeyValue::new("host.memory.available_bytes", available_memory.to_string()),
-    );
-    push_fact_if_absent(
-        &mut facts,
-        StringKeyValue::new(
-            "legacy.host.memory.total_kb",
-            (total_memory / 1024).to_string(),
-        ),
-    );
-    push_fact_if_absent(
-        &mut facts,
-        StringKeyValue::new(
-            "legacy.host.memory.available_kb",
-            (available_memory / 1024).to_string(),
-        ),
-    );
-    // 总量未知时不发比例：算出 0% 会伪造一个「内存很空」的读数。
-    if let Some(ratio) = memory_usage_ratio(total_memory, available_memory) {
-        push_fact_if_absent(
-            &mut facts,
-            StringKeyValue::new("host.memory.usage_ratio", ratio.to_string()),
-        );
-    }
-    // swap 总量为 0 表示未配置交换分区（或平台拿不到）：两者都不发，避免伪造 0。
-    let swap_total = system.total_swap();
-    if swap_total > 0 {
-        push_fact_if_absent(
-            &mut facts,
-            StringKeyValue::new("host.memory.swap_total_bytes", swap_total.to_string()),
-        );
-        push_fact_if_absent(
-            &mut facts,
-            StringKeyValue::new(
-                "host.memory.swap_free_bytes",
-                system.free_swap().to_string(),
-            ),
-        );
-    }
-
-    let disks = Disks::new_with_refreshed_list();
-    collect_host_disk_usage(&disks, &mut facts);
-    collect_host_filesystem_usage(&disks, &mut labeled_facts);
-    collect_disk_io(&mut labeled_facts);
-
-    HostRuntimeFacts {
-        facts,
-        labeled_facts,
-    }
-}
-
-fn collect_host_disk_usage(disks: &Disks, facts: &mut Vec<StringKeyValue>) {
-    if cfg!(target_os = "linux") {
-        collect_linux_disk_usage(disks, facts);
-    } else {
-        collect_primary_disk_usage(disks, facts);
-    }
-}
-
-/// 非 Linux 平台只报「主盘」：macOS APFS 把用户数据放在 Data 卷（`/` 只是只读系统快照），
-/// 所以优先取 Data、回落到 `/`；其它 Unix 取 `/`。
-fn collect_primary_disk_usage(disks: &Disks, facts: &mut Vec<StringKeyValue>) {
-    let mounts: &[&str] = if cfg!(target_os = "macos") {
-        &["/System/Volumes/Data", "/"]
-    } else {
-        &["/"]
-    };
-
-    for mount in mounts {
-        let Some(disk) = disks
-            .list()
-            .iter()
-            .find(|disk| disk.mount_point() == Path::new(mount))
-        else {
-            continue;
-        };
-        push_disk_capacity_facts(facts, "system", disk.total_space(), disk.available_space());
-        return;
-    }
-}
-
-/// Linux 把容量拆成两个角色：
-/// - `system`：根文件系统 `/`（系统盘）；
-/// - `data`：其余本地块设备挂载点（数据盘）。多块数据盘按容量汇总，
-///   同一设备被 bind mount 到多个路径时只算一次。
-///
-/// 原有的 `host.disk.*` 保持为系统盘，兼容既有网关接口与页面。
-fn collect_linux_disk_usage(disks: &Disks, facts: &mut Vec<StringKeyValue>) {
-    let Some(root) = disks
-        .list()
-        .iter()
-        .find(|disk| disk.mount_point() == Path::new("/"))
-    else {
-        return;
-    };
-    let root_total = root.total_space();
-    let root_available = root.available_space();
-    push_disk_capacity_facts(facts, "system", root_total, root_available);
-
-    let mut seen_devices = HashSet::new();
-    // 根文件系统的 bind mount 也是「系统盘」，不能重复计入数据盘。
-    let root_device = root.name().to_string_lossy();
-    if !root_device.is_empty() {
-        seen_devices.insert(root_device.into_owned());
-    }
-    let mut data_total = 0u64;
-    let mut data_available = 0u64;
-    let mut data_mounts = 0usize;
-    for disk in disks.list() {
-        if !is_linux_data_mount(disk) {
-            continue;
-        }
-        // 同一设备可能被 bind mount 到多个路径（如 /data 与 /mnt/data），只算一次。
-        let device = disk.name().to_string_lossy();
-        let key = if device.is_empty() {
-            format!("mount:{}", disk.mount_point().display())
-        } else {
-            device.into_owned()
-        };
-        if !seen_devices.insert(key) {
-            continue;
-        }
-        data_total = data_total.saturating_add(disk.total_space());
-        data_available = data_available.saturating_add(disk.available_space());
-        data_mounts += 1;
-    }
-
-    if data_mounts > 0 {
-        push_disk_capacity_facts(facts, "data", data_total, data_available);
-        push_fact_if_absent(
-            facts,
-            StringKeyValue::new("host.disk.data.mounts", data_mounts.to_string()),
-        );
-        push_fact_if_absent(
-            facts,
-            StringKeyValue::new("legacy.host.disk.data.mount_count", data_mounts.to_string()),
-        );
-    }
-}
-
-/// 是否计入 Linux「数据盘」。
-///
-/// `sysinfo::Disks` 已经过滤掉 proc/sys/devtmpfs/tmpfs/NFS 等虚拟或网络挂载；
-/// 这里再排除根（系统盘）、引导分区、运行期目录与容器叠加层，避免把系统自身
-/// 或临时文件系统误算成数据盘。
-fn is_linux_data_mount(disk: &sysinfo::Disk) -> bool {
-    is_linux_data_mount_point(
-        &disk.mount_point().to_string_lossy(),
-        &disk.file_system().to_string_lossy(),
-        disk.total_space(),
-    )
-}
-
-fn is_linux_data_mount_point(mount: &str, file_system: &str, total_space: u64) -> bool {
-    if total_space == 0 || mount == "/" {
-        return false;
-    }
-    if mount == "/boot" || mount.starts_with("/boot/") {
-        return false;
-    }
-    if mount == "/run"
-        || mount.starts_with("/run/")
-        || mount == "/sys"
-        || mount.starts_with("/sys/")
-        || mount == "/proc"
-        || mount.starts_with("/proc/")
-        || mount == "/dev"
-        || mount.starts_with("/dev/")
-    {
-        return false;
-    }
-    !is_excluded_filesystem(file_system)
-}
-
-fn push_disk_capacity_facts(
-    facts: &mut Vec<StringKeyValue>,
-    role: &str,
-    total: u64,
-    available: u64,
-) {
-    let available = available.min(total);
-    let usage_ratio = if total == 0 {
-        0.0
-    } else {
-        total.saturating_sub(available) as f64 / total as f64
-    };
-    push_fact_if_absent(
-        facts,
-        StringKeyValue::new(
-            format!("host.disk.{role}.usage_ratio"),
-            usage_ratio.to_string(),
-        ),
-    );
-    push_fact_if_absent(
-        facts,
-        StringKeyValue::new(format!("host.disk.{role}.total_bytes"), total.to_string()),
-    );
-    push_fact_if_absent(
-        facts,
-        StringKeyValue::new(
-            format!("host.disk.{role}.available_bytes"),
-            available.to_string(),
-        ),
-    );
-    // 双写期：旧口径（percent / KiB）。
-    push_fact_if_absent(
-        facts,
-        StringKeyValue::new(
-            format!("legacy.host.disk.{role}.usage_percent"),
-            (usage_ratio * 100.0).to_string(),
-        ),
-    );
-    push_fact_if_absent(
-        facts,
-        StringKeyValue::new(
-            format!("legacy.host.disk.{role}.total_kb"),
-            (total / 1024).to_string(),
-        ),
-    );
-    push_fact_if_absent(
-        facts,
-        StringKeyValue::new(
-            format!("legacy.host.disk.{role}.available_kb"),
-            (available / 1024).to_string(),
-        ),
-    );
-}
-
-/// 逐挂载点文件系统容量：同一 fact key 的多条实例用 `mount` / `fstype` 标签区分。
-///
-/// 这是 `system.filesystem.*` 的来源；过渡版的 `host.disk.*` 汇总仍由
-/// [`collect_host_disk_usage`] 产出，两者并存。
-fn collect_host_filesystem_usage(disks: &Disks, facts: &mut Vec<MetricsLabeledFact>) {
-    for filesystem in local_filesystems(disks) {
-        facts.extend(filesystem_facts(
-            &filesystem.mount,
-            &filesystem.file_system,
-            filesystem.total_space,
-            filesystem.available_space,
-        ));
-    }
-}
-
-/// 本机一个「真实文件系统」的容量快照。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LocalFilesystem {
-    pub mount: String,
-    pub device: String,
-    pub file_system: String,
-    pub total_space: u64,
-    pub available_space: u64,
-}
-
-/// 本机真实文件系统清单（指标与 `investigate disk` **共用同一套过滤与去重规则**）。
-///
-/// 顺序是刻意的：**规范挂载点优先**（Linux `/`、macOS 的 Data 卷），其余按系统给出的顺序补齐。
-/// 同一设备被 bind mount / btrfs 子卷挂到多处时只保留第一条 —— 逐条上报会把容量重复计数。
-pub(crate) fn local_filesystems(disks: &Disks) -> Vec<LocalFilesystem> {
-    if !(cfg!(target_os = "linux") || cfg!(target_os = "macos")) {
-        return Vec::new();
-    }
-    let preferred: &[&str] = if cfg!(target_os = "macos") {
-        &["/System/Volumes/Data", "/"]
-    } else {
-        &["/"]
-    };
-
-    let mut seen = HashSet::new();
-    let mut filesystems = Vec::new();
-    for mount in preferred {
-        let Some(disk) = disks
-            .list()
-            .iter()
-            .find(|disk| disk.mount_point() == Path::new(mount))
-        else {
-            continue;
-        };
-        if !is_local_filesystem_mount(disk) {
-            continue;
-        }
-        let device = disk.name().to_string_lossy().to_string();
-        if !seen.insert(filesystem_dedupe_key(&device, mount)) {
-            continue;
-        }
-        filesystems.push(local_filesystem(disk));
-    }
-    for disk in disks.list() {
-        if !is_local_filesystem_mount(disk) {
-            continue;
-        }
-        let device = disk.name().to_string_lossy().to_string();
-        let mount = disk.mount_point().to_string_lossy();
-        if !seen.insert(filesystem_dedupe_key(&device, &mount)) {
-            continue;
-        }
-        filesystems.push(local_filesystem(disk));
-    }
-    filesystems
-}
-
-fn local_filesystem(disk: &sysinfo::Disk) -> LocalFilesystem {
-    LocalFilesystem {
-        mount: disk.mount_point().to_string_lossy().to_string(),
-        device: disk.name().to_string_lossy().to_string(),
-        file_system: disk.file_system().to_string_lossy().to_string(),
-        total_space: disk.total_space(),
-        available_space: disk.available_space(),
-    }
-}
-
-fn is_local_filesystem_mount(disk: &sysinfo::Disk) -> bool {
-    if cfg!(target_os = "macos") {
-        is_macos_filesystem_mount(disk)
-    } else {
-        is_linux_filesystem_mount(disk)
-    }
-}
-
-/// 同一设备（bind mount / btrfs 子卷）只保留第一条；设备名为空时用挂载点兜底。
-fn filesystem_dedupe_key(device: &str, mount: &str) -> String {
-    if device.is_empty() {
-        format!("mount:{mount}")
-    } else {
-        device.to_string()
-    }
-}
-
-fn is_linux_filesystem_mount(disk: &sysinfo::Disk) -> bool {
-    is_linux_filesystem_mount_point(
-        &disk.mount_point().to_string_lossy(),
-        &disk.file_system().to_string_lossy(),
-        disk.total_space(),
-    )
-}
-
-fn is_linux_filesystem_mount_point(mount: &str, file_system: &str, total_space: u64) -> bool {
-    if total_space == 0 {
-        return false;
-    }
-    if mount == "/boot" || mount.starts_with("/boot/") {
-        return false;
-    }
-    if mount == "/run"
-        || mount.starts_with("/run/")
-        || mount == "/sys"
-        || mount.starts_with("/sys/")
-        || mount == "/proc"
-        || mount.starts_with("/proc/")
-        || mount == "/dev"
-        || mount.starts_with("/dev/")
-    {
-        return false;
-    }
-    !is_excluded_filesystem(file_system)
-}
-
-fn is_macos_filesystem_mount(disk: &sysinfo::Disk) -> bool {
-    is_macos_filesystem_mount_point(
-        &disk.mount_point().to_string_lossy(),
-        &disk.file_system().to_string_lossy(),
-        disk.total_space(),
-    )
-}
-
-fn is_macos_filesystem_mount_point(mount: &str, file_system: &str, total_space: u64) -> bool {
-    if total_space == 0 {
-        return false;
-    }
-    if mount == "/" || mount == "/System/Volumes/Data" {
-        return true;
-    }
-    // 其它系统辅助卷（Preboot / VM / Update / xarts / iSCPreboot / Hardware）
-    // 与 Data 共享 APFS container，逐卷上报会重复计数。
-    if mount.starts_with("/System/Volumes/") {
-        return false;
-    }
-    if mount.starts_with("/Volumes/") {
-        return !is_excluded_filesystem(file_system) && !file_system.contains("fuse");
-    }
-    false
-}
-
-fn is_excluded_filesystem(file_system: &str) -> bool {
-    matches!(
-        file_system,
-        "proc"
-            | "sysfs"
-            | "devtmpfs"
-            | "devpts"
-            | "tmpfs"
-            | "cgroup"
-            | "cgroup2"
-            | "pstore"
-            | "securityfs"
-            | "debugfs"
-            | "tracefs"
-            | "hugetlbfs"
-            | "mqueue"
-            | "configfs"
-            | "fusectl"
-            | "binfmt_misc"
-            | "rpc_pipefs"
-            | "nsfs"
-            | "efivarfs"
-            | "ramfs"
-            | "rootfs"
-            | "overlay"
-            | "aufs"
-            | "squashfs"
-            | "iso9660"
-            | "nfs"
-            | "nfs4"
-            | "cifs"
-            | "smb3"
-            | "ceph"
-            | "glusterfs"
-            | "lustre"
-            | "beegfs"
-            | "gpfs"
-            | "orangefs"
-            | "pvfs2"
-            | "afs"
-            | "ncpfs"
-            | "coda"
-            | "davfs"
-            | "shfs"
-            | "9p"
-            | "virtiofs"
-            | "autofs"
-            | "devfs"
-            | "map"
-            | "smbfs"
-            | "webdav"
-            | "afpfs"
-    ) || file_system.starts_with("fuse")
-}
-
-fn filesystem_facts(
-    mount: &str,
-    file_system: &str,
-    total: u64,
-    available: u64,
-) -> Vec<MetricsLabeledFact> {
-    let available = available.min(total);
-    let usage_ratio = if total == 0 {
-        0.0
-    } else {
-        total.saturating_sub(available) as f64 / total as f64
-    };
-    let mut labels = vec![StringKeyValue::new("mountpoint", mount)];
-    if !file_system.is_empty() {
-        labels.push(StringKeyValue::new("fstype", file_system));
-    }
-    let mut facts = vec![
-        MetricsLabeledFact {
-            key: "host.filesystem.usage_ratio".to_string(),
-            value: usage_ratio.to_string(),
-            labels: labels.clone(),
-        },
-        MetricsLabeledFact {
-            key: "host.filesystem.total_bytes".to_string(),
-            value: total.to_string(),
-            labels: labels.clone(),
-        },
-        MetricsLabeledFact {
-            key: "host.filesystem.available_bytes".to_string(),
-            value: available.to_string(),
-            labels: labels.clone(),
-        },
-    ];
-    facts.push(MetricsLabeledFact {
-        key: "legacy.host.filesystem.usage_percent".to_string(),
-        value: (usage_ratio * 100.0).to_string(),
-        labels: labels.clone(),
-    });
-    facts.push(MetricsLabeledFact {
-        key: "legacy.host.filesystem.total_kb".to_string(),
-        value: (total / 1024).to_string(),
-        labels: labels.clone(),
-    });
-    facts.push(MetricsLabeledFact {
-        key: "legacy.host.filesystem.available_kb".to_string(),
-        value: (available / 1024).to_string(),
-        labels: labels.clone(),
-    });
-    if let Some((inodes, inodes_free)) = filesystem_inode_counts(mount) {
-        facts.push(MetricsLabeledFact {
-            key: "host.filesystem.inodes".to_string(),
-            value: inodes.to_string(),
-            labels: labels.clone(),
-        });
-        facts.push(MetricsLabeledFact {
-            key: "host.filesystem.inodes_free".to_string(),
-            value: inodes_free.to_string(),
-            labels,
-        });
-    }
-    facts
-}
-
-/// inode 总数 / 剩余数（`statvfs`）。读不到就不发这两个事实。
-#[cfg(unix)]
-fn filesystem_inode_counts(mount: &str) -> Option<(u64, u64)> {
-    use std::ffi::CString;
-
-    let path = CString::new(mount).ok()?;
-    let mut buf: libc::statvfs = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::statvfs(path.as_ptr(), &mut buf) };
-    if rc != 0 {
-        return None;
-    }
-    Some((buf.f_files as u64, buf.f_ffree as u64))
-}
-
-#[cfg(not(unix))]
-fn filesystem_inode_counts(_mount: &str) -> Option<(u64, u64)> {
-    None
-}
-
-/// 解析 `/proc/diskstats` 的一行（纯函数，便于在任何平台跑测试）。
-#[cfg(any(target_os = "linux", test))]
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct DiskIoStat {
-    pub device: String,
-    pub reads: u64,
-    pub read_bytes: u64,
-    pub writes: u64,
-    pub written_bytes: u64,
-    pub io_seconds: f64,
-}
-
-/// `/proc/diskstats` 字段：2 name / 3 reads / 5 sectors read / 7 writes /
-/// 9 sectors written / 12 ms doing I/O；扇区恒为 512 字节。
-#[cfg(any(target_os = "linux", test))]
-pub(crate) fn parse_diskstats(text: &str) -> Vec<DiskIoStat> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 13 {
-            continue;
-        }
-        let device = fields[2];
-        if device.starts_with("loop") || device.starts_with("ram") {
-            continue;
-        }
-        let number = |index: usize| -> u64 { fields[index].parse().unwrap_or(0) };
-        out.push(DiskIoStat {
-            device: device.to_string(),
-            reads: number(3),
-            read_bytes: number(5).saturating_mul(512),
-            writes: number(7),
-            written_bytes: number(9).saturating_mul(512),
-            io_seconds: number(12) as f64 / 1000.0,
-        });
-    }
-    out
-}
-
-/// 分区（`sda1`、`nvme0n1p1`）与整盘（`sda`、`nvme0n1`）共存于 diskstats；
-/// 两者都上报会在求和时双计，因此只保留整盘。
-#[cfg(target_os = "linux")]
-fn is_partition(device: &str) -> bool {
-    std::path::Path::new("/sys/class/block")
-        .join(device)
-        .join("partition")
-        .exists()
-}
-
-/// 块设备 I/O 累计计数（`/proc/diskstats`）。其它平台暂不提供。
-#[cfg(target_os = "linux")]
-fn collect_disk_io(labeled: &mut Vec<MetricsLabeledFact>) {
-    let Ok(text) = fs::read_to_string("/proc/diskstats") else {
-        return;
-    };
-    for stat in parse_diskstats(&text) {
-        if is_partition(&stat.device) {
-            continue;
-        }
-        let labels = vec![StringKeyValue::new("device", stat.device.clone())];
-        for (key, value) in [
-            ("host.disk.read_bytes", stat.read_bytes.to_string()),
-            ("host.disk.written_bytes", stat.written_bytes.to_string()),
-            ("host.disk.reads", stat.reads.to_string()),
-            ("host.disk.writes", stat.writes.to_string()),
-            (
-                "host.disk.io_time_seconds",
-                format!("{:.3}", stat.io_seconds),
-            ),
-        ] {
-            labeled.push(MetricsLabeledFact {
-                key: key.to_string(),
-                value,
-                labels: labels.clone(),
-            });
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn collect_disk_io(_labeled: &mut Vec<MetricsLabeledFact>) {}
-
-/// 内存使用率：`(total - available) / total`；总量未知返回 `None`（不发比例）。
-fn memory_usage_ratio(total: u64, available: u64) -> Option<f64> {
-    if total == 0 {
-        return None;
-    }
-    Some(total.saturating_sub(available.min(total)) as f64 / total as f64)
-}
-
-fn push_fact_if_absent(facts: &mut Vec<StringKeyValue>, candidate: StringKeyValue) {
+pub(super) fn push_fact_if_absent(facts: &mut Vec<StringKeyValue>, candidate: StringKeyValue) {
     if facts.iter().any(|fact| fact.key == candidate.key) {
         return;
     }
@@ -1032,306 +370,6 @@ fn maybe_push_sample(
         runtime_facts: Vec::new(),
         labeled_facts: Vec::new(),
     });
-}
-
-fn probe_process_target(target: &MetricsTargetViewEntry) -> MetricsCollectionTargetSample {
-    let mut sample = MetricsCollectionTargetSample {
-        candidate_id: target.candidate_id.clone(),
-        target_ref: target.target_ref.clone(),
-        status: "failed".to_string(),
-        last_error: None,
-        resource_ref: target.resource_ref.clone(),
-        execution_hints: target.execution_hints.clone(),
-        runtime_facts: Vec::new(),
-        labeled_facts: Vec::new(),
-    };
-
-    let Some(pid) = target
-        .execution_hints
-        .iter()
-        .find(|hint| hint.key == "process.pid")
-        .and_then(|hint| hint.value.parse::<u32>().ok())
-    else {
-        sample.last_error = Some("process.pid execution hint missing".to_string());
-        return sample;
-    };
-
-    match collect_process_runtime_facts(pid, &sample.execution_hints) {
-        Ok(runtime_facts) => {
-            sample.status = "succeeded".to_string();
-            sample.runtime_facts = runtime_facts;
-            sample
-        }
-        Err(err) => {
-            sample.last_error = Some(err.to_string());
-            sample
-        }
-    }
-}
-
-fn probe_container_target(target: &MetricsTargetViewEntry) -> MetricsCollectionTargetSample {
-    let mut sample = MetricsCollectionTargetSample {
-        candidate_id: target.candidate_id.clone(),
-        target_ref: target.target_ref.clone(),
-        status: "failed".to_string(),
-        last_error: None,
-        resource_ref: target.resource_ref.clone(),
-        execution_hints: target.execution_hints.clone(),
-        runtime_facts: Vec::new(),
-        labeled_facts: Vec::new(),
-    };
-
-    let mut facts = Vec::new();
-    for hint in &sample.execution_hints {
-        if matches!(
-            hint.key.as_str(),
-            "container.runtime"
-                | "container.runtime.namespace"
-                | "cgroup.path"
-                | "k8s.namespace.name"
-                | "k8s.pod.uid"
-                | "k8s.pod.name"
-                | "k8s.container.name"
-        ) {
-            push_fact_if_absent(&mut facts, hint.clone());
-        }
-    }
-
-    let mut process_probe_error = None;
-    if let Some(pid) = sample
-        .execution_hints
-        .iter()
-        .find(|hint| hint.key == "pid")
-        .and_then(|hint| hint.value.parse::<u32>().ok())
-    {
-        match collect_process_runtime_facts(pid, &[]) {
-            Ok(process_facts) => {
-                push_fact_if_absent(
-                    &mut facts,
-                    StringKeyValue::new("container.pid", pid.to_string()),
-                );
-                for fact in process_facts {
-                    // pid 在容器域由 `container.pid` 表达；`process.pid` 在此域没有登记，直接丢弃。
-                    if fact.key == "process.pid" {
-                        continue;
-                    }
-                    push_fact_if_absent(&mut facts, fact);
-                }
-            }
-            Err(err) => {
-                process_probe_error = Some(err.to_string());
-            }
-        }
-    }
-
-    if facts.is_empty() {
-        sample.last_error = process_probe_error
-            .or_else(|| Some("container metrics probe produced no runtime facts".to_string()));
-        return sample;
-    }
-
-    sample.status = if process_probe_error.is_some() {
-        "partial".to_string()
-    } else {
-        "succeeded".to_string()
-    };
-    sample.last_error = process_probe_error;
-    sample.runtime_facts = facts;
-    sample
-}
-
-fn collect_process_runtime_facts(
-    pid: u32,
-    execution_hints: &[StringKeyValue],
-) -> io::Result<Vec<StringKeyValue>> {
-    let mut facts = Vec::new();
-    push_fact_if_absent(
-        &mut facts,
-        StringKeyValue::new("process.pid", pid.to_string()),
-    );
-    for hint in execution_hints {
-        if matches!(
-            hint.key.as_str(),
-            "process.identity" | "discovery.identity_strength" | "discovery.identity_status"
-        ) {
-            push_fact_if_absent(&mut facts, hint.clone());
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
-        if let Some(state) = parse_linux_proc_state(&stat) {
-            push_fact_if_absent(
-                &mut facts,
-                StringKeyValue::new("process.state", process_state_label(state)),
-            );
-        }
-        if let Some(rss_pages) = parse_linux_proc_rss_pages(&stat) {
-            let bytes = rss_pages.max(0) as u64 * page_size();
-            push_fact_if_absent(
-                &mut facts,
-                StringKeyValue::new("process.memory.rss_bytes", bytes.to_string()),
-            );
-            push_fact_if_absent(
-                &mut facts,
-                StringKeyValue::new("legacy.process.memory.rss_pages", rss_pages.to_string()),
-            );
-        }
-        if let Some((utime, stime)) = parse_linux_proc_cpu_ticks(&stat) {
-            let seconds = (utime + stime) as f64 / clock_ticks();
-            push_fact_if_absent(
-                &mut facts,
-                StringKeyValue::new("process.cpu.seconds", format!("{seconds:.3}")),
-            );
-        }
-    }
-
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        let output = Command::new("ps")
-            .args(["-o", "state=,rss=,cputime=,comm=", "-p", &pid.to_string()])
-            .output()?;
-        if !output.status.success() {
-            return Err(io::Error::other("ps did not exit successfully"));
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let line = stdout.trim();
-        if line.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "ps returned no process row",
-            ));
-        }
-        let mut parts = line.split_whitespace();
-        if let Some(state) = parts.next() {
-            let label = process_state_label(state.chars().next().unwrap_or('?'));
-            push_fact_if_absent(&mut facts, StringKeyValue::new("process.state", label));
-        }
-        if let Some(rss_kb) = parts.next() {
-            let kb = rss_kb.parse::<u64>().unwrap_or(0);
-            push_fact_if_absent(
-                &mut facts,
-                StringKeyValue::new(
-                    "process.memory.rss_bytes",
-                    kb.saturating_mul(1024).to_string(),
-                ),
-            );
-            push_fact_if_absent(
-                &mut facts,
-                StringKeyValue::new("legacy.process.memory.rss_kb", kb.to_string()),
-            );
-        }
-        if let Some(cputime) = parts.next()
-            && let Some(seconds) = parse_ps_cputime(cputime)
-        {
-            push_fact_if_absent(
-                &mut facts,
-                StringKeyValue::new("process.cpu.seconds", format!("{seconds:.3}")),
-            );
-        }
-        if let Some(comm) = parts.next() {
-            push_fact_if_absent(
-                &mut facts,
-                StringKeyValue::new("process.executable.name", comm),
-            );
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "process metrics probe unsupported on this platform",
-        ));
-    }
-
-    Ok(facts)
-}
-
-#[cfg(target_os = "linux")]
-fn parse_linux_proc_state(stat: &str) -> Option<char> {
-    let (_, tail) = stat.rsplit_once(") ")?;
-    tail.chars().next()
-}
-
-/// 状态字符 → 规范闭集取值（未识别的一律 `unknown`）。
-fn process_state_label(state: char) -> &'static str {
-    match state {
-        'R' => "running",
-        'S' => "sleeping",
-        'D' => "disk_sleep",
-        'T' | 't' => "stopped",
-        'Z' => "zombie",
-        'X' | 'x' => "dead",
-        'I' => "idle",
-        _ => "unknown",
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn page_size() -> u64 {
-    let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if value <= 0 { 4096 } else { value as u64 }
-}
-
-#[cfg(target_os = "linux")]
-fn clock_ticks() -> f64 {
-    let value = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if value <= 0 { 100.0 } else { value as f64 }
-}
-
-#[cfg(target_os = "linux")]
-fn parse_linux_proc_rss_pages(stat: &str) -> Option<i64> {
-    let (_, tail) = stat.rsplit_once(") ")?;
-    let fields: Vec<&str> = tail.split_whitespace().collect();
-    if fields.len() <= 21 {
-        return None;
-    }
-    fields.get(21)?.parse().ok()
-}
-
-/// `utime` / `stime`（field 14/15）→ 累计 CPU ticks。
-#[cfg(target_os = "linux")]
-fn parse_linux_proc_cpu_ticks(stat: &str) -> Option<(u64, u64)> {
-    let (_, tail) = stat.rsplit_once(") ")?;
-    let fields: Vec<&str> = tail.split_whitespace().collect();
-    // tail[0] 是 field 3（state）；utime = field 14 → index 11，stime = field 15 → index 12。
-    let utime = fields.get(11)?.parse().ok()?;
-    let stime = fields.get(12)?.parse().ok()?;
-    Some((utime, stime))
-}
-
-/// `ps -o cputime` 的 `[[HH:]MM:]SS[.cc]` → 秒。
-#[cfg(any(all(unix, not(target_os = "linux")), test))]
-fn parse_ps_cputime(text: &str) -> Option<f64> {
-    let mut seconds = 0.0;
-    let mut seen = false;
-    for part in text.split(':') {
-        let value: f64 = part.parse().ok()?;
-        seconds = seconds * 60.0 + value;
-        seen = true;
-    }
-    seen.then_some(seconds)
-}
-
-fn process_probe_mode() -> &'static str {
-    #[cfg(target_os = "linux")]
-    {
-        "procfs"
-    }
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        "ps"
-    }
-    #[cfg(not(unix))]
-    {
-        "unsupported"
-    }
-}
-
-fn container_probe_mode() -> &'static str {
-    "discovery_hints"
 }
 
 #[cfg(test)]
@@ -1660,7 +698,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_host_runtime_facts_are_collected() {
-        let facts = super::collect_host_runtime_facts(&[]).facts;
+        let collected = super::collect_host_runtime_facts(&[]);
+        let facts = collected.facts;
         let fact_value = |key: &str| {
             facts
                 .iter()
@@ -1691,6 +730,33 @@ mod tests {
             available > 0,
             "available memory should be positive, got {available}"
         );
+
+        // 磁盘 I/O：平台拿不到时不发；发了就必须是整盘、数值可解析。
+        let disk_io: Vec<_> = collected
+            .labeled_facts
+            .iter()
+            .filter(|fact| fact.key == "host.disk.read_bytes")
+            .collect();
+        for fact in disk_io {
+            assert!(fact.value.parse::<u64>().is_ok(), "{}", fact.value);
+            assert!(
+                fact.labels
+                    .iter()
+                    .any(|label| label.key == "device" && !label.value.is_empty()),
+                "disk io fact must carry a device label"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_whole_disk_strips_volume_suffixes() {
+        // APFS 卷名是 `diskNsM`（可嵌套）；I/O 统计只在整盘上有一份。
+        assert_eq!(super::macos_whole_disk("/dev/disk3s1s1"), "disk3");
+        assert_eq!(super::macos_whole_disk("/dev/disk0s2"), "disk0");
+        assert_eq!(super::macos_whole_disk("disk3"), "disk3");
+        assert_eq!(super::macos_whole_disk("/dev/disk10"), "disk10");
+        assert_eq!(super::macos_whole_disk("/dev/disk3"), "disk3");
     }
 
     #[cfg(unix)]

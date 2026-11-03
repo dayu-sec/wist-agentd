@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -258,25 +259,44 @@ fn export_metrics_writes_flattened_samples() {
         .expect("store runtime snapshot");
 
     let source = ExporterSource::new("test-agent", "test-instance");
-    export_metrics(&state_dir, &source).expect("export metrics");
+    let selection = BTreeMap::from([
+        ("cluster".to_string(), "kafka-prod".to_string()),
+        ("env".to_string(), "prod".to_string()),
+    ]);
+    export_metrics(&state_dir, &source, &selection).expect("export metrics");
 
     let rows = read_jsonl(&state_dir.join("export").join("metrics.jsonl"));
-    assert_eq!(
-        rows.len(),
-        2,
-        "one uptime row plus the collect-targets ledger"
-    );
-    assert_eq!(rows[0]["metric"]["__name__"], "system_uptime_seconds");
-    assert_eq!(rows[0]["metric"]["agent"], "test-agent");
-    assert_eq!(rows[0]["metric"]["instance"], "host-1");
-    assert_eq!(rows[0]["values"][0], 42.0);
-    assert_eq!(rows[0]["timestamps"][0], 1_776_556_800_000i64);
+    let find_row = |name: &str| {
+        rows.iter()
+            .find(|row| row["metric"]["__name__"] == name)
+            .unwrap_or_else(|| panic!("missing row {name}: {rows:#?}"))
+    };
+
+    let uptime = find_row("system_uptime_seconds");
+    assert_eq!(uptime["metric"]["agent"], "test-agent");
+    assert_eq!(uptime["metric"]["instance"], "host-1");
+    // 选择类 label 与上送线同构：本地文件也要能按集群/环境筛。
+    assert_eq!(uptime["metric"]["cluster"], "kafka-prod");
+    assert_eq!(uptime["metric"]["env"], "prod");
+    assert_eq!(uptime["values"][0], 42.0);
+    assert_eq!(uptime["timestamps"][0], 1_776_556_800_000i64);
 
     // 采样上限/失败记账也要落到导出文件，不得只存在于内存。
-    assert_eq!(rows[1]["metric"]["__name__"], "agent_collect_targets");
-    assert_eq!(rows[1]["metric"]["target_kind"], "host");
-    assert_eq!(rows[1]["metric"]["outcome"], "succeeded");
-    assert!(rows[1]["metric"].get("instance").is_none());
+    let ledger = find_row("agent_collect_targets");
+    assert_eq!(ledger["metric"]["target_kind"], "host");
+    assert_eq!(ledger["metric"]["outcome"], "succeeded");
+    assert!(ledger["metric"].get("instance").is_none());
+
+    // 自观测：agent 自己的计数器/内存也同构写入，不带 instance。
+    assert!(
+        find_row("agent_uplink_metrics_failed_total")["metric"]
+            .get("instance")
+            .is_none()
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row["metric"]["__name__"] == "agent_memory_bytes")
+    );
 }
 
 #[test]
@@ -284,7 +304,7 @@ fn export_skips_when_no_cache() {
     let state_dir = temp_dir("no-cache");
     let source = ExporterSource::new("a", "b");
     assert!(export_disc_snap(&state_dir, &source).is_ok());
-    assert!(export_metrics(&state_dir, &source).is_ok());
+    assert!(export_metrics(&state_dir, &source, &Default::default()).is_ok());
 }
 
 #[test]

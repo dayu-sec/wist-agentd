@@ -19,6 +19,7 @@ use wist_shared::time::now_ts_ms;
 use super::runtime::{
     MetricsCollectionOutcome, MetricsCollectionTargetSample, MetricsRuntimeSnapshot,
 };
+use super::self_obs;
 use super::spec::find_metric_spec;
 
 static METRICS_BATCH_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -98,15 +99,7 @@ pub struct VmMetricLabels {
     pub selection: BTreeMap<String, String>,
 }
 
-/// 把样本快照拍平成 VM JSON lines（一 sample 一行）。
-pub fn build_vm_metric_lines(
-    snapshot: &MetricsSamplesSnapshot,
-    agent_id: &str,
-) -> Vec<VmMetricLine> {
-    build_vm_metric_lines_with(snapshot, agent_id, &BTreeMap::new())
-}
-
-/// 同 [`build_vm_metric_lines`]，额外把选择类 label 贴到每条序列上。
+/// 把样本快照拍平成 VM JSON lines（一 sample 一行），并把选择类 label 贴到每条序列上。
 pub fn build_vm_metric_lines_with(
     snapshot: &MetricsSamplesSnapshot,
     agent_id: &str,
@@ -165,7 +158,7 @@ pub fn build_samples_snapshot(runtime: &MetricsRuntimeSnapshot) -> MetricsSample
     for outcome in &runtime.outcomes {
         build_outcome_groups(outcome, &mut groups);
     }
-    if let Some(group) = build_collect_targets_group(runtime) {
+    if let Some(group) = build_agent_group(runtime) {
         groups.push(group);
     }
 
@@ -176,8 +169,20 @@ pub fn build_samples_snapshot(runtime: &MetricsRuntimeSnapshot) -> MetricsSample
     }
 }
 
+/// agent 自有指标（无 `instance`）：采集记账 + 自观测。
+///
+/// 合成一组而不是两组：它们共享同一个实例为空的身份，分开写只会在 Gateway 上多一次合并。
+fn build_agent_group(runtime: &MetricsRuntimeSnapshot) -> Option<MetricsSampleGroup> {
+    let mut samples = build_collect_target_samples(runtime);
+    samples.extend(build_self_observation_samples(&self_obs::snapshot()));
+    (!samples.is_empty()).then(|| MetricsSampleGroup {
+        instance: String::new(),
+        samples,
+    })
+}
+
 /// 采集记账：每批按 `target_kind × outcome` 报目标数（`dropped` 必须有账）。
-fn build_collect_targets_group(runtime: &MetricsRuntimeSnapshot) -> Option<MetricsSampleGroup> {
+fn build_collect_target_samples(runtime: &MetricsRuntimeSnapshot) -> Vec<MetricsSampleRecord> {
     let mut samples = Vec::new();
     for outcome in &runtime.outcomes {
         let kind = match outcome.collection_kind.as_str() {
@@ -207,10 +212,60 @@ fn build_collect_targets_group(runtime: &MetricsRuntimeSnapshot) -> Option<Metri
             });
         }
     }
-    (!samples.is_empty()).then(|| MetricsSampleGroup {
-        instance: String::new(),
-        samples,
-    })
+    samples
+}
+
+/// 自观测：拿不到的读数**不发**（`None`），不补 0；失败累计是真实计数器，0 也发。
+fn build_self_observation_samples(obs: &self_obs::SelfObservation) -> Vec<MetricsSampleRecord> {
+    let mut samples = Vec::new();
+    let mut push = |name: &str, value: Value, value_type: &str| {
+        samples.push(MetricsSampleRecord {
+            name: name.to_string(),
+            value,
+            value_type: value_type.to_string(),
+            const_labels: Vec::new(),
+            labels: Vec::new(),
+        });
+    };
+
+    if let Some(bytes) = obs.memory_bytes {
+        push(
+            "agent_memory_bytes",
+            Value::Number(bytes.into()),
+            "gauge_i64",
+        );
+    }
+    if let Some(cores) = obs.cpu_cores {
+        push("agent_cpu_cores", Value::Number(cores.into()), "gauge_i64");
+    }
+    if let Some(ratio) = obs.cpu_ratio
+        && let Some(number) = serde_json::Number::from_f64(ratio)
+    {
+        push("agent_cpu_ratio", Value::Number(number), "gauge_f64");
+    }
+    if let Some(seconds) = obs.admin_latency_seconds
+        && let Some(number) = serde_json::Number::from_f64(seconds)
+    {
+        push(
+            "agent_admin_latency_seconds",
+            Value::Number(number),
+            "gauge_f64",
+        );
+    }
+    if let Some(version) = obs.discovery_policy_version {
+        push(
+            "agent_discovery_policy_version",
+            Value::Number(version.into()),
+            "gauge_i64",
+        );
+    }
+    push(
+        "agent_uplink_metrics_failed_total",
+        Value::Number(obs.uplink_metrics_failed_total.into()),
+        "counter_i64",
+    );
+
+    samples
 }
 
 fn build_outcome_groups(outcome: &MetricsCollectionOutcome, groups: &mut Vec<MetricsSampleGroup>) {
@@ -355,7 +410,7 @@ mod tests {
 
     use super::{
         MetricsSampleGroup, MetricsSampleRecord, MetricsSamplesSnapshot, build_samples_snapshot,
-        build_vm_metric_lines, build_vm_metric_lines_with,
+        build_vm_metric_lines_with,
     };
     use crate::telemetry::metrics::runtime::{
         MetricsCollectionOutcome, MetricsCollectionTargetSample, MetricsLabeledFact,
@@ -479,7 +534,7 @@ mod tests {
         assert_eq!(sample.labels.len(), 2, "unknown label must be dropped");
         assert!(sample.const_labels.is_empty());
 
-        let lines = build_vm_metric_lines(&snapshot, "agent-1");
+        let lines = build_vm_metric_lines_with(&snapshot, "agent-1", &BTreeMap::new());
         let line = lines
             .iter()
             .find(|line| line.metric.name == "system_filesystem_available_bytes")
@@ -568,7 +623,7 @@ mod tests {
                 }],
             }],
         };
-        let lines = build_vm_metric_lines(&snapshot, "agent-1");
+        let lines = build_vm_metric_lines_with(&snapshot, "agent-1", &BTreeMap::new());
         assert_eq!(lines[0].timestamps, vec![1_776_556_800_000]);
     }
 
@@ -617,8 +672,11 @@ mod tests {
             "dropped targets must be accounted"
         );
 
-        let lines = build_vm_metric_lines(&snapshot, "agent-1");
-        let line = &lines[0];
+        let lines = build_vm_metric_lines_with(&snapshot, "agent-1", &BTreeMap::new());
+        let line = lines
+            .iter()
+            .find(|line| line.metric.name == "agent_collect_targets")
+            .expect("collect-targets line");
         assert_eq!(line.metric.name, "agent_collect_targets");
         assert_eq!(line.metric.target_kind.as_deref(), Some("process"));
         assert!(line.metric.instance.is_empty());
@@ -631,7 +689,7 @@ mod tests {
         let mut sample_target = target("succeeded", "host-1");
         sample_target.runtime_facts = vec![StringKeyValue::new("host.loadavg.1m", "0.25")];
         let snapshot = build_samples_snapshot(&snapshot("host_metrics", vec![sample_target]));
-        let lines = build_vm_metric_lines(&snapshot, "agent-1");
+        let lines = build_vm_metric_lines_with(&snapshot, "agent-1", &BTreeMap::new());
         let line = lines
             .iter()
             .find(|line| line.metric.name == "system_load_average_1m")
@@ -671,6 +729,61 @@ mod tests {
     }
 
     #[test]
+    fn self_observation_samples_skip_unknown_readings() {
+        let obs = super::self_obs::SelfObservation {
+            cpu_ratio: Some(0.5),
+            cpu_cores: Some(8),
+            memory_bytes: Some(1024),
+            // 管理面还没成功交互过：不发这个序列，而不是补 0。
+            admin_latency_seconds: None,
+            discovery_policy_version: Some(7),
+            uplink_metrics_failed_total: 3,
+        };
+
+        let samples = super::build_self_observation_samples(&obs);
+        let names: Vec<&str> = samples.iter().map(|sample| sample.name.as_str()).collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "agent_memory_bytes",
+                "agent_cpu_cores",
+                "agent_cpu_ratio",
+                "agent_discovery_policy_version",
+                "agent_uplink_metrics_failed_total",
+            ]
+        );
+        let uplink = samples
+            .iter()
+            .find(|sample| sample.name == "agent_uplink_metrics_failed_total")
+            .expect("uplink counter");
+        assert_eq!(uplink.value_type, "counter_i64");
+        assert_eq!(uplink.value.as_i64(), Some(3));
+    }
+
+    #[test]
+    fn agent_group_merges_accounting_and_self_observation() {
+        let snapshot = build_samples_snapshot(&snapshot(
+            "host_metrics",
+            vec![target("succeeded", "host-1")],
+        ));
+        // 记账与自观测共享同一身份（`instance` 为空），合成一组。
+        let agent_groups: Vec<_> = snapshot
+            .groups
+            .iter()
+            .filter(|group| group.instance.is_empty())
+            .collect();
+        assert_eq!(agent_groups.len(), 1, "agent metrics must not split groups");
+        let sample_names: Vec<&str> = agent_groups[0]
+            .samples
+            .iter()
+            .map(|sample| sample.name.as_str())
+            .collect();
+        assert!(sample_names.contains(&"agent_collect_targets"));
+        assert!(sample_names.contains(&"agent_uplink_metrics_failed_total"));
+    }
+
+    #[test]
     fn batch_seq_is_monotonic_across_snapshots() {
         let first = build_samples_snapshot(&snapshot("host_metrics", Vec::new()));
         let second = build_samples_snapshot(&snapshot("host_metrics", Vec::new()));
@@ -698,6 +811,6 @@ mod tests {
                 }],
             }],
         };
-        assert!(build_vm_metric_lines(&snapshot, "agent-1").is_empty());
+        assert!(build_vm_metric_lines_with(&snapshot, "agent-1", &BTreeMap::new()).is_empty());
     }
 }

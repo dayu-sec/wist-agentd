@@ -14,6 +14,7 @@
 //! (PID < 100) are filtered before classification. The filter is exporter-only
 //! and does not affect the internal discovery cache.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -383,14 +384,20 @@ async fn export_process_classified_async(
 
 /// Reads current metrics runtime snapshot and writes one VM JSON line per sample.
 ///
-/// 本地落盘与线格式同构（`metric` / `values` / `timestamps`），不得存在第二套字段定义。
-pub async fn export_metrics_async(state_dir: &Path, source: &ExporterSource) -> RuntimeResult<()> {
+/// 本地落盘与线格式同构（`metric` / `values` / `timestamps`）：字段、label 集合与
+/// 上送线逐字一致，因此选择类 label（`app` / `env` / `cluster` …）也一并写入。
+pub async fn export_metrics_async(
+    state_dir: &Path,
+    source: &ExporterSource,
+    selection: &BTreeMap<String, String>,
+) -> RuntimeResult<()> {
     let runtime_path = metrics_runtime::path_for(state_dir);
 
     match read_json_async::<MetricsRuntimeSnapshot>(&runtime_path).await {
         Ok(snapshot) => {
             let samples_snapshot = samples::build_samples_snapshot(&snapshot);
-            let lines = samples::build_vm_metric_lines(&samples_snapshot, &source.agent_id);
+            let lines =
+                samples::build_vm_metric_lines_with(&samples_snapshot, &source.agent_id, selection);
             let rows: Vec<serde_json::Value> = lines
                 .into_iter()
                 .filter_map(|line| serde_json::to_value(line).ok())
@@ -407,16 +414,24 @@ pub async fn export_metrics_async(state_dir: &Path, source: &ExporterSource) -> 
 }
 
 #[cfg(test)]
-pub fn export_metrics(state_dir: &Path, source: &ExporterSource) -> RuntimeResult<()> {
-    block_on(export_metrics_async(state_dir, source))
+pub fn export_metrics(
+    state_dir: &Path,
+    source: &ExporterSource,
+    selection: &BTreeMap<String, String>,
+) -> RuntimeResult<()> {
+    block_on(export_metrics_async(state_dir, source, selection))
 }
 
 /// Export all probe discovery snapshots and metrics. Errors are logged, not propagated.
-pub async fn export_all_async(state_dir: &Path, source: &ExporterSource) {
+pub async fn export_all_async(
+    state_dir: &Path,
+    source: &ExporterSource,
+    selection: &BTreeMap<String, String>,
+) {
     if let Err(err) = export_disc_snap_async(state_dir, source).await {
         log::error!("exporter: disc_snap error: {err}");
     }
-    if let Err(err) = export_metrics_async(state_dir, source).await {
+    if let Err(err) = export_metrics_async(state_dir, source, selection).await {
         log::error!("exporter: metrics error: {err}");
     }
 }

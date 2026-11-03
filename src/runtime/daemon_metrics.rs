@@ -560,14 +560,14 @@ mod tests {
         drop(sink);
 
         // 取号递增 + 高水位持久化到独立全局 seq 文件。
-        // 两个数值样本各一行，外加一行采集记账（`agent_collect_targets`）。
-        assert_eq!(next_seq, 8);
+        // 帧数 = 两个数值样本 + 采集记账 + 若干自观测行（后者取决于本机平台）。
         let persisted = crate::state_store::log_seq_state::load_or_default_async(&global_seq_path)
             .await
             .expect("load global seq");
-        assert_eq!(persisted, 8);
+        assert!(next_seq > 5, "uplink must have drawn seq numbers");
+        assert_eq!(persisted, next_seq);
 
-        // 帧信封 seq 来自全局计数器（5、6、7），而非 batch_seq。
+        // 帧信封 seq 来自全局计数器（从 5 开始连续递增），而非 batch_seq。
         let body = server.await.expect("join");
         let seqs: Vec<u64> = body
             .lines()
@@ -578,6 +578,8 @@ mod tests {
                 parsed["seq"].as_u64().expect("seq")
             })
             .collect();
-        assert_eq!(seqs, vec![5, 6, 7]);
+        assert_eq!(seqs.len() as u64 + 5, next_seq);
+        let expected: Vec<u64> = (5..5 + seqs.len() as u64).collect();
+        assert_eq!(seqs, expected);
     }
 }

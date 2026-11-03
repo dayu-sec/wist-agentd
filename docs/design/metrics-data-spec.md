@@ -343,6 +343,7 @@ process_state{state="running"} 1
 | 进程状态 | `*_state{state}` 一热 | 状态字符 → 闭集枚举 |
 | 主机容量 | `system_filesystem_*{mountpoint,fstype}` | 只保留本地真实文件系统；虚拟/网络/临时挂载排除 |
 | 磁盘角色 | `system_disk_*{disk_role}` | 根文件系统 = `system`；其余本地块设备汇总 = `data`，同一设备的多挂载点只计一次 |
+| 块设备 I/O | `system_disk_{read,written}_bytes_total{device}` | Linux 读 `/proc/diskstats` 并过滤分区；macOS 的 IOKit 计数挂在整盘上，APFS 多卷共享同一组计数，必须按整盘 bsd 名去重后取一次（逐卷相加会按卷数放大） |
 | 可用量 | `*_available_bytes` | 必须夹取到 `[0, total]` |
 
 - `available` 必须满足 `available ≤ total`；违反时夹取并记一次自观测事件。
@@ -385,7 +386,8 @@ process_state{state="running"} 1
 ### 8.2 投递保证
 
 - **至多一次**：指标不进入持久化补偿队列。发送失败时该批次丢弃，下个周期重新采集。
-- 失败**必须**计入 `agent_uplink_metrics_failed_total`（`counter_i64`）。
+- 失败**必须**计入 `agent_uplink_metrics_failed_total`（`counter_i64`，每批 +1）。
+  该计数器不持久化：进程重启后从 0 开始，查询侧按 Prometheus 重置语义（`rate` / `increase`）处理。
 - 消费方**必须**容忍时间缺口，不得把「缺一批」当作故障。
 
 理由：指标可重采，重传预算应留给不可重采的信号；前提是失败可观测。
@@ -513,12 +515,19 @@ process_state{state="running"} 1
 | 指标名 | 类型 | 单位 | 动态 label | 语义 |
 |---|---|---|---|---|
 | `agent_memory_bytes` | gauge_i64 | By | — | agent 进程常驻内存 |
-| `agent_cpu_ratio` | gauge_f64 | 1 | — | 单核口径（1.0 = 占满一个核；分母声明） |
+| `agent_cpu_ratio` | gauge_f64 | 1 | — | 单核口径（1.0 = 占满一个核；分母声明）；窗口 = 相邻两批的间隔 |
 | `agent_cpu_cores` | gauge_i64 | 1 | — | 逻辑核数，用于把单核口径换算成整机占比 |
-| `agent_admin_latency_seconds` | gauge_f64 | s | — | 管理面交互延迟 |
+| `agent_admin_latency_seconds` | gauge_f64 | s | — | 最近一次成功的管理面交互耗时 |
 | `agent_discovery_policy_version` | gauge_i64 | 1 | — | 已生效的发现策略版本 |
 | `agent_collect_targets` | gauge_i64 | 1 | `target_kind`,`outcome` | 本批次各结果的目标计数；`target_kind` ∈ {`host`,`process`,`container`}，`outcome` ∈ {`succeeded`,`failed`,`dropped`} |
-| `agent_uplink_metrics_failed_total` | counter_i64 | 1 | — | 指标上送失败累计次数 |
+| `agent_uplink_metrics_failed_total` | counter_i64 | 1 | — | 指标上送失败累计次数（每批 +1） |
+
+规则：
+
+1. **拿不到就不发**：字段无值时不写该序列，**不补 0**。只有 `agent_uplink_metrics_failed_total` 是真实计数器，0 也发（0 是有意义的历史值）。
+2. **窗口声明**：`agent_cpu_ratio` 是单核口径，窗口取**相邻两次样本的间隔**；首轮没有基线不发。换算整机占比 = `agent_cpu_ratio / agent_cpu_cores`，换算在查询侧做。
+3. **计数器重置**：`*_total` 在进程重启后从 0 开始，不做持久化；查询用 `rate` / `increase`，不直接对原始值做差。
+4. **不带 `instance`**：自观测属于 agent 自身，不指向任何采集目标；`agent_collect_targets` 与自观测共享同一组（`instance` 为空）。
 
 ### 10.5 ignore 表（登记但不产出指标）
 

@@ -31,11 +31,11 @@
 |---|---|---|---|---|---|---|
 | WP0 | `wist-agentd` | `docs/metrics-spec-v1` | `docs/design/metrics-data-spec.md`、`docs/design/README.md` | — | S | 已合入 `alpha` |
 | WP1 | `wist-metrics` | `feat/metrics-wp1-registry` | `src/spec.rs`、`src/provider.rs`（文档） | WP0 | M | 已发布 `0.6.0`（`main`） |
-| WP1b | `wist-agentd` | `refactor/metrics-split-runtime` | `src/telemetry/metrics/runtime.rs` → `mod host; mod process; mod container;`（**纯搬移**） | WP1 | S | 未开始 |
-| WP2 | `wist-agentd` | `feat/metrics-runtime-v1` | `src/telemetry/metrics/runtime.rs`、`Cargo.toml`（依赖版本） | WP1 | L | 已合入 `alpha`（`0.19.0-alpha`；macOS 磁盘 I/O 待补） |
+| WP1b | `wist-agentd` | `refactor/metrics-split-runtime` | `src/telemetry/metrics/runtime.rs` → `mod host; mod process; mod container;`（**纯搬移**） | WP1 | S | 已合入 `alpha`（`runtime/{host,process,container}.rs`） |
+| WP2 | `wist-agentd` | `feat/metrics-runtime-v1` | `src/telemetry/metrics/runtime.rs`、`Cargo.toml`（依赖版本） | WP1 | L | 已合入 `alpha`（Linux + macOS 磁盘 I/O） |
 | WP3 | `wist-agentd` | `feat/metrics-runtime-v1` | `src/telemetry/metrics/samples.rs`、`src/config/*`、`src/reporting/exporter.rs` | WP1 | L | 已合入 `alpha`（`0.19.0-alpha`） |
 | WP4 | `wist-agentd` | `feat/metrics-runtime-v1` | `src/telemetry/metrics/runtime.rs`（进程/容器 CPU） | WP2 | M | 已合入 `alpha`（Linux） |
-| WP5 | `wist-agentd` | `feat/metrics-runtime-v1` | `src/runtime/daemon_metrics.rs` | WP3 | S | 部分：时间戳已合入；`agent_uplink_metrics_failed_total` 待补 |
+| WP5 | `wist-agentd` | `feat/metrics-runtime-v1` | `src/runtime/daemon_metrics.rs`、`src/telemetry/metrics/self_obs.rs` | WP3 | S | 已合入 `alpha`（时间戳 + 自观测指标） |
 | WP6 | `wist-gateway` | `feat/metrics-wp6-query` | `src/api/host_metrics.rs`、`src/api/agent_ops.rs` | WP1 | M | 已合入 `alpha`（`0.35.0-alpha`） |
 | WP7 | 三仓 | `chore/metrics-drop-legacy` | 各仓被 WP1/WP2/WP3/WP6 改过的文件 | WP2…WP6 上线 ≥ 7 天 | S | 未开始 |
 | WP8 | `wist-agentd` | `docs/metrics-rollout-close` | 本文、`docs/design/README.md`、各仓 `CHANGELOG.md` | WP7 | S | 未开始 |
@@ -74,7 +74,8 @@
 
 - 快照记录采集完成时刻，`collected_at` 与 VM `timestamps` 同源；
 - `agent_uplink_metrics_failed_total` 计数；
-- 验收：断言同一批次所有样本时间戳一致，且等于采集结束时刻。
+- 自观测组（`agent_cpu_ratio` / `agent_cpu_cores` / `agent_memory_bytes` / `agent_admin_latency_seconds` / `agent_discovery_policy_version`）与采集记账共享 `instance` 为空的同一组；
+- 验收：断言同一批次所有样本时间戳一致，且等于采集结束时刻；拿不到的读数不发而不是补 0。
 
 ### WP6 网关查询适配
 
