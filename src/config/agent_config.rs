@@ -630,6 +630,22 @@ fn default_discovery_source_resolve_enabled() -> bool {
     true
 }
 
+fn default_kafka_interval_ms() -> u64 {
+    30_000
+}
+
+fn default_kafka_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_kafka_security_protocol() -> String {
+    "PLAINTEXT".to_string()
+}
+
+fn default_kafka_sasl_mechanism() -> String {
+    "auto".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -815,20 +831,4 @@ mod tests {
             .is_err()
         );
     }
-}
-
-fn default_kafka_interval_ms() -> u64 {
-    30_000
-}
-
-fn default_kafka_timeout_ms() -> u64 {
-    5_000
-}
-
-fn default_kafka_security_protocol() -> String {
-    "PLAINTEXT".to_string()
-}
-
-fn default_kafka_sasl_mechanism() -> String {
-    "auto".to_string()
 }
