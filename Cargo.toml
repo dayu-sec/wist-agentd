@@ -45,6 +45,10 @@ wist-shared = { version = "0.2" }
 # 运行日志：`log` 门面 + 共享 crate `wist-log`（级别 / 格式 / 落点 / 轮转 统一口径）。
 # env_logger 由 `wist-log` 内部装配，本仓不直依赖。
 log = "0.4"
+# Kafka SASL（SCRAM-SHA-256/512）与 TLS 显式 CA：都是纯 Rust，无 C 依赖。
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+rustls-pemfile = "2"
 wist-log = { version = "0.1" }
 #wist-log = { version = "0.1", path = "../wist-log" }
 wist-validate = { version = "0.8" }
