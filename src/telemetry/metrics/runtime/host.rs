@@ -91,11 +91,72 @@ pub(super) fn collect_host_runtime_facts(
     collect_host_disk_usage(&disks, &mut facts);
     collect_host_filesystem_usage(&disks, &mut labeled_facts);
     collect_disk_io(&disks, &mut labeled_facts);
+    collect_host_info(&mut labeled_facts);
 
     HostRuntimeFacts {
         facts,
         labeled_facts,
     }
+}
+
+/// 主机身份：一条 `system_host_info` 序列（值恒为 1），承载「这是哪台机器」。
+///
+/// 为什么不把这些字段贴到每条测量序列上：主机名会改、IP 会随 DHCP/迁移变、内核会升级。
+/// 平铺会让全部 `system_*` 序列在变化时断成两段；集中在 info 指标上，变化只替换这一条。
+fn collect_host_info(labeled_facts: &mut Vec<MetricsLabeledFact>) {
+    let mut labels = Vec::new();
+
+    let host_name = crate::discovery::host::default_host_name();
+    if !host_name.trim().is_empty() {
+        labels.push(StringKeyValue::new("host_name", host_name));
+    }
+    if let Some(ip) = primary_host_ip() {
+        labels.push(StringKeyValue::new("host_ip", ip));
+    }
+    labels.push(StringKeyValue::new("os", std::env::consts::OS));
+    labels.push(StringKeyValue::new("arch", std::env::consts::ARCH));
+    if let Some(kernel) = System::kernel_version()
+        && !kernel.trim().is_empty()
+    {
+        labels.push(StringKeyValue::new("kernel", kernel));
+    }
+
+    labeled_facts.push(MetricsLabeledFact {
+        key: "host.info".to_string(),
+        value: "1".to_string(),
+        labels,
+    });
+}
+
+/// 主 IP：非回环 IPv4，按接口名排序取第一条（与日志链路 `host_ip` 同一口径）。
+///
+/// 多网卡机器只能有一个 `host_ip`，否则同一主机会裂出多条 info 序列；取不到就不写
+/// （不补 `127.0.0.1`，也不写空串）。
+fn primary_host_ip() -> Option<String> {
+    primary_host_ip_from(crate::discovery::network::local_ip_addresses())
+}
+
+/// 纯函数：从 `<iface> <addr>/<prefix>` 列表里选主 IP。
+///
+/// 拆出来是为了能用合成数据单测：真实枚举依赖运行环境的网卡，测不稳定。
+fn primary_host_ip_from(entries: Vec<String>) -> Option<String> {
+    let mut candidates: Vec<(String, String)> = entries
+        .into_iter()
+        .filter_map(|entry| {
+            // 用 `split_whitespace` 而不是 `split_once(' ')`：多一个空格也不至于整台机器丢 IP。
+            let mut parts = entry.split_whitespace();
+            let iface = parts.next()?;
+            let spec = parts.next()?;
+            let addr = spec.split('/').next()?;
+            let parsed: std::net::Ipv4Addr = addr.parse().ok()?;
+            if parsed.is_loopback() {
+                return None;
+            }
+            Some((iface.to_string(), addr.to_string()))
+        })
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next().map(|(_, addr)| addr)
 }
 
 pub(super) fn collect_host_disk_usage(disks: &Disks, facts: &mut Vec<StringKeyValue>) {
@@ -680,4 +741,51 @@ pub(super) fn memory_usage_ratio(total: u64, available: u64) -> Option<f64> {
         return None;
     }
     Some(total.saturating_sub(available.min(total)) as f64 / total as f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::primary_host_ip_from;
+
+    fn entries(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn primary_host_ip_picks_first_ipv4_by_interface_name() {
+        assert_eq!(
+            primary_host_ip_from(entries(&[
+                "utun100 100.64.0.9/32",
+                "en1 10.0.0.7/24",
+                "en0 192.168.1.5/24",
+            ])),
+            Some("192.168.1.5".to_string())
+        );
+    }
+
+    #[test]
+    fn primary_host_ip_skips_loopback_and_ipv6() {
+        assert_eq!(
+            primary_host_ip_from(entries(&[
+                "lo0 127.0.0.1/8",
+                "en0 fd00::1/64",
+                "en1 10.0.0.7/24",
+            ])),
+            Some("10.0.0.7".to_string())
+        );
+        assert_eq!(
+            primary_host_ip_from(entries(&["lo0 127.0.0.1/8", "en0 fd00::1/64"])),
+            None
+        );
+    }
+
+    #[test]
+    fn primary_host_ip_tolerates_extra_whitespace() {
+        // 枚举侧万一多拼了空格，也不能整台机器丢 `host_ip`。
+        assert_eq!(
+            primary_host_ip_from(entries(&["  eth0   10.1.2.3/24  "])),
+            Some("10.1.2.3".to_string())
+        );
+        assert_eq!(primary_host_ip_from(entries(&["malformed"])), None);
+    }
 }

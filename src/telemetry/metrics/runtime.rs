@@ -381,7 +381,10 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{MetricsRuntimeSnapshot, build_runtime_snapshot, path_for, store};
+    use super::{
+        MetricsCollectionOutcome, MetricsCollectionTargetSample, MetricsRuntimeSnapshot,
+        build_runtime_snapshot, path_for, store,
+    };
     use crate::telemetry::metrics::target_view::{MetricsTargetView, MetricsTargetViewEntry};
     use wist_contracts::discovery::StringKeyValue;
 
@@ -793,6 +796,124 @@ mod tests {
             available >= 0,
             "available disk should be non-negative, got {available}"
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn host_info_fact_carries_machine_identity() {
+        let collected = super::collect_host_runtime_facts(&[]);
+        let info = collected
+            .labeled_facts
+            .iter()
+            .find(|fact| fact.key == "host.info")
+            .expect("host.info");
+
+        assert_eq!(info.value, "1", "info 指标的值恒为 1");
+        let label = |key: &str| {
+            info.labels
+                .iter()
+                .find(|label| label.key == key)
+                .map(|label| label.value.as_str())
+        };
+        assert!(!label("host_name").unwrap_or_default().is_empty());
+        assert_eq!(label("os"), Some(std::env::consts::OS));
+        assert_eq!(label("arch"), Some(std::env::consts::ARCH));
+
+        // `host_ip` 可缺（机器没有可用 IPv4），但一旦有值，必须是可解析的非回环 IPv4。
+        if let Some(ip) = label("host_ip") {
+            let parsed: std::net::Ipv4Addr = ip.parse().expect("host_ip must be an IPv4 address");
+            assert!(!parsed.is_loopback(), "host_ip 不得是回环地址: {ip}");
+        }
+    }
+
+    /// 端到端：真实采集 → 样本 → VM 行。`system_host_info` 必须真的带上身份 label，
+    /// 且这些 label **不得**跑到测量序列上。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn real_host_facts_become_a_single_host_info_vm_line() {
+        use crate::telemetry::metrics::samples::{
+            build_samples_snapshot, build_vm_metric_lines_with,
+        };
+
+        let collected = super::collect_host_runtime_facts(&[]);
+        let target = MetricsCollectionTargetSample {
+            candidate_id: "host-1:host:host_metrics".to_string(),
+            target_ref: "host-1:host".to_string(),
+            status: "succeeded".to_string(),
+            last_error: None,
+            resource_ref: "host-1".to_string(),
+            execution_hints: Vec::new(),
+            runtime_facts: collected.facts,
+            labeled_facts: collected.labeled_facts,
+        };
+        let runtime = MetricsRuntimeSnapshot {
+            generated_at: "2026-04-19T00:00:00Z".to_string(),
+            total_targets: 1,
+            host_targets: 1,
+            process_targets: 0,
+            container_targets: 0,
+            outcomes: vec![MetricsCollectionOutcome {
+                collection_kind: "host_metrics".to_string(),
+                status: "succeeded".to_string(),
+                attempted_targets: 1,
+                succeeded_targets: 1,
+                failed_targets: 0,
+                dropped_targets: 0,
+                last_error: None,
+                runtime_facts: Vec::new(),
+                labeled_facts: Vec::new(),
+                sample_targets: vec![target],
+            }],
+        };
+
+        let snapshot = build_samples_snapshot(&runtime);
+        let lines = build_vm_metric_lines_with(&snapshot, "agent-1", &Default::default());
+
+        let info_lines: Vec<_> = lines
+            .iter()
+            .filter(|line| line.metric.name == "system_host_info")
+            .collect();
+        assert_eq!(info_lines.len(), 1, "每批只能有一条 info 序列");
+        let info = info_lines[0];
+        assert_eq!(info.metric.instance, "host-1");
+        assert!(
+            !info
+                .metric
+                .host_name
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+        );
+        assert_eq!(info.metric.os.as_deref(), Some(std::env::consts::OS));
+        assert_eq!(info.metric.arch.as_deref(), Some(std::env::consts::ARCH));
+        if let Some(host_ip) = info.metric.host_ip.as_deref() {
+            let parsed: std::net::Ipv4Addr = host_ip.parse().expect("host_ip must be IPv4");
+            assert!(!parsed.is_loopback());
+        }
+
+        // 身份 label 只能出现在 info 序列上：漏到测量序列就是序列身份漂移。
+        for line in &lines {
+            if line.metric.name == "system_host_info" {
+                continue;
+            }
+            assert!(
+                line.metric.host_name.is_none(),
+                "{} 带了 host_name",
+                line.metric.name
+            );
+            assert!(
+                line.metric.host_ip.is_none(),
+                "{} 带了 host_ip",
+                line.metric.name
+            );
+            assert!(line.metric.os.is_none(), "{} 带了 os", line.metric.name);
+            assert!(line.metric.arch.is_none(), "{} 带了 arch", line.metric.name);
+            assert!(
+                line.metric.kernel.is_none(),
+                "{} 带了 kernel",
+                line.metric.name
+            );
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

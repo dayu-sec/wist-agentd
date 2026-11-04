@@ -3,6 +3,23 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.24.0-alpha] - 2026-11-04
+
+### 新增
+
+- 主机指标新增身份序列 `system_host_info`（值恒为 1），带 `host_name` / `host_ip` / `os` /
+  `arch` / `kernel`。这些字段随每批主机指标上送，VM 侧第一次能直接回答「这是哪台机器」，
+  不再依赖读侧 join 注册表。
+- `host_ip` 取**非回环 IPv4、按接口名排序的第一条**（与日志链路 `host_ip` 同一口径）；
+  取不到就不写该 label，多网卡机器不会裂出多条 info 序列。
+- 依赖 `wist-metrics 0.13.0` 新增的 label 常量（`HOST_NAME` / `HOST_IP` / `OS` / `ARCH` / `KERNEL`）。
+
+### 为什么
+
+注册表的机器画像只在管理面读时 join 才有（`wist-gateway/src/api/host_metrics.rs`），
+数据面（Grafana / 告警 / 中心聚合）拿不到主机名与 IP；而 `os` / `arch` / 内核连注册表都没存。
+不把这些值平铺到测量序列上是有意的：它们会变，平铺会让全部 `system_*` 在变化时断段。
+
 ## [0.23.4-alpha] - 2026-11-03
 
 ### 变更（内部：规范名收口）

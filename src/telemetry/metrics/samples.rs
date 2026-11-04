@@ -99,6 +99,18 @@ pub struct VmMetricLabels {
     pub target_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
+    /// 主机身份（`system_host_info`）：主机名 / 主 IP / 系统 / 架构 / 内核。
+    /// 只在这条 info 序列上出现；其余指标不写（`Option` + `skip_serializing_if` 保证不落空键）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<String>,
     /// 选择类 label（`app` / `env` / `cluster` …）：由配置下发，不参与身份。
     #[serde(flatten)]
     pub selection: BTreeMap<String, String>,
@@ -141,6 +153,11 @@ pub fn build_vm_metric_lines_with(
                     target_kind: label_value(&sample.labels, label::TARGET_KIND)
                         .map(str::to_string),
                     outcome: label_value(&sample.labels, label::OUTCOME).map(str::to_string),
+                    host_name: label_value(&sample.labels, label::HOST_NAME).map(str::to_string),
+                    host_ip: label_value(&sample.labels, label::HOST_IP).map(str::to_string),
+                    os: label_value(&sample.labels, label::OS).map(str::to_string),
+                    arch: label_value(&sample.labels, label::ARCH).map(str::to_string),
+                    kernel: label_value(&sample.labels, label::KERNEL).map(str::to_string),
                     selection: selection.clone(),
                 },
                 values: vec![value],
@@ -155,18 +172,20 @@ pub fn build_vm_metric_lines_with(
 fn sanitize_selection(selection: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let mut kept = BTreeMap::new();
     for (key, value) in selection {
+        // 身份 / 序列 label 优先判：闭合集以后扩容时也不会把
+        // `host_ip` / `instance` 这类键放进去改写身份。
+        if label::ALL_LABELS.contains(&key.as_str()) || key == "__name__" {
+            log::warn!(
+                "event=MetricsSelectionLabelRejected key={key} reason=identity_collision \
+                 detail=\"选择类 label 不得覆盖身份 / 序列 label，已丢弃\""
+            );
+            continue;
+        }
         if wist_api::metrics_labels::rules::KEYS.contains(&key.as_str()) {
             kept.insert(key.clone(), value.clone());
             continue;
         }
-        if matches!(key.as_str(), "agent" | "instance" | "__name__") {
-            log::warn!(
-                "event=MetricsSelectionLabelRejected key={key} reason=identity_collision \
-                 detail=\"选择类 label 不得覆盖身份 label，已丢弃\""
-            );
-        } else {
-            log::debug!("event=MetricsSelectionLabelRejected key={key} reason=not_in_closed_set");
-        }
+        log::debug!("event=MetricsSelectionLabelRejected key={key} reason=not_in_closed_set");
     }
     kept
 }

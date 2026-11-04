@@ -120,6 +120,10 @@ snake_case，闭集（§3 给出值域与准入规则）。**不得**出现 `_re
 | `target_kind` | 按需 | `host` / `process` / `container` | 计数类指标的统计对象 | 自造（主流无对应，值域闭集） |
 | `outcome` | 按需 | `succeeded` / `partial` / `failed` / `dropped` | 采集结果 | 自造（主流无对应，值域闭集） |
 | `device` | 按需 | 内核设备名（如 `sda` / `nvme0n1`） | 块设备 I/O 维度 | node_exporter |
+| `host_name` | 按需 | 系统主机名；空则不写 | 机器可读名（**只**出现在 `system_host_info`） | OTel `host.name` |
+| `host_ip` | 按需 | 非回环 IPv4；取不到不写 | 机器主 IP（**只**出现在 `system_host_info`） | OTel `host.ip` |
+| `os` / `arch` | 按需 | `linux` / `darwin` / `x86_64` / `aarch64` … | 操作系统与 CPU 架构 | OTel `os.type` / `host.arch` |
+| `kernel` | 按需 | 内核版本；空则不写 | 内核版本 | OTel `os.build_id`（近似） |
 | `namespace` / `pod` / `container` | 预留 | k8s 原始值 | 容器身份维度 | kube-state-metrics |
 
 ### 3.1 `instance` 的取值
@@ -136,6 +140,14 @@ agent 自身 →  不适用（自观测指标没有 instance）
 - 主机用资源 id，不用主机名：主机名会改，资源 id 不变。
 
 主机与 `agent` 通常一一对应，但仍保留 `instance`：agent 重新注册会变，主机不变。
+
+**身份由 `instance` 承载，可读属性不进测量序列**：主机名 / IP / 系统 / 架构 / 内核只出现在一条
+`system_host_info` 的 info 指标上（值恒为 1）。它们会变（改名、DHCP 换 IP、内核升级），平铺到
+`system_cpu_seconds_total` 一类测量序列上会让历史在变化时断成两段；集中在 info 指标上，变化只替换
+这一条序列。查询侧靠 `by (agent)` 或 `* on(agent) group_left(host_ip) system_host_info` 关联。
+
+`host_ip` 的取值口径与日志链路同一份定义：**非回环 IPv4，按接口名排序取第一条**；取不到就不写
+（不写空串、不补 `127.0.0.1`），多网卡机器也不会裂出多条 info 序列。
 
 ### 3.2 label 准入规则
 
@@ -499,6 +511,7 @@ process_state{state="running"} 1
 | `host.filesystem.available_bytes` | `system_filesystem_available_bytes` | gauge_i64 | By | — | `mountpoint`,`fstype` | `system.filesystem.usage`（state=free，近似） |
 | `host.filesystem.inodes` | `system_filesystem_inodes` | gauge_i64 | 1 | — | `mountpoint`,`fstype` | — |
 | `host.filesystem.inodes_free` | `system_filesystem_inodes_free` | gauge_i64 | 1 | — | `mountpoint`,`fstype` | — |
+| `host.info` | `system_host_info` | gauge_i64 | 1 | — | `host_name`,`host_ip`,`os`,`arch`,`kernel` | `host.name` / `host.ip` |
 
 - `disk_role=system` 的磁盘序列**必须**存在；`disk_role=data` 仅在存在数据盘时出现。
 - `system_disk_*{disk_role}` 是角色汇总，`system_filesystem_*{mountpoint}` 是逐挂载点明细；两者对同一角色必须一致。
@@ -506,6 +519,9 @@ process_state{state="running"} 1
 - **内存**：`system_memory_usage_ratio` 与 `available` 同批采集，保证互不矛盾；swap 只报总量与剩余，使用率在查询层算。
 - **磁盘**：容量（total / available / usage）按挂载点表达，供 `mountpoint` 下钻；`device` 维度只承载 I/O 计数，不重复报容量；`disk_role` 保留为角色汇总的快速视图。
 - **inodes**：使用率在查询层派生 `1 - inodes_free / inodes`；inode 总数命名为 `system_filesystem_inodes`（**不带** `_total`，避免与计数器后缀混淆）。
+- **`system_host_info`**：一条 1 值序列回答「这是哪台机器」。只承载会随环境变化的可读属性，
+  **不参与测量序列身份**；`agent` 与 `instance` 仍是唯一的身份位。`host_ip` 单值（多网卡取主 IP），
+  全量地址列表由控制面注册表承载。
 
 ### 10.2 进程（域 `process`）
 
@@ -551,7 +567,7 @@ process_state{state="running"} 1
 | `process.executable.name` | 身份信息，属发现域 |
 | `process.identity` | 身份信息，用于 `instance` 取值 |
 | `container.runtime` / `cgroup.path` / `k8s.*` | 身份信息，属发现域；k8s 身份经 `namespace` / `pod` / `container` label 表达 |
-| `host.name` | 身份信息，由 `agent` / `instance` 承载 |
+| `host.name` | 身份信息，由 `agent` / `instance` / `system_host_info` 承载 |
 
 ---
 
