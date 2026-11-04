@@ -148,6 +148,8 @@ agent 自身 →  不适用（自观测指标没有 instance）
 
 `host_ip` 的取值口径与日志链路同一份定义：**非回环 IPv4，按接口名排序取第一条**；取不到就不写
 （不写空串、不补 `127.0.0.1`），多网卡机器也不会裂出多条 info 序列。
+**全量网卡地址列表**仍由控制面注册表 `ip_addresses` 承载（形如 `en0 192.168.1.5/24`）；
+采集时机、失败语义与样例帧见 §7.7。
 
 ### 3.2 label 准入规则
 
@@ -371,6 +373,7 @@ process_state{state="running"} 1
 | 主机容量 | `system_filesystem_*{mountpoint,fstype}` | 只保留本地真实文件系统；虚拟/网络/临时挂载排除 |
 | 磁盘角色 | `system_disk_*{disk_role}` | 根文件系统 = `system`；其余本地块设备汇总 = `data`，同一设备的多挂载点只计一次 |
 | 块设备 I/O | `system_disk_{read,written}_bytes_total{device}` | Linux 读 `/proc/diskstats` 并过滤分区；macOS 的 IOKit 计数挂在整盘上，APFS 多卷共享同一组计数，必须按整盘 bsd 名去重后取一次（逐卷相加会按卷数放大） |
+| 主机主 IP | `system_host_info{host_ip}` | 只取**非回环 IPv4**：排除 IPv6 / 回环 / IPv4 自分配（`169.254/16`），剥掉 `/prefix`，按接口名排序取第一条（§7.7） |
 | 可用量 | `*_available_bytes` | 必须夹取到 `[0, total]` |
 
 - `available` 必须满足 `available ≤ total`；违反时夹取并记一次自观测事件。
@@ -394,6 +397,41 @@ process_state{state="running"} 1
 - 每批次产出一份采集快照，上送内容由该快照规范化得到。
 - 无有效样本时**整批跳过**，不发空帧。
 - 目标视图缺失时**可以**沿用上一次缓存的采集快照，但必须让该批次在自观测中可见（`used_cached_snapshot=true`）。
+
+### 7.7 主机身份（`system_host_info`）
+
+`host_name` / `host_ip` / `os` / `arch` / `kernel` 是「这是哪台机器」的可读属性，统一走一条 info 指标，
+**不进测量序列**（理由见 §3.1、D18）。
+
+**采集源**：本机网卡枚举（`getifaddrs`）+ 系统主机名 / OS / 架构 / 内核版本。不读网关下发配置，
+不使用发现快照里的过期值。
+
+**产出与周期**：
+
+- 每批主机指标**只发一条** `system_host_info`（值恒为 `1`），与同批测量样本共用同一个 `collected_at`；
+- 它没有独立周期：周期 = `MetricInterval`（§7.6）。没有指标授权就没有这条序列；
+- 主机级事实只挂在该批第一个主机目标上（§7.1），**不得**按目标复制。
+
+**`host_ip` 取值规则**（唯一实现：agentd `primary_host_ip`）：
+
+1. 枚举本机地址，排除 IPv6、回环、IPv4 自分配（`169.254/16`）；
+2. 只保留 IPv4，并剥掉 `/prefix`；
+3. 按接口名字典序排序（同名接口再按地址排序）；
+4. 取第一条；
+5. 没有可用地址 → **不写** `host_ip`（不写空串、不补回环、不沿用上批值）。
+
+**为什么只取一个 IP**：多网卡若按地址拆成多条 info 序列，`count by (host_ip)` 之类的查询会把一台
+机器数成多台；全量地址列表属于注册表（`ip_addresses`）而不是指标。
+
+**变化与缺失语义**：IP / 主机名 / 内核版本变化**只影响这条 info 序列**，测量序列身份不变；info
+序列自身会因 label 变化而断成两条 —— 这是 info 指标的预期行为（§3.1）。拿不到就不写，不补 `0`、
+不沿用旧值（§7.3）。
+
+样例帧：
+
+```text
+{"schema":"v1","agent":"agent-1","ts":"2026-01-01T00:00:00Z","seq":42} METRICS: {"metric":{"__name__":"system_host_info","agent":"agent-1","instance":"host-1","host_name":"web-01","host_ip":"10.0.0.5","os":"linux","arch":"x86_64","kernel":"6.8.0"},"values":[1],"timestamps":[1767225600000]}
+```
 
 ---
 
@@ -438,6 +476,9 @@ process_state{state="running"} 1
 7. 新增消费方**必须**只使用 §10 注册表内的名字与 label。
 8. **按机器看趋势用 `by (agent)`**；按用途/环境/部署单元圈定范围用 `app` / `env` / `cluster`；不得用正则匹配 `agent`。`app` 可能缺失（未判定）：未分类机器用 `{app=""}` 统计，总量类查询不要加 `app` 过滤，否则未分类机器会被静默排除。
 9. 选择类 label 的值变更会断开历史，看板**不得**把它当可变维度（如按归属团队过滤）；归属类信息从控制面注册表 join。
+10. **主机可读身份用 `system_host_info` join**：`host_ip` / `host_name` 只在 info 序列上，消费方按
+    `* on(agent) group_left(host_ip) last_over_time(system_host_info[2m])` 关联；**不得**假设测量序列自带 IP。
+    join 窗口 ≥ 4×采集间隔（§9.1）；info 缺失时查询结果退化为「无 host_ip」，不得回填旧值。
 
 ### 9.1 派生量与查询窗口
 
@@ -521,7 +562,7 @@ process_state{state="running"} 1
 - **inodes**：使用率在查询层派生 `1 - inodes_free / inodes`；inode 总数命名为 `system_filesystem_inodes`（**不带** `_total`，避免与计数器后缀混淆）。
 - **`system_host_info`**：一条 1 值序列回答「这是哪台机器」。只承载会随环境变化的可读属性，
   **不参与测量序列身份**；`agent` 与 `instance` 仍是唯一的身份位。`host_ip` 单值（多网卡取主 IP），
-  全量地址列表由控制面注册表承载。
+  全量地址列表由控制面注册表承载。取值规则、周期与样例帧见 §7.7。
 
 ### 10.2 进程（域 `process`）
 
@@ -592,6 +633,7 @@ process_state{state="running"} 1
 | D16 | `app` 的判定 | 高置信度来源（k8s label / 镜像名 / systemd unit）规范化后命中注册表才写入，其余留空，由网关补判 | 推断值会变、误判且静默；留空可被 `{app=""}` 显式发现，比写 `unknown` 或猜一个安全 |
 | D15 | CPU 表示 | 只存累计秒，比例在查询层派生 | 比例必须带分母口径，落库即固化 |
 | D17 | 网关与注册表的关系 | 网关**不依赖** `wist-metrics`，按线上名字字符串查询；名字契约由规范 + 测试守 | 加依赖会把网关绑进 crate 发布链（每次改注册表都要重发网关）；代价是名字写错编译期不报错，用白名单常量 + 真实 VM 校验兜底 |
+| D18 | 主机可读身份（`host_ip` / `host_name` / `os` / `arch` / `kernel`） | 单独一条 `system_host_info` info 指标；测量序列不带这些 label | IP / 主机名会随 DHCP、改名、迁移变化，平铺会在变化时切断全部 `system_*` 历史；info 指标只让这一条换 label。代价是查询需要 `group_left` join（§9 第 10 条） |
 
 ---
 
@@ -624,6 +666,7 @@ process_state{state="running"} 1
 | 选择类 label | 键 ⊆ §3.4 闭集；值合法（小写、≤ 32 字符、`env` ∈ 闭集）；`env` / `cluster` 的存在性与每 app 允许键集由控制面注册校验保证（agent 不猜部署单元）；`app` 允许缺失，若存在则必须来自白名单来源且命中注册表 |
 | 选择类取值 | 值小写、无空格；`env` ∈ 闭集；值不得编码其他维度（不含环境名、应用名）；不得含动态状态、版本、归属、IP/PID |
 | 覆盖完整性 | 每个采集域的 fact 产出集合 ⊆ 注册表 ∪ ignore 表 |
+| info 指标 | 每批 `(name, agent, instance)` 至多一条；值恒为 `1`；`host_name` / `host_ip` / `os` / `arch` / `kernel` **只**出现在 `system_host_info`，测量序列不得携带 |
 | 投递可观测 | 每批次失败必须反映在 `agent_uplink_metrics_failed_total` |
 
 ---
