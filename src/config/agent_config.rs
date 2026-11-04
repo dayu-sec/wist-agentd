@@ -83,9 +83,29 @@ pub struct MetricsSection {
 pub struct KafkaSection {
     #[serde(default)]
     pub enabled: bool,
-    /// `host:port` 列表。V1 只支持 PLAINTEXT，不支持 SASL / TLS。
+    /// `host:port` 列表。
     #[serde(default)]
     pub bootstrap_servers: Vec<String>,
+    /// `PLAINTEXT` / `SSL` / `SASL_PLAINTEXT` / `SASL_SSL`（默认 `PLAINTEXT`）。
+    ///
+    /// **不自动降级**：从 TLS 回落到明文是安全降级，只能显式选。
+    #[serde(default = "default_kafka_security_protocol")]
+    pub security_protocol: String,
+    /// `auto` / `SCRAM-SHA-512` / `SCRAM-SHA-256` / `PLAIN`（默认 `auto`）。
+    ///
+    /// `auto` 在**同一加密等级内**按 `SCRAM-SHA-512 > SCRAM-SHA-256 > PLAIN` 挑，
+    /// 依据是 broker 在 `SaslHandshake` 里回的机制列表 —— 不猜、不跨等级。
+    #[serde(default = "default_kafka_sasl_mechanism")]
+    pub sasl_mechanism: String,
+    /// SASL 用户名；`SASL_*` 模式必填。
+    #[serde(default)]
+    pub username: Option<String>,
+    /// SASL 密码文件（`0600`）。密码不写进配置、不进日志、不进退诊断包。
+    #[serde(default)]
+    pub password_file: Option<String>,
+    /// 覆盖系统根证书的 CA（PEM）；`SSL` / `SASL_SSL` 可选。
+    #[serde(default)]
+    pub tls_ca_file: Option<String>,
     /// 采集周期（毫秒）。默认 30s：metadata 一次拿全集群，很便宜。
     #[serde(default = "default_kafka_interval_ms")]
     pub interval_ms: u64,
@@ -99,6 +119,11 @@ impl Default for KafkaSection {
         Self {
             enabled: false,
             bootstrap_servers: Vec::new(),
+            security_protocol: default_kafka_security_protocol(),
+            sasl_mechanism: default_kafka_sasl_mechanism(),
+            username: None,
+            password_file: None,
+            tls_ca_file: None,
             interval_ms: default_kafka_interval_ms(),
             timeout_ms: default_kafka_timeout_ms(),
         }
@@ -798,4 +823,12 @@ fn default_kafka_interval_ms() -> u64 {
 
 fn default_kafka_timeout_ms() -> u64 {
     5_000
+}
+
+fn default_kafka_security_protocol() -> String {
+    "PLAINTEXT".to_string()
+}
+
+fn default_kafka_sasl_mechanism() -> String {
+    "auto".to_string()
 }

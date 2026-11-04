@@ -552,6 +552,39 @@ fn validate_kafka_section(kafka: &KafkaSection) -> Result<(), ValidationError> {
             return Err(ValidationError::new("invalid_kafka_bootstrap_server"));
         }
     }
+    if !matches!(
+        kafka.security_protocol.as_str(),
+        "PLAINTEXT" | "SSL" | "SASL_PLAINTEXT" | "SASL_SSL"
+    ) {
+        return Err(ValidationError::new("invalid_kafka_security_protocol"));
+    }
+    if !matches!(
+        kafka.sasl_mechanism.as_str(),
+        "auto" | "SCRAM-SHA-512" | "SCRAM-SHA-256" | "PLAIN"
+    ) {
+        return Err(ValidationError::new("invalid_kafka_sasl_mechanism"));
+    }
+    if kafka.security_protocol.starts_with("SASL_") {
+        // 认证材料缺一个都只会在连接期失败，而且是"认证失败"这种最没信息量的报错。
+        if kafka
+            .username
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            return Err(ValidationError::new("missing_kafka_username"));
+        }
+        if kafka
+            .password_file
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            return Err(ValidationError::new("missing_kafka_password_file"));
+        }
+    }
     if kafka.interval_ms < 1_000 {
         return Err(ValidationError::new("invalid_kafka_interval"));
     }
@@ -589,6 +622,47 @@ mod kafka_validation_tests {
         assert!(validate_kafka_section(&section(&["kafka-0:not-a-port"])).is_err());
         assert!(validate_kafka_section(&section(&[":9092"])).is_err());
         assert!(validate_kafka_section(&section(&["kafka-0:9092"])).is_ok());
+    }
+
+    #[test]
+    fn kafka_security_protocol_is_a_closed_set() {
+        let mut section_ = section(&["kafka-0:9093"]);
+        section_.security_protocol = "SSL_SASL".to_string();
+        assert!(validate_kafka_section(&section_).is_err());
+
+        section_.security_protocol = "SSL".to_string();
+        assert!(validate_kafka_section(&section_).is_ok());
+    }
+
+    #[test]
+    fn sasl_modes_require_credentials() {
+        let mut sasl = section(&["kafka-0:9093"]);
+        sasl.security_protocol = "SASL_SSL".to_string();
+
+        assert!(validate_kafka_section(&sasl).is_err(), "缺用户名/密码文件");
+
+        sasl.username = Some("wist-probe".to_string());
+        assert!(validate_kafka_section(&sasl).is_err(), "缺密码文件");
+
+        sasl.password_file = Some("/etc/wist-agentd/kafka-password".to_string());
+        assert!(validate_kafka_section(&sasl).is_ok());
+    }
+
+    #[test]
+    fn sasl_mechanism_is_a_closed_set_but_plaintext_ignores_it() {
+        let mut plain = section(&["kafka-0:9092"]);
+        plain.sasl_mechanism = "GSSAPI".to_string();
+        assert!(
+            validate_kafka_section(&plain).is_err(),
+            "机制名写错要立刻报，不要等连接期"
+        );
+
+        let mut auto = section(&["kafka-0:9093"]);
+        auto.security_protocol = "SASL_SSL".to_string();
+        auto.username = Some("u".to_string());
+        auto.password_file = Some("/p".to_string());
+        auto.sasl_mechanism = "auto".to_string();
+        assert!(validate_kafka_section(&auto).is_ok());
     }
 
     #[test]
