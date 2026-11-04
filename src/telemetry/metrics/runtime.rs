@@ -7,6 +7,8 @@ mod container;
 mod host;
 mod process;
 
+use super::kafka;
+
 use std::io;
 use std::path::Path;
 
@@ -76,6 +78,7 @@ pub fn build_runtime_snapshot_from_view(view: &MetricsTargetView) -> MetricsRunt
                 .collect();
             provider.collect(targets)
         })
+        .chain(kafka::collect_outcome())
         .collect();
 
     MetricsRuntimeSnapshot {

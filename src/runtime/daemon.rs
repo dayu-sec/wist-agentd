@@ -1802,6 +1802,24 @@ pub struct DaemonLoop<'a> {
 pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     // 运行时**跨 tick 活着**：观测频率的调度记忆就在它里面（内存态，不落盘）。
     let mut discovery_runtime = DiscoveryRuntime::new(discovery_probes(loop_ctx.config));
+    // Kafka 协议探针：未启用时不启动线程，快照里也不会出现这个采集域。
+    // 采集在独立线程里跑，collect 只读最近一次快照 —— 网络超时不会拖住主循环。
+    if loop_ctx.config.kafka.enabled {
+        log::info!(
+            "event=KafkaProbeEnabled servers={} interval_ms={} timeout_ms={}",
+            loop_ctx.config.kafka.bootstrap_servers.join(","),
+            loop_ctx.config.kafka.interval_ms,
+            loop_ctx.config.kafka.timeout_ms
+        );
+        crate::telemetry::metrics::kafka::init(
+            crate::telemetry::metrics::kafka::KafkaProbeConfig::new(
+                loop_ctx.config.kafka.bootstrap_servers.clone(),
+                "wist-agentd".to_string(),
+                loop_ctx.config.kafka.timeout_ms,
+                loop_ctx.config.kafka.interval_ms,
+            ),
+        );
+    }
     // L3 搜索范围：启动时先用**上次落盘**的那份（重启后不必等一次拉取才能搜），
     // 之后在循环里按最小间隔刷新。空 = 不搜（默认，也是旧网关下的唯一状态）。
     let mut last_source_search_fetch: Option<Instant> = None;

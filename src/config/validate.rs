@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use wist_contracts::SCHEMA_VERSION_V1;
 
-use crate::config::agent_config::{AgentConfig, LogsSection};
+use crate::config::agent_config::{AgentConfig, KafkaSection, LogsSection};
 use wist_validate::{ValidationError, require_non_empty};
 
 pub fn validate_config(contract: &AgentConfig) -> Result<(), ValidationError> {
@@ -50,6 +50,7 @@ pub fn validate_config(contract: &AgentConfig) -> Result<(), ValidationError> {
     }
 
     validate_logs_section(&contract.telemetry.logs)?;
+    validate_kafka_section(&contract.kafka)?;
     // `[metrics.labels]` **不再校验**：它已废弃、不再生效（选择类 label 由网关下发）。
     // 保留解析而不是拒收，是为了让带旧字段的 toml 仍能启动（`deny_unknown_fields` 会
     // 让“删掉结构体”变成“旧配置启动失败”）。
@@ -530,5 +531,74 @@ mod tests {
         logs.file_inputs.push(duplicate);
         let config = base_config().with_telemetry(TelemetrySection { logs });
         assert_code(validate_config(&config), "duplicate_log_input_id");
+    }
+}
+
+/// `[kafka]` 段：启用时地址必须齐、周期不能为零。
+///
+/// 这些错了不会在启动时暴露 —— 表现为「每 30s 一条连接失败日志」，运维很难看出是配置问题。
+fn validate_kafka_section(kafka: &KafkaSection) -> Result<(), ValidationError> {
+    if !kafka.enabled {
+        return Ok(());
+    }
+    if kafka.bootstrap_servers.is_empty() {
+        return Err(ValidationError::new("missing_kafka_bootstrap_servers"));
+    }
+    for server in &kafka.bootstrap_servers {
+        let (host, port) = server
+            .rsplit_once(':')
+            .ok_or_else(|| ValidationError::new("invalid_kafka_bootstrap_server"))?;
+        if host.is_empty() || port.parse::<u16>().is_err() {
+            return Err(ValidationError::new("invalid_kafka_bootstrap_server"));
+        }
+    }
+    if kafka.interval_ms < 1_000 {
+        return Err(ValidationError::new("invalid_kafka_interval"));
+    }
+    if kafka.timeout_ms == 0 {
+        return Err(ValidationError::new("invalid_kafka_timeout"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod kafka_validation_tests {
+    use super::*;
+
+    fn section(servers: &[&str]) -> KafkaSection {
+        KafkaSection {
+            enabled: true,
+            bootstrap_servers: servers.iter().map(|s| (*s).to_string()).collect(),
+            ..KafkaSection::default()
+        }
+    }
+
+    #[test]
+    fn disabled_kafka_section_needs_nothing() {
+        assert!(validate_kafka_section(&KafkaSection::default()).is_ok());
+    }
+
+    #[test]
+    fn enabled_kafka_section_requires_servers() {
+        assert!(validate_kafka_section(&section(&[])).is_err());
+    }
+
+    #[test]
+    fn kafka_server_must_be_host_and_port() {
+        assert!(validate_kafka_section(&section(&["kafka-0"])).is_err());
+        assert!(validate_kafka_section(&section(&["kafka-0:not-a-port"])).is_err());
+        assert!(validate_kafka_section(&section(&[":9092"])).is_err());
+        assert!(validate_kafka_section(&section(&["kafka-0:9092"])).is_ok());
+    }
+
+    #[test]
+    fn kafka_interval_and_timeout_must_be_non_zero() {
+        let mut fast = section(&["kafka-0:9092"]);
+        fast.interval_ms = 10;
+        assert!(validate_kafka_section(&fast).is_err());
+
+        let mut zero_timeout = section(&["kafka-0:9092"]);
+        zero_timeout.timeout_ms = 0;
+        assert!(validate_kafka_section(&zero_timeout).is_err());
     }
 }

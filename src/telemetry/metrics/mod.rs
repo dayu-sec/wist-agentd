@@ -1,6 +1,7 @@
 //! Metrics runtime scaffolding.
 
 pub mod cpu;
+pub mod kafka;
 pub mod runtime;
 pub mod samples;
 pub mod self_obs;

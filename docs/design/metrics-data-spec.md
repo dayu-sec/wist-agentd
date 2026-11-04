@@ -66,12 +66,12 @@
 
 ```text
 name    = ns "_" subject { "_" field } [ unit_suffix ] [ "_total" ]
-ns      = "system" | "process" | "container" | "agent"      // 可扩展，须先入规范
+ns      = "system" | "process" | "container" | "agent" | "kafka"   // 可扩展，须先入规范
 segment = 1*( %x61-7A / %x30-39 )                          // [a-z0-9]；首段必须字母开头，窗口段（如 `1m`）允许数字开头
 ```
 
 - 全小写；分隔符只有 `_`；**不得**出现 `.` / `-` / `:` / 空格 / 驼峰；**不得**以 `_` 开头或结尾；**不得**出现连续 `__`。
-- 首段是命名空间，表示**数据主体**：`system`（主机）、`process`（进程）、`container`（容器）、`agent`（agent 自身）。
+- 首段是命名空间，表示**数据主体**：`system`（主机）、`process`（进程）、`container`（容器）、`agent`（agent 自身）、`kafka`（Kafka broker，协议探针采集）。
 - 第二段起描述「对象 + 字段」，用名词而不是动词，也不写实现：**不得**出现 `procfs` / `ps` / `sysinfo` / `gather` / `scrape`。
 - **窗口**用独立指标名（`system_load_average_1m` / `_5m` / `_15m`）：不同窗口是同时存在的三条曲线，与 `node_load1` 一类主流口径一致。
 - **磁盘角色**用 `disk_role` label（`system_disk_usage_ratio{disk_role="data"}`）：角色是同一量的分组维度，用 label 才能聚合与过滤。

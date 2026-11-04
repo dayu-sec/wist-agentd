@@ -24,6 +24,11 @@ pub struct AgentConfig {
     /// 指标的选择类 label（`[metrics.labels]`）：用途 / 环境 / 部署单元。
     #[serde(default)]
     pub metrics: MetricsSection,
+    /// Kafka 应用指标（`[kafka]`）：协议探针，不依赖任何 exporter。
+    ///
+    /// 设计见 `wist-design/doc/design/telemetry/kafka-broker-metrics-spec.md`。
+    #[serde(default)]
+    pub kafka: KafkaSection,
     /// 本进程**运行日志**的 `[log]` 段（与 `telemetry.logs` 的“被采集日志”不同）。
     ///
     /// 直接内嵌共享 crate 的单类型 [`wist_log::LogSection`]（同名同义，单一事实来源），
@@ -48,6 +53,7 @@ impl AgentConfig {
             telemetry: TelemetrySection::default(),
             discovery: DiscoverySection::default(),
             metrics: MetricsSection::default(),
+            kafka: KafkaSection::default(),
             log: wist_log::LogSection::default(),
         }
     }
@@ -66,6 +72,37 @@ pub struct MetricsSection {
     /// 允许的键：`app` / `env` / `cluster` / `role` / `shard` / `tier` / `region` / `zone`。
     #[serde(default)]
     pub labels: std::collections::BTreeMap<String, String>,
+}
+
+/// `[kafka]`：Kafka 协议探针。
+///
+/// 默认**关**：没有任何 broker 地址时启动它只会在日志里刷失败。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Discovery", module = "Discovery.Config")]
+#[serde(deny_unknown_fields)]
+pub struct KafkaSection {
+    #[serde(default)]
+    pub enabled: bool,
+    /// `host:port` 列表。V1 只支持 PLAINTEXT，不支持 SASL / TLS。
+    #[serde(default)]
+    pub bootstrap_servers: Vec<String>,
+    /// 采集周期（毫秒）。默认 30s：metadata 一次拿全集群，很便宜。
+    #[serde(default = "default_kafka_interval_ms")]
+    pub interval_ms: u64,
+    /// 单次请求超时（毫秒）。默认 5s。
+    #[serde(default = "default_kafka_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for KafkaSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bootstrap_servers: Vec::new(),
+            interval_ms: default_kafka_interval_ms(),
+            timeout_ms: default_kafka_timeout_ms(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ::jumo_derive::Jumo)]
@@ -753,4 +790,12 @@ mod tests {
             .is_err()
         );
     }
+}
+
+fn default_kafka_interval_ms() -> u64 {
+    30_000
+}
+
+fn default_kafka_timeout_ms() -> u64 {
+    5_000
 }
