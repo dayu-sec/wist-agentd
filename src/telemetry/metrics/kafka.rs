@@ -35,6 +35,10 @@ pub const COLLECTION_KIND: &str = "kafka_broker_metrics";
 const API_KEY_METADATA: i16 = 3;
 /// 用 v1：0.10 起就有，字段刚好够（brokers / controller / partitions / ISR）。
 const API_VERSION_METADATA: i16 = 1;
+/// `DescribeLogDirs` 的 API key。
+const API_KEY_DESCRIBE_LOG_DIRS: i16 = 35;
+/// v0 从 0.11 起就有；它只给分区 `size`（不给磁盘总量，总量由主机文件系统指标回答）。
+const API_VERSION_DESCRIBE_LOG_DIRS: i16 = 0;
 
 /// 探测配置（来自 `[kafka]` 段）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,7 +157,20 @@ fn probe_once(config: &KafkaProbeConfig) -> ProbeResult {
     let mut last_error = None;
     for addr in &config.bootstrap_servers {
         match fetch_metadata(addr, &config.client_id, config.timeout) {
-            Ok(metadata) => return build_targets(&metadata, config.bootstrap_servers.len()),
+            Ok(metadata) => {
+                // 容量面：逐个 broker 连一次 `DescribeLogDirs`。
+                // 单个 broker 拿不到就少一条容量读数（缺序列），不影响其余指标。
+                let mut sizes = std::collections::BTreeMap::new();
+                for broker in &metadata.brokers {
+                    let broker_addr = format!("{}:{}", broker.host, broker.port);
+                    if let Ok(bytes) =
+                        fetch_log_dir_total(&broker_addr, &config.client_id, config.timeout)
+                    {
+                        sizes.insert(broker.node_id, bytes);
+                    }
+                }
+                return build_targets(&metadata, &sizes, config.bootstrap_servers.len());
+            }
             Err(err) => last_error = Some(format!("{addr}: {err}")),
         }
     }
@@ -169,7 +186,11 @@ fn probe_once(config: &KafkaProbeConfig) -> ProbeResult {
 ///
 /// 每个 broker 一个 `sample_target`：`resource_ref` 即实例身份
 /// （`kafka:<cluster>:<broker_id>`），因此不需要额外的 `broker_id` label。
-pub fn build_targets(metadata: &Metadata, attempted: usize) -> ProbeResult {
+pub fn build_targets(
+    metadata: &Metadata,
+    log_dir_sizes: &std::collections::BTreeMap<i32, i64>,
+    attempted: usize,
+) -> ProbeResult {
     let mut targets = Vec::with_capacity(metadata.brokers.len() + 1);
 
     for broker in &metadata.brokers {
@@ -187,24 +208,29 @@ pub fn build_targets(metadata: &Metadata, attempted: usize) -> ProbeResult {
             })
             .count();
 
+        let mut facts = vec![
+            fact("kafka.broker.up", "1"),
+            fact(
+                "kafka.broker.is_controller",
+                if metadata.controller_id == broker.node_id {
+                    "1"
+                } else {
+                    "0"
+                },
+            ),
+            fact("kafka.partition.count", &led.len().to_string()),
+            fact(
+                "kafka.partition.under_replicated",
+                &under_replicated.to_string(),
+            ),
+        ];
+        // 拿不到容量的 broker 不发这条 —— 不补 0（0 会被当成"磁盘空"）。
+        if let Some(bytes) = log_dir_sizes.get(&broker.node_id) {
+            facts.push(fact("kafka.log_dir.size_bytes", &bytes.to_string()));
+        }
         targets.push(target(
             &format!("kafka:{}:{}", metadata.cluster_key, broker.node_id),
-            vec![
-                fact("kafka.broker.up", "1"),
-                fact(
-                    "kafka.broker.is_controller",
-                    if metadata.controller_id == broker.node_id {
-                        "1"
-                    } else {
-                        "0"
-                    },
-                ),
-                fact("kafka.partition.count", &led.len().to_string()),
-                fact(
-                    "kafka.partition.under_replicated",
-                    &under_replicated.to_string(),
-                ),
-            ],
+            facts,
         ));
     }
 
@@ -284,6 +310,66 @@ pub fn fetch_metadata(addr: &str, client_id: &str, timeout: Duration) -> io::Res
         )));
     }
     parse_metadata_v1(&mut reader)
+}
+
+/// 拉一个 broker 的 log dir 合计大小（字节）。
+pub fn fetch_log_dir_total(addr: &str, client_id: &str, timeout: Duration) -> io::Result<i64> {
+    let payload = encode_describe_log_dirs_request(12, client_id);
+    let response = round_trip(addr, timeout, &payload)?;
+    let mut reader = Reader::new(&response);
+    let correlation_id = reader.i32()?;
+    if correlation_id != 12 {
+        return Err(invalid(format!(
+            "unexpected correlation id {correlation_id}"
+        )));
+    }
+    let partitions = parse_describe_log_dirs_v0(&mut reader)?;
+    Ok(partitions.into_iter().map(|(_, size)| size).sum())
+}
+
+/// `DescribeLogDirs` v0 请求：`topics = null`（= 全部）。
+pub fn encode_describe_log_dirs_request(correlation_id: i32, client_id: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&API_KEY_DESCRIBE_LOG_DIRS.to_be_bytes());
+    body.extend_from_slice(&API_VERSION_DESCRIBE_LOG_DIRS.to_be_bytes());
+    body.extend_from_slice(&correlation_id.to_be_bytes());
+    body.extend_from_slice(&(client_id.len() as i16).to_be_bytes());
+    body.extend_from_slice(client_id.as_bytes());
+    body.extend_from_slice(&(-1i32).to_be_bytes());
+
+    let mut frame = Vec::with_capacity(body.len() + 4);
+    frame.extend_from_slice(&(body.len() as i32).to_be_bytes());
+    frame.extend_from_slice(&body);
+    frame
+}
+
+/// 解析 `DescribeLogDirs` v0 响应体，返回 `(partition_index, size_bytes)`。
+///
+/// v0 没有 `throttle_time_ms`，也没有 `total_bytes` —— 磁盘总量由主机文件系统指标回答，
+/// 这里不编造分母。
+pub fn parse_describe_log_dirs_v0(reader: &mut Reader<'_>) -> io::Result<Vec<(i32, i64)>> {
+    let dirs = reader.array_len()?;
+    let mut out = Vec::new();
+    for _ in 0..dirs {
+        let error_code = reader.i16()?;
+        let _log_dir = reader.string()?;
+        let topics = reader.array_len()?;
+        for _ in 0..topics {
+            let _topic = reader.string()?;
+            let partitions = reader.array_len()?;
+            for _ in 0..partitions {
+                let partition_index = reader.i32()?;
+                let size = reader.i64()?;
+                let _offset_lag = reader.i64()?;
+                let is_future = reader.boolean()?;
+                // 未来副本不是本地已有数据，算进去会让容量虚高。
+                if error_code == 0 && !is_future {
+                    out.push((partition_index, size));
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn round_trip(addr: &str, timeout: Duration, payload: &[u8]) -> io::Result<Vec<u8>> {
@@ -442,6 +528,13 @@ impl<'a> Reader<'a> {
         Ok(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
+    pub fn i64(&mut self) -> io::Result<i64> {
+        let bytes = self.take(8)?;
+        Ok(i64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
     pub fn boolean(&mut self) -> io::Result<bool> {
         Ok(self.take(1)?[0] != 0)
     }
@@ -591,7 +684,7 @@ mod tests {
 
     #[test]
     fn build_targets_emits_one_target_per_broker_plus_cluster() {
-        let result = build_targets(&metadata(), 2);
+        let result = build_targets(&metadata(), &std::collections::BTreeMap::new(), 2);
         assert_eq!(result.targets.len(), 3, "2 broker + 1 集群级");
         let first = &result.targets[0];
         assert_eq!(first.resource_ref, "kafka:abc:1");
@@ -633,10 +726,63 @@ mod tests {
     }
 
     #[test]
+    fn log_dir_sizes_are_only_emitted_when_known() {
+        let mut sizes = std::collections::BTreeMap::new();
+        sizes.insert(2, 1_048_576i64);
+        let result = build_targets(&metadata(), &sizes, 2);
+
+        let broker1 = &result.targets[0];
+        assert!(
+            !broker1
+                .runtime_facts
+                .iter()
+                .any(|fact| fact.key == "kafka.log_dir.size_bytes"),
+            "拿不到容量的 broker 不能补 0（0 会被读成磁盘空）"
+        );
+
+        let broker2 = &result.targets[1];
+        let size = broker2
+            .runtime_facts
+            .iter()
+            .find(|fact| fact.key == "kafka.log_dir.size_bytes")
+            .expect("有容量就要发");
+        assert_eq!(size.value, "1048576");
+    }
+
+    #[test]
+    fn parses_describe_log_dirs_v0_and_skips_future_replicas() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1i32.to_be_bytes()); // log_dirs
+        buf.extend_from_slice(&0i16.to_be_bytes()); // error_code
+        buf.extend_from_slice(&5i16.to_be_bytes());
+        buf.extend_from_slice(b"/data");
+        buf.extend_from_slice(&1i32.to_be_bytes()); // topics
+        buf.extend_from_slice(&1i16.to_be_bytes());
+        buf.extend_from_slice(b"t");
+        buf.extend_from_slice(&2i32.to_be_bytes()); // partitions
+        // 分区 0：真实数据
+        buf.extend_from_slice(&0i32.to_be_bytes());
+        buf.extend_from_slice(&1_000i64.to_be_bytes());
+        buf.extend_from_slice(&0i64.to_be_bytes());
+        buf.push(0);
+        // 分区 1：未来副本（不计数）
+        buf.extend_from_slice(&1i32.to_be_bytes());
+        buf.extend_from_slice(&7_000i64.to_be_bytes());
+        buf.extend_from_slice(&0i64.to_be_bytes());
+        buf.push(1);
+
+        let mut reader = Reader::new(&buf);
+        let partitions = parse_describe_log_dirs_v0(&mut reader).expect("parse");
+        assert_eq!(partitions, vec![(0, 1_000)], "未来副本不算本地容量");
+    }
+
+    #[test]
     fn every_emitted_fact_is_registered_in_the_metric_spec() {
         // 与 runtime 的「覆盖完整性」同一条纪律：新增 fact 忘了在 wist-metrics 注册，
         // 上游会静默丢掉整条序列，而现场只表现为「这个指标没数据」。
-        let result = build_targets(&metadata(), 1);
+        let mut sizes = std::collections::BTreeMap::new();
+        sizes.insert(1, 4_096i64);
+        let result = build_targets(&metadata(), &sizes, 1);
         for target in &result.targets {
             for fact in &target.runtime_facts {
                 let spec = wist_metrics::spec::find_metric_spec(COLLECTION_KIND, &fact.key);
