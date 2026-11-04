@@ -25,6 +25,7 @@ wist-agentd（edge daemon）实现时最重要的设计文档。
 ## 指标采集（配合 `src/telemetry/metrics/`）
 
 - [metrics-data-spec.md](./metrics-data-spec.md) — 指标数据规范（v1 草案：命名/单位/类型/身份/选择类 label/主机身份 info 指标（`system_host_info`）/常见系统取值/投递语义与决策记录）
+- [kafka-sasl-implementation.md](./kafka-sasl-implementation.md) — Kafka 探针的 SASL/TLS 实现交接（协议顺序 / SCRAM 步骤 / 测试清单）
 - [metrics-selection-labels.md](./metrics-selection-labels.md) — 选择类 label 的下发与刷新（网关三层来源 / agent 拉取与缓存 / 手工刷新命令面 / 管理面补发入口 P4）
 - [metrics-spec-rollout.md](./metrics-spec-rollout.md) — 上述规范的落地计划（工作包 / 分支策略 / 切换策略 / 验收）
 
