@@ -1,6 +1,6 @@
 # 采集运行时：统一调度与 async / blocking 双执行器
 
-> 状态：**设计（P0 已落地；P1 待做）**。决策记录见 §12（5 之外都已定）。
+> 状态：**设计（P0 已落地；P1 进行中）**。决策记录见 §12（**已全部定案**）。
 > P0 的落地范围与验收见 §10。
 >
 > 范围：**指标采集**（主机 / 进程 / 容器 / Kafka / 关系型数据库 / Doris …）。
@@ -477,7 +477,8 @@ let outcomes = scheduler::collect_all(view);    // 主机三域 + Kafka（最近
 
 - `wist-metrics` 新增 `mysql_metrics` 指标声明（连接数、QPS/TPS、慢查询、InnoDB buffer pool、复制延迟…先选 P0 子集）；
 - 新 collector：`sqlx 0.9`（`runtime-tokio` + `mysql` + `tls-rustls-aws-lc-rs`，不启 `macros`）连接池、只读查询、会话级超时；
-- 凭据：`/etc/wist-agentd/secrets/mysql/<key>/password`；自探：`my.cnf`/argv/env/端口；
+- 凭据：`/etc/wist-agentd/secrets/mysql/port-<port>/password`（用户名固定 `wist-probe`，见 §12.1-5）；
+  自探：`my.cnf`/argv/env/端口；
 - 授权：agentd 内先定 `SqlEndpoint`，`target` 只认 `auto`；
 - 验收：真机（开发库）live 用例 全绿；断网/错密码/无权限三种失败各自可定位；基数上限生效。
 
@@ -518,12 +519,11 @@ let outcomes = scheduler::collect_all(view);    // 主机三域 + Kafka（最近
 | 8 | **主机指标也进 collector 线程** | P0 一并搬；上送侧要接受「快照最多比 tick 晚一拍」 |
 | 3 | **DB 驱动用 `sqlx`**（2026-11-05 探针通过） | `default-features = false` + `runtime-tokio` + `tls-rustls-aws-lc-rs` + `mysql`，不启 `macros`；musl 静态发布下**不引入新的 C 依赖**（复用已在树上的 `aws-lc-sys`）。证据见 §12.3 |
 | 7 | **Doris P0 指标子集 = BE 存活 / 容量 / tablet** | 只用 `SHOW BACKENDS` / `SHOW PROC '/backends'`（不依赖审计日志）；compaction/rowset、FE 的 `information_schema` 基数、查询延迟类推到 P1 |
+| 5 | **凭据目录 `<target-key>` = `port-<port>`** | `/etc/wist-agentd/secrets/mysql/port-3306/password`；用户名固定 `wist-probe`（不进文件），`ca.pem` 可选；文件 `0400` / 属主 root。规则只有一条，不搞 `auto` 特例 |
 
-### 12.2 待定（P1 启动前定）
+### 12.2 待定
 
-| # | 待定 | 默认倾向 / 需要的输入 |
-|---|---|---|
-| 5 | **凭据目录的 `<target-key>`** | 倾向 `port-<port>`（如 `/etc/wist-agentd/secrets/mysql/port-3306/password`），保证「可预测、可脚本投放」 |
+（无。驱动 / 凭据目录 / Doris 子集已在 §12.1 定案，P1 可以开工。）
 
 ### 12.3 探针记录：`sqlx` × `x86_64-unknown-linux-musl`（2026-11-05）
 
@@ -599,5 +599,4 @@ cargo build --offline --release --target x86_64-unknown-linux-musl
 - 完成标志：§10 P0 验收 5 条全过，Kafka 真集群 `kafka_live` 9/9；
 - 回填本文 §10 的验收，并在 `CHANGELOG.md` 记一行「采集运行时 P0（行为不变）」。
 
-**P0 之后**：只剩 §12.2 的 5（凭据目录 `<target-key>` 命名，驱动与 Doris 子集已定），
-定了就开 P1（MySQL/TiDB）。
+**P0 之后**：§12 已全部定案，直接开 P1（MySQL/TiDB），领子见 §10。
