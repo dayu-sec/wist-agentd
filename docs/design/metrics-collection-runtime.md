@@ -171,13 +171,9 @@ pub enum Collector {
 impl Collector {
     pub fn domain(&self) -> &'static str { /* match */ }
 
-    /// 对一个目标跑一轮；同步实现内部用 `spawn_blocking` 包一层（§6.4）。
-    pub fn collect<'a>(
-        &'a self,
-        target: &'a CollectTarget,
-    ) -> Pin<Box<dyn Future<Output = ProbeResult> + Send + 'a>> {
-        match self { /* 每个分支返回 ready 或 spawn_blocking 的 future */ }
-    }
+    /// 对一个目标跑一轮；同步实现在这里 `spawn_blocking`，async 实现直接 await（§6.4）。
+    /// `self` 按值取走：作业要拥有自己那份状态才能丢进 `JoinSet`（§6.4）。
+    pub async fn collect(self) -> CollectorOutput;
 }
 ```
 
@@ -229,8 +225,8 @@ pub struct ProbeResult {
 async 与 blocking，默认 8；blocking 任务额外受「同域最多 2 个并发」约束，避免一台机器上的
 多个 DB 同时把 worker 池占满。
 
-> **P0 现状**：两个采集器都是同步实现，直接跑在采集线程上（还没有 `Semaphore` / JoinSet）。
-> P1 引入 async 采集器时，同步采集器才改走 `spawn_blocking`，同时启用并发上限。
+> **已落地（P0.5）**：两个同步采集器现在都在作业里走 `spawn_blocking`；调度循环用
+> `JoinSet` + `Semaphore`（8）跑作业，超过预算只打 `CollectorTargetStalled`，不终止阻塞调用。
 
 **超时后 `inflight` 不能立刻清空**：async 实现可以（future 已经被 drop），blocking 实现不行——
 任务是「不再等」而不是「已退出」，此时清空会给一个还卡着的目标再排一轮，越积越多。
@@ -274,15 +270,16 @@ pub fn revoke();
 pub fn collect_all(view: &MetricsTargetView) -> Vec<MetricsCollectionOutcome>;
 ```
 
-调度线程的主体（示意）：
+调度线程的主体（示意，**已按此落地**）：
 
 ```rust
-let mut inflight = JoinSet::new();
+let permits = Arc::new(Semaphore::new(8));
+let mut jobs: JoinSet<JobOutcome> = JoinSet::new();
 loop {
-    // 1) 收集已完成的结果 → 写 DomainState（同目标释放 inflight）
-    // 2) 自探：pending_scan 有值就先跑（受 budget 约束）
-    // 3) 为到期且未在飞的目标起任务（受 Semaphore 约束）
-    // 4) 退避：睡到「最近一个 next_at」与 500ms 的较小值
+    while let Some(joined) = jobs.try_join_next() { apply(joined) }   // 1) 收结果
+    // 2) 自探 / 主机 / Kafka 各自到期且未在飞 → 拿 permit 后 spawn
+    // 3) 看门狗：在飞超过预算打一次 CollectorTargetStalled（不杀作业）
+    // 4) 等一个作业完成或 100ms 空转
 }
 ```
 
@@ -317,7 +314,7 @@ let outcomes = scheduler::collect_all(view);    // 主机三域 + Kafka（最近
 | 域 | 执行器 | 关键点 |
 |---|---|---|
 | 主机 / 进程 / 容器 | blocking（现有同步实现） | **目标来源是 `target_view`（发现策略），不是工作授权**；调度器只接管执行，不新造 `*_grant()`；`attempted` 仍按目标数。**已定：P0 一并搬进 collector 线程** |
-| Kafka | blocking（现有 `probe_once`） | P0 只做「搬家」：不改协议、不改语义；`capacity_budget` 变成 `TargetPolicy.budget`，消费组周期作为该域自己的子周期（沿用 `group_interval`） |
+| Kafka | blocking（现有 `probe_once`，作业里走 `spawn_blocking`） | 协议与语义不变；周期 / 容量预算 / 消费组预算都是该域自己的旋钮 |
 | MySQL / TiDB | async | `sqlx`（MySQL + rustls，无 C 依赖）或 `mysql_async`；只读账号 + `SET SESSION MAX_EXECUTION_TIME` / `statement_timeout`；查 `information_schema` + `SHOW GLOBAL STATUS` |
 | Doris | async（**复用 MySQL transport**） | 与 MySQL **不是同一个 collector**：Doris 的读数是 `SHOW BACKENDS` / `SHOW PROC '/backends'` / `information_schema` 里的 tablet·副本视图。transport 复用、SQL 与指标映射各自实现 |
 | PostgreSQL（可选） | async | `sqlx` / `tokio-postgres`；`pg_stat_*` |
@@ -443,18 +440,38 @@ let outcomes = scheduler::collect_all(view);    // 主机三域 + Kafka（最近
 | `src/runtime/daemon.rs` | `kafka::request_scan` → `scheduler::request_scan`；`kafka::revoke` → `scheduler::revoke` |
 | `src/runtime/daemon_metrics.rs` | `process_metrics_tick` 改读 `build_runtime_snapshot_live`（不再现场采集） |
 
-**一处与初稿的偏差（有意）**：P0 的两个采集器都是同步实现，所以**直接跑在采集线程上**，
-没有套 `spawn_blocking`（一条专属线程上再开阻塞池是白绕一圈）。P1 起 async 采集器
-（MySQL / Doris）上这条线程时，同步采集器再改走 `spawn_blocking`——那时才有「不能阻塞
-异步执行器」的问题。
+**一处与初稿的偏差（当时有意，已在 P0.5 补上）**：P0 的两个采集器都是同步实现，所以当时
+直接跑在采集线程上，没有套 `spawn_blocking`。P0.5 把执行器改成 async 作业后，两者都能在
+作业里走 `spawn_blocking`（见下）。
 
 **验收结果**
 
 - `cargo test --lib`：1331 passed / 0 failed（2 条历史 flaky 的 upgrade 用例单跑通过）；
 - `cargo test --test local_exec -- --test-threads=1`：57 passed（含 `run_once` 的主机指标与上送链路）；
 - `clippy --all-targets -D warnings`、`fmt --check` 干净；
-- Kafka 真集群 live：**本轮未能复跑**——采集环境（`10.168.1.145`）当前不可达（22/30001 均超时），
+- Kafka 真集群 live：**未能复跑**——采集环境（`10.168.1.145`）不可达（22/30001 均超时），
   上次基线为 9/9；协议与采集逻辑本轮未改动（`probe_once` 原样）。
+
+### P0.5：执行器改 async（**已完成**，2026-11-05）
+
+- `collection::Collector::collect` 改成 `async fn`：作业**拥有**自己那份状态
+  （主机视图 / Kafka config + 组缓存），才能丢进 `JoinSet`；
+- 两个同步实现都在作业里走 `tokio::task::spawn_blocking`（阻塞调用不霸住异步执行器），
+  作业 panic 只丢这一轮（`event=CollectorRoundPanicked`）；
+- 调度循环：`JoinSet::try_join_next` 收结果、`Semaphore`（8）限总并发、
+  同一个目标在飞时不重复排轮次；
+- 看门狗：在飞超过预算（主机 30s / Kafka 60s）打一次 `event=CollectorTargetStalled`，
+  **不终止**作业（阻塞调用本来就停不下来），在飞标记保留到作业真正返回；
+- 自探扫描也从「线程内同步」改成 blocking 作业（不会霸住异步执行器）；
+- 新增用例：主机 / Kafka 作业在 async 运行时里完成；扫描作业异常不会伪装成
+  `KafkaProbeNoEndpoint`；超预算不会给同一目标重复排轮次。
+
+**验收结果**（2026-11-05 实测）：`cargo test --lib` 1336 passed / 1 failed——失败的是历史 flaky
+的 `upgrade::tests::spawn_upgrader_falls_back_to_a_detached_process`，单跑通过；
+`local_exec` 57 passed、`clippy -D warnings` / `fmt --check` 干净。
+
+**未覆盖**：Kafka 真集群 `kafka_live` 仍未能复跑（客户环境 `10.168.1.145` 22 / 30001 均超时）；
+本轮未改协议与采集逻辑，等环境可达后补跑并回填 9/9。
 
 ### P1：MySQL / TiDB（第一个 async 域）
 

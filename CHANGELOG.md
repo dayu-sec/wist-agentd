@@ -7,6 +7,10 @@
 
 ### 新增
 
+- **采集运行时 P0.5（行为不变）**：采集作业改成 async —— `Collector::collect` 返回 future，
+  同步实现（主机三域 / Kafka）在作业里走 `spawn_blocking`；调度循环用 `JoinSet` + `Semaphore`
+  并发跑作业，同目标在飞时不重复排轮；超预算只打 `CollectorTargetStalled`（不终止阻塞调用）。
+  自探扫描也改成 blocking 作业，不再霸住异步执行器。
 - **采集运行时 P0（行为不变）**：把 Kafka 的单域线程抽象成统一调度器
   （`src/telemetry/metrics/scheduler.rs`）：一条采集线程 + 自带 `current_thread` runtime，
   同时管主机三域与 Kafka 的周期/预算/撤授权/自探扫描；`enum Collector` 分发，
