@@ -1,6 +1,6 @@
 # 采集运行时：统一调度与 async / blocking 双执行器
 
-> 状态：**设计（P0 已落地；P1 待做）**。决策记录见 §12（1/2/4/6/8 已定，3/5/7 待定）。
+> 状态：**设计（P0 已落地；P1 待做）**。决策记录见 §12（1/2/3/4/6/8 已定，5/7 待定）。
 > P0 的落地范围与验收见 §10。
 >
 > 范围：**指标采集**（主机 / 进程 / 容器 / Kafka / 关系型数据库 / Doris …）。
@@ -315,7 +315,7 @@ let outcomes = scheduler::collect_all(view);    // 主机三域 + Kafka（最近
 |---|---|---|
 | 主机 / 进程 / 容器 | blocking（现有同步实现） | **目标来源是 `target_view`（发现策略），不是工作授权**；调度器只接管执行，不新造 `*_grant()`；`attempted` 仍按目标数。**已定：P0 一并搬进 collector 线程** |
 | Kafka | blocking（现有 `probe_once`，作业里走 `spawn_blocking`） | 协议与语义不变；周期 / 容量预算 / 消费组预算都是该域自己的旋钮 |
-| MySQL / TiDB | async | `sqlx`（MySQL + rustls，无 C 依赖）或 `mysql_async`；只读账号 + `SET SESSION MAX_EXECUTION_TIME` / `statement_timeout`；查 `information_schema` + `SHOW GLOBAL STATUS` |
+| MySQL / TiDB | async | `sqlx` + `mysql` + `tls-rustls-aws-lc-rs`（musl 探针已过，见 §12.3）；只读账号 + `SET SESSION MAX_EXECUTION_TIME` / `statement_timeout`；查 `information_schema` + `SHOW GLOBAL STATUS` |
 | Doris | async（**复用 MySQL transport**） | 与 MySQL **不是同一个 collector**：Doris 的读数是 `SHOW BACKENDS` / `SHOW PROC '/backends'` / `information_schema` 里的 tablet·副本视图。transport 复用、SQL 与指标映射各自实现 |
 | PostgreSQL（可选） | async | `sqlx` / `tokio-postgres`；`pg_stat_*` |
 
@@ -476,7 +476,7 @@ let outcomes = scheduler::collect_all(view);    // 主机三域 + Kafka（最近
 ### P1：MySQL / TiDB（第一个 async 域）
 
 - `wist-metrics` 新增 `mysql_metrics` 指标声明（连接数、QPS/TPS、慢查询、InnoDB buffer pool、复制延迟…先选 P0 子集）；
-- 新 collector：`sqlx`（MySQL + rustls）连接池、只读查询、会话级超时；
+- 新 collector：`sqlx 0.9`（`runtime-tokio` + `mysql` + `tls-rustls-aws-lc-rs`，不启 `macros`）连接池、只读查询、会话级超时；
 - 凭据：`/etc/wist-agentd/secrets/mysql/<key>/password`；自探：`my.cnf`/argv/env/端口；
 - 授权：agentd 内先定 `SqlEndpoint`，`target` 只认 `auto`；
 - 验收：真机（开发库）live 用例 全绿；断网/错密码/无权限三种失败各自可定位；基数上限生效。
@@ -514,14 +514,54 @@ let outcomes = scheduler::collect_all(view);    // 主机三域 + Kafka（最近
 | 4 | **DB 端点也只认 `auto`**（本机自探） | 不新增显式地址入口，SSRF 面不扩大；远端库采集需单独设计 |
 | 6 | **contracts 分批收口** | 每个域在其网关开始派发时才进 `wist-contracts`；P0/P1 都先在 agentd 内定义，四个仓不同时动 |
 | 8 | **主机指标也进 collector 线程** | P0 一并搬；上送侧要接受「快照最多比 tick 晚一拍」 |
+| 3 | **DB 驱动用 `sqlx`**（2026-11-05 探针通过） | `default-features = false` + `runtime-tokio` + `tls-rustls-aws-lc-rs` + `mysql`，不启 `macros`；musl 静态发布下**不引入新的 C 依赖**（复用已在树上的 `aws-lc-sys`）。证据见 §12.3 |
 
 ### 12.2 待定（P1 启动前定）
 
 | # | 待定 | 默认倾向 / 需要的输入 |
 |---|---|---|
-| 3 | **DB 驱动** | 先在 musl 静态发布下核对 `sqlx`（`default-features = false` + `runtime-tokio` + `tls-rustls` + `mysql`/`postgres`）是否引入 C 依赖；不行则 `mysql_async` + `tokio-postgres` 两套 |
 | 5 | **凭据目录的 `<target-key>`** | 倾向复用自探身份的稳定摘要（如 `port-3306` / 集群 id），保证「可预测、可脚本投放」；多实例命名冲突时再调整 |
 | 7 | **Doris 的 P0 指标子集** | 倾向先做 BE 存活/容量/tablet（不依赖审计日志）；查询延迟类指标等与 Doris 版本对齐后再定 |
+
+### 12.3 探针记录：`sqlx` × `x86_64-unknown-linux-musl`（2026-11-05）
+
+**问题**：发布制品是静态 musl（`.github/workflows/release.yml`），新驱动的 C 依赖会直接卡在发布链上。
+
+**做法**：在 macOS 上用预编译交叉工具链做真实 `--release` 构建（本机无 `musl-gcc`，CI 那套 `apt install musl-tools` 用不了）：
+
+```bash
+# 工具链（不用 brew：本机 Xcode 过旧会被拒）
+curl -L -o /tmp/musl-cross.tar.gz \
+  https://github.com/messense/homebrew-macos-cross-toolchains/releases/download/v15.2.0/x86_64-unknown-linux-musl-aarch64-darwin.tar.gz
+mkdir -p /tmp/musl-cross && tar -xzf /tmp/musl-cross.tar.gz -C /tmp/musl-cross
+export CROSS=/tmp/musl-cross/x86_64-unknown-linux-musl/bin
+
+# 与 release.yml 同一套 env
+CC_x86_64_unknown_linux_musl=$CROSS/x86_64-linux-musl-gcc \
+AR_x86_64_unknown_linux_musl=$CROSS/x86_64-linux-musl-ar \
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=$CROSS/x86_64-linux-musl-gcc \
+cargo build --offline --release --target x86_64-unknown-linux-musl
+```
+
+**结果**（依赖形态 `sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "mysql", <TLS>] }`）：
+
+| 变体 | 构建 | 产物 | `-sys` 新增 | rustls 供应商 |
+|---|---|---|---|---|
+| 基线（无 sqlx） | ✅ 20.4s | 21,363,832 B · `static-pie` | `aws-lc-sys` / `ring`（既有） | 仅 `aws_lc_rs` |
+| `tls-rustls-aws-lc-rs` | ✅ 22.6s | 21,402,704 B · `static-pie` | **无新增** | 仅 `aws_lc_rs` |
+| `tls-rustls`（= `tls-rustls-ring`） | ✅ 21.9s | 21,391,680 B · `static-pie` | **无新增** | `aws_lc_rs` **+ `ring`**（双供应商） |
+| `mysql_async` 0.36 | 未试（定案不需要） | — | — | — |
+
+**结论：选 `sqlx` + `tls-rustls-aws-lc-rs`。** 理由：
+
+1. 一个 C 依赖都没新增（`aws-lc-sys` 本来就因 `rustls` 在树上，CI 已经在用 `musl-gcc` 编它）；
+2. 不启 `macros` → 没有 `sqlx-macros`，也不需要编译期连库；
+3. `tls-rustls-ring` 虽然也过，但会把 `ring` feature 塞进 `rustls`，一个进程里同时存在两套加密实现
+   （rustls 的 process-level `CryptoProvider` 会变得含糊），因此不选；
+4. 未引入 `rsa` / `native-tls` / `openssl-sys`（`caching_sha2_password` 在 TLS 上走明文交换，不需要 RSA 公钥通道）。
+
+**注意**：本次探针里 `sqlx` 还没有被业务代码引用，链接期被 dead-code 掉了，所以 38 KB 的体积差**不代表**
+真实增量；P1 collector 落地后要复测一次。`aarch64-unknown-linux-musl` 本机无工具链，仍由 CI 覆盖。
 
 ## 13. 一个域的最小落地清单（checklist）
 
@@ -557,4 +597,4 @@ let outcomes = scheduler::collect_all(view);    // 主机三域 + Kafka（最近
 - 完成标志：§10 P0 验收 5 条全过，Kafka 真集群 `kafka_live` 9/9；
 - 回填本文 §10 的验收，并在 `CHANGELOG.md` 记一行「采集运行时 P0（行为不变）」。
 
-**P0 之后**：先定 §12.2 的 3 / 5 / 7，再开 P1（MySQL/TiDB）。
+**P0 之后**：先定 §12.2 的 5 / 7（驱动已在 §12.1-3 定为 `sqlx`），再开 P1（MySQL/TiDB）。
