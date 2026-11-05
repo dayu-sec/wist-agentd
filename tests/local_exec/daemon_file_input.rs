@@ -23,6 +23,13 @@ use super::common::{
     standalone_config_with_file_output, standalone_config_with_tcp_output, temp_dir, test_exec_bin,
 };
 
+/// 假数据服务的**读超时**：只是“对端再也不发就放弃”的防挂死上限，不是“预期这么久才有数据”。
+///
+/// 取 30s：这套用例有 50+ 个 daemon 并行跑，一轮 tick 被调度拖到几秒是常见的；
+/// 读取正常时连接关闭（EOF）会先返回，不会等满这个值。曾经的 2s 在并行负载下会
+/// 偶发先超时后数据，让“本轮发了什么”变成空。
+const FAKE_SERVER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn bind_tcp_listener(addr: &str) -> Option<TcpListener> {
     match TcpListener::bind(addr) {
         Ok(listener) => Some(listener),
@@ -1171,7 +1178,7 @@ fn daemon_run_once_sends_raw_log_lines_to_tcp_output() {
         for _ in 0..2 {
             let (mut socket, _) = listener.accept().expect("accept");
             socket
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(FAKE_SERVER_READ_TIMEOUT))
                 .expect("set timeout");
             let mut buf = Vec::new();
             let mut chunk = [0u8; 128];
@@ -1620,7 +1627,7 @@ fn accept_and_drain(listener: &TcpListener) -> String {
     }
     let mut socket = socket.expect("待命期必须建立上行连接推进程列表");
     socket
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(FAKE_SERVER_READ_TIMEOUT))
         .expect("set read timeout");
     let mut payload = String::new();
     let mut chunk = [0u8; 512];
@@ -1654,7 +1661,7 @@ fn run_once_collecting_tcp(root: &std::path::Path, work: &AppliedWorkGrant) -> V
             return Vec::new();
         };
         socket
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(FAKE_SERVER_READ_TIMEOUT))
             .expect("set read timeout");
         let mut buf = Vec::new();
         let mut chunk = [0u8; 256];
@@ -1810,7 +1817,7 @@ fn daemon_run_once_without_granted_metrics_work_skips_the_metrics_frame() {
         for _ in 0..2 {
             let (mut socket, _) = listener.accept().expect("accept");
             socket
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(FAKE_SERVER_READ_TIMEOUT))
                 .expect("set timeout");
             let mut buf = Vec::new();
             let mut chunk = [0u8; 128];
@@ -1865,7 +1872,7 @@ fn a_granted_log_work_collects_the_glob_without_any_config_file_input() {
         for _ in 0..2 {
             let (mut socket, _) = listener.accept().expect("accept");
             socket
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(FAKE_SERVER_READ_TIMEOUT))
                 .expect("set timeout");
             let mut buf = Vec::new();
             let mut chunk = [0u8; 128];
@@ -1979,7 +1986,7 @@ fn daemon_run_once_replays_spool_when_tcp_output_recovers() {
     let server = thread::spawn(move || {
         let (mut socket, _) = listener.accept().expect("accept");
         socket
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(FAKE_SERVER_READ_TIMEOUT))
             .expect("set timeout");
         let mut buf = Vec::new();
         let mut chunk = [0u8; 128];
@@ -2075,7 +2082,7 @@ fn daemon_run_once_exposes_paused_input_and_recovers_in_health_snapshot() {
     let server = thread::spawn(move || {
         let (mut socket, _) = listener.accept().expect("accept");
         socket
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(FAKE_SERVER_READ_TIMEOUT))
             .expect("set timeout");
         let mut buf = Vec::new();
         let mut chunk = [0u8; 128];
