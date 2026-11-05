@@ -1883,6 +1883,9 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     let mut last_sql_scan: Option<Instant> = None;
     let mut last_sql_revision: Option<i64> = None;
     let mut sql_authorized = false;
+    let mut last_pg_scan: Option<Instant> = None;
+    let mut last_pg_revision: Option<i64> = None;
+    let mut pg_authorized = false;
     // 数据面上送启用同样跨 tick 活着：上一次已应用的 grant 就在里面（拉取失败保留它）。
     let mut uplink_runtime = AppliedUplink::default();
     let mut last_uplink_fetch: Option<Instant> = None;
@@ -2286,6 +2289,38 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                     sql_authorized = false;
                     last_sql_scan = None;
                     last_sql_revision = None;
+                }
+            }
+        }
+        // PostgreSQL：与 MySQL 同一套（授权 + 自探 + 撤授权即停）。
+        match work_runtime.pg_grant() {
+            Some(grant) => {
+                pg_authorized = true;
+                let snapshot = discovery_runtime.latest_snapshot();
+                let snapshot_key = snapshot.map(|snapshot| snapshot.revision);
+                let changed = snapshot_key != last_pg_revision;
+                let due = last_pg_scan.is_none_or(|at| at.elapsed() >= MYSQL_SCAN_INTERVAL);
+                if changed || due {
+                    let settings = crate::telemetry::metrics::postgres::PgTargetSettings {
+                        timeout: Duration::from_millis(loop_ctx.config.postgres.timeout_ms),
+                        interval: grant
+                            .interval
+                            .unwrap_or(Duration::from_millis(loop_ctx.config.postgres.interval_ms)),
+                    };
+                    crate::telemetry::metrics::scheduler::request_pg_scan(
+                        snapshot.cloned(),
+                        settings,
+                    );
+                    last_pg_scan = Some(Instant::now());
+                    last_pg_revision = snapshot_key;
+                }
+            }
+            None => {
+                if pg_authorized {
+                    crate::telemetry::metrics::scheduler::revoke_pg();
+                    pg_authorized = false;
+                    last_pg_scan = None;
+                    last_pg_revision = None;
                 }
             }
         }

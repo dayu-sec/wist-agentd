@@ -313,6 +313,7 @@ async fn diagnose(config_root: &Path, offline: bool) -> Report {
     checks.push(log_source_check(&config));
     checks.push(kafka_discovery_check(&config));
     checks.push(mysql_discovery_check(&config));
+    checks.push(pg_discovery_check(&config));
 
     if offline {
         checks.push(Check::warn(
@@ -1114,6 +1115,49 @@ fn mysql_discovery_check(config: &AgentConfig) -> Check {
         "discovery.mysql",
         "已发现 MySQL 实例",
         format!("{detail}；采集还要采集面授权（MysqlInstance/auto）"),
+    )
+}
+
+/// PostgreSQL 自探（与 MySQL 同一套口径）。
+fn pg_discovery_check(config: &AgentConfig) -> Check {
+    if !config.discovery.process_enabled {
+        return Check::warn(
+            "discovery.postgres",
+            "自探开着，但进程发现是关的",
+            "process_enabled = false；自探靠进程证据",
+        )
+        .hint("把 [discovery] 的 `process_enabled` 打开");
+    }
+
+    let instances = crate::discovery::pg_source::resolve_live();
+    if instances.is_empty() {
+        return Check::ok(
+            "discovery.postgres",
+            "本机没有发现 PostgreSQL 实例",
+            "只读进程证据 + SSLRequest 握手；库跑在容器 / pod 里时，agentd 要能看见宿主进程（k8s 需 hostPID: true）",
+        );
+    }
+
+    let detail = instances
+        .iter()
+        .map(|instance| {
+            format!(
+                "{} => {}:{}（证据 {}，凭据 {}）",
+                instance.instance(),
+                instance.host,
+                instance.port,
+                instance.evidence,
+                crate::telemetry::metrics::postgres::password_file_for_key(
+                    &instance.credential_key
+                )
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Check::ok(
+        "discovery.postgres",
+        "已发现 PostgreSQL 实例",
+        format!("{detail}；采集还要采集面授权（PostgresInstance/auto）"),
     )
 }
 

@@ -4,67 +4,43 @@
 //! **进程本身就是证据**。运维不需要在配置文件里写任何地址 —— 采不采、什么时候采
 //! 由采集面授权决定，地址由这里给。
 //!
-//! ## 三种运行时同一套逻辑
+//! ## 运行时无关
 //!
 //! 数据目录里 MySQL 可能跑在 **host**、**docker-compose**、**k8s pod** 里。
-//! 决定"连哪儿"的不是运行时类型，而是**进程所在的 network namespace**：
+//! 端口、地址与身份都由 [`super::db_source`] 按 **netns** 统一处理
+//! （`/proc/<pid>/net/tcp` + 回环优先的多候选握手），本模块只管 MySQL 自己的事：
 //!
-//! 1. 端口读 `/proc/<pid>/net/tcp` —— 这是**该进程 netns** 的监听表（不是宿主的），
-//!    root 直接读，不需要 `setns`；
-//! 2. 地址按候选顺序逐个握手：`127.0.0.1`（同 netns / compose 发布了端口）→
-//!    该 netns 里的非回环地址（docker bridge IP / pod IP，从 `/proc/<pid>/net/fib_trie` 取）；
-//! 3. 第一个握得通的地址就是端点。
+//! - **证据**：`[mysqld] port=` / `--port=` / `--skip-networking`；
+//! - **握手**：读问候包首字节必须是 `protocol_version = 10`。
 //!
-//! 这样 host（同 netns）、compose（发布端口到回环）、k8s（pod IP）都走同一条路。
-//! 前提只有一个：agentd 要能看见进程（k8s 需 DaemonSet + `hostPID: true`）。
-//!
-//! ## 证据层（从强到弱）
-//!
-//! 1. `--defaults-file` / `/etc/my.cnf` / `/etc/mysql/my.cnf` 的 `[mysqld] port=`；
-//! 2. 命令行 `--port=` / `--skip-networking`；
-//! 3. netns 里的 TCP 监听端口（只看得到「这里有个监听」）。
-//!
-//! ## 为什么还要握手
-//!
-//! 一个 `mysqld` 通常监听两个端口（3306 经典协议、33060 X 协议），容器里还可能有
-//! 别的转发。**只认「发 Protocol 10 问候包」的端口**：TCP 能连不等于能用 SQL 采，
-//! 把 X 协议端口当 MySQL 采会每轮都失败一次。
+//! 握手这一步是必须的：`mysqld` 通常同时监听 3306（经典协议）与 33060（X 协议），
+//! TCP 能连不等于能用 SQL 采 —— 把 X 协议端口当 MySQL 采会每轮失败一次，
+//! 而那在指标上看起来和「库挂了」一模一样。
 //!
 //! ## 红线
 //!
 //! 只读白名单键：`[mysqld]` 段的 `port` / `skip-networking` / `socket`。
 //! 任何含 `password` / `user` 的键一律不读、不报、不进日志。
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::collections::BTreeMap;
 
 use serde::Serialize;
 use wist_contracts::discovery::DiscoverySnapshot;
 
+use super::db_source::{
+    DbProc, ObservedProcess, RealProc, candidate_addrs, container_identities, credential_key,
+    processes, rooted, tcp_probe,
+};
+
+/// MySQL 经典协议的问候包第一字节（`protocol_version`）。
+const PROTOCOL_10: u8 = 0x0a;
 /// 一次解析最多看多少个进程（数据库机器上进程很多，不必全扫）。
 const MAX_INSPECTED_PROCESSES: usize = 8;
 /// 单个进程最多实测几个端口（3306 + 33060 + 少量转发）。
 const MAX_PROBE_PORTS_PER_PROCESS: usize = 4;
-/// 单个 netns 最多试几个地址（回环 + 少量 veth / pod IP）。
-const MAX_ADDRS_PER_NETNS: usize = 3;
-/// `cmdline` 的读取上限。
-const MAX_PROC_BYTES: usize = 4096;
-/// 配置文件读取上限：`my.cnf` 一般几 KB。
-const MAX_EVIDENCE_BYTES: u64 = 64 * 1024;
-/// 单次 TCP 握手的超时（与 Kafka 自探同一量级）。
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(300);
-/// MySQL 经典协议的问候包第一字节（`protocol_version`）。
-const PROTOCOL_10: u8 = 0x0a;
 
-/// 实例所在的"范围"：决定凭据目录怎么命名。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub enum InstanceScope {
-    /// 与 agentd 同一个 netns（host 上的 systemd 服务 / 裸二进制）。
-    Host,
-    /// 独立的 netns（docker / docker-compose / k8s pod）。
-    Container,
-}
+/// 实例所在范围（host / 容器）；由公共层定义，这里重导出便于同域代码引用。
+pub use super::db_source::InstanceScope;
 
 /// 一条 MySQL 实例候选（自探产物；只在进程内使用）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -75,8 +51,7 @@ pub struct MysqlInstanceEntry {
     pub host: String,
     /// 经典协议端口（已通过握手）。
     pub port: u16,
-    /// 凭据目录名（见设计文档 §12.1-5）：
-    /// `port-<port>` / `pod-<ns>-<pod>` / `container-<name>` / `addr-<ip>-<port>`。
+    /// 凭据目录名：`port-<port>` / `pod-<ns>-<pod>` / `container-<name>` / `addr-<ip>-<port>`。
     pub credential_key: String,
     pub scope: InstanceScope,
     /// 证据层：`config` / `argv` / `listening_port`。
@@ -106,7 +81,11 @@ pub struct TcpHandshake;
 
 impl Handshake for TcpHandshake {
     fn mysql_greeting(&self, addr: &str) -> bool {
-        mysql_greeting(addr)
+        tcp_probe(addr, |stream| {
+            use std::io::Read;
+            let mut first = [0u8; 1];
+            matches!(stream.read(&mut first), Ok(1)) && first[0] == PROTOCOL_10
+        })
     }
 }
 
@@ -117,65 +96,18 @@ pub fn resolve_from_snapshot(snapshot: &DiscoverySnapshot) -> Vec<MysqlInstanceE
 
 /// 现场诊断用：立即跑一次进程 / 端点 / 容器发现再解析（不读缓存、不写盘）。
 pub fn resolve_live() -> Vec<MysqlInstanceEntry> {
-    use crate::discovery::DiscoveryProbe as _;
-
-    let now = std::time::SystemTime::now();
-    let stamp = wist_shared::time::now_rfc3339();
-    let mut snapshot = DiscoverySnapshot::new(format!("mysql-candidates-live-{stamp}"), 0, stamp);
-    for output in [
-        crate::discovery::process::ProcessDiscoveryProbe.refresh(now),
-        crate::discovery::endpoint::EndpointDiscoveryProbe.refresh(now),
-        crate::discovery::container::ContainerDiscoveryProbe.refresh(now),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        snapshot.resources.extend(output.resources);
-        snapshot.targets.extend(output.targets);
-    }
-    resolve_from_snapshot(&snapshot)
+    resolve_from_snapshot(&super::db_source::live_snapshot("mysql"))
 }
 
 // ---------------------------------------------------------------------------
 // 解析主体
 // ---------------------------------------------------------------------------
 
-/// 读进程证据的能力（生产实现 [`RealProc`]，测试用假实现）。
-trait MysqlProc {
-    fn cmdline(&self, pid: u32) -> Vec<String>;
-    /// 读一个文件；`path` 已含 `/proc/<pid>/root` 前缀。
-    fn read_file(&self, path: &str) -> Option<String>;
-    /// 该进程 **netns** 里的 TCP 监听端口（读 `/proc/<pid>/net/tcp{,6}`）。
-    ///
-    /// 与宿主 `/proc/net/tcp` 的区别就是容器：pod 里的监听在宿主表里看不到。
-    fn listen_ports(&self, pid: u32) -> Vec<u16>;
-    /// 该进程 netns 里的**非回环**地址（docker bridge IP / pod IP）。
-    fn net_addrs(&self, pid: u32) -> Vec<String>;
-    /// 进程 netns 是否与 agentd 相同（同为 `net:[inode]`）。
-    fn same_netns(&self, pid: u32) -> bool;
-}
-
-struct ObservedProcess {
-    pid: u32,
-    exe: String,
-    /// 进程所属容器（`/proc/<pid>/cgroup` 推出来的 id）。
-    container_id: Option<String>,
-}
-
-/// 容器身份（从 `container` 探针的资源里 join 出来）。
-#[derive(Default)]
-struct ContainerIdentity {
-    k8s_namespace: Option<String>,
-    k8s_pod: Option<String>,
-    name: Option<String>,
-}
-
 fn resolve(
     snapshot: &DiscoverySnapshot,
-    proc: &dyn MysqlProc,
+    proc: &dyn DbProc,
     handshake: &dyn Handshake,
 ) -> Vec<MysqlInstanceEntry> {
-    let snapshot_ports = tcp_ports(snapshot);
     let containers = container_identities(snapshot);
     let mut by_target: BTreeMap<(String, u16), MysqlInstanceEntry> = BTreeMap::new();
     let mut inspected = 0usize;
@@ -209,19 +141,12 @@ fn resolve(
         } else {
             InstanceScope::Container
         };
-        let addrs = candidate_addrs(process.pid, same_netns, proc);
+        let addrs = candidate_addrs(process.pid, same_netns, proc, "mysql");
 
         let candidates = match hint.port {
             Some(port) => vec![port],
             None => {
                 let mut list = proc.listen_ports(process.pid);
-                if list.is_empty() {
-                    // 没有 `/proc/<pid>/net`（非 Linux / 无权限）：退回快照里的端点证据。
-                    list = snapshot_ports
-                        .get(&process.pid)
-                        .map(|entries| entries.iter().map(|(_, port)| *port).collect())
-                        .unwrap_or_default();
-                }
                 list.truncate(MAX_PROBE_PORTS_PER_PROCESS);
                 list
             }
@@ -240,7 +165,7 @@ fn resolve(
             };
             let credential_key = credential_key(
                 scope,
-                &host.to_string(),
+                host,
                 port,
                 process
                     .container_id
@@ -249,7 +174,7 @@ fn resolve(
             );
             let entry = MysqlInstanceEntry {
                 source_ref: format!("port:{port}"),
-                host: host.to_string(),
+                host: host.clone(),
                 port,
                 credential_key,
                 scope,
@@ -272,70 +197,6 @@ fn resolve(
     out
 }
 
-/// 候选连接地址：同 netns 只有回环；否则先试回环（compose 常把端口发布到宿主），
-/// 再试该 netns 自己的地址（docker bridge / pod IP）。
-fn candidate_addrs(pid: u32, same_netns: bool, proc: &dyn MysqlProc) -> Vec<String> {
-    let mut addrs = vec!["127.0.0.1".to_string()];
-    if same_netns {
-        return addrs;
-    }
-    for addr in proc.net_addrs(pid) {
-        if addrs.len() >= MAX_ADDRS_PER_NETNS {
-            break;
-        }
-        if addr != "127.0.0.1" && !addrs.contains(&addr) {
-            addrs.push(addr);
-        }
-    }
-    if addrs.len() == 1 {
-        log::debug!(
-            "event=MysqlNetnsAddrUnavailable source_ref=pid:{pid} detail=\"容器网络里没读到非回环地址：只能试宿主回环（compose 发布端口时仍可用）\""
-        );
-    }
-    addrs
-}
-
-/// 凭据目录名。
-///
-/// host 用端口（一个 host 上一个 3306）；容器必须用**名字**：一个节点上多个 pod 都是
-/// 3306，用端口会互相覆盖凭据。
-fn credential_key(
-    scope: InstanceScope,
-    host: &str,
-    port: u16,
-    container: Option<&ContainerIdentity>,
-) -> String {
-    if scope == InstanceScope::Host {
-        return format!("port-{port}");
-    }
-    let Some(container) = container else {
-        return sanitize_key(&format!("addr-{host}-{port}"));
-    };
-    if let (Some(namespace), Some(pod)) = (&container.k8s_namespace, &container.k8s_pod) {
-        return sanitize_key(&format!("pod-{namespace}-{pod}"));
-    }
-    match &container.name {
-        Some(name) if !name.is_empty() => sanitize_key(&format!("container-{name}")),
-        _ => sanitize_key(&format!("addr-{host}-{port}")),
-    }
-}
-
-/// 目录名安全化：小写、只留 `[a-z0-9-]`、不重复连字符。
-fn sanitize_key(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut last_dash = true;
-    for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-            last_dash = false;
-        } else if !last_dash {
-            out.push('-');
-            last_dash = true;
-        }
-    }
-    out.trim_end_matches('-').to_string()
-}
-
 /// 端口从哪来。
 struct PortHint {
     port: Option<u16>,
@@ -345,7 +206,7 @@ struct PortHint {
 }
 
 /// 依证据强弱给出端口假设；`None` = 明确不能走 TCP。
-fn port_hint(process: &ObservedProcess, argv: &[String], proc: &dyn MysqlProc) -> Option<PortHint> {
+fn port_hint(process: &ObservedProcess, argv: &[String], proc: &dyn DbProc) -> Option<PortHint> {
     if argv
         .iter()
         .any(|arg| arg == "--skip-networking" || arg == "--skip_networking")
@@ -355,6 +216,7 @@ fn port_hint(process: &ObservedProcess, argv: &[String], proc: &dyn MysqlProc) -
 
     // 1) 配置文件（`--defaults-file` 优先，否则标准路径）。
     //    走 `/proc/<pid>/root` 读：容器里跑的时候，读到的是**容器内**的 my.cnf。
+    let mut config_from: Option<(String, u16)> = None;
     for path in defaults_files(argv) {
         let full = rooted(process.pid, &path);
         let Some(text) = proc.read_file(&full) else {
@@ -369,13 +231,17 @@ fn port_hint(process: &ObservedProcess, argv: &[String], proc: &dyn MysqlProc) -
             return None;
         }
         if let Some(port) = parsed.port {
-            return Some(PortHint {
-                port: Some(port),
-                evidence: "config",
-                detail: format!("{path} 的 [mysqld] port={port}"),
-                confidence: 90,
-            });
+            config_from = Some((path, port));
+            break;
         }
+    }
+    if let Some((path, port)) = config_from {
+        return Some(PortHint {
+            port: Some(port),
+            evidence: "config",
+            detail: format!("{path} 的 [mysqld] port={port}"),
+            confidence: 90,
+        });
     }
 
     // 2) 命令行。
@@ -466,48 +332,6 @@ fn from_my_cnf(text: &str) -> MyCnf {
     out
 }
 
-fn processes(snapshot: &DiscoverySnapshot) -> Vec<ObservedProcess> {
-    snapshot
-        .resources
-        .iter()
-        .filter(|resource| resource.kind == "process")
-        .filter_map(|resource| {
-            let pid = resource.attributes.get("process.pid")?.parse().ok()?;
-            let exe = resource
-                .attributes
-                .get("process.executable.name")
-                .cloned()
-                .unwrap_or_default();
-            Some(ObservedProcess {
-                pid,
-                exe,
-                container_id: resource.attributes.get("container.id").cloned(),
-            })
-        })
-        .collect()
-}
-
-/// `container.id` → 容器身份（k8s 的 namespace/pod 名、docker 的容器名）。
-fn container_identities(snapshot: &DiscoverySnapshot) -> BTreeMap<String, ContainerIdentity> {
-    snapshot
-        .resources
-        .iter()
-        .filter(|resource| resource.kind == "container")
-        .filter_map(|resource| {
-            let attrs = &resource.attributes;
-            let id = attrs.get("container.id")?.clone();
-            Some((
-                id,
-                ContainerIdentity {
-                    k8s_namespace: attrs.get("k8s.namespace.name").cloned(),
-                    k8s_pod: attrs.get("k8s.pod.name").cloned(),
-                    name: attrs.get("container.name").cloned(),
-                },
-            ))
-        })
-        .collect()
-}
-
 /// 读 argv 之前的粗筛。
 ///
 /// 可执行名拿不到（空）时返回 `true` —— 宁可多读一个 cmdline，也不要漏报。
@@ -567,229 +391,10 @@ fn is_server(exe: &str, argv: &[String]) -> bool {
                 .any(|arg| arg.contains("mysqld") || arg.contains("tidb-server")))
 }
 
-fn tcp_ports(snapshot: &DiscoverySnapshot) -> BTreeMap<u32, Vec<(String, u16)>> {
-    let mut ports: BTreeMap<u32, BTreeSet<(String, u16)>> = BTreeMap::new();
-    for resource in &snapshot.resources {
-        if resource.kind != "service_endpoint" {
-            continue;
-        }
-        let attrs = &resource.attributes;
-        if attrs.get("endpoint.protocol").map(String::as_str) != Some("tcp") {
-            continue;
-        }
-        let Some(pid) = attrs.get("process.pid").and_then(|pid| pid.parse().ok()) else {
-            continue;
-        };
-        let Some(port) = attrs
-            .get("endpoint.bind.port")
-            .and_then(|port| port.parse().ok())
-        else {
-            continue;
-        };
-        let ip = attrs.get("endpoint.bind.ip").cloned().unwrap_or_default();
-        ports.entry(pid).or_default().insert((ip, port));
-    }
-    ports
-        .into_iter()
-        .map(|(pid, set)| (pid, set.into_iter().collect()))
-        .collect()
-}
-
-fn rooted(pid: u32, path: &str) -> String {
-    format!("/proc/{pid}/root{path}")
-}
-
-/// TCP 连上并读问候包首字节。
-fn mysql_greeting(addr: &str) -> bool {
-    use std::io::Read;
-
-    let Ok(mut addrs) = addr.to_socket_addrs() else {
-        return false;
-    };
-    let Some(target) = addrs.next() else {
-        return false;
-    };
-    let Ok(mut stream) = TcpStream::connect_timeout(&target, HANDSHAKE_TIMEOUT) else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
-    let mut first = [0u8; 1];
-    matches!(stream.read(&mut first), Ok(1)) && first[0] == PROTOCOL_10
-}
-
-// ---------------------------------------------------------------------------
-// 生产实现
-// ---------------------------------------------------------------------------
-
-struct RealProc;
-
-impl RealProc {
-    /// `/proc/<pid>/net/<name>` 的文本（这就是该进程 netns 的视图）。
-    fn net_file(pid: u32, name: &str) -> Option<String> {
-        std::fs::read_to_string(format!("/proc/{pid}/net/{name}")).ok()
-    }
-}
-
-impl MysqlProc for RealProc {
-    fn cmdline(&self, pid: u32) -> Vec<String> {
-        use std::io::Read;
-
-        let Ok(file) = std::fs::File::open(format!("/proc/{pid}/cmdline")) else {
-            return Vec::new();
-        };
-        let mut buf = Vec::new();
-        if file
-            .take(MAX_PROC_BYTES as u64)
-            .read_to_end(&mut buf)
-            .is_err()
-        {
-            return Vec::new();
-        }
-        buf.split(|byte| *byte == 0)
-            .filter(|chunk| !chunk.is_empty())
-            .map(|chunk| String::from_utf8_lossy(chunk).to_string())
-            .collect()
-    }
-
-    fn read_file(&self, path: &str) -> Option<String> {
-        use std::io::Read;
-
-        let file = std::fs::File::open(path).ok()?;
-        let mut buf = Vec::new();
-        file.take(MAX_EVIDENCE_BYTES).read_to_end(&mut buf).ok()?;
-        Some(String::from_utf8_lossy(&buf).to_string())
-    }
-
-    fn listen_ports(&self, pid: u32) -> Vec<u16> {
-        let mut ports: BTreeSet<u16> = BTreeSet::new();
-        for name in ["tcp", "tcp6"] {
-            let Some(text) = Self::net_file(pid, name) else {
-                continue;
-            };
-            ports.extend(listen_ports_in_table(&text));
-        }
-        let owned = owned_socket_ports(pid);
-        if !owned.is_empty() {
-            ports.retain(|port| owned.contains(port));
-        }
-        ports.into_iter().collect()
-    }
-
-    fn net_addrs(&self, pid: u32) -> Vec<String> {
-        Self::net_file(pid, "fib_trie")
-            .map(|text| local_addrs_in_fib(&text))
-            .unwrap_or_default()
-    }
-
-    fn same_netns(&self, pid: u32) -> bool {
-        let read = |path: String| std::fs::read_link(path).ok();
-        match (
-            read(format!("/proc/{pid}/ns/net")),
-            read("/proc/self/ns/net".into()),
-        ) {
-            (Some(a), Some(b)) => a == b,
-            // 读不到就保守当成「不同 netns」：多试一个地址而已，不会漏报。
-            _ => false,
-        }
-    }
-}
-
-/// `/proc/<pid>/net/tcp{,6}` 里状态为 `0A`（LISTEN）的本地端口。
-fn listen_ports_in_table(text: &str) -> Vec<u16> {
-    let mut ports = Vec::new();
-    for line in text.lines().skip(1) {
-        // 列：`sl local_address rem_address st …`（`st=0A` 是 LISTEN）。
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 4 || fields[3] != "0A" {
-            continue;
-        }
-        let Some((_, port)) = fields[1].rsplit_once(':') else {
-            continue;
-        };
-        if let Ok(port) = u16::from_str_radix(port, 16) {
-            ports.push(port);
-        }
-    }
-    ports
-}
-
-/// 该 pid 自己持有的监听端口（`/proc/<pid>/fd` 的 socket inode → 表里的 inode）。
-///
-/// 读不到（无权限 / 已退出）时返回空，调用方会退化为「该 netns 的全部监听端口」——
-/// 多出来的候选端口会被握手筛掉。
-fn owned_socket_ports(pid: u32) -> BTreeSet<u16> {
-    let mut inode_ports: BTreeMap<String, u16> = BTreeMap::new();
-    for name in ["tcp", "tcp6"] {
-        let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/net/{name}")) else {
-            continue;
-        };
-        for line in text.lines().skip(1) {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() < 10 || fields[3] != "0A" {
-                continue;
-            }
-            let Some((_, port)) = fields[1].rsplit_once(':') else {
-                continue;
-            };
-            let (Ok(port), inode) = (u16::from_str_radix(port, 16), fields[9]) else {
-                continue;
-            };
-            inode_ports.insert(inode.to_string(), port);
-        }
-    }
-    if inode_ports.is_empty() {
-        return BTreeSet::new();
-    }
-
-    let mut out = BTreeSet::new();
-    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let Ok(target) = std::fs::read_link(entry.path()) else {
-            continue;
-        };
-        let target = target.to_string_lossy();
-        let Some(inode) = target
-            .strip_prefix("socket:[")
-            .and_then(|rest| rest.strip_suffix(']'))
-        else {
-            continue;
-        };
-        if let Some(port) = inode_ports.get(inode) {
-            out.insert(*port);
-        }
-    }
-    out
-}
-
-/// `/proc/<pid>/net/fib_trie` 里标了 `host LOCAL` 的非回环 IPv4 地址。
-///
-/// 不引 netlink：fib_trie 是内核导出的本地地址表，读一行文本就够，
-/// 也不用 `setns` 或起子进程。
-fn local_addrs_in_fib(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut pending: Option<String> = None;
-    for raw in text.lines() {
-        let line = raw.trim();
-        if let Some(rest) = line.strip_prefix("|-- ") {
-            pending = Some(rest.trim().to_string());
-            continue;
-        }
-        let Some(addr) = pending.take() else {
-            continue;
-        };
-        // 紧跟着的那行是分类：`/32 host LOCAL`。
-        if line.contains("host LOCAL") && !addr.starts_with("127.") {
-            out.push(addr);
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use wist_contracts::discovery::DiscoveredResource;
 
     #[derive(Default)]
@@ -801,7 +406,7 @@ mod tests {
         same_netns: BTreeSet<u32>,
     }
 
-    impl MysqlProc for FakeProc {
+    impl DbProc for FakeProc {
         fn cmdline(&self, pid: u32) -> Vec<String> {
             self.cmdlines.get(&pid).cloned().unwrap_or_default()
         }
@@ -861,18 +466,6 @@ mod tests {
         resource("container", all)
     }
 
-    fn listener(pid: u32, port: u16) -> DiscoveredResource {
-        resource(
-            "service_endpoint",
-            vec![
-                ("process.pid", pid.to_string()),
-                ("endpoint.protocol", "tcp".to_string()),
-                ("endpoint.bind.ip", "0.0.0.0".to_string()),
-                ("endpoint.bind.port", port.to_string()),
-            ],
-        )
-    }
-
     fn resource(kind: &str, attrs: Vec<(&str, String)>) -> DiscoveredResource {
         DiscoveredResource {
             resource_id: format!(
@@ -905,7 +498,7 @@ mod tests {
 
     #[test]
     fn a_host_mysqld_is_reached_over_loopback() {
-        let snapshot = snapshot(vec![process(42, "mysqld"), listener(42, 3306)]);
+        let snapshot = snapshot(vec![process(42, "mysqld")]);
         let mut proc = FakeProc::default();
         proc.listen.insert(42, vec![3306]);
         proc.same_netns.insert(42);
@@ -934,7 +527,6 @@ mod tests {
                     ("k8s.pod.name", "mysql-0".to_string()),
                 ],
             ),
-            listener(42, 3306),
         ]);
         let mut proc = FakeProc::default();
         proc.listen.insert(42, vec![3306, 33060]);
@@ -1121,27 +713,5 @@ mod tests {
         assert!(parsed.skip_networking);
         let parsed = from_my_cnf("[mysqld]\nskip-networking = 1\n");
         assert!(parsed.skip_networking);
-    }
-
-    #[test]
-    fn listen_ports_are_read_from_the_proc_net_table() {
-        // 真实格式：sl local_address rem_address st ... inode
-        let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 3500007F:0CEA 00000000:0000 0A 00000000:00000000 00:00000000 00000000   999        0 12345 1\n   1: 3500007F:9C40 00000000:0000 0A 00000000:00000000 00:00000000 00000000   999        0 12346 1\n   2: 3500007F:0CEA 0100007F:9C40 01 00000000:00000000 00:00000000 00000000   999        0 12347 1\n";
-        let ports = listen_ports_in_table(table);
-        assert_eq!(ports, vec![3306, 40000], "只取 LISTEN（0A）");
-    }
-
-    #[test]
-    fn fib_trie_yields_non_loopback_local_addresses() {
-        let trie = "Main:\n  +-- 0.0.0.0/0 3 0 5\n     |-- 127.0.0.1\n        /32 host LOCAL\n     |-- 172.17.0.2\n        /32 host LOCAL\n     |-- 172.17.0.0\n        /16 link UNICAST\n";
-        let addrs = local_addrs_in_fib(trie);
-        assert_eq!(addrs, vec!["172.17.0.2".to_string()], "回环与网段不算");
-    }
-
-    #[test]
-    fn sanitize_key_makes_a_directory_safe_name() {
-        assert_eq!(sanitize_key("pod-prod-mysql-0"), "pod-prod-mysql-0");
-        assert_eq!(sanitize_key("pod-Prod_MySQL.0"), "pod-prod-mysql-0");
-        assert_eq!(sanitize_key("---"), "");
     }
 }

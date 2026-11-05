@@ -37,14 +37,24 @@ InnoDB 命中率（需要跨轮差分）、TiDB 的 region/GC 指标。理由：
 ## 3. 怎么连
 
 ```
-主机：127.0.0.1（端点只来自本机自探，不接受外部地址）
 用户：wist-probe（固定，不是秘密）
-密码：/etc/wist-agentd/secrets/mysql/port-<port>/password   （0400，属主 root）
-CA  ：/etc/wist-agentd/secrets/mysql/port-<port>/ca.pem      （可选）
+密码：/etc/wist-agentd/secrets/mysql/<key>/password   （0400，属主 root）
+CA  ：/etc/wist-agentd/secrets/mysql/<key>/ca.pem      （可选）
 ```
 
-- `<port>` 就是自探出来的端口（`port-3306`）——**运维可以在 agentd 自探之前就把文件放好**，
-  这是选择端口而不是哈希/实例 id 的唯一理由（决策记录见运行时文档 §12.1-5）；
+`<key>` 按**运行时**取（决策记录见运行时文档 §12.1-5）：
+
+| 运行时 | 连接地址 | `<key>` | 例子 |
+|---|---|---|---|
+| host（systemd / 裸二进制） | `127.0.0.1` | `port-<port>` | `port-3306` |
+| k8s pod（非 hostNetwork） | pod IP | `pod-<namespace>-<pod>` | `pod-prod-mysql-0` |
+| docker / docker-compose（发布了端口） | `127.0.0.1` | `container-<name>` | `container-compose-mysql-1` |
+| 容器但拿不到身份 | 容器 IP | `addr-<ip>-<port>` | `addr-172-18-0-7-3306` |
+
+- key 里的名字是**运维在投放凭据之前就能知道**的东西（端口 / pod 名 / 容器名）；
+- 容器不能用端口做 key：一个节点上多个 pod 都是 3306，会互相覆盖；
+- `wist-agentd doctor` 的 `discovery.mysql` 会直接列出「发现的实例 + 它期望的凭据文件路径」，
+  照着放即可，不用猜；
 - 有 `ca.pem` ⇒ `ssl_mode=VerifyCa`；没有 ⇒ `Preferred`（支持加密就加密、否则明文）。
   **配了 CA 不会静默降级**：要求校验但文件不在，直接算这一轮失败并说清楚；
 - 连接后先跑 `SET SESSION max_execution_time = <timeout_ms>`（参数走 bind），
@@ -53,20 +63,32 @@ CA  ：/etc/wist-agentd/secrets/mysql/port-<port>/ca.pem      （可选）
 只读账号的最小权限：
 
 ```sql
+-- host：进程就在本机，走回环
 CREATE USER 'wist-probe'@'127.0.0.1' IDENTIFIED BY '<随机密码>';
 GRANT PROCESS, REPLICATION CLIENT ON *.* TO 'wist-probe'@'127.0.0.1';
+
+-- 容器 / k8s：agentd 从**宿主侧**连 pod IP，来源不是 127.0.0.1
+CREATE USER 'wist-probe'@'%' IDENTIFIED BY '<随机密码>';
+GRANT PROCESS, REPLICATION CLIENT ON *.* TO 'wist-probe'@'%';
 -- PROCESS 足以读 SHOW GLOBAL STATUS / VARIABLES；REPLICATION CLIENT 用于 SHOW REPLICA STATUS
 ```
 
+> 这一步最容易漏：容器场景只建 `'wist-probe'@'127.0.0.1'` 会一直认不过，
+> 而报错看起来像「密码错」。
+
 ## 4. 证据层（自探）
 
-`src/discovery/mysql_source.rs`，从强到弱：
+`src/discovery/mysql_source.rs`（运行时部分在 `src/discovery/db_source.rs`），从强到弱：
 
 1. **配置文件**：`--defaults-file=` 或 `/etc/my.cnf`、`/etc/mysql/my.cnf`、
    `.../mysql.conf.d/mysqld.cnf`、`.../mariadb.conf.d/50-server.cnf` 里的
    `[mysqld] port=` / `skip-networking`；
 2. **命令行**：`--port=`、`--skip-networking`；
-3. **监听端口**：该进程的 TCP 监听（只看得到「这里有个监听」）。
+3. **监听端口**：该进程 **netns** 里的 TCP 监听（`/proc/<pid>/net/tcp`，宿主表里看不到 pod 的）。
+
+连接地址按候选顺序逐个握手：`127.0.0.1` → 该 netns 的非回环地址（docker bridge / pod IP）。
+这样 host、compose（发布端口到回环）、k8s（pod IP）走同一条路；**前提是 agentd 看得见进程**
+（k8s 需 DaemonSet + `hostPID: true`）。
 
 然后**每个候选端口实测一次握手**：连上后读第一个字节，必须是 MySQL 经典协议的
 `protocol_version = 10`。

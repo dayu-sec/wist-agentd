@@ -7,6 +7,15 @@
 
 ### 新增
 
+- **数据库自探改看 netns（host / docker-compose / k8s）**：端口读 `/proc/<pid>/net/tcp`
+  （该进程 netns 的监听表，宿主表里看不到 pod 的），地址按「回环 → 该 netns 的非回环地址」
+  逐个握手；凭据 key 分运行时：`port-<port>` / `pod-<ns>-<pod>` / `container-<name>` /
+  `addr-<ip>-<port>`。`doctor` 新增 `discovery.mysql` / `discovery.postgres`，
+  直接列出「发现的实例 + 它期望的凭据文件路径」。
+- **PostgreSQL 指标采集（P1.2）**：新采集域 `pg_metrics`（13 条指标：存活 / 连接 /
+  事务与回滚 / 死锁 / 临时文件 / 磁盘读与缓存命中 / 库大小 / 复制）。授权
+  `collect_metrics` + `PostgresInstance/auto`，凭据 `secrets/postgres/<key>/password`
+  （用户名 `wist-probe`），握手用 `SSLRequest`。设计见 `docs/design/pg-metrics.md`。
 - **MySQL / TiDB 指标采集（P1）**：新采集域 `mysql_metrics`（15 条指标：存活 / 连接 / 线程 /
   QPS·慢查询·异常连接·收发字节 / InnoDB buffer pool / 复制延迟与运行状态）。
   采集由采集面授权驱动（`collect_metrics` + `MysqlInstance/auto`），撤授权下一个 tick 内停采；

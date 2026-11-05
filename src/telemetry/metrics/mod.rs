@@ -10,6 +10,8 @@ pub mod kafka_groups;
 mod kafka_live;
 /// MySQL / TiDB 指标采集（SQL 直采，只读）。
 pub mod mysql;
+/// PostgreSQL 指标采集（SQL 直采，只读；与 mysql 共用查询通道）。
+pub mod postgres;
 pub mod runtime;
 pub mod samples;
 pub mod scheduler;

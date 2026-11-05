@@ -74,6 +74,19 @@ pub(crate) fn is_mysql_instance_source(kind: &str, target: &str) -> bool {
     target.is_empty() || target.eq_ignore_ascii_case(MYSQL_SOURCE_TARGET_AUTO)
 }
 
+/// PostgreSQL 采集来源的 `kind`。
+pub(crate) const PG_INSTANCE_SOURCE_KIND: &str = "PostgresInstance";
+/// `PostgresInstance` 唯一支持的 `target`。
+pub(crate) const PG_SOURCE_TARGET_AUTO: &str = "auto";
+
+pub(crate) fn is_pg_instance_source(kind: &str, target: &str) -> bool {
+    if kind != PG_INSTANCE_SOURCE_KIND {
+        return false;
+    }
+    let target = target.trim();
+    target.is_empty() || target.eq_ignore_ascii_case(PG_SOURCE_TARGET_AUTO)
+}
+
 /// 工作里没写清指标周期时的上送间隔（与采集目录里 `MetricInterval` 的策展值同值）。
 ///
 /// 为什么要有默认：`collect_metrics` 单元理论上都带一条 `MetricInterval` 来源，
@@ -93,6 +106,12 @@ pub struct KafkaGrant {
 /// MySQL / TiDB 采集授权（与 [`KafkaGrant`] 同形）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MysqlGrant {
+    pub interval: Option<Duration>,
+}
+
+/// PostgreSQL 采集授权（与 [`MysqlGrant`] 同形）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgGrant {
     pub interval: Option<Duration>,
 }
 
@@ -762,6 +781,36 @@ impl AppliedWorkGrant {
         granted.then_some(MysqlGrant { interval })
     }
 
+    /// PostgreSQL 采集授权：`collect_metrics` + `PostgresInstance/auto`。
+    pub fn pg_grant(&self) -> Option<PgGrant> {
+        let mut interval: Option<Duration> = None;
+        let mut granted = false;
+        for work in self.works.values() {
+            if !work.is_working() {
+                continue;
+            }
+            let Some(spec) = work.spec.as_ref() else {
+                continue;
+            };
+            let authorized = spec.units.iter().any(|unit| {
+                unit.capability == "collect_metrics"
+                    && unit
+                        .sources
+                        .iter()
+                        .any(|source| is_pg_instance_source(&source.kind, &source.target))
+            });
+            if !authorized {
+                continue;
+            }
+            granted = true;
+            if let Some(secs) = spec.metric_interval_seconds() {
+                let current = Duration::from_secs(secs.max(1) as u64);
+                interval = Some(interval.map_or(current, |existing| existing.min(current)));
+            }
+        }
+        granted.then_some(PgGrant { interval })
+    }
+
     /// 折算不了的单元（`Exporter` / `UnifiedLogPredicate` …）。
     pub fn unsupported_units(&self) -> Vec<UnsupportedUnit> {
         let mut unsupported = Vec::new();
@@ -780,6 +829,7 @@ impl AppliedWorkGrant {
                     if wist_contracts::work::is_executable_source(&source.kind, &source.target)
                         || is_kafka_cluster_source(&source.kind, &source.target)
                         || is_mysql_instance_source(&source.kind, &source.target)
+                        || is_pg_instance_source(&source.kind, &source.target)
                     {
                         continue;
                     }
@@ -818,9 +868,16 @@ impl AppliedWorkGrant {
             },
             None => "off".to_string(),
         };
+        let pg = match self.pg_grant() {
+            Some(grant) => match grant.interval {
+                Some(interval) => format!("on({}s)", interval.as_secs()),
+                None => "on".to_string(),
+            },
+            None => "off".to_string(),
+        };
         let unsupported = self.unsupported_units().len();
         format!(
-            "held={} working={} log_inputs={} exporters={} metrics={} kafka={} mysql={} unsupported_units={} one_shot_pending={}",
+            "held={} working={} log_inputs={} exporters={} metrics={} kafka={} mysql={} postgres={} unsupported_units={} one_shot_pending={}",
             self.works.len(),
             working,
             log_inputs,
@@ -828,6 +885,7 @@ impl AppliedWorkGrant {
             metrics,
             kafka,
             mysql,
+            pg,
             unsupported,
             self.unexecutable_one_shot.len()
         )
@@ -866,6 +924,11 @@ fn unsupported_reason(source: &WorkSpecSource) -> String {
         // MySQL / TiDB 同口径。
         MYSQL_INSTANCE_SOURCE_KIND => format!(
             "MysqlInstance target {:?} is not supported on this agent \
+             (only `auto`: endpoints are self-discovered on the database host)",
+            source.target
+        ),
+        PG_INSTANCE_SOURCE_KIND => format!(
+            "PostgresInstance target {:?} is not supported on this agent \
              (only `auto`: endpoints are self-discovered on the database host)",
             source.target
         ),

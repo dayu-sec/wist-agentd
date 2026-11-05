@@ -32,9 +32,12 @@ pub struct AgentConfig {
     /// MySQL / TiDB 应用指标（`[mysql]`）：SQL 直采，只读。
     ///
     /// 这里**只有调优旋钮**：采集开关由采集面授权决定，端口由自探决定，
-    /// 凭据在 `/etc/wist-agentd/secrets/mysql/port-<port>/`。
+    /// 凭据在 `/etc/wist-agentd/secrets/mysql/<key>/`。
     #[serde(default)]
     pub mysql: MysqlSection,
+    /// PostgreSQL 应用指标（`[postgres]`）：与 `[mysql]` 同形。
+    #[serde(default)]
+    pub postgres: PgSection,
     /// 本进程**运行日志**的 `[log]` 段（与 `telemetry.logs` 的“被采集日志”不同）。
     ///
     /// 直接内嵌共享 crate 的单类型 [`wist_log::LogSection`]（同名同义，单一事实来源），
@@ -61,6 +64,7 @@ impl AgentConfig {
             metrics: MetricsSection::default(),
             kafka: KafkaSection::default(),
             mysql: MysqlSection::default(),
+            postgres: PgSection::default(),
             log: wist_log::LogSection::default(),
         }
     }
@@ -198,6 +202,26 @@ pub struct MysqlSection {
 }
 
 impl Default for MysqlSection {
+    fn default() -> Self {
+        Self {
+            interval_ms: default_mysql_interval_ms(),
+            timeout_ms: default_mysql_timeout_ms(),
+        }
+    }
+}
+
+/// PostgreSQL 的调优旋钮（与 [`MysqlSection`] 同形）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Discovery", module = "Discovery.Config")]
+#[serde(deny_unknown_fields)]
+pub struct PgSection {
+    #[serde(default = "default_mysql_interval_ms")]
+    pub interval_ms: u64,
+    #[serde(default = "default_mysql_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for PgSection {
     fn default() -> Self {
         Self {
             interval_ms: default_mysql_interval_ms(),

@@ -82,12 +82,12 @@ struct KafkaState {
     stalled_logged: bool,
 }
 
-/// 一个待采的 SQL 实例。
+/// 一个待采的 SQL 实例（MySQL / PostgreSQL 共用）。
 ///
-/// 与 Kafka 的区别只有一处：作业里不再带缓存（每轮独立），因为 `sqlx` 的连接
-/// 不进调度器状态——连接在作业内部开、作业内部关，卡住时不会把状态带脏。
-struct SqlState {
-    config: MysqlProbeConfig,
+/// 与 Kafka 的区别只有一处：作业里不再带缓存（每轮独立），因为连接在作业内部开、
+/// 作业内部关，卡住时不会把状态带脏。
+struct SqlState<C> {
+    config: C,
     next_at: Instant,
     gate: WarningGate,
     latest: Option<ProbeResult>,
@@ -96,8 +96,8 @@ struct SqlState {
     stalled_logged: bool,
 }
 
-impl SqlState {
-    fn new(config: MysqlProbeConfig) -> Self {
+impl<C> SqlState<C> {
+    fn new(config: C) -> Self {
         Self {
             next_at: Instant::now(),
             config,
@@ -128,12 +128,14 @@ struct PendingScan {
 enum ScanKind {
     Kafka(KafkaTargetSettings),
     Mysql(super::mysql::MysqlTargetSettings),
+    Postgres(super::postgres::PgTargetSettings),
 }
 
 /// 扫描作业的产物。
 enum ScanProduct {
     Kafka(Vec<KafkaProbeConfig>),
     Mysql(Vec<MysqlProbeConfig>),
+    Postgres(Vec<super::postgres::PgProbeConfig>),
 }
 
 /// 调度器状态。一个进程一份（见 [`scheduler`]）；测试可以自己造一份。
@@ -142,8 +144,10 @@ struct Scheduler {
     host: HostState,
     /// key = bootstrap 列表的稳定串（目前就是自探出来的那一个端点地址）。
     kafka: BTreeMap<String, KafkaState>,
-    /// key = `mysql:<host>:<port>`（与指标 `instance` 同形）。
-    sql: BTreeMap<String, SqlState>,
+    /// key = `mysql:<host>:<port>` / `mysql:<凭据 key>`（与指标 `instance` 同形）。
+    sql: BTreeMap<String, SqlState<MysqlProbeConfig>>,
+    /// key = `postgres:<host>:<port>` / `postgres:<凭据 key>`。
+    pg: BTreeMap<String, SqlState<super::postgres::PgProbeConfig>>,
     pending_scan: Option<PendingScan>,
     scan_inflight: bool,
     /// 自探代次：每次投递 / 撤授权 +1，用来丢弃晚到的扫描结果。
@@ -153,8 +157,10 @@ struct Scheduler {
     sql_scan_epoch: u64,
     /// 已授权但本机没有可达端点：只打一条，端点回来时复位。
     no_endpoint_logged: bool,
-    /// SQL 侧的同一条口径。
+    /// SQL 侧的同一条口径（MySQL）。
     sql_no_endpoint_logged: bool,
+    /// PostgreSQL 侧的同一条口径。
+    pg_no_endpoint_logged: bool,
     /// 上一次对账后生效的集群集合（变化才打日志）。
     log_signature: String,
     /// 采集线程是否已经拉起（由**调用方**维护，线程自己不碰）。
@@ -187,7 +193,7 @@ impl Scheduler {
                 self.scan_epoch = self.scan_epoch.wrapping_add(1);
                 self.scan_epoch
             }
-            ScanKind::Mysql(_) => {
+            ScanKind::Mysql(_) | ScanKind::Postgres(_) => {
                 self.sql_scan_epoch = self.sql_scan_epoch.wrapping_add(1);
                 self.sql_scan_epoch
             }
@@ -205,48 +211,40 @@ impl Scheduler {
     /// 与 Kafka 不同，这里**不保留**已撤销实例的任何读数：连接断了就是断了，
     /// 拿旧值接着上报会让「库已经停了」看不出来。
     fn apply_sql_targets(&mut self, targets: Vec<MysqlProbeConfig>) -> bool {
-        let before: Vec<String> = self.sql.keys().cloned().collect();
-        let mut next = BTreeMap::new();
-        for config in targets {
-            let key = config.instance();
-            match self.sql.remove(&key) {
-                // 保留周期 / 闸门 / 在飞状态：目标集合刷新不等于重启采集。
-                Some(existing) => {
-                    next.insert(key, SqlState { config, ..existing });
-                }
-                None => {
-                    log::info!(
-                        "event=MysqlTargetAdded target=\"{}\" interval_ms={}",
-                        key,
-                        config.interval.as_millis()
-                    );
-                    next.insert(key, SqlState::new(config));
-                }
-            }
-        }
-        for removed in &before {
-            if !next.contains_key(removed) {
-                log::info!("event=MysqlTargetRemoved target=\"{removed}\"");
-            }
-        }
-        self.sql = next;
+        apply_probe_targets(
+            &mut self.sql,
+            targets,
+            "mysql",
+            |config| config.instance(),
+            |config| config.interval,
+        );
         self.start_worker()
     }
 
-    /// 撤授权：停采 SQL（下个 tick 内序列消失），并作废在途的 SQL 扫描。
+    /// MySQL 撤授权。
     fn revoke_sql(&mut self) {
-        self.sql_scan_epoch = self.sql_scan_epoch.wrapping_add(1);
-        if matches!(
-            self.pending_scan.as_ref().map(|scan| &scan.kind),
-            Some(ScanKind::Mysql(_))
-        ) {
-            self.pending_scan = None;
-        }
+        self.cancel_sql_scan(false);
         self.sql_no_endpoint_logged = false;
-        if !self.sql.is_empty() {
-            log::info!("event=MysqlTargetRemoved targets={}", self.sql.len());
-        }
-        self.sql.clear();
+        revoke_probe_targets(&mut self.sql, "mysql");
+    }
+
+    /// 投递 PostgreSQL 目标集合（与 MySQL 同一套）。
+    fn apply_pg_targets(&mut self, targets: Vec<super::postgres::PgProbeConfig>) -> bool {
+        apply_probe_targets(
+            &mut self.pg,
+            targets,
+            "postgres",
+            |config| config.instance(),
+            |config| config.interval,
+        );
+        self.start_worker()
+    }
+
+    /// PostgreSQL 撤授权。
+    fn revoke_pg(&mut self) {
+        self.cancel_sql_scan(true);
+        self.pg_no_endpoint_logged = false;
+        revoke_probe_targets(&mut self.pg, "postgres");
     }
 
     /// 撤授权：停采、作废待执行 / 在途的扫描。
@@ -298,18 +296,27 @@ impl Scheduler {
 
     /// 取一个到期的 SQL 实例（排好下一轮时间、置在飞标记）。
     fn begin_next_due_sql(&mut self) -> Option<(String, Collector)> {
-        let now = Instant::now();
-        let key = self
-            .sql
-            .iter()
-            .find(|(_, state)| !state.inflight && state.next_at <= now)
-            .map(|(key, _)| key.clone())?;
-        let state = self.sql.get_mut(&key)?;
-        state.next_at = now + state.config.interval;
-        state.inflight = true;
-        state.started_at = Some(now);
-        state.stalled_logged = false;
-        Some((key, Collector::Mysql(Box::new(state.config.clone()))))
+        let (key, config) = begin_due(&mut self.sql, |config| config.interval)?;
+        Some((key, Collector::Mysql(Box::new(config))))
+    }
+
+    /// 取一个到期的 PostgreSQL 实例。
+    fn begin_next_due_pg(&mut self) -> Option<(String, Collector)> {
+        let (key, config) = begin_due(&mut self.pg, |config| config.interval)?;
+        Some((key, Collector::Postgres(Box::new(config))))
+    }
+
+    /// 作废在途 / 待执行的 SQL 扫描（MySQL 与 PostgreSQL 共用一个在飞槽）。
+    fn cancel_sql_scan(&mut self, pg: bool) {
+        self.sql_scan_epoch = self.sql_scan_epoch.wrapping_add(1);
+        let matches_domain = match self.pending_scan.as_ref().map(|scan| &scan.kind) {
+            Some(ScanKind::Mysql(_)) => !pg,
+            Some(ScanKind::Postgres(_)) => pg,
+            _ => false,
+        };
+        if matches_domain {
+            self.pending_scan = None;
+        }
     }
 
     fn begin_scan(&mut self) -> Option<PendingScan> {
@@ -387,19 +394,11 @@ impl Scheduler {
     }
 
     fn finish_sql(&mut self, key: &str, result: ProbeResult) {
-        let Some(state) = self.sql.get_mut(key) else {
-            // 实例在采集期间被撤销：结果直接丢弃。
-            return;
-        };
-        state.inflight = false;
-        state.started_at = None;
-        state.stalled_logged = false;
-        if state.gate.changed(&result.warnings) {
-            for warning in &result.warnings {
-                log::warn!("event=MysqlProbeWarning target=\"{key}\" detail=\"{warning}\"");
-            }
-        }
-        state.latest = Some(result);
+        finish_probe(&mut self.sql, key, result, "MysqlProbeWarning");
+    }
+
+    fn finish_pg(&mut self, key: &str, result: ProbeResult) {
+        finish_probe(&mut self.pg, key, result, "PgProbeWarning");
     }
 
     /// 作业异常（JoinError）：清掉所有在飞标记，下一轮重新排。
@@ -414,6 +413,10 @@ impl Scheduler {
             state.started_at = None;
         }
         for state in self.sql.values_mut() {
+            state.inflight = false;
+            state.started_at = None;
+        }
+        for state in self.pg.values_mut() {
             state.inflight = false;
             state.started_at = None;
         }
@@ -451,19 +454,22 @@ impl Scheduler {
             }
         }
         for (key, state) in self.sql.iter_mut() {
-            if state.inflight
-                && !state.stalled_logged
-                && state
-                    .started_at
-                    .is_some_and(|at| now.duration_since(at) > SQL_ROUND_BUDGET)
-            {
-                state.stalled_logged = true;
-                log::warn!(
-                    "event=CollectorTargetStalled domain={} target=\"{key}\" budget_ms={}",
-                    super::mysql::COLLECTION_KIND,
-                    SQL_ROUND_BUDGET.as_millis()
-                );
-            }
+            stalled(
+                state,
+                now,
+                super::mysql::COLLECTION_KIND,
+                key,
+                SQL_ROUND_BUDGET,
+            );
+        }
+        for (key, state) in self.pg.iter_mut() {
+            stalled(
+                state,
+                now,
+                super::postgres::COLLECTION_KIND,
+                key,
+                SQL_ROUND_BUDGET,
+            );
         }
     }
 
@@ -555,7 +561,7 @@ impl Scheduler {
         // 代号按域比对：Kafka 的扫描结果不能拿 SQL 的代次来判有效。
         let current = match &product {
             ScanProduct::Kafka(_) => self.scan_epoch,
-            ScanProduct::Mysql(_) => self.sql_scan_epoch,
+            ScanProduct::Mysql(_) | ScanProduct::Postgres(_) => self.sql_scan_epoch,
         };
         if epoch != current {
             return;
@@ -588,6 +594,20 @@ impl Scheduler {
                 }
                 self.apply_sql_targets(targets);
             }
+            ScanProduct::Postgres(targets) => {
+                if targets.is_empty() {
+                    if !self.pg_no_endpoint_logged {
+                        log::info!(
+                            "event=PgProbeNoEndpoint detail=\"已授权，但本机没有通过握手的 PostgreSQL 实例\""
+                        );
+                        self.pg_no_endpoint_logged = true;
+                    }
+                } else {
+                    self.pg_no_endpoint_logged = false;
+                    log::debug!("event=PgDiscoveryResolved targets={}", targets.len());
+                }
+                self.apply_pg_targets(targets);
+            }
         }
     }
 
@@ -609,6 +629,14 @@ impl Scheduler {
         )
     }
 
+    fn pg_outcome(&self) -> Option<MetricsCollectionOutcome> {
+        super::collection::probe_outcome(
+            super::postgres::COLLECTION_KIND,
+            !self.pg.is_empty(),
+            self.pg.values().filter_map(|state| state.latest.as_ref()),
+        )
+    }
+
     /// 快照读取：主机三域 + Kafka + SQL。没有授权的域不出现。
     fn collect_all_for(&mut self, view: &MetricsTargetView) -> Vec<MetricsCollectionOutcome> {
         self.ensure_host_for(view);
@@ -619,6 +647,9 @@ impl Scheduler {
         if let Some(sql) = self.sql_outcome() {
             outcomes.push(sql);
         }
+        if let Some(pg) = self.pg_outcome() {
+            outcomes.push(pg);
+        }
         outcomes
     }
 }
@@ -626,6 +657,106 @@ impl Scheduler {
 /// 集群的稳定键：bootstrap 列表拼起来。
 fn probe_key(config: &KafkaProbeConfig) -> String {
     config.bootstrap_servers.join(",")
+}
+
+// ---------------------------------------------------------------------------
+// SQL 域的公共实现（MySQL / PostgreSQL 各自一份状态，逻辑共用）
+// ---------------------------------------------------------------------------
+
+fn apply_probe_targets<C>(
+    current: &mut BTreeMap<String, SqlState<C>>,
+    targets: Vec<C>,
+    domain: &str,
+    key_of: impl Fn(&C) -> String,
+    interval_of: impl Fn(&C) -> Duration,
+) {
+    let before: Vec<String> = current.keys().cloned().collect();
+    let mut next = BTreeMap::new();
+    for config in targets {
+        let key = key_of(&config);
+        match current.remove(&key) {
+            // 保留周期 / 闸门 / 在飞状态：目标集合刷新不等于重启采集。
+            Some(existing) => {
+                next.insert(key, SqlState { config, ..existing });
+            }
+            None => {
+                log::info!(
+                    "event=DbTargetAdded domain={domain} target=\"{key}\" interval_ms={}",
+                    interval_of(&config).as_millis()
+                );
+                next.insert(key, SqlState::new(config));
+            }
+        }
+    }
+    for removed in &before {
+        if !next.contains_key(removed) {
+            log::info!("event=DbTargetRemoved domain={domain} target=\"{removed}\"");
+        }
+    }
+    *current = next;
+}
+
+fn revoke_probe_targets<C>(current: &mut BTreeMap<String, SqlState<C>>, domain: &str) {
+    if !current.is_empty() {
+        log::info!(
+            "event=DbTargetRemoved domain={domain} targets={}",
+            current.len()
+        );
+    }
+    current.clear();
+}
+
+fn begin_due<C: Clone>(
+    map: &mut BTreeMap<String, SqlState<C>>,
+    interval_of: impl Fn(&C) -> Duration,
+) -> Option<(String, C)> {
+    let now = Instant::now();
+    let key = map
+        .iter()
+        .find(|(_, state)| !state.inflight && state.next_at <= now)
+        .map(|(key, _)| key.clone())?;
+    let state = map.get_mut(&key)?;
+    state.next_at = now + interval_of(&state.config);
+    state.inflight = true;
+    state.started_at = Some(now);
+    state.stalled_logged = false;
+    Some((key, state.config.clone()))
+}
+
+fn finish_probe<C>(
+    map: &mut BTreeMap<String, SqlState<C>>,
+    key: &str,
+    result: ProbeResult,
+    warning_event: &str,
+) {
+    let Some(state) = map.get_mut(key) else {
+        // 实例在采集期间被撤销：结果直接丢弃。
+        return;
+    };
+    state.inflight = false;
+    state.started_at = None;
+    state.stalled_logged = false;
+    if state.gate.changed(&result.warnings) {
+        for warning in &result.warnings {
+            log::warn!("event={warning_event} target=\"{key}\" detail=\"{warning}\"");
+        }
+    }
+    state.latest = Some(result);
+}
+
+fn stalled<C>(state: &mut SqlState<C>, now: Instant, domain: &str, key: &str, budget: Duration) {
+    if state.inflight
+        && !state.stalled_logged
+        && state
+            .started_at
+            .is_some_and(|at| now.duration_since(at) > budget)
+    {
+        state.stalled_logged = true;
+        log::warn!(
+            "event=CollectorTargetStalled domain={domain} target=\"{key}\" budget_ms={}",
+            budget.as_millis()
+        );
+    }
 }
 
 /// 采集作业的产物（由 `JoinSet` 送回调度循环）。
@@ -646,6 +777,7 @@ enum JobKey {
     Host,
     Kafka(String),
     Sql(String),
+    Pg(String),
 }
 
 impl Scheduler {
@@ -663,6 +795,9 @@ impl Scheduler {
                 (JobKey::Sql(key), CollectorOutput::Mysql { result }) => {
                     self.finish_sql(&key, result)
                 }
+                (JobKey::Pg(key), CollectorOutput::Postgres { result }) => {
+                    self.finish_pg(&key, result)
+                }
                 (key, output) => {
                     // 分派错了（只可能是改代码时接错分支）：留痕并清标记，别把目标卡死。
                     let domain = output.domain_name();
@@ -670,6 +805,7 @@ impl Scheduler {
                         JobKey::Host => "host_metrics",
                         JobKey::Kafka(_) => kafka::COLLECTION_KIND,
                         JobKey::Sql(_) => super::mysql::COLLECTION_KIND,
+                        JobKey::Pg(_) => super::postgres::COLLECTION_KIND,
                     };
                     log::error!(
                         "event=CollectorOutputMismatch expected={expected} actual={domain}"
@@ -733,6 +869,22 @@ pub fn revoke() {
 /// 撤 SQL 授权：停采（下个 tick 内序列消失），并作废在途的 SQL 扫描。
 pub fn revoke_sql() {
     scheduler().revoke_sql();
+}
+
+/// 投递一次 PostgreSQL 自探扫描（**不等结果**）。
+pub fn request_pg_scan(
+    snapshot: Option<wist_contracts::discovery::DiscoverySnapshot>,
+    settings: super::postgres::PgTargetSettings,
+) {
+    let start = scheduler().request_scan(snapshot, ScanKind::Postgres(settings));
+    if start {
+        spawn_worker();
+    }
+}
+
+/// 撤 PostgreSQL 授权：停采（下个 tick 内序列消失），并作废在途的扫描。
+pub fn revoke_pg() {
+    scheduler().revoke_pg();
 }
 
 /// 最近一次完成的采集结果：主机三域 + Kafka（没有授权就没有 Kafka）。
@@ -847,6 +999,9 @@ fn start_due(jobs: &mut JoinSet<JobOutcome>, permits: &Arc<Semaphore>) -> bool {
                 ScanKind::Mysql(settings) => ScanProduct::Mysql(
                     super::mysql::targets_from_discovery(scan.snapshot.as_ref(), settings),
                 ),
+                ScanKind::Postgres(settings) => ScanProduct::Postgres(
+                    super::postgres::targets_from_discovery(scan.snapshot.as_ref(), settings),
+                ),
             })
             .await
             .ok();
@@ -900,6 +1055,24 @@ fn start_due(jobs: &mut JoinSet<JobOutcome>, permits: &Arc<Semaphore>) -> bool {
             let _permit = permit;
             JobOutcome::Collected {
                 key: JobKey::Sql(key),
+                output: collector.collect().await,
+            }
+        });
+        started = true;
+    }
+
+    // PostgreSQL：与 MySQL 并行（同一个并发闸门）。
+    loop {
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            break;
+        };
+        let Some((key, collector)) = scheduler().begin_next_due_pg() else {
+            break;
+        };
+        jobs.spawn(async move {
+            let _permit = permit;
+            JobOutcome::Collected {
+                key: JobKey::Pg(key),
                 output: collector.collect().await,
             }
         });

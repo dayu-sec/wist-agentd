@@ -1,6 +1,6 @@
 # 采集运行时：统一调度与 async / blocking 双执行器
 
-> 状态：**设计（P0 / P0.5 / P1 已落地；P2 待做）**。决策记录见 §12（**已全部定案**）。
+> 状态：**设计（P0 / P0.5 / P1 / P1.1 / P1.2 已落地；P2 待做）**。决策记录见 §12（**已全部定案**）。
 > P0 的落地范围与验收见 §10。
 >
 > 范围：**指标采集**（主机 / 进程 / 容器 / Kafka / 关系型数据库 / Doris …）。
@@ -488,8 +488,23 @@ let outcomes = scheduler::collect_all(view);    // 主机三域 + Kafka（最近
 `config_validation` 18 passed、`clippy -D warnings` / `fmt --check` 干净；
 `x86_64-unknown-linux-musl` 静态构建通过（§12.3）。
 
-**未覆盖**：真库 live 用例未跑（环境不可达）；`wist-metrics` 的 `0.15.0` 待发布后才能
-让 agentd 的依赖从 registry 解析（当前 P1 代码已能编，但新域的事实需要 0.15 的注册表才会被规范化层认领）。
+**未覆盖**：真库 live 用例未跑（环境不可达）；`wist-metrics` 的 `0.15.0` / `0.16.0` 待发布后才能
+让 agentd 的依赖从 registry 解析（当前代码已能编，但新域的事实需要新注册表才会被规范化层认领）。
+
+### P1.1：自探改看 netns（**已完成**，2026-11-05）
+
+- 端口：`/proc/<pid>/net/tcp`（该进程 netns 的表）+ `/proc/<pid>/fd` 的 socket inode 归属；
+- 地址：`127.0.0.1` → 该 netns 的非回环地址（`/proc/<pid>/net/fib_trie` 的 `host LOCAL`），
+  逐个握手，第一个通的为准；
+- 身份：host `port-<port>`；k8s `pod-<ns>-<pod>`；docker `container-<name>`；
+  身份拿不到 `addr-<ip>-<port>`（§12.1-5 的运行时扩展）；
+- 指标 `instance`：host 仍是 `<ip>:<port>`，容器改用凭据 key（pod 重建换 IP 不断档）。
+
+### P1.2：PostgreSQL（**已完成**，2026-11-05）
+
+- 与 MySQL 共用 `db_source`（运行时）/ `SqlTransport`（查询通道），只换 SQL、握手与指标；
+- 指纹：发 `SSLRequest` 收 `S`/`N`；排除 pooler 与客户端工具；
+- 授权 `PostgresInstance/auto`，凭据 `secrets/postgres/<key>/`，配置 `[postgres] interval_ms/timeout_ms`。
 
 ### P2：Doris（复用 transport）
 

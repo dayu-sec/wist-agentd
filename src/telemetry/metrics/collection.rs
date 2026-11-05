@@ -29,6 +29,8 @@ pub(super) enum Collector {
     },
     /// MySQL / TiDB：作业内部自己开连接（不进调度器状态）。
     Mysql(Box<MysqlProbeConfig>),
+    /// PostgreSQL：同上，只是换一套 SQL 与协议。
+    Postgres(Box<super::postgres::PgProbeConfig>),
 }
 
 /// 一轮采集的产物。
@@ -46,6 +48,9 @@ pub(super) enum CollectorOutput {
     Mysql {
         result: ProbeResult,
     },
+    Postgres {
+        result: ProbeResult,
+    },
 }
 
 impl Collector {
@@ -54,6 +59,7 @@ impl Collector {
             Self::Host(_) => "host_metrics",
             Self::Kafka { .. } => super::kafka::COLLECTION_KIND,
             Self::Mysql(_) => super::mysql::COLLECTION_KIND,
+            Self::Postgres(_) => super::postgres::COLLECTION_KIND,
         }
     }
 
@@ -69,6 +75,11 @@ impl Collector {
                 result: super::mysql::probe_once(config.as_ref()).await,
             };
         }
+        if let Self::Postgres(config) = self {
+            return CollectorOutput::Postgres {
+                result: super::postgres::probe_once(config.as_ref()).await,
+            };
+        }
         tokio::task::spawn_blocking(move || match self {
             Self::Host(view) => {
                 let used = view.targets.clone();
@@ -82,7 +93,7 @@ impl Collector {
                 CollectorOutput::Kafka { result, groups }
             }
             // 上面已经拦住；这里只是让匹配穷尽。
-            Self::Mysql(_) => CollectorOutput::panicked(domain),
+            Self::Mysql(_) | Self::Postgres(_) => CollectorOutput::panicked(domain),
         })
         .await
         .unwrap_or_else(|err| {
@@ -100,6 +111,7 @@ impl CollectorOutput {
             Self::Host { .. } => "host_metrics",
             Self::Kafka { .. } => super::kafka::COLLECTION_KIND,
             Self::Mysql { .. } => super::mysql::COLLECTION_KIND,
+            Self::Postgres { .. } => super::postgres::COLLECTION_KIND,
         }
     }
 
@@ -117,6 +129,16 @@ impl CollectorOutput {
             }
         } else if domain == super::mysql::COLLECTION_KIND {
             Self::Mysql {
+                result: ProbeResult {
+                    targets: Vec::new(),
+                    attempted: 1,
+                    failed: 1,
+                    last_error: Some("采集任务 panic（已丢弃这一轮）".to_string()),
+                    warnings: Vec::new(),
+                },
+            }
+        } else if domain == super::postgres::COLLECTION_KIND {
+            Self::Postgres {
                 result: ProbeResult {
                     targets: Vec::new(),
                     attempted: 1,

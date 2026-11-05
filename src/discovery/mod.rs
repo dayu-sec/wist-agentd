@@ -3,6 +3,9 @@
 pub mod cache;
 pub mod cgroup;
 pub mod container;
+// 数据库自探的公共层（MySQL / PostgreSQL / Doris 共用）：netns 视角的端口/地址、
+// 运行时判据、凭据 key。
+pub mod db_source;
 pub mod endpoint;
 pub mod host;
 pub mod k8s;
@@ -15,6 +18,8 @@ pub mod log_source;
 // MySQL / TiDB 实例自探：从进程证据 + my.cnf + 监听端口推出候选（只发现，不下发采集）。
 pub mod mysql_source;
 pub mod network;
+// PostgreSQL 实例自探（证据 + SSLRequest 握手），运行时交给 db_source。
+pub mod pg_source;
 pub mod policy;
 pub mod process;
 pub mod runtime;

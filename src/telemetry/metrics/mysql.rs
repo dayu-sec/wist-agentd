@@ -211,15 +211,15 @@ impl Default for MysqlTargetSettings {
 // ---------------------------------------------------------------------------
 
 /// 一行结果：列名 → 文本值。NULL 不出现在 map 里（与「不存在」同义，都不补 0）。
-pub type Row = BTreeMap<String, String>;
+pub(super) type Row = BTreeMap<String, String>;
 
-type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub(super) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// 只读查询通道。
 ///
 /// 刻意只暴露「执行一条静态 SQL」：采集逻辑就三条 `SHOW`，不需要事务、参数绑定
 /// 或连接池管理，接口越窄，假实现越好写、真实现越不容易跑偏。
-pub trait SqlTransport: Send {
+pub(super) trait SqlTransport: Send {
     fn query(&mut self, sql: &'static str) -> BoxFuture<'_, Result<Vec<Row>, String>>;
 }
 
@@ -408,7 +408,7 @@ fn is_unsupported(detail: &str) -> bool {
         || lowered.contains("not supported")
 }
 
-fn into_map(rows: Vec<Row>) -> BTreeMap<String, String> {
+pub(super) fn into_map(rows: Vec<Row>) -> BTreeMap<String, String> {
     // `SHOW GLOBAL STATUS` / `VARIABLES` 是两列的表：`Variable_name` 与 `Value`。
     // **按列名取**，不按顺序取：`Row` 是 `BTreeMap`，迭代顺序是键排序，不是列顺序。
     rows.into_iter()
@@ -422,14 +422,14 @@ fn into_map(rows: Vec<Row>) -> BTreeMap<String, String> {
 
 /// 事实收集器：缺键只记 warning，不补 0。
 #[derive(Default)]
-struct Facts {
-    facts: Vec<StringKeyValue>,
-    warnings: Vec<String>,
+pub(super) struct Facts {
+    pub(super) facts: Vec<StringKeyValue>,
+    pub(super) warnings: Vec<String>,
     seen_keys: BTreeSet<String>,
 }
 
 impl Facts {
-    fn push(&mut self, key: &str, value: &str) {
+    pub(super) fn push(&mut self, key: &str, value: &str) {
         if self.facts.len() >= MAX_FACTS {
             return;
         }

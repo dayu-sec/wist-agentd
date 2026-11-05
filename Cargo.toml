@@ -62,6 +62,7 @@ sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls-aws-lc-rs",
     "mysql",
+    "postgres",
 ] }
 wist-log = { version = "0.1" }
 #wist-log = { version = "0.1", path = "../wist-log" }
