@@ -37,12 +37,23 @@ const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 /// 一轮 `SHOW` 里最多保留多少条事实（防止异常版本回一个天量 `SHOW STATUS`）。
 const MAX_FACTS: usize = 64;
 
-/// 凭据目录：`<root>/port-<port>`。
+/// 凭据目录：`<root>/<key>`。
 ///
-/// 一条 agent 上可能同时跑 3306 / 3307 两个实例，所以 key 必须能区分实例；
-/// 用端口而不是哈希：**运维要能在 agentd 自探之前就把文件放好**。
+/// key 的取值按运行时（决策见设计文档 §12.1-5）：
+/// - host：`port-3306`
+/// - k8s：`pod-<namespace>-<pod>`
+/// - docker / compose：`container-<name>`
+/// - 容器身份拿不到：`addr-<ip>-<port>`
+///
+/// 为什么容器不能用端口：一个节点上多个 pod 都是 3306，用端口会互相覆盖凭据；
+/// 而名字（pod / 容器名）是运维**在投放凭据之前就能知道**的东西。
+pub fn secret_dir_for_key(key: &str) -> String {
+    format!("{MYSQL_SECRET_ROOT}/{key}")
+}
+
+/// host 的 key 形态：一条 agent 上一个 3306。
 pub fn secret_dir_for_port(port: u16) -> String {
-    format!("{MYSQL_SECRET_ROOT}/port-{port}")
+    secret_dir_for_key(&format!("port-{port}"))
 }
 
 pub fn password_file_for_port(port: u16) -> String {
@@ -50,8 +61,12 @@ pub fn password_file_for_port(port: u16) -> String {
 }
 
 /// 可选的自签 CA：存在就用它校验（`VerifyCa`），不存在就走 `Preferred`。
-pub fn ca_file_for_port(port: u16) -> String {
-    format!("{}/ca.pem", secret_dir_for_port(port))
+pub fn password_file_for_key(key: &str) -> String {
+    format!("{}/password", secret_dir_for_key(key))
+}
+
+pub fn ca_file_for_key(key: &str) -> String {
+    format!("{}/ca.pem", secret_dir_for_key(key))
 }
 
 /// TLS 策略。
@@ -77,6 +92,10 @@ pub struct MysqlProbeConfig {
     pub password_file: String,
     /// `VerifyCa` 时必填。
     pub ca_file: Option<String>,
+    /// 凭据目录名（`port-3306` / `pod-...`），也用于日志。
+    pub credential_key: String,
+    /// 指标 `instance`：host 用 `<host>:<port>`，容器用凭据 key（重启换 IP 不断档）。
+    instance_id: String,
 }
 
 impl MysqlProbeConfig {
@@ -86,7 +105,8 @@ impl MysqlProbeConfig {
             tls: TlsMode::Preferred,
             password_file: password_file_for_port(port),
             ca_file: None,
-            // 端口是 `u16`，`u64 → u16` 的截断在这里只会来自调用方传错，保守夹一下。
+            credential_key: format!("port-{port}"),
+            instance_id: format!("{}:{host}:{port}", COLLECTION_KIND_PREFIX),
             port,
             host,
             timeout: Duration::from_millis(timeout_ms.max(1)),
@@ -94,9 +114,18 @@ impl MysqlProbeConfig {
         }
     }
 
-    /// 实例身份：`mysql:<host>:<port>`。
+    /// 按自探结果设置凭据目录与容器身份。
+    pub fn with_identity(mut self, credential_key: &str, instance_id: String) -> Self {
+        self.credential_key = credential_key.to_string();
+        self.password_file = password_file_for_key(credential_key);
+        self.ca_file = None;
+        self.instance_id = instance_id;
+        self
+    }
+
+    /// 实例身份：host 是 `mysql:<host>:<port>`，容器是 `mysql:<credential_key>`。
     pub fn instance(&self) -> String {
-        format!("{}:{}:{}", COLLECTION_KIND_PREFIX, self.host, self.port)
+        self.instance_id.clone()
     }
 }
 
@@ -131,23 +160,28 @@ pub fn targets_from_instances(
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for instance in instances {
-        if !seen.insert(instance.port) {
+        // 实例身份去重：容器看名字（同一 pod 换 IP 仍是一条），host 看地址+端口。
+        if !seen.insert(instance.instance()) {
             continue;
         }
         let mut config = MysqlProbeConfig::new(
-            "127.0.0.1",
+            &instance.host,
             instance.port,
             settings.timeout.as_millis() as u64,
             settings.interval.as_millis() as u64,
-        );
-        let ca = ca_file_for_port(instance.port);
+        )
+        .with_identity(&instance.credential_key, instance.instance());
+        let ca = ca_file_for_key(&instance.credential_key);
         if std::path::Path::new(&ca).is_file() {
             config.tls = TlsMode::VerifyCa;
             config.ca_file = Some(ca);
         }
         log::debug!(
-            "event=MysqlTargetResolved target=\"{}\" evidence={} confidence={}",
+            "event=MysqlTargetResolved target=\"{}\" addr=\"{}:{}\" credential=\"{}\" evidence={} confidence={}",
             config.instance(),
+            instance.host,
+            instance.port,
+            instance.credential_key,
             instance.evidence,
             instance.confidence
         );
@@ -883,7 +917,7 @@ mod tests {
             "/etc/wist-agentd/secrets/mysql/port-3307/password"
         );
         assert_eq!(
-            ca_file_for_port(3306),
+            ca_file_for_key("port-3306"),
             "/etc/wist-agentd/secrets/mysql/port-3306/ca.pem"
         );
         assert_eq!(config().instance(), "mysql:127.0.0.1:3306");
@@ -905,12 +939,15 @@ mod tests {
 
     #[test]
     fn discovered_instances_become_loopback_targets() {
-        use crate::discovery::mysql_source::MysqlInstanceEntry;
+        use crate::discovery::mysql_source::{InstanceScope, MysqlInstanceEntry};
 
         let settings = MysqlTargetSettings::default();
         let entry = |port: u16, evidence: &str| MysqlInstanceEntry {
             source_ref: format!("port:{port}"),
+            host: "127.0.0.1".to_string(),
             port,
+            credential_key: format!("port-{port}"),
+            scope: InstanceScope::Host,
             evidence: evidence.to_string(),
             detail: String::new(),
             confidence: 50,
@@ -924,18 +961,49 @@ mod tests {
             &settings,
         );
 
-        assert_eq!(targets.len(), 2, "同一端口只留一条");
+        assert_eq!(targets.len(), 2, "同一实例只留一条");
         let target = targets
             .iter()
             .find(|target| target.port == 3998)
             .expect("3998");
         assert_eq!(target.instance(), "mysql:127.0.0.1:3998");
-        assert_eq!(target.host, "127.0.0.1", "端点只来自自探，永远走本机回环");
+        assert_eq!(target.host, "127.0.0.1", "host 实例走近回环");
         assert_eq!(
             target.password_file,
             "/etc/wist-agentd/secrets/mysql/port-3998/password"
         );
         assert_eq!(target.tls, TlsMode::Preferred, "没有 ca.pem 就允许回落明文");
         assert_eq!(target.timeout, settings.timeout);
+    }
+
+    #[test]
+    fn a_container_instance_uses_its_name_as_identity_and_credential() {
+        use crate::discovery::mysql_source::{InstanceScope, MysqlInstanceEntry};
+
+        let targets = targets_from_instances(
+            vec![MysqlInstanceEntry {
+                source_ref: "port:3306".to_string(),
+                host: "10.244.1.5".to_string(),
+                port: 3306,
+                credential_key: "pod-prod-mysql-0".to_string(),
+                scope: InstanceScope::Container,
+                evidence: "config".to_string(),
+                detail: String::new(),
+                confidence: 90,
+            }],
+            &MysqlTargetSettings::default(),
+        );
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].instance(),
+            "mysql:pod-prod-mysql-0",
+            "容器身份用名字：pod 重建换 IP 也不会断成两条序列"
+        );
+        assert_eq!(targets[0].host, "10.244.1.5", "连接走 pod IP");
+        assert_eq!(
+            targets[0].password_file,
+            "/etc/wist-agentd/secrets/mysql/pod-prod-mysql-0/password"
+        );
     }
 }

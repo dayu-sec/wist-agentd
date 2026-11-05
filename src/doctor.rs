@@ -312,6 +312,7 @@ async fn diagnose(config_root: &Path, offline: bool) -> Report {
     checks.extend(exporter_tool_checks(&config));
     checks.push(log_source_check(&config));
     checks.push(kafka_discovery_check(&config));
+    checks.push(mysql_discovery_check(&config));
 
     if offline {
         checks.push(Check::warn(
@@ -1068,6 +1069,51 @@ fn kafka_discovery_check(config: &AgentConfig) -> Check {
         "discovery.kafka",
         "已发现可达的 Kafka 端点",
         format!("{detail}；采集时直接用它，不需要本机配置"),
+    )
+}
+
+/// MySQL / TiDB 自探：本机（含 docker / pod）到底有没有实例、握手通没通，
+/// 以及**凭据该放哪个文件** —— 最后这句是运维真正需要的。
+///
+/// 与守护进程走同一条解析路径（[`crate::discovery::mysql_source::resolve_live`]），
+/// 所以不会出现「工具说发现了、进程没采」。
+fn mysql_discovery_check(config: &AgentConfig) -> Check {
+    if !config.discovery.process_enabled {
+        return Check::warn(
+            "discovery.mysql",
+            "自探开着，但进程发现是关的",
+            "process_enabled = false；自探靠进程证据，关着时必然什么都找不到",
+        )
+        .hint("把 [discovery] 的 `process_enabled` 打开");
+    }
+
+    let instances = crate::discovery::mysql_source::resolve_live();
+    if instances.is_empty() {
+        return Check::ok(
+            "discovery.mysql",
+            "本机没有发现 MySQL 实例",
+            "只读进程证据 + 协议 10 握手；库跑在容器 / pod 里时，agentd 要能看见宿主进程（k8s 需 hostPID: true）",
+        );
+    }
+
+    let detail = instances
+        .iter()
+        .map(|instance| {
+            format!(
+                "{} => {}:{}（证据 {}，凭据 {}）",
+                instance.instance(),
+                instance.host,
+                instance.port,
+                instance.evidence,
+                crate::telemetry::metrics::mysql::password_file_for_key(&instance.credential_key)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Check::ok(
+        "discovery.mysql",
+        "已发现 MySQL 实例",
+        format!("{detail}；采集还要采集面授权（MysqlInstance/auto）"),
     )
 }
 
