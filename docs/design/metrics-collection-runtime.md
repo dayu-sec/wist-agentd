@@ -592,6 +592,10 @@ cargo build --offline --release --target x86_64-unknown-linux-musl
 **复测（P1 落地后，`sqlx` 已被真实引用，2026-11-05）**：`static-pie` 构建通过，产物
 22,345,920 B（基线 21,363,832 B，**+0.94 MiB / +4.6%**，其中包含 `sqlx` 与 P1 自身代码）。
 
+**再复测（P1.2 / P2 之后，sqlx 加了 `postgres` feature）**：仍是 `static-pie`，
+23,467,832 B（相对基线 **+2.01 MiB / +9.9%**）。三个 SQL 域共用同一个 `sqlx`，
+加 PG 只多了驱动本身，没有新增 C 依赖。
+
 ## 13. 一个域的最小落地清单（checklist）
 
 新增一个采集域需要动的地方（照此逐项打勾，缺一项就会在现场表现为「没数据」或「假数据」）：
