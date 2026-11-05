@@ -50,7 +50,7 @@ agentd 以 root 跑在 broker 机器上，**进程本身就是证据** —— �
 
 | 用途 | 路径 |
 |---|---|
-| 采集时用哪个端点/协议 | `kafka::request_scan`（主循环投递）→ 探测线程解析 → `kafka::finish_scan` |
+| 采集时用哪个端点/协议 | `scheduler::request_scan`（主循环投递）→ 采集线程解析 → `scheduler::finish_scan` |
 | 现场诊断 | `wist-agentd doctor` 的 `discovery.kafka` 检查（与守护进程同一解析路径） |
 | 网关 | **没有**：不上报、不存储、不新增接口 |
 
@@ -73,8 +73,8 @@ agentd 从固定路径读文件。**密码不经过平台。**
 
 只有本机**真的发现 broker** 时才会发生网络探测，普通主机这一项是零网络成本。
 
-**扫描不在 3s 主循环里跑**：主循环只判断「需不需要重算」并把快照投递到探测线程
-（`kafka::request_scan`）；解析 `/proc` 与有界 TCP 探测都在那个线程上完成。
+**扫描不在 3s 主循环里跑**：主循环只判断「需不需要重算」并把快照投递到采集线程
+（`scheduler::request_scan`）；解析 `/proc` 与有界 TCP 探测都在那个线程上完成。
 极限情况（8 个 broker 进程 × 6 个端点 × 300ms）也不超过十几秒，而主循环一次都不会等。
 扫描带代号（epoch）：撤授权或又投递了新扫描时，晚一步回来的旧结果会被丢弃——
 否则撤销授权后一个迟到的扫描会把集群又加回去。
@@ -99,7 +99,7 @@ kafka_discovery = true
 
 1. ~~agentd：授权驱动的启停~~ —— **已完成**：授权来自采集面
    （`collect_metrics` + `KafkaCluster/auto`），端点来自自探，撤授权即停。
-   自探扫描走 `request_scan` / `finish_scan`（在探测线程执行，不占主循环）。
+   自探扫描走 `request_scan` / `finish_scan`（在采集线程执行，不占主循环）。
 2. ~~Web：`接入 → Kafka` 页面只放**帮助代码**~~ —— **已完成**：页面分三段
    ① 采集面授权（工作单元片段，`KafkaCluster/auto`）；② Kafka 侧授权与凭据投放
    （建主体 / 最小 ACL 集 / Secret 或主机文件 / DaemonSet 挂载，密码在浏览器生成、

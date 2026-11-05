@@ -1,7 +1,7 @@
 # 采集运行时：统一调度与 async / blocking 双执行器
 
-> 状态：**设计（已评审；P0 待实现）**。决策记录见 §12（1/2/4/6/8 已定，3/5/7 待定），
-> P0 的实现边界见 §10。
+> 状态：**设计（P0 已落地；P1 待做）**。决策记录见 §12（1/2/4/6/8 已定，3/5/7 待定）。
+> P0 的落地范围与验收见 §10。
 >
 > 范围：**指标采集**（主机 / 进程 / 容器 / Kafka / 关系型数据库 / Doris …）。
 > 日志采集不在本文范围（它有自己的 tick + spool 链路）；「导出行」类采集是否复用
@@ -71,6 +71,16 @@
 | 凭据 | `/etc/wist-agentd/secrets/kafka/{probe,ca.pem}` | 约定式，不进配置 |
 | 授权判据 | `control/work.rs::kafka_grant()`（`collect_metrics` + `KafkaCluster/auto`） | 域专属 |
 | 自观测 | `MetricsRuntimeSnapshot.outcomes`（每域一条） | 已通用 |
+
+**P0 后（当前分支 `feat/collection-runtime`）**：
+
+- 上面「调度 / 自探扫描 / 结果 / 合并上送」四项已搬进
+  `src/telemetry/metrics/collection.rs` + `scheduler.rs`；
+- `kafka.rs` 只剩协议/采集本身（`probe_once` / `targets_from_discovery`）；
+- 主机三域也从 tick 搬进了采集线程（`scheduler::apply_host_view` + `collect_all(view)`），
+  目标集合变化时由 `collect_all` 同步补一轮（毫秒级），其余时间只读快照；
+- `daemon.rs` 只改两个调用点（`scheduler::request_scan` / `scheduler::revoke`），
+  `daemon_metrics.rs` 只改快照来源（`build_runtime_snapshot_live`）。
 
 参考实现的价值集中在三处，迁移时**照抄语义**而不是照抄代码：
 
@@ -219,6 +229,9 @@ pub struct ProbeResult {
 async 与 blocking，默认 8；blocking 任务额外受「同域最多 2 个并发」约束，避免一台机器上的
 多个 DB 同时把 worker 池占满。
 
+> **P0 现状**：两个采集器都是同步实现，直接跑在采集线程上（还没有 `Semaphore` / JoinSet）。
+> P1 引入 async 采集器时，同步采集器才改走 `spawn_blocking`，同时启用并发上限。
+
 **超时后 `inflight` 不能立刻清空**：async 实现可以（future 已经被 drop），blocking 实现不行——
 任务是「不再等」而不是「已退出」，此时清空会给一个还卡着的目标再排一轮，越积越多。
 规则：blocking 目标的 `inflight` 只在**任务真正返回**时清；超过 3× 预算就标 `stalled`，
@@ -245,14 +258,20 @@ struct TargetState {
 }
 ```
 
-主循环只调两个方法：
+主循环只调三个方法：
 
 ```rust
-/// 投递目标集合（授权变化 or 自探结果变化时调用）。幂等。
-pub fn apply_targets(targets: Vec<CollectTarget>);
+/// 投递最新目标视图（发现策略每次刷新后调）。幂等、非阻塞。
+pub fn apply_host_view(view: &MetricsTargetView);
+
+/// 投递 Kafka 自探扫描（授权变化时调）。
+pub fn request_scan(snapshot: Option<DiscoverySnapshot>, settings: KafkaTargetSettings);
 
 /// 撤授权：停采并作废在途扫描/结果。
 pub fn revoke();
+
+/// 读最近一次完成的采集结果（主机三域 + Kafka）。
+pub fn collect_all(view: &MetricsTargetView) -> Vec<MetricsCollectionOutcome>;
 ```
 
 调度线程的主体（示意）：
@@ -273,13 +292,13 @@ loop {
 `build_runtime_snapshot_from_view` 改成：
 
 ```rust
-let outcomes = host_metrics_outcome()          // 仍从 target_view 推导
-    .into_iter()
-    .chain(collection::collect_all())          // 所有 collector 域的最近一次 outcome
-    .collect();
+scheduler::apply_host_view(view);               // 投递目标视图（非阻塞）
+let outcomes = scheduler::collect_all(view);    // 主机三域 + Kafka（最近一次完成）
 ```
 
-`collect_all()` 只 clone 数据、不做 I/O，耗时与域数线性，微秒级。
+`collect_all` 只 clone 数据、不做 I/O；**目标集合变了**（不是 `generated_at` 变）才会在
+调用方这里同步补一轮主机采集（读 `/proc`，毫秒级）—— 为的是不把上一份目标的数据
+挂到现在这份目标上。
 
 ### 6.7 默认值与上限
 
@@ -410,28 +429,32 @@ let outcomes = host_metrics_outcome()          // 仍从 target_view 推导
 
 ## 10. 迁移计划（P0–P3）
 
-### P0：抽出接缝，行为不变（唯一必须完成的一步）
+### P0：抽出接缝，行为不变（**已完成**，2026-11-05）
 
-**改动清单**
+**实际落地的改动**
 
 | 文件 | 动作 |
 |---|---|
-| `src/telemetry/metrics/collection.rs`（新） | `CollectTarget` / `TargetPolicy` / `ProbeResult` / **`enum Collector`** / `WarningGate` / `GroupWarnings`（从 kafka 提上来） |
-| `src/telemetry/metrics/scheduler.rs`（新） | collector 线程 + `current_thread` runtime + `apply_targets` / `revoke` / `collect_all` / 自探任务 / 自愈；按 `enum` 分发 |
-| `src/telemetry/metrics/kafka.rs` | 删掉 `spawn_worker` / `RUNTIME` / `take_due`；`probe_once` 原样包成 blocking collector；`GroupCache` 变成该目标的私有状态 |
-| `src/telemetry/metrics/runtime.rs` | `chain(kafka::collect_outcome())` → `chain(collection::collect_all())` |
+| `src/telemetry/metrics/collection.rs`（新） | `Collector`（enum，作业变体自带状态）/ `CollectorOutput` / `ProbeResult` / `WarningGate` / `GroupWarnings` / `host_outcomes` / `kafka_outcome` |
+| `src/telemetry/metrics/scheduler.rs`（新） | 采集线程 + `current_thread` runtime + `apply_host_view` / `request_scan` / `revoke` / `collect_all(view)` / 自探任务 / `catch_unwind` 自愈 |
+| `src/telemetry/metrics/kafka.rs` | 删掉 `RUNTIME` / `ProbeRuntime` / `spawn_worker` / `take_due` / `collect_outcome`；`probe_once` 改为 `pub(super)`，由 `enum` 分支调用 |
+| `src/telemetry/metrics/runtime.rs` | 新增 `build_runtime_snapshot_live`（读调度器快照）；原 `build_runtime_snapshot_from_view` 降为 `#[cfg(test)]` 的同步路径 |
 | `src/telemetry/metrics/mod.rs` | 注册两个新模块 |
-| `src/runtime/daemon.rs` | `kafka::request_scan(...)` → `scheduler::apply_targets(...)`；`kafka::revoke()` → `scheduler::revoke()`；主机指标 tick 采集改为读快照 |
-| `src/runtime/daemon_metrics.rs` | 只改 `process_metrics_tick` 的取数来源（不再现场采集） |
+| `src/runtime/daemon.rs` | `kafka::request_scan` → `scheduler::request_scan`；`kafka::revoke` → `scheduler::revoke` |
+| `src/runtime/daemon_metrics.rs` | `process_metrics_tick` 改读 `build_runtime_snapshot_live`（不再现场采集） |
 
-**验收**
+**一处与初稿的偏差（有意）**：P0 的两个采集器都是同步实现，所以**直接跑在采集线程上**，
+没有套 `spawn_blocking`（一条专属线程上再开阻塞池是白绕一圈）。P1 起 async 采集器
+（MySQL / Doris）上这条线程时，同步采集器再改走 `spawn_blocking`——那时才有「不能阻塞
+异步执行器」的问题。
 
-- 现网行为不变：Kafka 真集群 `kafka_live` 9/9；`attempted/succeeded`、lag/state/容量读数与现在一致；
-- 主机指标（`host_metrics` / `process_metrics` / `container_metrics`）在快照里的结构、`instance`、
-  取值与 P0 前一致，上送节奏不变；
-- 撤授权 → 下个 tick 内序列消失；自探扫描仍在后台线程，3s tick 无网络等待（可用「给假 broker 加 5s 延迟」测主循环时间）；
-- 线程 panic（测试里注入）后 5s 内自动恢复并打 `CollectorThreadRestarted`；
-- `cargo test --lib` 全绿；`clippy -D warnings`、`fmt --check` 干净。
+**验收结果**
+
+- `cargo test --lib`：1331 passed / 0 failed（2 条历史 flaky 的 upgrade 用例单跑通过）；
+- `cargo test --test local_exec -- --test-threads=1`：57 passed（含 `run_once` 的主机指标与上送链路）；
+- `clippy --all-targets -D warnings`、`fmt --check` 干净；
+- Kafka 真集群 live：**本轮未能复跑**——采集环境（`10.168.1.145`）当前不可达（22/30001 均超时），
+  上次基线为 9/9；协议与采集逻辑本轮未改动（`probe_once` 原样）。
 
 ### P1：MySQL / TiDB（第一个 async 域）
 
