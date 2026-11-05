@@ -36,12 +36,43 @@ use crate::control::enrollment::enrollment_http_client;
 /// 两条路径都在主循环里排在采集之前，必须自己封顶 —— 否则网关卡住会连采集一起停。
 const WORK_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Kafka 采集来源的 `kind`（工作 spec 里的值）。
+///
+/// 为什么先放在 agentd：`wist-contracts 0.10` 里还没有它，而改 contracts 要连带
+/// `wist-api` / `wist-metrics` / `wist-validate` 四个仓一起切 path（否则会出现两份
+/// contracts，类型互不认识）。等网关开始派发这种单元时，再把它收进 `wist-contracts`
+/// 的 [`is_executable_source`](wist_contracts::work::is_executable_source)，两边同口径。
+pub(crate) const KAFKA_CLUSTER_SOURCE_KIND: &str = "KafkaCluster";
+/// `KafkaCluster` 唯一支持的 `target`（空串等同 `auto`）。
+pub(crate) const KAFKA_SOURCE_TARGET_AUTO: &str = "auto";
+
+/// 这条来源是不是「允许在本机采集 Kafka」。
+///
+/// 只认 `auto`：端点/协议/机制全部由 agentd 自探。允许工作里写具体地址会把
+/// 「猜地址」的活搬回控制面，也会给探针开一个「连网关指定地址」的口子。
+pub(crate) fn is_kafka_cluster_source(kind: &str, target: &str) -> bool {
+    if kind != KAFKA_CLUSTER_SOURCE_KIND {
+        return false;
+    }
+    let target = target.trim();
+    target.is_empty() || target.eq_ignore_ascii_case(KAFKA_SOURCE_TARGET_AUTO)
+}
+
 /// 工作里没写清指标周期时的上送间隔（与采集目录里 `MetricInterval` 的策展值同值）。
 ///
 /// 为什么要有默认：`collect_metrics` 单元理论上都带一条 `MetricInterval` 来源，
 /// 但"理论上"不该是**必须**——一份缺了周期的授权不该让指标彻底不上送，
 /// 该做的是用一个保守的默认值继续上送，并把这件事写进日志。
 pub const DEFAULT_METRICS_UPLINK_SECONDS: u64 = 15;
+
+/// 采集面授予的 Kafka 采集权限。
+///
+/// 只有“允许采”这一个结论：端点/协议/机制全部由 agentd 自探，凭据走本机 Secret。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KafkaGrant {
+    /// 授权里的采集周期（取 `MetricInterval` 的最小值）；没写 = 用本机默认。
+    pub interval: Option<Duration>,
+}
 
 /// 从工作折算出来的一条日志采集任务。
 ///
@@ -643,6 +674,39 @@ impl AppliedWorkGrant {
         seconds.map(|seconds| Duration::from_secs(seconds.max(1) as u64))
     }
 
+    /// Kafka 采集授权（采集面）。
+    ///
+    /// 判据是「有一份在干活的工作，它的 `collect_metrics` 单元里带了一条
+    /// `KafkaCluster/auto` 来源」。端点不在这里 —— 那是 agentd 自探的事。
+    pub fn kafka_grant(&self) -> Option<KafkaGrant> {
+        let mut interval: Option<Duration> = None;
+        let mut granted = false;
+        for work in self.works.values() {
+            if !work.is_working() {
+                continue;
+            }
+            let Some(spec) = work.spec.as_ref() else {
+                continue;
+            };
+            let authorized = spec.units.iter().any(|unit| {
+                unit.capability == "collect_metrics"
+                    && unit
+                        .sources
+                        .iter()
+                        .any(|source| is_kafka_cluster_source(&source.kind, &source.target))
+            });
+            if !authorized {
+                continue;
+            }
+            granted = true;
+            if let Some(secs) = spec.metric_interval_seconds() {
+                let current = Duration::from_secs(secs.max(1) as u64);
+                interval = Some(interval.map_or(current, |existing| existing.min(current)));
+            }
+        }
+        granted.then_some(KafkaGrant { interval })
+    }
+
     /// 折算不了的单元（`Exporter` / `UnifiedLogPredicate` …）。
     pub fn unsupported_units(&self) -> Vec<UnsupportedUnit> {
         let mut unsupported = Vec::new();
@@ -654,7 +718,15 @@ impl AppliedWorkGrant {
                 continue;
             };
             for unit in &spec.units {
-                for source in unit.unsupported_sources() {
+                for source in &unit.sources {
+                    // 先看 contracts 的口径，再补上 agentd 自己新增的 Kafka 来源：
+                    // `wist-contracts 0.10` 还不认识 `KafkaCluster`，不补这一步会把
+                    // 已经能采的单元误报成 unsupported。
+                    if wist_contracts::work::is_executable_source(&source.kind, &source.target)
+                        || is_kafka_cluster_source(&source.kind, &source.target)
+                    {
+                        continue;
+                    }
                     unsupported.push(UnsupportedUnit {
                         work_id: work_id.clone(),
                         unit_id: unit.unit_id.clone(),
@@ -676,14 +748,22 @@ impl AppliedWorkGrant {
             Some(interval) => format!("on({}s)", interval.as_secs()),
             None => "off".to_string(),
         };
+        let kafka = match self.kafka_grant() {
+            Some(grant) => match grant.interval {
+                Some(interval) => format!("on({}s)", interval.as_secs()),
+                None => "on".to_string(),
+            },
+            None => "off".to_string(),
+        };
         let unsupported = self.unsupported_units().len();
         format!(
-            "held={} working={} log_inputs={} exporters={} metrics={} unsupported_units={} one_shot_pending={}",
+            "held={} working={} log_inputs={} exporters={} metrics={} kafka={} unsupported_units={} one_shot_pending={}",
             self.works.len(),
             working,
             log_inputs,
             exporters,
             metrics,
+            kafka,
             unsupported,
             self.unexecutable_one_shot.len()
         )
@@ -711,6 +791,12 @@ fn unsupported_reason(source: &WorkSpecSource) -> String {
         "Exporter" => format!(
             "Exporter target {:?} is not a known exporter id (see \
              wist_contracts::work::EXPORTER_IDS)",
+            source.target
+        ),
+        // Kafka：端点必须由 agentd 自探，工作里只能写 `auto`。
+        KAFKA_CLUSTER_SOURCE_KIND => format!(
+            "KafkaCluster target {:?} is not supported on this agent \
+             (only `auto`: endpoints are self-discovered on the broker host)",
             source.target
         ),
         _ => format!(
@@ -1003,6 +1089,98 @@ mod tests {
         assert!(applied.log_inputs().is_empty());
         assert_eq!(applied.metrics_interval(), None);
         assert!(applied.is_empty());
+    }
+
+    #[test]
+    fn kafka_collection_requires_a_kafka_cluster_source() {
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![standing(
+                "w-kafka",
+                "KafkaBrokerHealth",
+                1,
+                "active",
+                &spec(&[
+                    ("kafka", "collect_metrics", "KafkaCluster:auto"),
+                    ("interval", "collect_metrics", "MetricInterval:30s"),
+                ]),
+            )],
+        ));
+
+        assert_eq!(
+            applied.kafka_grant(),
+            Some(KafkaGrant {
+                interval: Some(Duration::from_secs(30))
+            })
+        );
+        assert!(
+            applied.unsupported_units().is_empty(),
+            "agentd 能接的 Kafka 来源不该报 unsupported：{:?}",
+            applied.unsupported_units()
+        );
+    }
+
+    #[test]
+    fn collect_metrics_without_kafka_is_not_a_kafka_grant() {
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![standing(
+                "w-host",
+                "HostMetrics",
+                1,
+                "active",
+                &spec(&[("host", "collect_metrics", "MetricInterval:15s")]),
+            )],
+        ));
+        assert!(applied.kafka_grant().is_none());
+        assert_eq!(
+            applied.metrics_interval(),
+            Some(Duration::from_secs(15)),
+            "主机指标仍照常上送"
+        );
+    }
+
+    #[test]
+    fn a_kafka_source_with_a_concrete_target_is_unsupported() {
+        // 端点必须自探：工作里写地址一定会被拒，而且要能说清原因。
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![standing(
+                "w-kafka",
+                "KafkaBrokerHealth",
+                1,
+                "active",
+                &spec(&[("kafka", "collect_metrics", "KafkaCluster:10.0.0.1:9092")]),
+            )],
+        ));
+
+        assert!(applied.kafka_grant().is_none());
+        let unsupported = applied.unsupported_units();
+        assert_eq!(unsupported.len(), 1, "{unsupported:?}");
+        assert!(
+            unsupported[0].detail.contains("only `auto`"),
+            "{} ",
+            unsupported[0].detail
+        );
+    }
+
+    #[test]
+    fn a_paused_kafka_work_is_not_a_grant() {
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![standing(
+                "w-kafka",
+                "KafkaBrokerHealth",
+                1,
+                "paused",
+                &spec(&[("kafka", "collect_metrics", "KafkaCluster:auto")]),
+            )],
+        ));
+        assert!(applied.kafka_grant().is_none(), "暂停不等于撤回，但不采");
     }
 
     #[test]

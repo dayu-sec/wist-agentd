@@ -1,6 +1,7 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::Path;
+use std::sync::{LazyLock, Mutex};
 
 use wist_contracts::telemetry_record::DataFrame;
 use wist_shared::fs::read_json;
@@ -29,13 +30,25 @@ pub(super) enum MetricsFailureKind {
     TargetViewLoad,
     RuntimeSnapshotLoad,
     RuntimeSnapshotStore,
+    /// 采集域 / 目标没采上来（数据面）。
+    ///
+    /// 不进 `MetricsTick::failures`：它不影响「这一拍走没走通」，也不该把一台空闲机器
+    /// 翻成 `Active`（broker 长期不可达是稳态，不是“有活干”）。
+    Collection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ::jumo_derive::Jumo)]
 #[jumo(kind = "struct", domain = "Reporting", module = "Reporting.Health")]
 pub(super) struct MetricsFailure {
     pub(super) kind: MetricsFailureKind,
+    /// tick 级：落盘阶段名；采集级：固定 `collect`。
     pub(super) phase: String,
+    /// 采集级：采集域（`kafka_broker_metrics` / `host_metrics` …）；tick 级为 `-`。
+    pub(super) collection: String,
+    /// 采集级：目标标识（`kafka:<cluster>:<broker>` 等）；域级失败为 `-`。
+    pub(super) target: String,
+    /// 采集级：`failed` / `partial`；tick 级为空。
+    pub(super) status: String,
     pub(super) path: String,
     pub(super) detail: String,
 }
@@ -178,6 +191,10 @@ pub(super) fn process_metrics_tick(state_dir: &Path) -> MetricsTick {
 }
 
 pub(super) fn emit_metrics_tick(tick: &MetricsTick) {
+    // 采集失败的明细无关稳态收敛：先按「变化才打 / 恢复也打」处理，
+    // 不能被下面那句汇总行的闸门吞掉。
+    emit_collection_failures(tick.snapshot.as_ref());
+
     let health = tick.health_snapshot();
     // 指标快照同样逐 tick 产生，走稳态收敛（内容变化立即打印，否则补心跳）。
     if !crate::runtime::steady_log::should_emit_metrics(
@@ -208,6 +225,25 @@ pub(super) fn emit_metrics_failures(failures: &[MetricsFailure]) {
 }
 
 pub(super) fn emit_metrics_failure(failure: &MetricsFailure) {
+    if failure.kind == MetricsFailureKind::Collection {
+        // 采集失败：现场要的是「哪个域 / 哪个目标 / 为什么」。整域没上来算 error，
+        // 部分目标失败算 warn（其余目标仍在上报）。
+        let event = if failure.status == "failed" {
+            "MetricsCollectionFailed"
+        } else {
+            "MetricsCollectionPartial"
+        };
+        let line = format!(
+            "event={event} collection={} target={} status={} error=\"{}\"",
+            failure.collection, failure.target, failure.status, failure.detail
+        );
+        if failure.status == "failed" {
+            log::error!("{line}");
+        } else {
+            log::warn!("{line}");
+        }
+        return;
+    }
     log::error!(
         "event=MetricsRuntimeFailed kind={:?} phase={} path={} error={}",
         failure.kind,
@@ -215,6 +251,104 @@ pub(super) fn emit_metrics_failure(failure: &MetricsFailure) {
         failure.path,
         failure.detail
     );
+}
+
+/// 把一次快照里「没采上来的东西」摊平成失败项（纯函数，便于测试）。
+///
+/// 优先给**目标级**明细（带上 `last_error`）；没目标明细时才退到域级一行，
+/// 至少把采集域、状态和计数说清楚，而不是现场只能看到汇总行里的 `failed_targets=2`。
+fn collection_failures(snapshot: &MetricsRuntimeSnapshot) -> Vec<MetricsFailure> {
+    let mut failures = Vec::new();
+    for outcome in &snapshot.outcomes {
+        let failing: Vec<&_> = outcome
+            .sample_targets
+            .iter()
+            .filter(|sample| sample.status == "failed")
+            .collect();
+        if !failing.is_empty() {
+            for sample in failing {
+                let target = if sample.resource_ref.is_empty() {
+                    sample.candidate_id.clone()
+                } else {
+                    sample.resource_ref.clone()
+                };
+                failures.push(MetricsFailure {
+                    kind: MetricsFailureKind::Collection,
+                    phase: "collect".to_string(),
+                    collection: outcome.collection_kind.clone(),
+                    target,
+                    status: sample.status.clone(),
+                    path: "-".to_string(),
+                    detail: sample
+                        .last_error
+                        .clone()
+                        .unwrap_or_else(|| "目标采集失败，但没有给 last_error".to_string()),
+                });
+            }
+            continue;
+        }
+
+        let failed =
+            outcome.status == "failed" || outcome.status == "partial" || outcome.failed_targets > 0;
+        if !failed {
+            continue;
+        }
+        failures.push(MetricsFailure {
+            kind: MetricsFailureKind::Collection,
+            phase: "collect".to_string(),
+            collection: outcome.collection_kind.clone(),
+            target: "-".to_string(),
+            status: outcome.status.clone(),
+            path: "-".to_string(),
+            detail: outcome.last_error.clone().unwrap_or_else(|| {
+                format!(
+                    "status={} attempted={} failed={}，采集器没有给 last_error",
+                    outcome.status, outcome.attempted_targets, outcome.failed_targets
+                )
+            }),
+        });
+    }
+    failures
+}
+
+/// 已经打过的采集失败（签名 → 失败项）。
+///
+/// 只在主循环里被访问（单线程拍），与 `steady_log` 的全局闸门同一取向。
+static EMITTED_COLLECTION_FAILURES: LazyLock<Mutex<BTreeMap<String, MetricsFailure>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// 只打「新出现的」失败；已经好了的补一行“恢复”。
+///
+/// 持久性故障（broker 挂了一整天）不能每 3s 刷一行：2.88 万行/天会把日志和诊断包
+/// 一起没掉，现场反而看不到别的东西。
+fn emit_collection_failures(snapshot: Option<&MetricsRuntimeSnapshot>) {
+    let current: BTreeMap<String, MetricsFailure> = snapshot
+        .map(collection_failures)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|failure| (failure_signature(&failure), failure))
+        .collect();
+
+    let mut emitted = EMITTED_COLLECTION_FAILURES
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
+    for (signature, failure) in &current {
+        if !emitted.contains_key(signature) {
+            emit_metrics_failure(failure);
+        }
+    }
+    for (signature, failure) in emitted.iter() {
+        if !current.contains_key(signature) {
+            // 恢复也是状态迁移：不只在汇总行里“少一个数”，要能搜到“什么时候回来的”。
+            log::info!(
+                "event=MetricsCollectionRecovered collection={} target={}",
+                failure.collection,
+                failure.target
+            );
+        }
+    }
+    *emitted = current;
 }
 
 pub(super) fn failure_signatures(failures: &[MetricsFailure]) -> BTreeSet<String> {
@@ -233,8 +367,14 @@ pub(super) fn filter_new_failures<'a>(
 
 fn failure_signature(failure: &MetricsFailure) -> String {
     format!(
-        "{:?}|{}|{}|{}",
-        failure.kind, failure.phase, failure.path, failure.detail
+        "{:?}|{}|{}|{}|{}|{}|{}",
+        failure.kind,
+        failure.phase,
+        failure.collection,
+        failure.target,
+        failure.status,
+        failure.path,
+        failure.detail
     )
 }
 
@@ -269,6 +409,9 @@ fn metrics_failure(
     MetricsFailure {
         kind,
         phase: phase.to_string(),
+        collection: "-".to_string(),
+        target: "-".to_string(),
+        status: String::new(),
         path: path.display().to_string(),
         detail: err.to_string(),
     }
@@ -283,7 +426,10 @@ mod tests {
     use wist_contracts::discovery::StringKeyValue;
     use wist_shared::fs::read_json;
 
-    use super::{process_metrics_tick, write_metrics_uplink};
+    use super::{
+        MetricsFailure, MetricsFailureKind, collection_failures, failure_signature,
+        process_metrics_tick, write_metrics_uplink,
+    };
     use crate::telemetry::metrics::runtime::{
         MetricsCollectionOutcome, MetricsCollectionTargetSample, MetricsRuntimeSnapshot,
         path_for as runtime_path_for,
@@ -304,6 +450,172 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("warp-insight-daemon-metrics-{name}-{suffix}"));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    fn sample(
+        resource_ref: &str,
+        status: &str,
+        last_error: Option<&str>,
+    ) -> MetricsCollectionTargetSample {
+        MetricsCollectionTargetSample {
+            candidate_id: resource_ref.to_string(),
+            target_ref: resource_ref.to_string(),
+            status: status.to_string(),
+            last_error: last_error.map(str::to_string),
+            resource_ref: resource_ref.to_string(),
+            execution_hints: Vec::new(),
+            runtime_facts: Vec::new(),
+            labeled_facts: Vec::new(),
+        }
+    }
+
+    fn outcome(
+        collection_kind: &str,
+        status: &str,
+        attempted: usize,
+        failed: usize,
+        last_error: Option<&str>,
+        sample_targets: Vec<MetricsCollectionTargetSample>,
+    ) -> MetricsCollectionOutcome {
+        MetricsCollectionOutcome {
+            collection_kind: collection_kind.to_string(),
+            status: status.to_string(),
+            attempted_targets: attempted,
+            succeeded_targets: attempted.saturating_sub(failed),
+            failed_targets: failed,
+            dropped_targets: 0,
+            last_error: last_error.map(str::to_string),
+            runtime_facts: Vec::new(),
+            labeled_facts: Vec::new(),
+            sample_targets,
+        }
+    }
+
+    fn snapshot(outcomes: Vec<MetricsCollectionOutcome>) -> MetricsRuntimeSnapshot {
+        MetricsRuntimeSnapshot {
+            generated_at: "2026-04-19T00:00:00Z".to_string(),
+            total_targets: outcomes.iter().map(|o| o.attempted_targets).sum(),
+            host_targets: 0,
+            process_targets: 0,
+            container_targets: 0,
+            outcomes,
+        }
+    }
+
+    /// 现场看不到「是谁、为什么」是这次要解决的问题：先把它钉住。
+    #[test]
+    fn collection_failures_name_the_target_and_the_reason() {
+        let tick = snapshot(vec![outcome(
+            "process_metrics",
+            "partial",
+            2,
+            1,
+            Some("pid 42 gone"),
+            vec![
+                sample("proc:42", "failed", Some("/proc/42 不存在")),
+                sample("proc:43", "succeeded", None),
+            ],
+        )]);
+
+        let failures = collection_failures(&tick);
+        assert_eq!(failures.len(), 1, "只报失败的那个目标；成功的不要噪音");
+        let failure = &failures[0];
+        assert_eq!(failure.kind, MetricsFailureKind::Collection);
+        assert_eq!(failure.collection, "process_metrics");
+        assert_eq!(failure.target, "proc:42");
+        assert_eq!(failure.status, "failed");
+        assert_eq!(failure.detail, "/proc/42 不存在");
+    }
+
+    /// kafka 探针就是这个形状：整轮不通时 `targets` 为空，只有域级 `last_error`。
+    #[test]
+    fn collection_failures_fall_back_to_the_domain_when_targets_are_absent() {
+        let tick = snapshot(vec![outcome(
+            "kafka_broker_metrics",
+            "failed",
+            1,
+            1,
+            Some("127.0.0.1:9092: Connection refused (os error 61)"),
+            Vec::new(),
+        )]);
+
+        let failures = collection_failures(&tick);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].target, "-", "域级失败不编造目标");
+        assert_eq!(failures[0].collection, "kafka_broker_metrics");
+        assert_eq!(failures[0].status, "failed");
+        assert!(
+            failures[0].detail.contains("127.0.0.1:9092"),
+            "原因里要带地址：{}",
+            failures[0].detail
+        );
+    }
+
+    /// 采集器没给 `last_error` 时也不能静默：至少把计数说清楚。
+    #[test]
+    fn collection_failures_never_hide_a_failure_without_a_reason() {
+        let tick = snapshot(vec![outcome(
+            "host_metrics",
+            "failed",
+            1,
+            1,
+            None,
+            Vec::new(),
+        )]);
+
+        let failures = collection_failures(&tick);
+        assert_eq!(failures.len(), 1);
+        let detail = &failures[0].detail;
+        assert!(
+            detail.contains("attempted=1") && detail.contains("failed=1"),
+            "没有 last_error 也要能看出发生了什么：{detail}"
+        );
+    }
+
+    /// 正常采集（含 `idle`）一律不出失败项：这条闸门决定了日志噪音量。
+    #[test]
+    fn successful_and_idle_outcomes_produce_no_failures() {
+        let tick = snapshot(vec![
+            outcome(
+                "process_metrics",
+                "succeeded",
+                2,
+                0,
+                None,
+                vec![
+                    sample("proc:1", "succeeded", None),
+                    sample("proc:2", "succeeded", None),
+                ],
+            ),
+            outcome("container_metrics", "idle", 0, 0, None, Vec::new()),
+        ]);
+        assert!(collection_failures(&tick).is_empty());
+    }
+
+    /// 「变化才打」靠签名：目标或原因一变就必须是新的签名，否则现场看不到第二次故障。
+    #[test]
+    fn collection_failure_signature_covers_target_and_reason() {
+        let base = MetricsFailure {
+            kind: MetricsFailureKind::Collection,
+            phase: "collect".to_string(),
+            collection: "process_metrics".to_string(),
+            target: "proc:42".to_string(),
+            status: "failed".to_string(),
+            path: "-".to_string(),
+            detail: "boom".to_string(),
+        };
+        let other_target = MetricsFailure {
+            target: "proc:43".to_string(),
+            ..base.clone()
+        };
+        let other_reason = MetricsFailure {
+            detail: "boom again".to_string(),
+            ..base.clone()
+        };
+
+        assert_ne!(failure_signature(&base), failure_signature(&other_target));
+        assert_ne!(failure_signature(&base), failure_signature(&other_reason));
+        assert_eq!(failure_signature(&base), failure_signature(&base.clone()));
     }
 
     #[test]

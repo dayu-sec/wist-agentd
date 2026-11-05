@@ -95,6 +95,12 @@ pub struct VmMetricLabels {
     pub mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+    /// Kafka 消费组（`kafka_consumergroup_lag` / `.state`）：业务标识，只做 label。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Kafka topic（`kafka_consumergroup_lag`）：定位积压落在哪条流上。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -150,6 +156,8 @@ pub fn build_vm_metric_lines_with(
                     cpu: label_value(&sample.labels, label::CPU).map(str::to_string),
                     mode: label_value(&sample.labels, label::MODE).map(str::to_string),
                     state: label_value(&sample.labels, label::STATE).map(str::to_string),
+                    group: label_value(&sample.labels, label::GROUP).map(str::to_string),
+                    topic: label_value(&sample.labels, label::TOPIC).map(str::to_string),
                     target_kind: label_value(&sample.labels, label::TARGET_KIND)
                         .map(str::to_string),
                     outcome: label_value(&sample.labels, label::OUTCOME).map(str::to_string),
@@ -398,7 +406,18 @@ fn push_metric_sample(
     };
 
     // 枚举类 fact：取值进 `state` label，样本值恒为 1（一热）。
+    // 其它声明的维度（如 `kafka_consumergroup_state` 的 `group`）必须一起带上 ——
+    // 丢掉它会让所有组的状态叠成一条序列。
     if spec.dynamic_labels.contains(&"state") {
+        let mut labels: Vec<StringKeyValue> = spec
+            .dynamic_labels
+            .iter()
+            .filter(|key| **key != "state")
+            .filter_map(|key| {
+                label_value(fact_labels, key).map(|value| StringKeyValue::new(*key, value))
+            })
+            .collect();
+        labels.push(StringKeyValue::new("state", normalize_state(raw_value)));
         samples.push(MetricsSampleRecord {
             name: spec.name.to_string(),
             value: Value::Number(1.into()),
@@ -408,7 +427,7 @@ fn push_metric_sample(
                 .iter()
                 .map(|(key, value)| StringKeyValue::new(*key, *value))
                 .collect(),
-            labels: vec![StringKeyValue::new("state", normalize_state(raw_value))],
+            labels,
         });
         return;
     }
@@ -441,7 +460,7 @@ fn push_metric_sample(
 fn normalize_state(raw: &str) -> &str {
     match raw {
         "running" | "sleeping" | "disk_sleep" | "stopped" | "zombie" | "dead" | "idle"
-        | "unknown" => raw,
+        | "stable" | "rebalancing" | "empty" | "unknown" => raw,
         _ => "unknown",
     }
 }
@@ -1081,5 +1100,57 @@ mod tests {
             }],
         };
         assert!(build_vm_metric_lines_with(&snapshot, "agent-1", &BTreeMap::new()).is_empty());
+    }
+
+    /// Kafka 消费组：lag / state 必须带着 `group`（lag 还要 `topic`）落在线协议上。
+    #[test]
+    fn kafka_consumergroup_facts_keep_their_labels_on_the_wire() {
+        let mut cluster = target("succeeded", "kafka:abc");
+        cluster.labeled_facts = vec![
+            MetricsLabeledFact {
+                key: "kafka.consumergroup.lag".to_string(),
+                value: "42".to_string(),
+                labels: vec![
+                    StringKeyValue::new("group", "orders"),
+                    StringKeyValue::new("topic", "orders-events"),
+                ],
+            },
+            MetricsLabeledFact {
+                key: "kafka.consumergroup.state".to_string(),
+                value: "rebalancing".to_string(),
+                labels: vec![StringKeyValue::new("group", "orders")],
+            },
+        ];
+        let snapshot = build_samples_snapshot(&snapshot("kafka_broker_metrics", vec![cluster]));
+        let lines = build_vm_metric_lines_with(&snapshot, "agent-1", &BTreeMap::new());
+
+        let lag = lines
+            .iter()
+            .find(|line| line.metric.name == "kafka_consumergroup_lag")
+            .expect("lag line");
+        assert_eq!(lag.metric.instance, "kafka:abc");
+        assert_eq!(lag.metric.group.as_deref(), Some("orders"));
+        assert_eq!(lag.metric.topic.as_deref(), Some("orders-events"));
+        assert_eq!(lag.values, vec![serde_json::Number::from(42)]);
+
+        let state = lines
+            .iter()
+            .find(|line| line.metric.name == "kafka_consumergroup_state")
+            .expect("state line");
+        assert_eq!(
+            state.metric.state.as_deref(),
+            Some("rebalancing"),
+            "枚举 fact 的取值进 state label"
+        );
+        assert_eq!(
+            state.metric.group.as_deref(),
+            Some("orders"),
+            "一热时不能把同级 label（group）丢掉"
+        );
+        assert_eq!(
+            state.values,
+            vec![serde_json::Number::from(1)],
+            "一热：样本值恒 1"
+        );
     }
 }

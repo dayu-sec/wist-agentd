@@ -1,0 +1,41 @@
+# 真 broker 夹具：**一个**容器，只开两条 listener（PLAINTEXT + SASL_PLAINTEXT），
+# 三种 SASL 机制。TLS 不在这里 —— 证书链那半截由离线用例覆盖（真 rustls 服务端 + 真 CA），
+# 不值得为它再引 openssl / PKCS12 / 多 listener 的组合成本。
+#
+# 钉 3.9.x 只为可重现。协议版本是**协商**出来的（ApiVersions），所以把
+# WIST_KAFKA_IMAGE 指到 4.x 镜像也能直接跑：4.0 移除了 DescribeLogDirs v0
+# （基线 v1，布局相同），Metadata 仍是 v0-13。
+#
+# 端口：宿主 9092 → 容器 19094（SASL_PLAINTEXT），宿主 9093 → 容器 19093（PLAINTEXT）。
+# 被占用的话，ports / listeners / advertised.listeners **三处一起**改。
+name: wist-kafka-sasl
+
+services:
+  kafka:
+    image: ${WIST_KAFKA_IMAGE:-apache/kafka:3.9.1}
+    container_name: wist-kafka-sasl
+    hostname: kafka
+    ports:
+      - "127.0.0.1:9092:19094"
+      - "127.0.0.1:9093:19093"
+    volumes:
+      - ./server.properties:/etc/kafka/live/server.properties:ro
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -euo pipefail
+        # 不挂数据卷：每次起来都是干净集群，SCRAM 凭据由 run.sh 重建。
+        CLUSTER_ID="$$(/opt/kafka/bin/kafka-storage.sh random-uuid)"
+        /opt/kafka/bin/kafka-storage.sh format --ignore-formatted \
+          -t "$$CLUSTER_ID" -c /etc/kafka/live/server.properties
+        exec /opt/kafka/bin/kafka-server-start.sh /etc/kafka/live/server.properties
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server 127.0.0.1:19092 >/dev/null 2>&1
+      interval: 3s
+      timeout: 10s
+      retries: 40
+      start_period: 10s
+    stop_grace_period: 5s

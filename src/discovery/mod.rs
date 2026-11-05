@@ -6,6 +6,9 @@ pub mod container;
 pub mod endpoint;
 pub mod host;
 pub mod k8s;
+// Kafka 集群自探：从进程证据 + broker 配置推出端点/协议/机制，作为候选上报。
+// 只发现、不下发采集任务；授权与限流仍由采集面（网关 + 知识策略）决定。
+pub mod kafka_source;
 // 日志源定位（v1 只做 PostgreSQL）：从发现快照的进程证据推出日志目录，作为候选上报。
 // 采不采、采哪个仍由网关判定（见 `wist-design/doc/design/edge/log-source-resolution.md`）。
 pub mod log_source;

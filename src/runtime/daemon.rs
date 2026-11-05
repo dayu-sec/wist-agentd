@@ -85,6 +85,11 @@ const STATUS_REPORT_INTERVAL: Duration = Duration::from_secs(3);
 /// - file 输入最坏延迟 3s（采集类负载可接受，仍远优于 scan 周期）；
 /// - `drain` 每轮只处理一个队列项且**等它跑完**，因此这个值是空闲轮询间隔，不是执行吞吐上限。
 const TICK_INTERVAL: Duration = Duration::from_secs(3);
+/// Kafka 自探的最小重算间隔。
+///
+/// 自探要读进程/配置并做有界探测；快照 revision 变化会提前触发，
+/// 这里只是“快照一直不变”时的保底刷新。
+const KAFKA_SCAN_INTERVAL: Duration = Duration::from_secs(300);
 
 /// 凭据续期的检查周期：没必要每 3s 都查，1 小时足够，而续期窗是 30 天。
 const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -1802,23 +1807,22 @@ pub struct DaemonLoop<'a> {
 pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     // 运行时**跨 tick 活着**：观测频率的调度记忆就在它里面（内存态，不落盘）。
     let mut discovery_runtime = DiscoveryRuntime::new(discovery_probes(loop_ctx.config));
-    // Kafka 协议探针：未启用时不启动线程，快照里也不会出现这个采集域。
-    // 采集在独立线程里跑，collect 只读最近一次快照 —— 网络超时不会拖住主循环。
-    if loop_ctx.config.kafka.enabled {
-        log::info!(
-            "event=KafkaProbeEnabled servers={} interval_ms={} timeout_ms={}",
-            loop_ctx.config.kafka.bootstrap_servers.join(","),
-            loop_ctx.config.kafka.interval_ms,
-            loop_ctx.config.kafka.timeout_ms
-        );
-        crate::telemetry::metrics::kafka::init(
-            crate::telemetry::metrics::kafka::KafkaProbeConfig::new(
-                loop_ctx.config.kafka.bootstrap_servers.clone(),
-                "wist-agentd".to_string(),
-                loop_ctx.config.kafka.timeout_ms,
-                loop_ctx.config.kafka.interval_ms,
-            ),
-        );
+    // Kafka 采集不再由本机配置决定：授权来自采集面（`collect_metrics` + `KafkaCluster/auto`），
+    // 端点来自本机自探。`[kafka]` 里只剩调优旋钮与兼容字段。
+    //
+    // 旧版连通性字段（地址 / 协议 / 凭据）**能加载但不生效**：启动时把它们点名打一行，
+    // 免得有人改了 `security_protocol` 却发现行为没变（一处配置两处真相）。
+    {
+        let mut ignored = loop_ctx.config.kafka.ignored_legacy_fields();
+        if loop_ctx.config.kafka.enabled {
+            ignored.insert(0, "enabled");
+        }
+        if !ignored.is_empty() {
+            log::info!(
+                "event=KafkaProbeConfigIgnored detail=\"这些键不再决定采集（采集由采集面授权 + 本机自探驱动）：{}\"",
+                ignored.join(",")
+            );
+        }
     }
     // L3 搜索范围：启动时先用**上次落盘**的那份（重启后不必等一次拉取才能搜），
     // 之后在循环里按最小间隔刷新。空 = 不搜（默认，也是旧网关下的唯一状态）。
@@ -1867,6 +1871,10 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
         }
     };
     let mut last_work_fetch: Option<Instant> = None;
+    // Kafka：自探端点集合的上次扫描时间 / 上次快照 revision / 上一轮是否已授权。
+    let mut last_kafka_scan: Option<Instant> = None;
+    let mut last_kafka_revision: Option<i64> = None;
+    let mut kafka_authorized = false;
     // 数据面上送启用同样跨 tick 活着：上一次已应用的 grant 就在里面（拉取失败保留它）。
     let mut uplink_runtime = AppliedUplink::default();
     let mut last_uplink_fetch: Option<Instant> = None;
@@ -2194,6 +2202,51 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
         .await
         {
             source_results.push((refresh_what::WORK, result));
+        }
+        // Kafka：授权来自采集面，端点来自本机自探（不经过网关）。
+        //
+        // 自探要读 `/proc` 并做有界 TCP 探测（每端点 ≤300ms），所以**不在这里做**：
+        // 主循环只决定何时需要重算（快照 revision 变了，或距上次扫描超过
+        // `KAFKA_SCAN_INTERVAL`），把快照投递给探测线程，3s 节奏不被网络拖住。
+        // 撤销授权则**立即**生效（不进节流），且会作废在途扫描 —— 否则晚一步回来的
+        // 扫描结果会把集群又加回去。
+        match work_runtime.kafka_grant() {
+            Some(grant) => {
+                kafka_authorized = true;
+                let snapshot = discovery_runtime.latest_snapshot();
+                let snapshot_key = snapshot.map(|snapshot| snapshot.revision);
+                let changed = snapshot_key != last_kafka_revision;
+                let due = last_kafka_scan.is_none_or(|at| at.elapsed() >= KAFKA_SCAN_INTERVAL);
+                if changed || due {
+                    let settings = crate::telemetry::metrics::kafka::KafkaTargetSettings {
+                        client_id: "wist-agentd".to_string(),
+                        timeout: Duration::from_millis(loop_ctx.config.kafka.timeout_ms),
+                        interval: grant
+                            .interval
+                            .unwrap_or(Duration::from_millis(loop_ctx.config.kafka.interval_ms)),
+                        group_interval: Duration::from_millis(
+                            loop_ctx.config.kafka.lag_interval_ms,
+                        ),
+                        groups: crate::telemetry::metrics::kafka_groups::GroupPolicy {
+                            allowlist: loop_ctx.config.kafka.lag_group_allowlist.clone(),
+                            max_groups: loop_ctx.config.kafka.max_groups,
+                            lag_threshold: loop_ctx.config.kafka.lag_threshold,
+                        },
+                    };
+                    crate::telemetry::metrics::kafka::request_scan(snapshot.cloned(), settings);
+                    last_kafka_scan = Some(Instant::now());
+                    last_kafka_revision = snapshot_key;
+                }
+            }
+            None => {
+                if kafka_authorized {
+                    // 撤授权：停采、序列消失（不保留陈旧数据）。
+                    crate::telemetry::metrics::kafka::revoke();
+                    kafka_authorized = false;
+                    last_kafka_scan = None;
+                    last_kafka_revision = None;
+                }
+            }
         }
         // 指标上送要不要发生在**这里**决定（而不是深入采集内部）：
         //   没授权 = 不上送（不做任务工作的 Agent 不该顺手送指标）；
