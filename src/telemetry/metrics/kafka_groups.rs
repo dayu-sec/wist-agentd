@@ -33,6 +33,7 @@ use std::time::Duration;
 
 use wist_contracts::discovery::StringKeyValue;
 
+use super::collection::GroupWarnings;
 use super::kafka::{self, Broker, Metadata, Reader};
 use super::kafka_auth::{self, Connection, SecurityConfig};
 use super::runtime::MetricsLabeledFact;
@@ -85,87 +86,6 @@ pub struct GroupCollection {
     pub warnings: Vec<String>,
     /// 因 `max_groups` 截断而未采集的组数（不得静默丢弃）。
     pub dropped_groups: usize,
-}
-
-/// 逐组告警的**聚合器**。
-///
-/// 大集群里「所有组都没权限 / 协调者都在迁移」是常态故障：200 个组各打一行会在
-/// 一轮里把日志刷满，真正有用的那行反而被挤掉（而且 `KafkaProbeWarning` 的闸门
-/// 按「内容变化」判断，组集合一变就重打一整屏）。
-///
-/// 所以按**原因**聚合：单组保留原来的一句话，多组变成「N 个组（如 a, b, c…）…」。
-#[derive(Default)]
-struct GroupWarnings {
-    /// 原因（不含组名）→ 受影响的组（按出现顺序、去重）。
-    failures: BTreeMap<String, Vec<String>>,
-    /// 分区级缺失的原因 → 受影响组与缺失分区总数。
-    partitions: BTreeMap<&'static str, PartitionShortfall>,
-}
-
-#[derive(Default)]
-struct PartitionShortfall {
-    groups: Vec<String>,
-    total: usize,
-}
-
-impl GroupWarnings {
-    /// `reason` 里**不能**带组名（否则聚合失效）。
-    fn failure(&mut self, reason: String, group: &str) {
-        push_group(self.failures.entry(reason).or_default(), group);
-    }
-
-    fn partitions(&mut self, reason: &'static str, group: &str, count: usize) {
-        let entry = self.partitions.entry(reason).or_default();
-        push_group(&mut entry.groups, group);
-        entry.total += count;
-    }
-
-    fn finish(self) -> Vec<String> {
-        let mut lines = Vec::new();
-        for (reason, groups) in self.failures {
-            lines.push(format!("{} {reason}", group_subject(&groups)));
-        }
-        for (reason, shortfall) in self.partitions {
-            if shortfall.groups.len() == 1 {
-                lines.push(format!(
-                    "组 {} 有 {} 个分区{reason}",
-                    shortfall.groups[0], shortfall.total
-                ));
-            } else {
-                lines.push(format!(
-                    "{} 共 {} 个分区{reason}",
-                    group_subject(&shortfall.groups),
-                    shortfall.total
-                ));
-            }
-        }
-        lines
-    }
-}
-
-fn push_group(groups: &mut Vec<String>, group: &str) {
-    if !groups.iter().any(|existing| existing == group) {
-        groups.push(group.to_string());
-    }
-}
-
-/// 聚合行里最多列多少个组名（剩下的用 `…` 略去）。
-const GROUP_SAMPLES: usize = 3;
-
-fn group_subject(groups: &[String]) -> String {
-    match groups.len() {
-        1 => format!("组 {}", groups[0]),
-        n if n <= GROUP_SAMPLES => format!("组 {}", groups.join(", ")),
-        n => format!(
-            "{n} 个组（如 {}…）",
-            groups
-                .iter()
-                .take(GROUP_SAMPLES)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    }
 }
 
 /// 一轮消费组采集的整体预算（规范 §6：单次总体超时 20s）。

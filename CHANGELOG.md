@@ -7,6 +7,14 @@
 
 ### 新增
 
+- **采集运行时 P0（行为不变）**：把 Kafka 的单域线程抽象成统一调度器
+  （`src/telemetry/metrics/scheduler.rs`）：一条采集线程 + 自带 `current_thread` runtime，
+  同时管主机三域与 Kafka 的周期/预算/撤授权/自探扫描；`enum Collector` 分发，
+  Kafka 的协议实现（`probe_once`）原样保留。
+  主机指标不再在 3s tick 里采集：`process_metrics_tick` 改读调度器快照
+  （目标集合变化时同步补一轮），上送链路与指标口径不变。
+  设计见 `docs/design/metrics-collection-runtime.md`。
+
 - **Kafka 采集改为采集面授权驱动**：网关派一份工作
   （`collect_metrics` + `source={kind:"KafkaCluster", target:"auto"}`）即启采，
   撤授权下一个 tick 内停采；机器侧**不需要任何 Kafka 配置**。

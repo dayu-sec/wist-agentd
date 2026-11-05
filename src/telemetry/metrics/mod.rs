@@ -1,5 +1,6 @@
 //! Metrics runtime scaffolding.
 
+pub mod collection;
 pub mod cpu;
 pub mod kafka;
 pub mod kafka_auth;
@@ -9,6 +10,7 @@ pub mod kafka_groups;
 mod kafka_live;
 pub mod runtime;
 pub mod samples;
+pub mod scheduler;
 pub mod self_obs;
 pub mod spec;
 pub mod target_view;

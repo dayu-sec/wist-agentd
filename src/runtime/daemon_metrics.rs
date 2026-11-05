@@ -153,7 +153,7 @@ pub(super) fn process_metrics_tick(state_dir: &Path) -> MetricsTick {
 
     match read_json::<MetricsTargetView>(&target_view_path) {
         Ok(view) => {
-            let snapshot = runtime::build_runtime_snapshot_from_view(&view);
+            let snapshot = runtime::build_runtime_snapshot_live(&view);
             let mut failures = Vec::new();
             if let Err(err) = runtime::store(&runtime_snapshot_path, &snapshot) {
                 failures.push(metrics_failure(

@@ -2233,7 +2233,7 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                             lag_threshold: loop_ctx.config.kafka.lag_threshold,
                         },
                     };
-                    crate::telemetry::metrics::kafka::request_scan(snapshot.cloned(), settings);
+                    crate::telemetry::metrics::scheduler::request_scan(snapshot.cloned(), settings);
                     last_kafka_scan = Some(Instant::now());
                     last_kafka_revision = snapshot_key;
                 }
@@ -2241,7 +2241,7 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
             None => {
                 if kafka_authorized {
                     // 撤授权：停采、序列消失（不保留陈旧数据）。
-                    crate::telemetry::metrics::kafka::revoke();
+                    crate::telemetry::metrics::scheduler::revoke();
                     kafka_authorized = false;
                     last_kafka_scan = None;
                     last_kafka_revision = None;

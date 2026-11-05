@@ -7,7 +7,7 @@ mod container;
 mod host;
 mod process;
 
-use super::kafka;
+use super::scheduler;
 
 use std::io;
 use std::path::Path;
@@ -54,7 +54,29 @@ pub fn build_runtime_snapshot(state_dir: &Path) -> io::Result<MetricsRuntimeSnap
     Ok(build_runtime_snapshot_from_view(&view))
 }
 
+/// 构建快照（**同步**采一轮主机三域，不碰 Kafka）。
+///
+/// 测试与离线工具用这一个；守护进程走 [`build_runtime_snapshot_live`]。
+#[cfg(test)]
 pub fn build_runtime_snapshot_from_view(view: &MetricsTargetView) -> MetricsRuntimeSnapshot {
+    let outcomes = super::collection::host_outcomes(view);
+    build_snapshot(view, outcomes)
+}
+
+/// 守护进程的路：主机三域与 Kafka 都读**调度器最近一次完成的结果**。
+///
+/// 采集不在主循环里发生（见 `scheduler.rs`）；目标集合变了时调度器会同步补一轮主机采集，
+/// 所以这里不会读到上一份目标的数据。
+pub fn build_runtime_snapshot_live(view: &MetricsTargetView) -> MetricsRuntimeSnapshot {
+    scheduler::apply_host_view(view);
+    let outcomes = scheduler::collect_all(view);
+    build_snapshot(view, outcomes)
+}
+
+fn build_snapshot(
+    view: &MetricsTargetView,
+    outcomes: Vec<MetricsCollectionOutcome>,
+) -> MetricsRuntimeSnapshot {
     let mut host_targets = 0;
     let mut process_targets = 0;
     let mut container_targets = 0;
@@ -67,19 +89,6 @@ pub fn build_runtime_snapshot_from_view(view: &MetricsTargetView) -> MetricsRunt
             _ => {}
         }
     }
-
-    let outcomes = providers()
-        .iter()
-        .map(|provider| {
-            let targets: Vec<&MetricsTargetViewEntry> = view
-                .targets
-                .iter()
-                .filter(|target| target.collection_kind == provider.collection_kind())
-                .collect();
-            provider.collect(targets)
-        })
-        .chain(kafka::collect_outcome())
-        .collect();
 
     MetricsRuntimeSnapshot {
         generated_at: now_rfc3339(),
