@@ -7,6 +7,14 @@
 
 ### 新增
 
+- **MySQL / TiDB 指标采集（P1）**：新采集域 `mysql_metrics`（15 条指标：存活 / 连接 / 线程 /
+  QPS·慢查询·异常连接·收发字节 / InnoDB buffer pool / 复制延迟与运行状态）。
+  采集由采集面授权驱动（`collect_metrics` + `MysqlInstance/auto`），撤授权下一个 tick 内停采；
+  本机配置只留 `[mysql] interval_ms / timeout_ms` 两个旋钮。
+  端口与凭据来自自探：`mysqld` 进程证据（`my.cnf` / argv / 监听端口）+ 协议 10 问候包握手，
+  密码固定走 `/etc/wist-agentd/secrets/mysql/port-<port>/password`（用户名 `wist-probe`）。
+  执行上走**真 async**（`sqlx` + tokio，不进阻塞池），与 Kafka 共用同一个调度器。
+  设计见 `docs/design/mysql-metrics.md`。
 - **采集运行时 P0.5（行为不变）**：采集作业改成 async —— `Collector::collect` 返回 future，
   同步实现（主机三域 / Kafka）在作业里走 `spawn_blocking`；调度循环用 `JoinSet` + `Semaphore`
   并发跑作业，同目标在飞时不重复排轮；超预算只打 `CollectorTargetStalled`（不终止阻塞调用）。

@@ -1,6 +1,6 @@
 # 采集运行时：统一调度与 async / blocking 双执行器
 
-> 状态：**设计（P0 已落地；P1 进行中）**。决策记录见 §12（**已全部定案**）。
+> 状态：**设计（P0 / P0.5 / P1 已落地；P2 待做）**。决策记录见 §12（**已全部定案**）。
 > P0 的落地范围与验收见 §10。
 >
 > 范围：**指标采集**（主机 / 进程 / 容器 / Kafka / 关系型数据库 / Doris …）。
@@ -473,14 +473,23 @@ let outcomes = scheduler::collect_all(view);    // 主机三域 + Kafka（最近
 **未覆盖**：Kafka 真集群 `kafka_live` 仍未能复跑（客户环境 `10.168.1.145` 22 / 30001 均超时）；
 本轮未改协议与采集逻辑，等环境可达后补跑并回填 9/9。
 
-### P1：MySQL / TiDB（第一个 async 域）
+### P1：MySQL / TiDB（第一个 async 域，**已完成**，2026-11-05）
 
-- `wist-metrics` 新增 `mysql_metrics` 指标声明（连接数、QPS/TPS、慢查询、InnoDB buffer pool、复制延迟…先选 P0 子集）；
-- 新 collector：`sqlx 0.9`（`runtime-tokio` + `mysql` + `tls-rustls-aws-lc-rs`，不启 `macros`）连接池、只读查询、会话级超时；
-- 凭据：`/etc/wist-agentd/secrets/mysql/port-<port>/password`（用户名固定 `wist-probe`，见 §12.1-5）；
-  自探：`my.cnf`/argv/env/端口；
-- 授权：agentd 内先定 `SqlEndpoint`，`target` 只认 `auto`；
-- 验收：真机（开发库）live 用例 全绿；断网/错密码/无权限三种失败各自可定位；基数上限生效。
+- `wist-metrics 0.15.0`：新增 `mysql_metrics` 域与 15 条指标（见 `mysql-metrics.md` §2）；
+- `src/telemetry/metrics/mysql.rs`：`sqlx 0.9`（`runtime-tokio` + `mysql` + `tls-rustls-aws-lc-rs`，
+  不启 `macros`）直采三条只读 `SHOW`；查询层是 `SqlTransport` trait，单测注入假结果集，不需要真库；
+- 执行：`Collector::Mysql` 是**真 async**（不进 `spawn_blocking`），与 Kafka 共用一个调度器；
+- 自探：`src/discovery/mysql_source.rs`（`my.cnf` / argv / 监听端口 + 协议 10 握手）；
+- 凭据：`/etc/wist-agentd/secrets/mysql/port-<port>/password`（用户名 `wist-probe`）；
+- 授权：`MysqlInstance/auto`（先在 agentd 内定，网关开始派发时再收进 contracts）；
+- 配置：本机只留 `[mysql] interval_ms / timeout_ms`，没有开关、没有地址。
+
+**验收结果**（2026-11-05）：`cargo test --lib` 1368 passed、`local_exec` 57 passed、
+`config_validation` 18 passed、`clippy -D warnings` / `fmt --check` 干净；
+`x86_64-unknown-linux-musl` 静态构建通过（§12.3）。
+
+**未覆盖**：真库 live 用例未跑（环境不可达）；`wist-metrics` 的 `0.15.0` 待发布后才能
+让 agentd 的依赖从 registry 解析（当前 P1 代码已能编，但新域的事实需要 0.15 的注册表才会被规范化层认领）。
 
 ### P2：Doris（复用 transport）
 
@@ -599,4 +608,5 @@ cargo build --offline --release --target x86_64-unknown-linux-musl
 - 完成标志：§10 P0 验收 5 条全过，Kafka 真集群 `kafka_live` 9/9；
 - 回填本文 §10 的验收，并在 `CHANGELOG.md` 记一行「采集运行时 P0（行为不变）」。
 
-**P0 之后**：§12 已全部定案，直接开 P1（MySQL/TiDB），领子见 §10。
+**P1 之后**：MySQL 已落地（见 §10）；下一步是 P2（Doris，复用 MySQL transport，
+P0 指标子集已在 §12.1-7 定案）。
