@@ -17,8 +17,8 @@ use wist_contracts::discovery::DiscoverySnapshot;
 
 /// 单次 TCP 握手超时（自探在采集启动前跑，一个实例通常只有一两个候选）。
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(300);
-/// 单个 netns 最多试几个地址（回环 + 少量 veth / pod IP）。
-pub(crate) const MAX_ADDRS_PER_NETNS: usize = 3;
+/// 单个 netns 最多试几个地址（回环 + 少量 veth / pod IP + 绑定地址）。
+pub(crate) const MAX_ADDRS_PER_NETNS: usize = 4;
 /// `cmdline` 的读取上限。
 pub(crate) const MAX_PROC_BYTES: usize = 4096;
 /// 配置文件读取上限（`my.cnf` / `postgresql.conf` 一般几 KB）。
@@ -50,6 +50,11 @@ pub(crate) trait DbProc {
     fn listen_ports(&self, pid: u32) -> Vec<u16>;
     /// 该进程 netns 里的**非回环**地址。
     fn net_addrs(&self, pid: u32) -> Vec<String>;
+    /// 该进程**监听 socket 实际绑定的**非回环、非通配地址。
+    ///
+    /// 需要它是因为 `bind-address = 10.0.0.5` 的实例不接回环：
+    /// 只试 `127.0.0.1` 会把一台活着的库判成「没有端点」。
+    fn bound_addrs(&self, pid: u32) -> Vec<String>;
     /// 进程 netns 是否与 agentd 相同。
     fn same_netns(&self, pid: u32) -> bool;
 }
@@ -114,24 +119,38 @@ pub(crate) fn candidate_addrs(
     proc: &dyn DbProc,
     domain: &str,
 ) -> Vec<String> {
-    let mut addrs = vec!["127.0.0.1".to_string()];
+    let mut addrs: Vec<String> = Vec::new();
     if same_netns {
+        // 同 netns：先回环，再补「只绑了某张网卡」的实例的绑定地址。
+        addrs.push("127.0.0.1".to_string());
+        push_unique(&mut addrs, proc.bound_addrs(pid));
         return addrs;
     }
-    for addr in proc.net_addrs(pid) {
-        if addrs.len() >= MAX_ADDRS_PER_NETNS {
-            break;
-        }
-        if addr != "127.0.0.1" && !addrs.contains(&addr) {
-            addrs.push(addr);
-        }
-    }
+
+    // 容器：**先试它自己的地址**。
+    //
+    // 顺序很关键：宿主上可能也跑着一个同端口的实例（比如宿主装了 MySQL，
+    // pod 里也有一个 3306）。先试 127.0.0.1 会握手上宿主的库，然后拿 pod 的凭据
+    // 去连——结果是「密码错」加「把宿主实例记到 pod 的凭据 key 上」，两个都错得很难查。
+    push_unique(&mut addrs, proc.net_addrs(pid));
+    addrs.push("127.0.0.1".to_string());
     if addrs.len() == 1 {
         log::debug!(
             "event=DbNetnsAddrUnavailable domain={domain} source_ref=pid:{pid} detail=\"容器网络里没读到非回环地址：只能试宿主回环（compose 发布端口时仍可用）\""
         );
     }
     addrs
+}
+
+fn push_unique(addrs: &mut Vec<String>, candidates: Vec<String>) {
+    for addr in candidates {
+        if addrs.len() >= MAX_ADDRS_PER_NETNS {
+            return;
+        }
+        if addr != "127.0.0.1" && !addrs.contains(&addr) {
+            addrs.push(addr);
+        }
+    }
 }
 
 /// 凭据目录名。
@@ -172,7 +191,13 @@ pub(crate) fn sanitize_key(raw: &str) -> String {
             last_dash = true;
         }
     }
-    out.trim_end_matches('-').to_string()
+    let out = out.trim_end_matches('-').to_string();
+    // 空 key 会让凭据路径退化成根目录（`secrets/mysql/password`），必须兜住。
+    if out.is_empty() {
+        "unknown".to_string()
+    } else {
+        out
+    }
 }
 
 pub(crate) fn rooted(pid: u32, path: &str) -> String {
@@ -280,6 +305,19 @@ impl DbProc for RealProc {
             .unwrap_or_default()
     }
 
+    fn bound_addrs(&self, pid: u32) -> Vec<String> {
+        let mut out = Vec::new();
+        for name in ["tcp", "tcp6"] {
+            let Some(text) = Self::net_file(pid, name) else {
+                continue;
+            };
+            out.extend(bound_addrs_in_table(&text));
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     fn same_netns(&self, pid: u32) -> bool {
         let read = |path: String| std::fs::read_link(path).ok();
         match (
@@ -310,6 +348,37 @@ pub(crate) fn listen_ports_in_table(text: &str) -> Vec<u16> {
         }
     }
     ports
+}
+
+/// `/proc/<pid>/net/tcp` 里 LISTEN 行绑定的**具体** IPv4 地址（跳过通配与回环）。
+///
+/// 只要 IPv4：IPv6 绑定地址在容器里常见的是 `::`（通配），具体地址基本用不上，
+/// 而为它写一套 hex 解析换不来收益。
+pub(crate) fn bound_addrs_in_table(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 4 || fields[3] != "0A" {
+            continue;
+        }
+        let Some((addr, _)) = fields[1].split_once(':') else {
+            continue;
+        };
+        // v4 地址是**小端**的 32 位十六进制：0100007F = 127.0.0.1。
+        if addr.len() != 8 {
+            continue;
+        }
+        let Ok(raw) = u32::from_str_radix(addr, 16) else {
+            continue;
+        };
+        let bytes = raw.to_le_bytes();
+        let ip = format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3]);
+        if ip.starts_with("127.") || ip == "0.0.0.0" {
+            continue;
+        }
+        out.push(ip);
+    }
+    out
 }
 
 /// 该 pid 自己持有的监听端口（`/proc/<pid>/fd` 的 socket inode → 表里的 inode）。
@@ -436,6 +505,19 @@ mod tests {
     fn sanitize_key_makes_a_directory_safe_name() {
         assert_eq!(sanitize_key("pod-prod-mysql-0"), "pod-prod-mysql-0");
         assert_eq!(sanitize_key("pod-Prod_MySQL.0"), "pod-prod-mysql-0");
-        assert_eq!(sanitize_key("---"), "");
+        assert_eq!(sanitize_key("---"), "unknown", "空 key 会退化成凭据根目录");
+        assert_eq!(sanitize_key(""), "unknown");
+    }
+
+    #[test]
+    fn bound_addrs_skip_wildcard_and_loopback() {
+        // 0100007F = 127.0.0.1，00000000 = 0.0.0.0，0A00000A = 10.0.0.10
+        let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000:0CEA 00000000:0000 0A 00000000:00000000 00:00000000 00000000   999        0 1 1
+   1: 0100007F:0CEA 00000000:0000 0A 00000000:00000000 00:00000000 00000000   999        0 2 1
+   2: 0A00000A:0CEA 00000000:0000 0A 00000000:00000000 00:00000000 00000000   999        0 3 1
+   3: 0A00000A:0CEA 0A00000B:1234 01 00000000:00000000 00:00000000 00000000   999        0 4 1
+";
+        assert_eq!(bound_addrs_in_table(table), vec!["10.0.0.10".to_string()]);
     }
 }

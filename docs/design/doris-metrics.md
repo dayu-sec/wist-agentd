@@ -43,8 +43,9 @@ FE 上创建一个只读账号即可（Doris 的权限模型里 `SHOW BACKENDS` 
 `ADMIN_PRIV`；若不想给太高权限，用 **Node 级别的只读运维账号**）：
 
 ```sql
-CREATE USER 'wist_probe' IDENTIFIED BY '<随机密码>';
-GRANT ADMIN_PRIV ON *.*.* TO 'wist_probe';
+-- 账号名必须和 agentd 发送的完全一致：`wist-probe`（连字符）
+CREATE USER 'wist-probe' IDENTIFIED BY '<随机密码>';
+GRANT ADMIN_PRIV ON *.*.* TO 'wist-probe';
 ```
 
 > Doris 没有更细的「只看节点」权限：`SHOW BACKENDS` 属于管理语句。

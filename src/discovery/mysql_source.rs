@@ -143,14 +143,21 @@ fn resolve(
         };
         let addrs = candidate_addrs(process.pid, same_netns, proc, "mysql");
 
-        let candidates = match hint.port {
-            Some(port) => vec![port],
-            None => {
-                let mut list = proc.listen_ports(process.pid);
-                list.truncate(MAX_PROBE_PORTS_PER_PROCESS);
-                list
+        // 证据给的端口先试；**再补上实际监听端口**。
+        // 配置写的端口和真正监听的可能不一致（改过 my.cnf 没重启），
+        // 只认前者会让一台活着的库被判成「端口上不是 MySQL」。
+        let mut candidates = Vec::new();
+        if let Some(port) = hint.port {
+            candidates.push(port);
+        }
+        for port in proc.listen_ports(process.pid) {
+            if candidates.len() >= MAX_PROBE_PORTS_PER_PROCESS {
+                break;
             }
-        };
+            if !candidates.contains(&port) {
+                candidates.push(port);
+            }
+        }
 
         for port in candidates {
             let Some(host) = addrs
@@ -402,6 +409,7 @@ mod tests {
         cmdlines: BTreeMap<u32, Vec<String>>,
         files: BTreeMap<String, String>,
         listen: BTreeMap<u32, Vec<u16>>,
+        bound: BTreeMap<u32, Vec<String>>,
         addrs: BTreeMap<u32, Vec<String>>,
         same_netns: BTreeSet<u32>,
     }
@@ -421,6 +429,10 @@ mod tests {
 
         fn net_addrs(&self, pid: u32) -> Vec<String> {
             self.addrs.get(&pid).cloned().unwrap_or_default()
+        }
+
+        fn bound_addrs(&self, pid: u32) -> Vec<String> {
+            self.bound.get(&pid).cloned().unwrap_or_default()
         }
 
         fn same_netns(&self, pid: u32) -> bool {
@@ -588,6 +600,58 @@ mod tests {
     }
 
     #[test]
+    fn a_host_instance_bound_to_a_specific_ip_is_reached_there() {
+        // `bind-address = 10.0.0.5` 的实例不接回环：只试 127.0.0.1 会漏报。
+        let snapshot = snapshot(vec![process(42, "mysqld")]);
+        let mut proc = FakeProc::default();
+        proc.listen.insert(42, vec![3306]);
+        proc.same_netns.insert(42);
+        proc.bound.insert(42, vec!["10.0.0.5".to_string()]);
+        let handshake = FakeHandshake {
+            accepting: vec!["10.0.0.5:3306".to_string()],
+        };
+
+        let found = resolve(&snapshot, &proc, &handshake);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].host, "10.0.0.5");
+        assert_eq!(
+            found[0].scope,
+            InstanceScope::Host,
+            "同 netns 仍是 host 语义"
+        );
+        assert_eq!(found[0].credential_key, "port-3306");
+    }
+
+    #[test]
+    fn a_container_prefers_its_own_address_over_the_host_loopback() {
+        // 宿主上可能也跑着一个 3306：先试回环会连到宿主的库，再拿 pod 的凭据去认，
+        // 结果是「密码错」+「把宿主实例记到 pod 的 key 上」。
+        let snapshot = snapshot(vec![
+            container_process(42, "mysqld", "abc123"),
+            container(
+                "abc123",
+                vec![
+                    ("k8s.namespace.name", "prod".to_string()),
+                    ("k8s.pod.name", "mysql-0".to_string()),
+                ],
+            ),
+        ]);
+        let mut proc = FakeProc::default();
+        proc.listen.insert(42, vec![3306]);
+        proc.addrs.insert(42, vec!["10.244.1.5".to_string()]);
+        let handshake = FakeHandshake {
+            accepting: vec!["127.0.0.1:3306".to_string(), "10.244.1.5:3306".to_string()],
+        };
+
+        let found = resolve(&snapshot, &proc, &handshake);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].host, "10.244.1.5", "容器自己的地址优先");
+        assert_eq!(found[0].credential_key, "pod-prod-mysql-0");
+    }
+
+    #[test]
     fn the_x_protocol_port_is_dropped_by_the_handshake() {
         let snapshot = snapshot(vec![process(42, "mysqld")]);
         let mut proc = FakeProc::default();
@@ -644,6 +708,33 @@ mod tests {
         assert_eq!(found[0].port, 3308);
         assert_eq!(found[0].evidence, "config");
         assert_eq!(found[0].confidence, 90);
+    }
+
+    #[test]
+    fn the_actual_listening_port_is_tried_when_the_configured_one_is_stale() {
+        // my.cnf 写 3306，但进程实际监听 3307（改过配置没重启）。
+        let snapshot = snapshot(vec![process(42, "mysqld")]);
+        let mut proc = FakeProc::default();
+        proc.cmdlines
+            .insert(42, vec!["/usr/sbin/mysqld".to_string()]);
+        proc.same_netns.insert(42);
+        proc.listen.insert(42, vec![3307]);
+        proc.files.insert(
+            "/proc/42/root/etc/my.cnf".to_string(),
+            "[mysqld]
+port = 3306
+"
+            .to_string(),
+        );
+        let handshake = FakeHandshake {
+            accepting: vec!["127.0.0.1:3307".to_string()],
+        };
+
+        let found = resolve(&snapshot, &proc, &handshake);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].port, 3307, "配置过期时要用实际监听端口");
+        assert_eq!(found[0].evidence, "config", "证据来源仍是配置文件");
     }
 
     #[test]

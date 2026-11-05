@@ -265,10 +265,14 @@ pub(super) async fn collect_with(
     );
 
     // 复制：只在备库上有意义。主库不出这两条（不补 0）。
-    let in_recovery = server
-        .get("in_recovery")
-        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
-        .unwrap_or(false);
+    let in_recovery = match server.get("in_recovery") {
+        Some(value) => value.eq_ignore_ascii_case("true") || value.trim() == "1",
+        None => {
+            // 缺这一列时绝不能默认「主库」了事：那会让备库的复制断掉静默消失。
+            warnings.push("状态查询缺少 in_recovery：本轮不出复制指标".to_string());
+            false
+        }
+    };
     if in_recovery {
         match transport.query(REPLICA_SQL).await {
             Ok(rows) => match first_row(rows).and_then(|row| row.get("lag_seconds").cloned()) {
@@ -652,6 +656,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_missing_in_recovery_column_is_reported() {
+        let mut transport = Fake::default()
+            .with(
+                SERVER_SQL,
+                Ok(vec![row(&[("uptime", "10"), ("max_connections", "100")])]),
+            )
+            .with(ACTIVITY_SQL, Ok(vec![row(&[("connections", "1")])]))
+            .with(DATABASE_SQL, database());
+
+        let result = collect_with(&mut transport, &config()).await;
+
+        assert_eq!(fact_value(&result, "pg.replication.running"), None);
+        assert!(
+            result.warnings.iter().any(|w| w.contains("in_recovery")),
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    #[tokio::test]
     async fn a_missing_column_is_reported_not_zeroed() {
         let mut transport = Fake::default()
             .with(
@@ -669,6 +693,27 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|w| w.contains("max_connections"))
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_ca_without_a_ca_file_fails_fast_instead_of_downgrading() {
+        let mut config = config();
+        config.tls = TlsMode::VerifyCa;
+        config.ca_file = None;
+        let path = std::env::temp_dir().join(format!(
+            "wist-agentd-pg-test-{}.password",
+            std::process::id()
+        ));
+        std::fs::write(&path, "secret\n").expect("write");
+        config.password_file = path.to_string_lossy().to_string();
+
+        let result = probe_once(&config).await;
+
+        assert_eq!(result.failed, 1);
+        assert!(
+            result.last_error.unwrap().contains("没有配置 ca.pem"),
+            "不能静默降级到明文"
         );
     }
 

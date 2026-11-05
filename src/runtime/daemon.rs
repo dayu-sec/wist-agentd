@@ -91,10 +91,10 @@ const TICK_INTERVAL: Duration = Duration::from_secs(3);
 /// 这里只是“快照一直不变”时的保底刷新。
 const KAFKA_SCAN_INTERVAL: Duration = Duration::from_secs(300);
 
-/// SQL 实例自探的节流：与 Kafka 同一个量级。
+/// 数据库实例自探的节流（MySQL / PostgreSQL / Doris 共用）：与 Kafka 同一个量级。
 ///
 /// 实例上线的节奏是分钟级（重启、扩缩容），扫得太频只会白白吃 `/proc` 与握手。
-const MYSQL_SCAN_INTERVAL: Duration = Duration::from_secs(300);
+const DB_SCAN_INTERVAL: Duration = Duration::from_secs(300);
 
 /// 凭据续期的检查周期：没必要每 3s 都查，1 小时足够，而续期窗是 30 天。
 const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -2270,7 +2270,7 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                 let snapshot = discovery_runtime.latest_snapshot();
                 let snapshot_key = snapshot.map(|snapshot| snapshot.revision);
                 let changed = snapshot_key != last_sql_revision;
-                let due = last_sql_scan.is_none_or(|at| at.elapsed() >= MYSQL_SCAN_INTERVAL);
+                let due = last_sql_scan.is_none_or(|at| at.elapsed() >= DB_SCAN_INTERVAL);
                 if changed || due {
                     let settings = crate::telemetry::metrics::mysql::MysqlTargetSettings {
                         timeout: Duration::from_millis(loop_ctx.config.mysql.timeout_ms),
@@ -2302,7 +2302,7 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                 let snapshot = discovery_runtime.latest_snapshot();
                 let snapshot_key = snapshot.map(|snapshot| snapshot.revision);
                 let changed = snapshot_key != last_pg_revision;
-                let due = last_pg_scan.is_none_or(|at| at.elapsed() >= MYSQL_SCAN_INTERVAL);
+                let due = last_pg_scan.is_none_or(|at| at.elapsed() >= DB_SCAN_INTERVAL);
                 if changed || due {
                     let settings = crate::telemetry::metrics::postgres::PgTargetSettings {
                         timeout: Duration::from_millis(loop_ctx.config.postgres.timeout_ms),
@@ -2334,7 +2334,7 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                 let snapshot = discovery_runtime.latest_snapshot();
                 let snapshot_key = snapshot.map(|snapshot| snapshot.revision);
                 let changed = snapshot_key != last_doris_revision;
-                let due = last_doris_scan.is_none_or(|at| at.elapsed() >= MYSQL_SCAN_INTERVAL);
+                let due = last_doris_scan.is_none_or(|at| at.elapsed() >= DB_SCAN_INTERVAL);
                 if changed || due {
                     let settings = crate::telemetry::metrics::doris::DorisTargetSettings {
                         timeout: Duration::from_millis(loop_ctx.config.doris.timeout_ms),

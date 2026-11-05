@@ -656,6 +656,16 @@ mod tests {
         MysqlProbeConfig::new("127.0.0.1", 3306, 1_000, 30_000)
     }
 
+    /// 写一个临时密码文件（`probe_once` 会先读它，再决定连不连）。
+    fn write_temp_password(tag: &str) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "wist-agentd-test-{tag}-{}.password",
+            std::process::id()
+        ));
+        std::fs::write(&path, "secret\n").expect("write");
+        path.to_string_lossy().to_string()
+    }
+
     fn fact_value<'a>(result: &'a ProbeResult, key: &str) -> Option<&'a str> {
         result.targets[0]
             .runtime_facts
@@ -921,6 +931,23 @@ mod tests {
             "/etc/wist-agentd/secrets/mysql/port-3306/ca.pem"
         );
         assert_eq!(config().instance(), "mysql:127.0.0.1:3306");
+    }
+
+    #[tokio::test]
+    async fn verify_ca_without_a_ca_file_fails_fast_instead_of_downgrading() {
+        let mut config = config();
+        config.tls = TlsMode::VerifyCa;
+        config.ca_file = None;
+        config.password_file = write_temp_password("verify-ca");
+
+        let result = probe_once(&config).await;
+
+        assert_eq!(result.failed, 1);
+        let error = result.last_error.unwrap();
+        assert!(
+            error.contains("没有配置 ca.pem"),
+            "不能静默降级到明文：{error}"
+        );
     }
 
     #[tokio::test]

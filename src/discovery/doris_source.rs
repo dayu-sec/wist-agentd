@@ -187,6 +187,7 @@ mod tests {
     struct FakeProc {
         cmdlines: BTreeMap<u32, Vec<String>>,
         listen: BTreeMap<u32, Vec<u16>>,
+        bound: BTreeMap<u32, Vec<String>>,
         addrs: BTreeMap<u32, Vec<String>>,
         same_netns: BTreeSet<u32>,
     }
@@ -203,6 +204,10 @@ mod tests {
         }
         fn net_addrs(&self, pid: u32) -> Vec<String> {
             self.addrs.get(&pid).cloned().unwrap_or_default()
+        }
+
+        fn bound_addrs(&self, pid: u32) -> Vec<String> {
+            self.bound.get(&pid).cloned().unwrap_or_default()
         }
         fn same_netns(&self, pid: u32) -> bool {
             self.same_netns.contains(&pid)

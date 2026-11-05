@@ -132,6 +132,14 @@ enum ScanKind {
     Doris(super::doris::DorisTargetSettings),
 }
 
+/// SQL 类域的标识（三个域共用一套扫描槽与状态机）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlDomain {
+    Mysql,
+    Postgres,
+    Doris,
+}
+
 /// 扫描作业的产物。
 enum ScanProduct {
     Kafka(Vec<KafkaProbeConfig>),
@@ -165,6 +173,8 @@ struct Scheduler {
     sql_no_endpoint_logged: bool,
     /// PostgreSQL 侧的同一条口径。
     pg_no_endpoint_logged: bool,
+    /// Doris 侧的同一条口径。
+    doris_no_endpoint_logged: bool,
     /// 上一次对账后生效的集群集合（变化才打日志）。
     log_signature: String,
     /// 采集线程是否已经拉起（由**调用方**维护，线程自己不碰）。
@@ -227,7 +237,7 @@ impl Scheduler {
 
     /// MySQL 撤授权。
     fn revoke_sql(&mut self) {
-        self.cancel_sql_scan(false);
+        self.cancel_sql_scan(SqlDomain::Mysql);
         self.sql_no_endpoint_logged = false;
         revoke_probe_targets(&mut self.sql, "mysql");
     }
@@ -246,7 +256,7 @@ impl Scheduler {
 
     /// PostgreSQL 撤授权。
     fn revoke_pg(&mut self) {
-        self.cancel_sql_scan(true);
+        self.cancel_sql_scan(SqlDomain::Postgres);
         self.pg_no_endpoint_logged = false;
         revoke_probe_targets(&mut self.pg, "postgres");
     }
@@ -265,7 +275,8 @@ impl Scheduler {
 
     /// Doris 撤授权。
     fn revoke_doris(&mut self) {
-        self.cancel_sql_scan(false);
+        self.cancel_sql_scan(SqlDomain::Doris);
+        self.doris_no_endpoint_logged = false;
         revoke_probe_targets(&mut self.doris, "doris");
     }
 
@@ -334,12 +345,15 @@ impl Scheduler {
         Some((key, Collector::Doris(Box::new(config))))
     }
 
-    /// 作废在途 / 待执行的 SQL 扫描（MySQL 与 PostgreSQL 共用一个在飞槽）。
-    fn cancel_sql_scan(&mut self, pg: bool) {
+    /// 作废在途 / 待执行的 SQL 扫描（三个 SQL 类域共用一个在飞槽）。
+    ///
+    /// 只作废**本域**的那一次：撤 MySQL 授权不该连带丢掉一个刚投递的 PG / Doris 扫描。
+    fn cancel_sql_scan(&mut self, domain: SqlDomain) {
         self.sql_scan_epoch = self.sql_scan_epoch.wrapping_add(1);
         let matches_domain = match self.pending_scan.as_ref().map(|scan| &scan.kind) {
-            Some(ScanKind::Mysql(_)) => !pg,
-            Some(ScanKind::Postgres(_)) => pg,
+            Some(ScanKind::Mysql(_)) => domain == SqlDomain::Mysql,
+            Some(ScanKind::Postgres(_)) => domain == SqlDomain::Postgres,
+            Some(ScanKind::Doris(_)) => domain == SqlDomain::Doris,
             _ => false,
         };
         if matches_domain {
@@ -657,10 +671,14 @@ impl Scheduler {
             }
             ScanProduct::Doris(targets) => {
                 if targets.is_empty() {
-                    log::info!(
-                        "event=DorisProbeNoEndpoint detail=\"已授权，但本机没有通过握手的 Doris FE（只有 BE 的机器采不了 SHOW BACKENDS）\""
-                    );
+                    if !self.doris_no_endpoint_logged {
+                        log::info!(
+                            "event=DorisProbeNoEndpoint detail=\"已授权，但本机没有通过握手的 Doris FE（只有 BE 的机器采不了 SHOW BACKENDS）\""
+                        );
+                        self.doris_no_endpoint_logged = true;
+                    }
                 } else {
+                    self.doris_no_endpoint_logged = false;
                     log::debug!("event=DorisDiscoveryResolved targets={}", targets.len());
                 }
                 self.apply_doris_targets(targets);
@@ -1534,6 +1552,124 @@ mod tests {
             runtime.begin_scan().is_some(),
             "撤 Kafka 授权不该连带丢掉 SQL 扫描"
         );
+    }
+
+    fn pg_config(port: u16) -> super::super::postgres::PgProbeConfig {
+        super::super::postgres::PgProbeConfig::new("127.0.0.1", port, 1_000, 30_000)
+    }
+
+    fn doris_config(port: u16) -> super::super::doris::DorisProbeConfig {
+        super::super::doris::DorisProbeConfig::new("127.0.0.1", port, 1_000, 30_000)
+    }
+
+    #[test]
+    fn a_pg_instance_is_scheduled_and_reported() {
+        let mut runtime = Scheduler::default();
+        runtime.apply_pg_targets(vec![pg_config(5432)]);
+
+        let (key, _collector) = runtime.begin_next_due_pg().expect("到期");
+        assert_eq!(key, "postgres:127.0.0.1:5432");
+        runtime.finish_pg(&key, probe_result(1, 0, "postgres:127.0.0.1:5432"));
+
+        let outcome = runtime.pg_outcome().expect("域存在");
+        assert_eq!(
+            outcome.collection_kind,
+            super::super::postgres::COLLECTION_KIND
+        );
+        assert_eq!(outcome.status, "succeeded");
+        assert!(runtime.sql_outcome().is_none(), "MySQL 域不该被 PG 带出来");
+    }
+
+    #[test]
+    fn a_doris_fe_is_scheduled_and_reported() {
+        let mut runtime = Scheduler::default();
+        runtime.apply_doris_targets(vec![doris_config(9030)]);
+
+        let (key, _collector) = runtime.begin_next_due_doris().expect("到期");
+        assert_eq!(key, "doris:127.0.0.1:9030");
+        runtime.finish_doris(&key, probe_result(1, 0, "doris:127.0.0.1:9030"));
+
+        let outcome = runtime.doris_outcome().expect("域存在");
+        assert_eq!(
+            outcome.collection_kind,
+            super::super::doris::COLLECTION_KIND
+        );
+        assert_eq!(outcome.status, "succeeded");
+    }
+
+    #[test]
+    fn the_snapshot_carries_every_authorized_domain() {
+        let mut runtime = Scheduler::default();
+        runtime.apply_host_view(&empty_view());
+        runtime.reconcile(vec![cluster_config("a:9092")]);
+        runtime.apply_sql_targets(vec![sql_config(3306)]);
+        runtime.apply_pg_targets(vec![pg_config(5432)]);
+        runtime.apply_doris_targets(vec![doris_config(9030)]);
+
+        let view = empty_view();
+        // 主机三域由 `apply_host_view` 同步补一轮；其余三域还没跑过 = pending。
+        let outcomes = runtime.collect_all_for(&view);
+        let kinds: Vec<&str> = outcomes
+            .iter()
+            .map(|outcome| outcome.collection_kind.as_str())
+            .collect();
+
+        for kind in [
+            "host_metrics",
+            "process_metrics",
+            "container_metrics",
+            super::super::kafka::COLLECTION_KIND,
+            super::super::mysql::COLLECTION_KIND,
+            super::super::postgres::COLLECTION_KIND,
+            super::super::doris::COLLECTION_KIND,
+        ] {
+            assert!(kinds.contains(&kind), "快照缺少 {kind}：{kinds:?}");
+        }
+    }
+
+    #[test]
+    fn revoking_mysql_keeps_a_pending_doris_scan() {
+        let mut runtime = Scheduler::default();
+        runtime.request_scan(None, ScanKind::Doris(Default::default()));
+
+        runtime.revoke_sql();
+
+        assert!(
+            runtime.begin_scan().is_some(),
+            "撤 MySQL 授权不该丢掉 Doris 的扫描"
+        );
+    }
+
+    #[test]
+    fn revoking_doris_cancels_its_pending_scan() {
+        let mut runtime = Scheduler::default();
+        runtime.request_scan(None, ScanKind::Doris(Default::default()));
+
+        runtime.revoke_doris();
+
+        assert!(
+            runtime.begin_scan().is_none(),
+            "撤 Doris 授权要作废它自己的扫描"
+        );
+    }
+
+    #[test]
+    fn revoking_every_domain_stops_all_rounds() {
+        let mut runtime = Scheduler::default();
+        runtime.apply_sql_targets(vec![sql_config(3306)]);
+        runtime.apply_pg_targets(vec![pg_config(5432)]);
+        runtime.apply_doris_targets(vec![doris_config(9030)]);
+
+        runtime.revoke_sql();
+        runtime.revoke_pg();
+        runtime.revoke_doris();
+
+        assert!(runtime.begin_next_due_sql().is_none());
+        assert!(runtime.begin_next_due_pg().is_none());
+        assert!(runtime.begin_next_due_doris().is_none());
+        assert!(runtime.sql_outcome().is_none());
+        assert!(runtime.pg_outcome().is_none());
+        assert!(runtime.doris_outcome().is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]

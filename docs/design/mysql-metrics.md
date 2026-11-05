@@ -86,7 +86,17 @@ GRANT PROCESS, REPLICATION CLIENT ON *.* TO 'wist-probe'@'%';
 2. **命令行**：`--port=`、`--skip-networking`；
 3. **监听端口**：该进程 **netns** 里的 TCP 监听（`/proc/<pid>/net/tcp`，宿主表里看不到 pod 的）。
 
-连接地址按候选顺序逐个握手：`127.0.0.1` → 该 netns 的非回环地址（docker bridge / pod IP）。
+连接地址按候选顺序逐个握手：
+
+- **host**：`127.0.0.1` → 该进程监听 socket 实际绑定的地址（`bind-address = 10.0.0.5`
+  的实例不接回环，只试回环会漏报）；
+- **容器 / pod**：先试**它自己的地址**（pod IP / 容器 IP）→ 再试 `127.0.0.1`。
+  顺序不能反：宿主上可能也跑着一个同端口的实例，先试回环会连到宿主的库、
+  再拿 pod 的凭据去认，结果是「密码错」加「把宿主实例记到 pod 的 key 上」。
+
+端口同理：配置/命令行给的端口先试，**再补该进程实际监听的端口** —— 改过 `my.cnf`
+没重启时前者是过期的，只认它会把一台活着的库判成「端口上不是 MySQL」。
+
 这样 host、compose（发布端口到回环）、k8s（pod IP）走同一条路；**前提是 agentd 看得见进程**
 （k8s 需 DaemonSet + `hostPID: true`）。
 

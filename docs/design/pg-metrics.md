@@ -52,15 +52,16 @@ CA  ：/etc/wist-agentd/secrets/postgres/<key>/ca.pem      （可选）
 只读账号与 `pg_hba.conf`：
 
 ```sql
-CREATE ROLE wist_probe LOGIN PASSWORD '<随机密码>';
-GRANT pg_monitor TO wist_probe;
+-- 账号名必须和 agentd 发送的完全一致（`wist-probe`，带连字符，所以要加引号）
+CREATE ROLE "wist-probe" LOGIN PASSWORD '<随机密码>';
+GRANT pg_monitor TO "wist-probe";
 -- pg_monitor 覆盖 pg_stat_* 与 pg_read_all_settings，不需要 superuser
 ```
 
 ```
 # pg_hba.conf：host 上走近回环；容器 / k8s 走节点地址
-host    all    wist_probe    127.0.0.1/32    scram-sha-256
-host    all    wist_probe    10.0.0.0/8      scram-sha-256   # 按你的节点 / pod CIDR 收窄
+host    all    "wist-probe"    127.0.0.1/32    scram-sha-256
+host    all    "wist-probe"    10.0.0.0/8      scram-sha-256   # 按你的节点 / pod CIDR 收窄
 ```
 
 > 容器 / k8s 下 agentd 从**宿主侧**连 pod IP，PG 看到的来源不是 `127.0.0.1`。

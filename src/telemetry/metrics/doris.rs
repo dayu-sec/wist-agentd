@@ -14,7 +14,7 @@ use std::time::Duration;
 use wist_contracts::discovery::StringKeyValue;
 
 use super::collection::ProbeResult;
-use super::mysql::{BoxFuture, Facts, Row, SqlTransport};
+use super::mysql::{BoxFuture, Row, SqlTransport};
 use super::runtime::{MetricsCollectionTargetSample, MetricsLabeledFact};
 
 pub const COLLECTION_KIND: &str = "doris_metrics";
@@ -160,7 +160,6 @@ pub(super) async fn collect_with(
         };
     }
 
-    let facts = Facts::default();
     let mut labeled: Vec<MetricsLabeledFact> = Vec::new();
     let mut alive = 0usize;
     for row in &rows {
@@ -168,10 +167,12 @@ pub(super) async fn collect_with(
             warnings.push("SHOW BACKENDS 的行缺少 IP/HeartbeatPort".to_string());
             continue;
         };
-        let up = row
-            .get("Alive")
-            .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
-            .unwrap_or(false);
+        // 缺 `Alive` 不等于「掉线」：那只是这条行没读全，不能凭空发一个 0。
+        let Some(alive_raw) = row.get("Alive") else {
+            warnings.push(format!("BE {be} 的行缺少 Alive，本轮跳过"));
+            continue;
+        };
+        let up = alive_raw.eq_ignore_ascii_case("true") || alive_raw.trim() == "1";
         if up {
             alive += 1;
         }
@@ -209,9 +210,8 @@ pub(super) async fn collect_with(
         ));
     }
 
-    warnings.extend(facts.warnings);
     ProbeResult {
-        targets: vec![sample(config, facts.facts, labeled)],
+        targets: vec![sample(config, labeled)],
         attempted: 1,
         failed: 0,
         last_error: None,
@@ -265,7 +265,6 @@ fn parse_size(raw: &str) -> Option<i64> {
 
 fn sample(
     config: &DorisProbeConfig,
-    facts: Vec<StringKeyValue>,
     labeled: Vec<MetricsLabeledFact>,
 ) -> MetricsCollectionTargetSample {
     let instance = config.instance();
@@ -276,7 +275,8 @@ fn sample(
         last_error: None,
         resource_ref: instance,
         execution_hints: Vec::new(),
-        runtime_facts: facts,
+        // Doris 的读数全部按 BE 打 label，没有「整条实例一个值」的事实。
+        runtime_facts: Vec::new(),
         labeled_facts: labeled,
     }
 }
@@ -485,6 +485,49 @@ mod tests {
             "掉线要留痕：{:?}",
             result.warnings
         );
+    }
+
+    #[tokio::test]
+    async fn a_missing_alive_column_is_skipped_instead_of_zeroed() {
+        let mut transport = Fake::with(vec![row(&[
+            ("IP", "10.0.0.3"),
+            ("HeartbeatPort", "9050"),
+            ("TotalCapacity", "1.000 TB"),
+        ])]);
+
+        let result = collect_with(&mut transport, &config()).await;
+
+        assert_eq!(result.failed, 0);
+        assert_eq!(
+            labeled(&result, "doris.be.up", "10.0.0.3:9050"),
+            None,
+            "缺 Alive 不能当成掉线（那就是伪造 0）"
+        );
+        assert!(
+            result.warnings.iter().any(|w| w.contains("缺少 Alive")),
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    #[tokio::test]
+    async fn alive_accepts_the_forms_doris_uses() {
+        for alive in ["true", "TRUE", "1"] {
+            let mut transport = Fake::with(vec![row(&[
+                ("IP", "10.0.0.4"),
+                ("HeartbeatPort", "9050"),
+                ("Alive", alive),
+                ("TotalCapacity", "1.000 TB"),
+                ("AvailCapacity", "1.000 TB"),
+                ("TabletNum", "1"),
+            ])]);
+            let result = collect_with(&mut transport, &config()).await;
+            assert_eq!(
+                labeled(&result, "doris.be.up", "10.0.0.4:9050"),
+                Some("1"),
+                "Alive={alive} 应当算存活"
+            );
+        }
     }
 
     #[tokio::test]

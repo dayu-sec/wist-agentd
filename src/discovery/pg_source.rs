@@ -123,14 +123,19 @@ fn resolve(
         };
         let addrs = candidate_addrs(process.pid, same_netns, proc, "postgres");
 
-        let candidates = match hint.port {
-            Some(port) => vec![port],
-            None => {
-                let mut list = proc.listen_ports(process.pid);
-                list.truncate(MAX_PROBE_PORTS_PER_PROCESS);
-                list
+        // 证据端口先试，再补实际监听端口（配置改了没重启时前者是错的）。
+        let mut candidates = Vec::new();
+        if let Some(port) = hint.port {
+            candidates.push(port);
+        }
+        for port in proc.listen_ports(process.pid) {
+            if candidates.len() >= MAX_PROBE_PORTS_PER_PROCESS {
+                break;
             }
-        };
+            if !candidates.contains(&port) {
+                candidates.push(port);
+            }
+        }
 
         for port in candidates {
             let Some(host) = addrs
@@ -351,6 +356,7 @@ mod tests {
         cmdlines: BTreeMap<u32, Vec<String>>,
         files: BTreeMap<String, String>,
         listen: BTreeMap<u32, Vec<u16>>,
+        bound: BTreeMap<u32, Vec<String>>,
         addrs: BTreeMap<u32, Vec<String>>,
         same_netns: BTreeSet<u32>,
     }
@@ -370,6 +376,10 @@ mod tests {
 
         fn net_addrs(&self, pid: u32) -> Vec<String> {
             self.addrs.get(&pid).cloned().unwrap_or_default()
+        }
+
+        fn bound_addrs(&self, pid: u32) -> Vec<String> {
+            self.bound.get(&pid).cloned().unwrap_or_default()
         }
 
         fn same_netns(&self, pid: u32) -> bool {
@@ -493,6 +503,26 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].port, 6543);
         assert_eq!(found[0].evidence, "argv");
+    }
+
+    #[test]
+    fn the_actual_listening_port_is_tried_when_the_config_is_stale() {
+        let snapshot = snapshot(vec![process(42, "postgres")]);
+        let mut proc = FakeProc::default();
+        proc.same_netns.insert(42);
+        proc.files.insert(
+            "/proc/42/root/var/lib/pgsql/data/postgresql.conf".to_string(),
+            "port = 5432\n".to_string(),
+        );
+        proc.listen.insert(42, vec![6432]);
+        let handshake = FakeHandshake {
+            accepting: vec!["127.0.0.1:6432".to_string()],
+        };
+
+        let found = resolve(&snapshot, &proc, &handshake);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].port, 6432);
     }
 
     #[test]
