@@ -7,6 +7,11 @@
 
 ### 新增
 
+- **Doris 指标采集（P2 P0 子集）**：新采集域 `doris_metrics` —— `doris_be_up` /
+  `doris_be_capacity_bytes` / `doris_be_available_bytes` / `doris_be_tablets`，全部带 `be` label。
+  只从**本机 FE** 读 `SHOW BACKENDS`（只有 BE 的机器采不了，`doctor` 会说清楚）；
+  掉线的 BE 只报 `up=0`，不报容量（不伪造）。授权 `DorisCluster/auto`，
+  凭据 `secrets/doris/<key>/password`。设计见 `docs/design/doris-metrics.md`。
 - **数据库自探改看 netns（host / docker-compose / k8s）**：端口读 `/proc/<pid>/net/tcp`
   （该进程 netns 的监听表，宿主表里看不到 pod 的），地址按「回环 → 该 netns 的非回环地址」
   逐个握手；凭据 key 分运行时：`port-<port>` / `pod-<ns>-<pod>` / `container-<name>` /

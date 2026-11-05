@@ -314,6 +314,7 @@ async fn diagnose(config_root: &Path, offline: bool) -> Report {
     checks.push(kafka_discovery_check(&config));
     checks.push(mysql_discovery_check(&config));
     checks.push(pg_discovery_check(&config));
+    checks.push(doris_discovery_check(&config));
 
     if offline {
         checks.push(Check::warn(
@@ -1158,6 +1159,46 @@ fn pg_discovery_check(config: &AgentConfig) -> Check {
         "discovery.postgres",
         "已发现 PostgreSQL 实例",
         format!("{detail}；采集还要采集面授权（PostgresInstance/auto）"),
+    )
+}
+
+/// Doris FE 自探（只有 FE 能跑 `SHOW BACKENDS`）。
+fn doris_discovery_check(config: &AgentConfig) -> Check {
+    if !config.discovery.process_enabled {
+        return Check::warn(
+            "discovery.doris",
+            "自探开着，但进程发现是关的",
+            "process_enabled = false；自探靠进程证据",
+        )
+        .hint("把 [discovery] 的 `process_enabled` 打开");
+    }
+
+    let fes = crate::discovery::doris_source::resolve_live();
+    if fes.is_empty() {
+        return Check::ok(
+            "discovery.doris",
+            "本机没有发现 Doris FE",
+            "只有 BE 的机器采不了：`SHOW BACKENDS` 是 FE 的命令（这是已知边界，不是故障）",
+        );
+    }
+
+    let detail = fes
+        .iter()
+        .map(|fe| {
+            format!(
+                "{} => {}:{}（凭据 {}）",
+                fe.instance(),
+                fe.host,
+                fe.port,
+                crate::telemetry::metrics::doris::password_file_for_key(&fe.credential_key)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Check::ok(
+        "discovery.doris",
+        "已发现 Doris FE",
+        format!("{detail}；采集还要采集面授权（DorisCluster/auto）"),
     )
 }
 

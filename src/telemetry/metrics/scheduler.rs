@@ -129,6 +129,7 @@ enum ScanKind {
     Kafka(KafkaTargetSettings),
     Mysql(super::mysql::MysqlTargetSettings),
     Postgres(super::postgres::PgTargetSettings),
+    Doris(super::doris::DorisTargetSettings),
 }
 
 /// 扫描作业的产物。
@@ -136,6 +137,7 @@ enum ScanProduct {
     Kafka(Vec<KafkaProbeConfig>),
     Mysql(Vec<MysqlProbeConfig>),
     Postgres(Vec<super::postgres::PgProbeConfig>),
+    Doris(Vec<super::doris::DorisProbeConfig>),
 }
 
 /// 调度器状态。一个进程一份（见 [`scheduler`]）；测试可以自己造一份。
@@ -148,6 +150,8 @@ struct Scheduler {
     sql: BTreeMap<String, SqlState<MysqlProbeConfig>>,
     /// key = `postgres:<host>:<port>` / `postgres:<凭据 key>`。
     pg: BTreeMap<String, SqlState<super::postgres::PgProbeConfig>>,
+    /// key = `doris:<host>:<port>` / `doris:<凭据 key>`。
+    doris: BTreeMap<String, SqlState<super::doris::DorisProbeConfig>>,
     pending_scan: Option<PendingScan>,
     scan_inflight: bool,
     /// 自探代次：每次投递 / 撤授权 +1，用来丢弃晚到的扫描结果。
@@ -193,7 +197,7 @@ impl Scheduler {
                 self.scan_epoch = self.scan_epoch.wrapping_add(1);
                 self.scan_epoch
             }
-            ScanKind::Mysql(_) | ScanKind::Postgres(_) => {
+            ScanKind::Mysql(_) | ScanKind::Postgres(_) | ScanKind::Doris(_) => {
                 self.sql_scan_epoch = self.sql_scan_epoch.wrapping_add(1);
                 self.sql_scan_epoch
             }
@@ -245,6 +249,24 @@ impl Scheduler {
         self.cancel_sql_scan(true);
         self.pg_no_endpoint_logged = false;
         revoke_probe_targets(&mut self.pg, "postgres");
+    }
+
+    /// 投递 Doris FE 目标集合。
+    fn apply_doris_targets(&mut self, targets: Vec<super::doris::DorisProbeConfig>) -> bool {
+        apply_probe_targets(
+            &mut self.doris,
+            targets,
+            "doris",
+            |config| config.instance(),
+            |config| config.interval,
+        );
+        self.start_worker()
+    }
+
+    /// Doris 撤授权。
+    fn revoke_doris(&mut self) {
+        self.cancel_sql_scan(false);
+        revoke_probe_targets(&mut self.doris, "doris");
     }
 
     /// 撤授权：停采、作废待执行 / 在途的扫描。
@@ -304,6 +326,12 @@ impl Scheduler {
     fn begin_next_due_pg(&mut self) -> Option<(String, Collector)> {
         let (key, config) = begin_due(&mut self.pg, |config| config.interval)?;
         Some((key, Collector::Postgres(Box::new(config))))
+    }
+
+    /// 取一个到期的 Doris FE。
+    fn begin_next_due_doris(&mut self) -> Option<(String, Collector)> {
+        let (key, config) = begin_due(&mut self.doris, |config| config.interval)?;
+        Some((key, Collector::Doris(Box::new(config))))
     }
 
     /// 作废在途 / 待执行的 SQL 扫描（MySQL 与 PostgreSQL 共用一个在飞槽）。
@@ -401,6 +429,10 @@ impl Scheduler {
         finish_probe(&mut self.pg, key, result, "PgProbeWarning");
     }
 
+    fn finish_doris(&mut self, key: &str, result: ProbeResult) {
+        finish_probe(&mut self.doris, key, result, "DorisProbeWarning");
+    }
+
     /// 作业异常（JoinError）：清掉所有在飞标记，下一轮重新排。
     ///
     /// 宁可多采一轮，也不要让一个目标因为一次意外永远不再被调度。
@@ -417,6 +449,10 @@ impl Scheduler {
             state.started_at = None;
         }
         for state in self.pg.values_mut() {
+            state.inflight = false;
+            state.started_at = None;
+        }
+        for state in self.doris.values_mut() {
             state.inflight = false;
             state.started_at = None;
         }
@@ -467,6 +503,15 @@ impl Scheduler {
                 state,
                 now,
                 super::postgres::COLLECTION_KIND,
+                key,
+                SQL_ROUND_BUDGET,
+            );
+        }
+        for (key, state) in self.doris.iter_mut() {
+            stalled(
+                state,
+                now,
+                super::doris::COLLECTION_KIND,
                 key,
                 SQL_ROUND_BUDGET,
             );
@@ -561,7 +606,9 @@ impl Scheduler {
         // 代号按域比对：Kafka 的扫描结果不能拿 SQL 的代次来判有效。
         let current = match &product {
             ScanProduct::Kafka(_) => self.scan_epoch,
-            ScanProduct::Mysql(_) | ScanProduct::Postgres(_) => self.sql_scan_epoch,
+            ScanProduct::Mysql(_) | ScanProduct::Postgres(_) | ScanProduct::Doris(_) => {
+                self.sql_scan_epoch
+            }
         };
         if epoch != current {
             return;
@@ -608,6 +655,16 @@ impl Scheduler {
                 }
                 self.apply_pg_targets(targets);
             }
+            ScanProduct::Doris(targets) => {
+                if targets.is_empty() {
+                    log::info!(
+                        "event=DorisProbeNoEndpoint detail=\"已授权，但本机没有通过握手的 Doris FE（只有 BE 的机器采不了 SHOW BACKENDS）\""
+                    );
+                } else {
+                    log::debug!("event=DorisDiscoveryResolved targets={}", targets.len());
+                }
+                self.apply_doris_targets(targets);
+            }
         }
     }
 
@@ -637,6 +694,16 @@ impl Scheduler {
         )
     }
 
+    fn doris_outcome(&self) -> Option<MetricsCollectionOutcome> {
+        super::collection::probe_outcome(
+            super::doris::COLLECTION_KIND,
+            !self.doris.is_empty(),
+            self.doris
+                .values()
+                .filter_map(|state| state.latest.as_ref()),
+        )
+    }
+
     /// 快照读取：主机三域 + Kafka + SQL。没有授权的域不出现。
     fn collect_all_for(&mut self, view: &MetricsTargetView) -> Vec<MetricsCollectionOutcome> {
         self.ensure_host_for(view);
@@ -649,6 +716,9 @@ impl Scheduler {
         }
         if let Some(pg) = self.pg_outcome() {
             outcomes.push(pg);
+        }
+        if let Some(doris) = self.doris_outcome() {
+            outcomes.push(doris);
         }
         outcomes
     }
@@ -778,6 +848,7 @@ enum JobKey {
     Kafka(String),
     Sql(String),
     Pg(String),
+    Doris(String),
 }
 
 impl Scheduler {
@@ -798,6 +869,9 @@ impl Scheduler {
                 (JobKey::Pg(key), CollectorOutput::Postgres { result }) => {
                     self.finish_pg(&key, result)
                 }
+                (JobKey::Doris(key), CollectorOutput::Doris { result }) => {
+                    self.finish_doris(&key, result)
+                }
                 (key, output) => {
                     // 分派错了（只可能是改代码时接错分支）：留痕并清标记，别把目标卡死。
                     let domain = output.domain_name();
@@ -806,6 +880,7 @@ impl Scheduler {
                         JobKey::Kafka(_) => kafka::COLLECTION_KIND,
                         JobKey::Sql(_) => super::mysql::COLLECTION_KIND,
                         JobKey::Pg(_) => super::postgres::COLLECTION_KIND,
+                        JobKey::Doris(_) => super::doris::COLLECTION_KIND,
                     };
                     log::error!(
                         "event=CollectorOutputMismatch expected={expected} actual={domain}"
@@ -885,6 +960,22 @@ pub fn request_pg_scan(
 /// 撤 PostgreSQL 授权：停采（下个 tick 内序列消失），并作废在途的扫描。
 pub fn revoke_pg() {
     scheduler().revoke_pg();
+}
+
+/// 投递一次 Doris FE 自探扫描（**不等结果**）。
+pub fn request_doris_scan(
+    snapshot: Option<wist_contracts::discovery::DiscoverySnapshot>,
+    settings: super::doris::DorisTargetSettings,
+) {
+    let start = scheduler().request_scan(snapshot, ScanKind::Doris(settings));
+    if start {
+        spawn_worker();
+    }
+}
+
+/// 撤 Doris 授权：停采（下个 tick 内序列消失）。
+pub fn revoke_doris() {
+    scheduler().revoke_doris();
 }
 
 /// 最近一次完成的采集结果：主机三域 + Kafka（没有授权就没有 Kafka）。
@@ -1002,6 +1093,9 @@ fn start_due(jobs: &mut JoinSet<JobOutcome>, permits: &Arc<Semaphore>) -> bool {
                 ScanKind::Postgres(settings) => ScanProduct::Postgres(
                     super::postgres::targets_from_discovery(scan.snapshot.as_ref(), settings),
                 ),
+                ScanKind::Doris(settings) => ScanProduct::Doris(
+                    super::doris::targets_from_discovery(scan.snapshot.as_ref(), settings),
+                ),
             })
             .await
             .ok();
@@ -1055,6 +1149,24 @@ fn start_due(jobs: &mut JoinSet<JobOutcome>, permits: &Arc<Semaphore>) -> bool {
             let _permit = permit;
             JobOutcome::Collected {
                 key: JobKey::Sql(key),
+                output: collector.collect().await,
+            }
+        });
+        started = true;
+    }
+
+    // Doris。
+    loop {
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            break;
+        };
+        let Some((key, collector)) = scheduler().begin_next_due_doris() else {
+            break;
+        };
+        jobs.spawn(async move {
+            let _permit = permit;
+            JobOutcome::Collected {
+                key: JobKey::Doris(key),
                 output: collector.collect().await,
             }
         });

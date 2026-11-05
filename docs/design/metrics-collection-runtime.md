@@ -1,6 +1,6 @@
 # 采集运行时：统一调度与 async / blocking 双执行器
 
-> 状态：**设计（P0 / P0.5 / P1 / P1.1 / P1.2 已落地；P2 待做）**。决策记录见 §12（**已全部定案**）。
+> 状态：**设计（P0 / P0.5 / P1 / P1.1 / P1.2 / P2-P0 已落地）**。决策记录见 §12（**已全部定案**）。
 > P0 的落地范围与验收见 §10。
 >
 > 范围：**指标采集**（主机 / 进程 / 容器 / Kafka / 关系型数据库 / Doris …）。
@@ -506,7 +506,7 @@ let outcomes = scheduler::collect_all(view);    // 主机三域 + Kafka（最近
 - 指纹：发 `SSLRequest` 收 `S`/`N`；排除 pooler 与客户端工具；
 - 授权 `PostgresInstance/auto`，凭据 `secrets/postgres/<key>/`，配置 `[postgres] interval_ms/timeout_ms`。
 
-### P2：Doris（复用 transport）
+### P2：Doris（复用 transport，**P0 子集已完成**，2026-11-05）
 
 - **P0 范围（已定，见 §12.1-7）**：`doris_metrics` 只做 BE 存活 / 容量 / tablet —— `SHOW BACKENDS`
   与 `SHOW PROC '/backends'`，不依赖审计日志；

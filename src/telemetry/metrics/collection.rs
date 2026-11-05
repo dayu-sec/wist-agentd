@@ -31,6 +31,8 @@ pub(super) enum Collector {
     Mysql(Box<MysqlProbeConfig>),
     /// PostgreSQL：同上，只是换一套 SQL 与协议。
     Postgres(Box<super::postgres::PgProbeConfig>),
+    /// Doris：连 FE 的 MySQL 协议口，读 BE 视图。
+    Doris(Box<super::doris::DorisProbeConfig>),
 }
 
 /// 一轮采集的产物。
@@ -51,6 +53,9 @@ pub(super) enum CollectorOutput {
     Postgres {
         result: ProbeResult,
     },
+    Doris {
+        result: ProbeResult,
+    },
 }
 
 impl Collector {
@@ -60,6 +65,7 @@ impl Collector {
             Self::Kafka { .. } => super::kafka::COLLECTION_KIND,
             Self::Mysql(_) => super::mysql::COLLECTION_KIND,
             Self::Postgres(_) => super::postgres::COLLECTION_KIND,
+            Self::Doris(_) => super::doris::COLLECTION_KIND,
         }
     }
 
@@ -80,6 +86,11 @@ impl Collector {
                 result: super::postgres::probe_once(config.as_ref()).await,
             };
         }
+        if let Self::Doris(config) = self {
+            return CollectorOutput::Doris {
+                result: super::doris::probe_once(config.as_ref()).await,
+            };
+        }
         tokio::task::spawn_blocking(move || match self {
             Self::Host(view) => {
                 let used = view.targets.clone();
@@ -93,7 +104,9 @@ impl Collector {
                 CollectorOutput::Kafka { result, groups }
             }
             // 上面已经拦住；这里只是让匹配穷尽。
-            Self::Mysql(_) | Self::Postgres(_) => CollectorOutput::panicked(domain),
+            Self::Mysql(_) | Self::Postgres(_) | Self::Doris(_) => {
+                CollectorOutput::panicked(domain)
+            }
         })
         .await
         .unwrap_or_else(|err| {
@@ -112,6 +125,7 @@ impl CollectorOutput {
             Self::Kafka { .. } => super::kafka::COLLECTION_KIND,
             Self::Mysql { .. } => super::mysql::COLLECTION_KIND,
             Self::Postgres { .. } => super::postgres::COLLECTION_KIND,
+            Self::Doris { .. } => super::doris::COLLECTION_KIND,
         }
     }
 
@@ -139,6 +153,16 @@ impl CollectorOutput {
             }
         } else if domain == super::postgres::COLLECTION_KIND {
             Self::Postgres {
+                result: ProbeResult {
+                    targets: Vec::new(),
+                    attempted: 1,
+                    failed: 1,
+                    last_error: Some("采集任务 panic（已丢弃这一轮）".to_string()),
+                    warnings: Vec::new(),
+                },
+            }
+        } else if domain == super::doris::COLLECTION_KIND {
+            Self::Doris {
                 result: ProbeResult {
                     targets: Vec::new(),
                     attempted: 1,

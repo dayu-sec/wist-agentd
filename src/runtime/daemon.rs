@@ -1886,6 +1886,9 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     let mut last_pg_scan: Option<Instant> = None;
     let mut last_pg_revision: Option<i64> = None;
     let mut pg_authorized = false;
+    let mut last_doris_scan: Option<Instant> = None;
+    let mut last_doris_revision: Option<i64> = None;
+    let mut doris_authorized = false;
     // 数据面上送启用同样跨 tick 活着：上一次已应用的 grant 就在里面（拉取失败保留它）。
     let mut uplink_runtime = AppliedUplink::default();
     let mut last_uplink_fetch: Option<Instant> = None;
@@ -2321,6 +2324,38 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                     pg_authorized = false;
                     last_pg_scan = None;
                     last_pg_revision = None;
+                }
+            }
+        }
+        // Doris：授权 + 本机 FE 自探（没有 FE 的机器不出指标）。
+        match work_runtime.doris_grant() {
+            Some(grant) => {
+                doris_authorized = true;
+                let snapshot = discovery_runtime.latest_snapshot();
+                let snapshot_key = snapshot.map(|snapshot| snapshot.revision);
+                let changed = snapshot_key != last_doris_revision;
+                let due = last_doris_scan.is_none_or(|at| at.elapsed() >= MYSQL_SCAN_INTERVAL);
+                if changed || due {
+                    let settings = crate::telemetry::metrics::doris::DorisTargetSettings {
+                        timeout: Duration::from_millis(loop_ctx.config.doris.timeout_ms),
+                        interval: grant
+                            .interval
+                            .unwrap_or(Duration::from_millis(loop_ctx.config.doris.interval_ms)),
+                    };
+                    crate::telemetry::metrics::scheduler::request_doris_scan(
+                        snapshot.cloned(),
+                        settings,
+                    );
+                    last_doris_scan = Some(Instant::now());
+                    last_doris_revision = snapshot_key;
+                }
+            }
+            None => {
+                if doris_authorized {
+                    crate::telemetry::metrics::scheduler::revoke_doris();
+                    doris_authorized = false;
+                    last_doris_scan = None;
+                    last_doris_revision = None;
                 }
             }
         }

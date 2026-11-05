@@ -38,6 +38,9 @@ pub struct AgentConfig {
     /// PostgreSQL 应用指标（`[postgres]`）：与 `[mysql]` 同形。
     #[serde(default)]
     pub postgres: PgSection,
+    /// Doris 应用指标（`[doris]`）：与 `[mysql]` 同形。
+    #[serde(default)]
+    pub doris: PgSection,
     /// 本进程**运行日志**的 `[log]` 段（与 `telemetry.logs` 的“被采集日志”不同）。
     ///
     /// 直接内嵌共享 crate 的单类型 [`wist_log::LogSection`]（同名同义，单一事实来源），
@@ -65,6 +68,7 @@ impl AgentConfig {
             kafka: KafkaSection::default(),
             mysql: MysqlSection::default(),
             postgres: PgSection::default(),
+            doris: PgSection::default(),
             log: wist_log::LogSection::default(),
         }
     }

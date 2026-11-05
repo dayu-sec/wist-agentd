@@ -20,6 +20,8 @@ pub mod mysql_source;
 pub mod network;
 // PostgreSQL 实例自探（证据 + SSLRequest 握手），运行时交给 db_source。
 pub mod pg_source;
+// Doris FE 自探（只找 FE：SHOW BACKENDS 是 FE 的命令）。
+pub mod doris_source;
 pub mod policy;
 pub mod process;
 pub mod runtime;

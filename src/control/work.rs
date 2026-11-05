@@ -87,6 +87,18 @@ pub(crate) fn is_pg_instance_source(kind: &str, target: &str) -> bool {
     target.is_empty() || target.eq_ignore_ascii_case(PG_SOURCE_TARGET_AUTO)
 }
 
+/// Doris 采集来源的 `kind`。
+pub(crate) const DORIS_CLUSTER_SOURCE_KIND: &str = "DorisCluster";
+pub(crate) const DORIS_SOURCE_TARGET_AUTO: &str = "auto";
+
+pub(crate) fn is_doris_cluster_source(kind: &str, target: &str) -> bool {
+    if kind != DORIS_CLUSTER_SOURCE_KIND {
+        return false;
+    }
+    let target = target.trim();
+    target.is_empty() || target.eq_ignore_ascii_case(DORIS_SOURCE_TARGET_AUTO)
+}
+
 /// 工作里没写清指标周期时的上送间隔（与采集目录里 `MetricInterval` 的策展值同值）。
 ///
 /// 为什么要有默认：`collect_metrics` 单元理论上都带一条 `MetricInterval` 来源，
@@ -112,6 +124,12 @@ pub struct MysqlGrant {
 /// PostgreSQL 采集授权（与 [`MysqlGrant`] 同形）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PgGrant {
+    pub interval: Option<Duration>,
+}
+
+/// Doris 采集授权。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DorisGrant {
     pub interval: Option<Duration>,
 }
 
@@ -811,6 +829,36 @@ impl AppliedWorkGrant {
         granted.then_some(PgGrant { interval })
     }
 
+    /// Doris 采集授权：`collect_metrics` + `DorisCluster/auto`。
+    pub fn doris_grant(&self) -> Option<DorisGrant> {
+        let mut interval: Option<Duration> = None;
+        let mut granted = false;
+        for work in self.works.values() {
+            if !work.is_working() {
+                continue;
+            }
+            let Some(spec) = work.spec.as_ref() else {
+                continue;
+            };
+            let authorized = spec.units.iter().any(|unit| {
+                unit.capability == "collect_metrics"
+                    && unit
+                        .sources
+                        .iter()
+                        .any(|source| is_doris_cluster_source(&source.kind, &source.target))
+            });
+            if !authorized {
+                continue;
+            }
+            granted = true;
+            if let Some(secs) = spec.metric_interval_seconds() {
+                let current = Duration::from_secs(secs.max(1) as u64);
+                interval = Some(interval.map_or(current, |existing| existing.min(current)));
+            }
+        }
+        granted.then_some(DorisGrant { interval })
+    }
+
     /// 折算不了的单元（`Exporter` / `UnifiedLogPredicate` …）。
     pub fn unsupported_units(&self) -> Vec<UnsupportedUnit> {
         let mut unsupported = Vec::new();
@@ -830,6 +878,7 @@ impl AppliedWorkGrant {
                         || is_kafka_cluster_source(&source.kind, &source.target)
                         || is_mysql_instance_source(&source.kind, &source.target)
                         || is_pg_instance_source(&source.kind, &source.target)
+                        || is_doris_cluster_source(&source.kind, &source.target)
                     {
                         continue;
                     }
@@ -930,6 +979,11 @@ fn unsupported_reason(source: &WorkSpecSource) -> String {
         PG_INSTANCE_SOURCE_KIND => format!(
             "PostgresInstance target {:?} is not supported on this agent \
              (only `auto`: endpoints are self-discovered on the database host)",
+            source.target
+        ),
+        DORIS_CLUSTER_SOURCE_KIND => format!(
+            "DorisCluster target {:?} is not supported on this agent \
+             (only `auto`: the FE is self-discovered on this host)",
             source.target
         ),
         _ => format!(

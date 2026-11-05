@@ -2,6 +2,8 @@
 
 pub mod collection;
 pub mod cpu;
+/// Doris 指标采集（连 FE 的 MySQL 协议口，读 BE 视图）。
+pub mod doris;
 pub mod kafka;
 pub mod kafka_auth;
 pub mod kafka_groups;
