@@ -16,44 +16,87 @@ use super::target_view::{MetricsTargetView, MetricsTargetViewEntry};
 ///
 /// 为什么是 `enum` 而不是 `trait object`：域只有两个，`match` 分发零分配、也没有
 /// 对象安全负担；域超过 5 个再评估换成 boxed-future 的 trait（见设计文档 §6.2 / §12）。
-/// 每个变体自带它需要的那一份状态，调度器不必了解协议。
-pub(super) enum Collector<'a> {
+/// 作业**拥有**它需要的那份状态：异步执行时不能借用调度器锁里的东西。
+pub(super) enum Collector {
     /// 主机 / 进程 / 容器：目标来自 `target_view`（发现策略），不是工作授权。
-    Host { view: &'a MetricsTargetView },
+    Host(MetricsTargetView),
     /// Kafka：目标来自采集面授权 + 本机自探。
     Kafka {
-        config: &'a KafkaProbeConfig,
-        groups: &'a mut GroupCache,
+        /// 盒子是为了不把 enum 撑大（`large_enum_variant`）。
+        config: Box<KafkaProbeConfig>,
+        groups: GroupCache,
     },
 }
 
-/// 一轮采集的产物：主机三域是批量 outcome，Kafka 是按目标的结果。
+/// 一轮采集的产物。
 pub(super) enum CollectorOutput {
-    Domains(Vec<MetricsCollectionOutcome>),
-    Targets(ProbeResult),
+    Host {
+        /// 用于回填校验：采集期间目标集合被换掉就丢弃这一轮。
+        used: Vec<MetricsTargetViewEntry>,
+        outcomes: Vec<MetricsCollectionOutcome>,
+    },
+    Kafka {
+        result: ProbeResult,
+        /// 消费组缓存跟着作业走，回来时交还调度器（下一轮继续用）。
+        groups: GroupCache,
+    },
 }
 
-impl<'a> Collector<'a> {
-    /// 执行一轮。
-    ///
-    /// 现在两个实现都是同步的，直接跑在采集线程上；P1 的 async 采集器（MySQL / Doris）
-    /// 会在这里返回 future，同步实现改走 `spawn_blocking`（设计文档 §6.4）。
-    pub(super) fn collect(self) -> CollectorOutput {
+impl Collector {
+    fn domain(&self) -> &'static str {
         match self {
-            Self::Host { view } => CollectorOutput::Domains(host_outcomes(view)),
-            Self::Kafka { config, groups } => {
-                CollectorOutput::Targets(super::kafka::probe_once(config, groups))
-            }
+            Self::Host(_) => "host_metrics",
+            Self::Kafka { .. } => super::kafka::COLLECTION_KIND,
         }
+    }
+
+    /// 异步执行一轮。
+    ///
+    /// 现在两个实现都是同步的，所以统一丢到 `spawn_blocking`：采集线程上的 async 执行器
+    /// 不能被 `/proc` 读取或 Kafka 握手的阻塞调用霸住。P1 的 async 采集器（MySQL / Doris）
+    /// 直接在 future 里跑，不经过这一步（设计文档 §6.4）。
+    pub(super) async fn collect(self) -> CollectorOutput {
+        let domain = self.domain();
+        tokio::task::spawn_blocking(move || match self {
+            Self::Host(view) => {
+                let used = view.targets.clone();
+                CollectorOutput::Host {
+                    used,
+                    outcomes: host_outcomes(&view),
+                }
+            }
+            Self::Kafka { config, mut groups } => {
+                let result = super::kafka::probe_once(config.as_ref(), &mut groups);
+                CollectorOutput::Kafka { result, groups }
+            }
+        })
+        .await
+        .unwrap_or_else(|err| {
+            // 阻塞任务 panic：只丢这一轮，线程继续（调度器会把在飞标记清掉）。
+            log::error!("event=CollectorRoundPanicked domain={domain} detail=\"{err}\"");
+            CollectorOutput::panicked(domain)
+        })
     }
 }
 
 impl CollectorOutput {
-    /// 主机分支的产物；分支不匹配时返回空（不让一次分派错误拖垮采集线程）。
-    pub(super) fn into_domains(self) -> Vec<MetricsCollectionOutcome> {
-        match self {
-            Self::Domains(outcomes) => outcomes,
-            Self::Targets(_) => Vec::new(),
+    fn panicked(domain: &str) -> Self {
+        if domain == super::kafka::COLLECTION_KIND {
+            Self::Kafka {
+                result: ProbeResult {
+                    targets: Vec::new(),
+                    attempted: 1,
+                    failed: 1,
+                    last_error: Some("采集任务 panic（已丢弃这一轮）".to_string()),
+                    warnings: Vec::new(),
+                },
+                groups: GroupCache::default(),
+            }
+        } else {
+            Self::Host {
+                used: Vec::new(),
+                outcomes: Vec::new(),
+            }
         }
     }
 }
