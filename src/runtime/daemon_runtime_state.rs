@@ -66,6 +66,17 @@ pub(super) fn emit_telemetry_failure(failure: &TelemetryFailure) {
                 failure.detail
             );
         }
+        // “没有头”被丢掉的行：启动 / 轮转时落在记录中间是正常代价，持续出现就是
+        // **读法没认出现场格式** —— 这时重写一行已经晚了，必须让人看到。打 `warn`。
+        TelemetryFailureKind::HeadlessLinesDropped => {
+            let magnitude = failure.magnitude.as_deref().unwrap_or("n/a");
+            log::warn!(
+                "telemetry headless lines dropped input_id={} path={} detail={} magnitude={magnitude}",
+                failure.input_id,
+                failure.path,
+                failure.detail
+            );
+        }
         // 超长行被截断：对纯文本只是“少了一点尾巴”，对 JSON Lines 就是产出一条
         // 下游永远解析不了的记录。打 `warn`：采集本身没停，但数据完整性已经受损。
         TelemetryFailureKind::TruncatedLine => {
@@ -319,6 +330,44 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].detail, "failed");
+    }
+
+    #[test]
+    fn a_persistent_headless_drop_reports_once_even_as_the_count_grows() {
+        // 量（lines=N）与身份分离：同一 input 上 3 → 40 仍是同一个签名，不刷屏；
+        // 换一个 input 就是另一件事；消失过一轮之后再出现要重新报。
+        let detail = "lines had no record header and were not sent";
+        let mut first = failure(
+            TelemetryFailureKind::HeadlessLinesDropped,
+            "app",
+            "/var/log/a.log",
+            detail,
+        );
+        first.magnitude = Some("lines=3".to_string());
+        let mut later = first.clone();
+        later.magnitude = Some("lines=40".to_string());
+        let other_input = failure(
+            TelemetryFailureKind::HeadlessLinesDropped,
+            "db",
+            "/var/log/a.log",
+            detail,
+        );
+
+        let previous = failure_signatures(&[first]);
+        assert!(
+            filter_new_failures(&[later.clone()], &previous).is_empty(),
+            "量变了不是新问题"
+        );
+        assert_eq!(
+            filter_new_failures(&[other_input], &previous).len(),
+            1,
+            "换 input 是另一件事"
+        );
+
+        // 消失过一轮（上一轮没有这条）后再出现：重新报一次 —— 否则运维只能在
+        // 首次出现时看到，后续复发彻底静默。
+        let quiet = failure_signatures(&[]);
+        assert_eq!(filter_new_failures(&[later], &quiet).len(), 1);
     }
 
     #[test]

@@ -31,6 +31,12 @@ pub(super) struct FoldedRead {
     pub(super) pending: Option<PendingMultilineState>,
     /// 本次按 `drop_if_contains` 丢掉的记录数（进自观测）。
     pub(super) dropped_noise: usize,
+    /// 本次因“手里没有头”、又没等到起始行而被丢掉的行数（进自观测）。
+    ///
+    /// 口径只算 **`Start::WaitForStart` 下无块可续的行**。到限时丢的那一行不算：
+    /// 那一刻手里有块，属于 `Oversized` 封口（闸门按 `RecordWithheld` 报的是那条被封口的记录）；
+    /// 把它混进来会让“读法认不出格式”和“块超长”两个原因共用一条告警。
+    pub(super) headless_lines: usize,
 }
 
 /// 只有未封口记录要交出去时的结果（到期 / 轮转 / 换源 / 停机）。
@@ -68,6 +74,8 @@ pub(super) fn records_from_read(
             records,
             pending,
             dropped_noise,
+            // csvlog 的“半条”由它自己的状态机处理，不走“没有头”这条计数。
+            headless_lines: 0,
         };
     }
 
@@ -96,6 +104,8 @@ pub(super) fn records_from_read(
             records,
             pending: None,
             dropped_noise,
+            // 一行一条：不存在“没有头”的行。
+            headless_lines: 0,
         };
     };
 
@@ -110,7 +120,13 @@ pub(super) fn records_from_read(
     };
 
     let mut folded = Vec::new();
+    let mut headless_lines = 0usize;
     for line in lines {
+        // “没有头”的判据：**送进去之前手里没有块**，而这一行也不是起始行 —— 界定器会
+        // 直接丢掉它。到限时丢的那一行不算（那时手里有块，属于 `Oversized` 封口）——
+        // 两个原因各走各的告警，不混计。
+        let was_accumulating = delimiter.is_accumulating();
+        let dropped_before = delimiter.dropped_lines();
         folded.extend(delimiter.push(
             records::Line {
                 text: &line.text,
@@ -119,6 +135,9 @@ pub(super) fn records_from_read(
             },
             signal,
         ));
+        if !was_accumulating && delimiter.dropped_lines() > dropped_before {
+            headless_lines += 1;
+        }
     }
     let (records, dropped_noise) =
         admit_with_noise_filter(gate, &path, folded, drop_if_contains, next_seq);
@@ -139,6 +158,7 @@ pub(super) fn records_from_read(
         records,
         pending,
         dropped_noise,
+        headless_lines,
     }
 }
 

@@ -41,6 +41,8 @@ pub(super) struct CollectedReadBatch {
     pub(super) read_lines: usize,
     /// 本批按 `drop_if_contains` 丢掉的记录数（噪音行，进自观测）。
     pub(super) dropped_noise: usize,
+    /// 本批因“没有头”被丢掉的行数（进自观测）。
+    pub(super) headless_lines: usize,
     /// 本次因**内容不全**被挡下（不转发）的记录。
     pub(super) withheld: Withheld,
     pub(super) resume: ResumeDecision,
@@ -56,6 +58,7 @@ impl CollectedReadBatch {
             truncated_lines: 0,
             read_lines: 0,
             dropped_noise: 0,
+            headless_lines: 0,
             withheld: Withheld::default(),
             resume,
         }

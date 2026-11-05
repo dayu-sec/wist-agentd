@@ -550,8 +550,9 @@ where
 
 /// TCP 上送帧：结构化信封（不含原文）与 `LOGRAW:` 原始行分离，避免把 raw 塞进 JSON。
 ///
-/// `{envelope} LOGRAW: <body>`，其中 envelope 只承载通用字段（`schema`/`agent`/`ts`/`seq`，短名），
-/// body 保持原文、不转义，供数据面审计核对与回放。来源细节（`input`/路径/偏移）不进帧。
+/// `{envelope} LOGRAW: <body>`，其中 envelope 承载通用字段（`schema`/`agent`/`ts`/`seq`，短名）
+/// 与**来源身份**（`family`/`unit`、`container`、k8s 的 `namespace`/`pod_name`/`log_path` 等）；
+/// body 保持原文、不转义，供数据面审计核对与回放。内部路由用的细节（`input`/偏移）不进帧。
 fn build_record_frame(record: &TelemetryRecord) -> io::Result<Vec<u8>> {
     let envelope = DataFrame::from(record);
     let mut frame = serde_json::to_vec(&envelope)
@@ -751,11 +752,12 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn tcp_sink_backs_off_after_connect_failure() {
         let port = closed_port().await;
-        // 测试用缩短退避窗口，避免真实等待 1s。
+        // 退避窗口取**足够长**：“窗口内不再重连”不能依赖两次调用只隔几毫秒 ——
+        // 并行跑测试时调度延迟完全可能跨过一个小窗口（这条用例以前就是这么偶发变红的）。
         let mut sink = TcpRecordSink::new("127.0.0.1".to_string(), port, TcpFraming::Line)
-            .with_backoff(Duration::from_millis(10));
+            .with_backoff(Duration::from_secs(30));
 
-        // 第一次 connect 失败，进入退避（10ms → 20ms）。
+        // 第一次 connect 失败，进入退避（30s → 翻倍后被上限 30s 截住）。
         let err = sink
             .write_records(&[record("a")])
             .await
@@ -766,6 +768,7 @@ mod tests {
             err.to_string().contains(&format!("127.0.0.1:{port}:")),
             "出口错误必须带目标地址：{err}"
         );
+        assert!(sink.in_backoff(), "失败后必须进入退避窗口");
 
         // 退避窗口内：快速返回 WouldBlock，不再尝试 connect；同样带目标。
         let err = sink
@@ -778,9 +781,23 @@ mod tests {
             "退避错误也要能看出目标：{err}"
         );
 
-        // 越过退避窗口：重新尝试 connect（仍失败，退避翻倍到 40ms）。
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        assert!(sink.write_records(&[record("c")]).await.is_err());
+        // 越过退避窗口：**手动**把窗口挪到过去，不靠 sleep —— 睡多久都会在读侧变成
+        // “够不够长”的猜测，而这正是偶发红的根源。窗口过了，下一次调用必须真的重连；
+        // 仍然失败，但错误回到连接错误本身（不再是 WouldBlock）。
+        sink.next_attempt_at = Some(Instant::now());
+        let err = sink
+            .write_records(&[record("c")])
+            .await
+            .expect_err("retried connect must fail");
+        assert_ne!(
+            err.kind(),
+            io::ErrorKind::WouldBlock,
+            "窗口已过，必须真的重连：{err}"
+        );
+        assert!(
+            err.to_string().contains(&format!("127.0.0.1:{port}:")),
+            "重连失败同样带目标：{err}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

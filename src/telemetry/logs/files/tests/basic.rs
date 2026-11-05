@@ -5,7 +5,79 @@ use super::{
     read_output_records, temp_dir,
 };
 use crate::telemetry::logs::files::file_watcher::StartupPosition;
+use crate::telemetry::logs::multiline::MultilineMode;
 use crate::telemetry::warp_parse::FileRecordSink;
+
+#[test]
+fn lines_without_a_record_header_are_counted_not_emitted() {
+    // 启动时落在一条记录中间：那几行没有头，不能当记录发，但**必须可对数** ——
+    // 否则“这个容器怎么一条都没有”只能靠猜。
+    let root = temp_dir("headless");
+    let source_path = root.join("app.log");
+    fs::create_dir_all(root.join("state")).expect("create state");
+    fs::write(
+        &source_path,
+        "  orphan-tail-1\nCaused by: orphan-tail-2\n\
+         2026-11-05 15:12:56,967 [ERROR] real record\ncontinuation\n",
+    )
+    .expect("write log");
+    let mut cfg = config(&root, &source_path);
+    cfg.multiline_mode = MultilineMode::ContainerCri;
+    let mut processor = FileInputProcessor::new(cfg, TestSink::default());
+
+    let outcome = processor.process_once().expect("process");
+    assert_eq!(outcome.headless_lines, 2, "只有没头的那两行");
+    assert_eq!(
+        outcome.records_processed, 0,
+        "真记录还悬在未封口块里，本批不发"
+    );
+}
+
+/// 显式单路径（不经 glob）也要带 k8s 身份：身份跟**路径**走，与读法 / 输入形态无关。
+#[cfg(unix)]
+#[test]
+fn an_explicit_container_symlink_carries_the_pod_identity() {
+    const ID: &str = "ca018a1ea97ad12934aa236df87fc3c2816ea70c41a07134b1f3298c9d73e217";
+    let root = temp_dir("explicit-container");
+    fs::create_dir_all(root.join("state")).expect("create state");
+    let real_dir = root
+        .join("pods")
+        .join("default_app-0_98af449f-af1b-4a19-8f82-f5f82a198794")
+        .join("app");
+    fs::create_dir_all(&real_dir).expect("create pod dir");
+    let real = real_dir.join("0.log");
+    fs::write(
+        &real,
+        "2026-11-05T15:12:56.967547835+08:00 stderr F 2026-11-05 15:12:56,967 [ERROR] boom\n\
+         2026-11-05T15:12:57.000001000+08:00 stderr F 2026-11-05 15:12:57,000 [WARN ] next\n",
+    )
+    .expect("write log");
+    let links = root.join("containers");
+    fs::create_dir_all(&links).expect("create links");
+    let link = links.join(format!("app-0_default_app-{ID}.log"));
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+    let mut cfg = config(&root, &link);
+    cfg.startup_position = StartupPosition::Head;
+    // NDJSON 输出：读回来就是一次 spool 同构的序列化往返。
+    cfg.multiline_mode = MultilineMode::ContainerCri;
+    let output = root.join("log").join("records.ndjson");
+    fs::create_dir_all(output.parent().unwrap()).expect("create log dir");
+    FileInputProcessor::new(cfg, FileRecordSink::new(output.clone()))
+        .process_once()
+        .expect("process");
+
+    let records = read_output_records(&output);
+    assert_eq!(records.len(), 1, "第二条还悬着等边界");
+    let record = &records[0];
+    let pod = record.pod_log.as_ref().expect("identity");
+    assert_eq!(pod.namespace, "default");
+    assert_eq!(pod.pod_name, "app-0");
+    assert_eq!(pod.service, "app");
+    assert_eq!(pod.node_name, "node-test");
+    assert_eq!(pod.log_path, real.display().to_string());
+    assert_eq!(record.container, None);
+}
 
 #[test]
 fn processes_new_lines_and_advances_checkpoint_after_successful_commit() {

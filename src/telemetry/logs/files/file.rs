@@ -61,6 +61,8 @@ pub const DEFAULT_RESCAN_INTERVAL_MS: i64 = 15_000;
 pub struct FileInputConfig {
     pub agent_id: String,
     pub input_id: String,
+    /// 这台机器的名字（节点的 `node_name`）：随 k8s 容器日志的身份进帧。
+    pub node_name: String,
     /// 来源身份（面 + 目录单元）：随记录进帧。空 = 本机运维手工配置的输入。
     pub origin: InputOrigin,
     pub source_path: PathBuf,
@@ -121,6 +123,11 @@ pub struct ProcessOutcome {
     pub withheld: Withheld,
     /// 本次按 `drop_if_contains` 丢掉的噪音记录数（配置的正常结果，不是失败）。
     pub dropped_noise: usize,
+    /// 因“没有头”、又没等到起始行而被丢掉的行数（读法 / `startup_position` 的后果）。
+    ///
+    /// 为什么要它：多行读法下这可能是**整台机器一条数据都采不到**的唯一线索
+    /// （容器的应用日志格式不在起始行表里），而以前这个数只活在界定器里、从不上报。
+    pub headless_lines: usize,
     /// 本轮被 `filters` 剔掉的现存路径数（`exclude_globs` 不算）。
     /// 非 0 = 配置的选择层真的在起作用；用于回答“为什么这个 input 少了很多文件”。
     pub selection_filtered: usize,
@@ -178,14 +185,21 @@ impl ProcessOutcome {
             spool_bytes: 0,
             capacity: None,
             dropped_noise: 0,
+            headless_lines: 0,
             selection_filtered: 0,
             identity_unknown: 0,
         }
     }
 
-    /// 带上本批被 `drop_if_contains` 丢掉的条数（自观测用）。
+    /// 带上本批按 `drop_if_contains` 丢掉的条数（自观测用）。
     fn with_dropped_noise(mut self, dropped_noise: usize) -> Self {
         self.dropped_noise = dropped_noise;
+        self
+    }
+
+    /// 带上本批“没有头”被丢掉的行数（自观测用）。
+    fn with_headless_lines(mut self, headless_lines: usize) -> Self {
+        self.headless_lines = headless_lines;
         self
     }
 
@@ -203,6 +217,7 @@ impl ProcessOutcome {
             read_lines: 0,
             withheld: Withheld::default(),
             dropped_noise: 0,
+            headless_lines: 0,
             selection_filtered: 0,
             identity_unknown: 0,
             rotated: false,
@@ -230,6 +245,7 @@ impl ProcessOutcome {
             read_lines: 0,
             withheld: Withheld::default(),
             dropped_noise: 0,
+            headless_lines: 0,
             selection_filtered: 0,
             identity_unknown: 0,
             rotated: false,
@@ -283,6 +299,7 @@ where
             truncated_lines,
             read_lines,
             dropped_noise,
+            headless_lines,
             withheld,
             resume,
         } = batch;
@@ -306,7 +323,8 @@ where
             resume.rotated,
             read_lines,
         )
-        .with_dropped_noise(dropped_noise))
+        .with_dropped_noise(dropped_noise)
+        .with_headless_lines(headless_lines))
     }
 
     #[cfg(test)]
@@ -361,6 +379,7 @@ where
             &self.config.agent_id,
             &observed_at,
             &self.config.input_id,
+            &self.config.node_name,
             self.config.origin.clone(),
         );
         let mut saw_new_lines = self
@@ -411,6 +430,7 @@ where
         );
         batch.records.extend(folded.records);
         batch.dropped_noise += folded.dropped_noise;
+        batch.headless_lines += folded.headless_lines;
         batch.pending_multiline = folded.pending;
         batch.checkpoint_offset = active_read.committed_end_offset;
         batch.checkpoints.push(PendingCheckpoint {
@@ -489,6 +509,7 @@ where
         );
         batch.records.extend(folded.records);
         batch.dropped_noise += folded.dropped_noise;
+        batch.headless_lines += folded.headless_lines;
         batch.pending_multiline = folded.pending;
         batch.checkpoints.push(PendingCheckpoint {
             source_path: rotated_path,
@@ -666,6 +687,7 @@ where
             truncated_lines,
             read_lines,
             dropped_noise,
+            headless_lines,
             selection_filtered,
             identity_unknown,
             rotated,
@@ -708,6 +730,7 @@ where
         );
         outcome.capacity = capacity;
         outcome.dropped_noise = dropped_noise;
+        outcome.headless_lines = headless_lines;
         outcome.selection_filtered = selection_filtered;
         outcome.identity_unknown = identity_unknown;
         Ok(outcome)
@@ -724,6 +747,7 @@ where
             &self.config.agent_id,
             &observed_at,
             &self.config.input_id,
+            &self.config.node_name,
             self.config.origin.clone(),
         );
         let mut batch = FamilyBatch::new();
@@ -1035,6 +1059,7 @@ where
         );
         batch.records.extend(folded.records);
         batch.dropped_noise += folded.dropped_noise;
+        batch.headless_lines += folded.headless_lines;
         let mut pending = folded.pending;
         if consumed_lines == 0
             && pending_should_flush(
@@ -1121,6 +1146,7 @@ where
         );
         batch.records.extend(folded.records);
         batch.dropped_noise += folded.dropped_noise;
+        batch.headless_lines += folded.headless_lines;
         let mut pending = folded.pending;
         if consumed_lines == 0
             && pending_should_flush(
@@ -1206,6 +1232,8 @@ struct FamilyBatch {
     read_lines: usize,
     /// 本批按 `drop_if_contains` 丢掉的记录数（噪音行，进自观测）。
     dropped_noise: usize,
+    /// 本批因“没有头”被丢掉的行数（跨文件累计，进自观测）。
+    headless_lines: usize,
     /// 本轮被 `filters` 剔掉的现存路径数（不含 `exclude_globs`）。
     selection_filtered: usize,
     /// 其中因为“取不到容器身份”而作判定的条数（进自观测）。
@@ -1228,6 +1256,7 @@ impl FamilyBatch {
             truncated_lines: 0,
             read_lines: 0,
             dropped_noise: 0,
+            headless_lines: 0,
             selection_filtered: 0,
             identity_unknown: 0,
             rotated: false,

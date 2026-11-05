@@ -102,6 +102,10 @@ pub(super) fn build_file_input_config(
             .clone()
             .unwrap_or_else(|| "unknown".to_string()),
         input_id: input.input_id.clone(),
+        // 节点名是本机事实：k8s 容器日志的身份里需要它，而路径里没有。
+        // 按输入取一次（一个 tick 一个来源一次），不缓存：它与 `/etc/hostname` 同源，
+        // 改主机名后不需要重启 agent 才能生效。
+        node_name: crate::discovery::host::default_host_name(),
         origin: origin.clone(),
         source_path,
         exclude_globs: input.exclude_globs.clone(),
@@ -308,6 +312,26 @@ pub(super) fn selection_filtered_failure(
     }
 }
 
+/// 多行读法下“没有头”被丢掉的行数（自观测）。
+///
+/// `detail` 必须**稳定**（去重按 `kind|input_id|path|detail`）：同一个读法持续丢只报一次；
+/// 丢了多少放 `magnitude`（它会变）。0 行返回 `None`（正常文件不该多一行日志）。
+pub(super) fn headless_lines_failure(
+    input: &LogFileInputSection,
+    lines: usize,
+) -> Option<TelemetryFailure> {
+    if lines == 0 {
+        return None;
+    }
+    Some(TelemetryFailure {
+        kind: TelemetryFailureKind::HeadlessLinesDropped,
+        input_id: input.input_id.clone(),
+        path: input.path.clone(),
+        detail: "lines had no record header and were not sent".to_string(),
+        magnitude: Some(format!("lines={lines}")),
+    })
+}
+
 /// 输入对应的 spool 文件。
 fn spool_path_for(config: &AgentConfig, input: &LogFileInputSection) -> PathBuf {
     spool_path_for_id(config, &input.input_id)
@@ -340,8 +364,9 @@ fn startup_position_for(input: &LogFileInputSection) -> StartupPosition {
 mod tests {
     use super::{
         InputOrigin, TelemetryFailureKind, Withheld, build_file_input_config, capacity_failure,
-        effective_output, multiline_mode_for, selection_filtered_failure, startup_position_for,
-        truncated_failure, unsupported_target, uplink_failure, withheld_failure,
+        effective_output, headless_lines_failure, multiline_mode_for, selection_filtered_failure,
+        startup_position_for, truncated_failure, unsupported_target, uplink_failure,
+        withheld_failure,
     };
     use crate::config::agent_config::{
         AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, LogFileInputSection,
@@ -494,6 +519,25 @@ mod tests {
         );
         assert_eq!(first.magnitude.as_deref(), Some("lines=1"));
         assert_eq!(second.magnitude.as_deref(), Some("lines=9"));
+    }
+
+    #[test]
+    fn a_headless_report_becomes_a_stable_failure() {
+        // 0 行不该凭空多一行告警。
+        assert!(headless_lines_failure(&input(), 0).is_none());
+
+        let entry = input();
+        let first = headless_lines_failure(&entry, 3).expect("failure");
+        let later = headless_lines_failure(&entry, 40).expect("failure");
+        assert_eq!(first.kind, TelemetryFailureKind::HeadlessLinesDropped);
+        assert_eq!(first.input_id, "app");
+        assert_eq!(first.path, "/var/log/app.log");
+        assert_eq!(
+            first.detail, later.detail,
+            "detail 参与去重，不能带会变的计数"
+        );
+        assert_eq!(first.magnitude.as_deref(), Some("lines=3"));
+        assert_eq!(later.magnitude.as_deref(), Some("lines=40"));
     }
 
     #[test]

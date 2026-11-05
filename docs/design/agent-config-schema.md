@@ -266,6 +266,13 @@ LogFileInputSection {
   - `mysql_slow`（W4）：MySQL slow log，`# Time:` 起块，下一条 `# Time:` 或空闲超时封口。
   - `postgres_csv`（W4）：PostgreSQL csvlog，**引号外**的换行才切记录（引号状态跨行，
     未封口块跨读批时从正文重算）。
+  - `container_cri`（issue #32）：kubelet `/var/log/containers/*.log`。CRI 的 `F` 只是
+    “这一行写完了”，不是记录边界；改按应用自己的头部切（行首时间戳 / glog / `RuntimeLogger`），
+    `at …` / `Caused by:` 等堆栈续行跟着整条走。
+
+  除 `none` 外都会折叠出**含换行**的正文，TCP 分帧会自动升到 `len`。
+  读法认不出头而被丢掉的行会进自观测（`telemetry headless lines dropped …`，`warn`、
+  按签名去重，量在 `magnitude=lines=N`）—— 持续出现就是“这个容器的格式不在起始行表里”。
 - `exclude_globs?`
   只对文件族目标有意义：从匹配集里剔掉的**绝对路径** glob（按展开后的完整路径匹配），为空则不输出。
   典型用法：`path = "/var/log/containers/*.log"` + `exclude_globs = ["/var/log/containers/*_kube-system_*.log"]`。

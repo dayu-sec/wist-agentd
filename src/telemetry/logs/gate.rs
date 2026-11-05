@@ -68,6 +68,8 @@ pub struct UplinkGate<'a> {
     agent_id: &'a str,
     observed_at: &'a str,
     input_id: &'a str,
+    /// 这台机器的名字：k8s 容器日志的节点身份（路径里没有，只有本机知道）。
+    node_name: &'a str,
     /// 这条输入的来源身份（面 + 目录单元）：随记录进帧。空 = 非派活来源。
     origin: InputOrigin,
     withheld: Withheld,
@@ -78,12 +80,14 @@ impl<'a> UplinkGate<'a> {
         agent_id: &'a str,
         observed_at: &'a str,
         input_id: &'a str,
+        node_name: &'a str,
         origin: InputOrigin,
     ) -> Self {
         Self {
             agent_id,
             observed_at,
             input_id,
+            node_name,
             origin,
             withheld: Withheld::default(),
         }
@@ -112,6 +116,7 @@ impl<'a> UplinkGate<'a> {
             self.agent_id,
             self.observed_at,
             self.input_id,
+            self.node_name,
             source_path,
             &self.origin,
             admitted,
@@ -155,6 +160,7 @@ mod tests {
             "agent-1",
             "2026-09-23T00:00:00Z",
             "input-a",
+            "node-1",
             InputOrigin::default(),
         )
     }

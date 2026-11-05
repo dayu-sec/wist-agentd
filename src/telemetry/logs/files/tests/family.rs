@@ -1040,3 +1040,141 @@ fn a_deselected_file_that_comes_back_is_read_from_head_like_a_new_file() {
         1
     );
 }
+
+/// issue #32 的验收：任意一条 `linux-container-stdout` 都能还原身份。
+#[cfg(unix)]
+#[test]
+fn kubelet_container_logs_carry_namespace_pod_container_and_node() {
+    const ID: &str = "ca018a1ea97ad12934aa236df87fc3c2816ea70c41a07134b1f3298c9d73e217";
+    const POD_DIR: &str = "default_doriscluster-helm-ms-2_98af449f-af1b-4a19-8f82-f5f82a198794";
+
+    let root = temp_dir("family-k8s-identity");
+    fs::create_dir_all(root.join("state")).expect("create state");
+    // 现场就是 kubelet 的两层目录：真实文件在 `pods/`，`containers/` 下只有软链接。
+    let real = root
+        .join("pods")
+        .join(POD_DIR)
+        .join("metaservice")
+        .join("0.log");
+    fs::create_dir_all(real.parent().unwrap()).expect("create pods dir");
+    fs::write(
+        &real,
+        "2026-11-05T15:12:56.967547835+08:00 stderr F RuntimeLogger 2026-11-05 15:12:56,967 INFO getTxnResponse: status {\n\
+         2026-11-05T15:12:56.967554075+08:00 stderr F   code: OK\n\
+         2026-11-05T15:12:56.967559535+08:00 stderr F }\n\
+         2026-11-05T15:12:57.000001000+08:00 stderr F RuntimeLogger 2026-11-05 15:12:57,000 ERROR next record\n",
+    )
+    .expect("write real log");
+    let links = root.join("containers");
+    fs::create_dir_all(&links).expect("create links dir");
+    std::os::unix::fs::symlink(
+        &real,
+        links.join(format!(
+            "doriscluster-helm-ms-2_default_metaservice-{ID}.log"
+        )),
+    )
+    .expect("symlink");
+
+    let output = output_path(&root);
+    let mut cfg = family_config(&root, &links.join("*.log"));
+    cfg.startup_position = StartupPosition::Head;
+    cfg.multiline_mode = MultilineMode::ContainerCri;
+    let mut processor = FileFamilyProcessor::new(cfg, FileRecordSink::new(output.clone()));
+    let outcome = processor.process_once().expect("process");
+    assert_eq!(outcome.read_lines, 4);
+    assert_eq!(outcome.headless_lines, 0, "都是有头的行");
+
+    // 第二条（ERROR）还悬着等下一个边界 / 到点封口；第一条已封口。
+    let records = read_output_records(&output);
+    assert_eq!(records.len(), 1, "三行 CRI 日志是同一条记录");
+    let record = &records[0];
+    assert_eq!(record.body.lines().count(), 3, "正文保留换行与 CRI 头");
+    let pod = record.pod_log.as_ref().expect("身份必须随记录走");
+    assert_eq!(pod.node_name, "node-test");
+    assert_eq!(pod.namespace, "default");
+    assert_eq!(pod.pod_name, "doriscluster-helm-ms-2");
+    assert_eq!(pod.pod_uid, "98af449f-af1b-4a19-8f82-f5f82a198794");
+    assert_eq!(pod.service, "metaservice");
+    assert_eq!(
+        pod.log_path,
+        real.display().to_string(),
+        "真实文件，不是软链接"
+    );
+    assert_eq!(pod.container.name, "metaservice");
+    assert_eq!(pod.container.id, ID);
+    assert_eq!(pod.container.image, "", "镜像不在路径里");
+    assert_eq!(record.container, None, "容器身份只留一份");
+}
+
+/// 每个文件自己一份未封口状态：同一个 pod 的两个容器各自缓冲，尾巴不会粘到一起。
+#[cfg(unix)]
+#[test]
+fn pending_records_never_mix_across_container_files() {
+    const ID_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const ID_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const POD_DIR: &str = "default_multictr_11111111-2222-3333-4444-555555555555";
+
+    let root = temp_dir("family-k8s-two-containers");
+    fs::create_dir_all(root.join("state")).expect("create state");
+    let pod_dir = root.join("pods").join(POD_DIR);
+    let links = root.join("containers");
+    fs::create_dir_all(&links).expect("create links");
+
+    let mut reals = Vec::new();
+    for (container, id, tag) in [("ctr-a", ID_A, "a"), ("ctr-b", ID_B, "b")] {
+        let dir = pod_dir.join(container);
+        fs::create_dir_all(&dir).expect("create container dir");
+        let real = dir.join("0.log");
+        fs::write(
+            &real,
+            format!(
+                "2026-11-05T15:12:56.967547835+08:00 stderr F 2026-11-05 15:12:56,967 [ERROR] {tag}-start\n\
+                 2026-11-05T15:12:56.967554075+08:00 stderr F   {tag}-continuation\n\
+                 2026-11-05T15:12:57.000001000+08:00 stderr F 2026-11-05 15:12:57,000 [WARN ] {tag}-next\n"
+            ),
+        )
+        .expect("write log");
+        std::os::unix::fs::symlink(
+            &real,
+            links.join(format!("multictr_default_{container}-{id}.log")),
+        )
+        .expect("symlink");
+        reals.push((container, real));
+    }
+
+    let output = output_path(&root);
+    let mut cfg = family_config(&root, &links.join("*.log"));
+    cfg.startup_position = StartupPosition::Head;
+    cfg.multiline_mode = MultilineMode::ContainerCri;
+    let mut processor = FileFamilyProcessor::new(cfg, FileRecordSink::new(output.clone()));
+    processor.process_once().expect("process");
+
+    let records = read_output_records(&output);
+    assert_eq!(records.len(), 2, "每个容器各封口一条");
+    for (container, real) in &reals {
+        let tag = container.trim_start_matches("ctr-");
+        let record = records
+            .iter()
+            .find(|record| {
+                record
+                    .pod_log
+                    .as_ref()
+                    .is_some_and(|pod| pod.service == *container)
+            })
+            .unwrap_or_else(|| panic!("missing record for {container}"));
+        let pod = record.pod_log.as_ref().expect("identity");
+        assert_eq!(pod.pod_name, "multictr");
+        assert_eq!(pod.log_path, real.display().to_string());
+        assert!(
+            record.body.contains(&format!("{tag}-continuation")),
+            "{}",
+            record.body
+        );
+        let other = if tag == "a" { "b" } else { "a" };
+        assert!(
+            !record.body.contains(&format!("{other}-")),
+            "两个文件的内容不得混在一起: {}",
+            record.body
+        );
+    }
+}

@@ -24,10 +24,10 @@ use crate::telemetry::warp_parse::{
 mod support;
 
 use support::{
-    build_file_input_config, build_record_sink, capacity_failure, invalid_output_failure,
-    missing_input_failure, noise_dropped_failure, processing_failure, replay_spool_only,
-    selection_filtered_failure, spool_paused_reason, truncated_failure, unsupported_target,
-    uplink_failure, withheld_failure,
+    build_file_input_config, build_record_sink, capacity_failure, headless_lines_failure,
+    invalid_output_failure, missing_input_failure, noise_dropped_failure, processing_failure,
+    replay_spool_only, selection_filtered_failure, spool_paused_reason, truncated_failure,
+    unsupported_target, uplink_failure, withheld_failure,
 };
 
 // 生效输出解析要给主循环用（它在短路前算），所以在同一层再导出一次；
@@ -66,6 +66,12 @@ pub(super) enum TelemetryFailureKind {
     /// 为什么走这条通道（并打 `info` 而不是 `error`）：它需要“同一问题只报一次”的去重，
     /// 否则每分钟一条的 `pam_unix(cron:session)` 会让自观测也变成噪音。
     NoiseDropped,
+    /// 多行读法下因「没有头」被丢掉的行：既可能是落在一条记录的中间（启动 / 轮转的正常代价），
+    /// 也可能是**这个格式根本不在起始行表里**（那就是这个容器一条数据都采不到）。
+    ///
+    /// 为什么它必须可见：以前这个数只活在界定器里，从不进自观测 ——
+    /// “这个容器的日志怎么一条都没有”只能靠猜。
+    HeadlessLinesDropped,
     /// 选源过滤器真的把现存文件剔掉了：**配置的正常结果，不是故障**。
     ///
     /// 与 `NoiseDropped` 同档（进 failure 通道只为蹭签名去重，打 `info`）。
@@ -565,6 +571,7 @@ struct InputTickReports {
     paused_spool_bytes: Option<u64>,
     withheld: Withheld,
     dropped_noise: usize,
+    headless_lines: usize,
     truncated_lines: usize,
     selection_filtered: usize,
     identity_unknown: usize,
@@ -581,6 +588,7 @@ impl InputTickReports {
         self.withheld.records += outcome.withheld.records;
         self.withheld.bytes += outcome.withheld.bytes;
         self.dropped_noise += outcome.dropped_noise;
+        self.headless_lines += outcome.headless_lines;
         self.truncated_lines += outcome.truncated_lines;
         self.selection_filtered += outcome.selection_filtered;
         self.identity_unknown += outcome.identity_unknown;
@@ -691,6 +699,11 @@ async fn process_telemetry_input<S: RecordSink>(
         tick.failures
             .push(noise_dropped_failure(input, reports.dropped_noise));
     }
+    // “没有头”被丢掉的行：多行读法下这就是“这个容器怎么一条都没有”的答案。
+    // 与噪音丢弃分开报：一个是配置主动剔除，一个是读法没认出这个格式。
+    if let Some(failure) = headless_lines_failure(input, reports.headless_lines) {
+        tick.failures.push(failure);
+    }
     // 超长行被截断：对纯文本是“丢一点尾巴”，对 **JSON Lines 就是产出一条永远解析不了的
     // 记录**。必须让它可见，否则“下游为什么有坏 JSON”查不到源头。
     if reports.truncated_lines > 0 {
@@ -757,6 +770,7 @@ mod tests {
             read_lines,
             withheld: Withheld::default(),
             dropped_noise: 0,
+            headless_lines: 0,
             selection_filtered: 0,
             identity_unknown: 0,
             rotated: false,
@@ -777,6 +791,7 @@ mod tests {
             bytes: 100,
         };
         first.dropped_noise = 1;
+        first.headless_lines = 4;
         first.truncated_lines = 3;
         first.spooled = 5;
         first.selection_filtered = 2;
@@ -796,6 +811,7 @@ mod tests {
             bytes: 50,
         };
         second.dropped_noise = 2;
+        second.headless_lines = 6;
         second.truncated_lines = 4;
         second.spooled = 6;
         second.selection_filtered = 1;
@@ -815,6 +831,7 @@ mod tests {
         assert_eq!(reports.withheld.records, 3);
         assert_eq!(reports.withheld.bytes, 150);
         assert_eq!(reports.dropped_noise, 3);
+        assert_eq!(reports.headless_lines, 10, "无头行跨批累加");
         assert_eq!(reports.truncated_lines, 7, "截断数是跨批累加的");
         assert_eq!(reports.spooled, 11);
         assert_eq!(reports.selection_filtered, 3);
@@ -974,6 +991,11 @@ mod tests {
         let output = output("tcp", "line");
         assert_eq!(
             required(&output, &[input("a", "none"), input("b", "indented")]),
+            Some("b".to_string())
+        );
+        // 新读法同样归并（CRI 容器日志的多行正文）：不升 `len` 就会把续行打散。
+        assert_eq!(
+            required(&output, &[input("a", "none"), input("b", "container_cri")]),
             Some("b".to_string())
         );
     }

@@ -3,6 +3,31 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.25.0-alpha] - 2026-11-05
+
+### 新增（k8s 容器日志：身份与多行合并，issue #32）
+
+- **`linux-container-stdout` 的帧带完整身份**：从日志路径还原 `namespace` / `pod_name` /
+  `pod_uid` / `service`（容器名）/ `log_path`（软链接解析后的真实文件）与 `node_name`（本机），
+  `container{name,image,id}` 与 Docker 侧同形（镜像需查运行时，查不到为空串）。
+  不再只能看到一串 64 位十六进制；旧 spool / 旧帧无这些键，`None` 或空串。
+- **新读法 `container_cri`**（契约侧词表同源）：按**应用自己的头部**（行首时间戳 /
+  glog / `RuntimeLogger`）切记录，`at …` / `Caused by:` 等堆栈续行跟着整条走，
+  空闲 1s 封口。CRI 的 `F` 只说“这一行写完了”，一次事务状态输出会被拆成
+  几十条 `F` 行 —— 按它切会把 ERROR 堆栈只剩第一行。
+  行首时间戳包括 `yyyy-mm-dd` 与 `yyyy/mm/dd`，所以 Go 标准库 / 无方括号的
+  log4j / Python 也能起头（否则这些容器的行会被当成“没有头”被全部丢掉）。
+- k8s + Docker（dockershim / cri-dockerd）节点上的 `{"log":…}` 仍是一行一条：
+  不认它会把整台机器的容器日志当成“没有头”全部丢掉。
+- **自观测新增 `HeadlessLinesDropped`**（`warn`，按签名去重）：多行读法下因“没有头”被丢掉的行数
+  现在会以 `telemetry headless lines dropped … lines=N` 上报。以前这个数只活在界定器里，
+  出事时（某容器的日志格式不在起始行表里）只能看到“没有数据”，看不到原因。
+
+### 升级
+
+- 依赖 `wist-contracts ≥ 0.10.1`（新信封字段 + 新读法）。旧网关不认识 `container_cri` 时
+  按能力清单裁掉该来源，需要网关同版或更新。
+
 ## [0.24.0-alpha] - 2026-11-04
 
 ### 新增
