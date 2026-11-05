@@ -574,6 +574,9 @@ cargo build --offline --release --target x86_64-unknown-linux-musl
 **注意**：本次探针里 `sqlx` 还没有被业务代码引用，链接期被 dead-code 掉了，所以 38 KB 的体积差**不代表**
 真实增量；P1 collector 落地后要复测一次。`aarch64-unknown-linux-musl` 本机无工具链，仍由 CI 覆盖。
 
+**复测（P1 落地后，`sqlx` 已被真实引用，2026-11-05）**：`static-pie` 构建通过，产物
+22,345,920 B（基线 21,363,832 B，**+0.94 MiB / +4.6%**，其中包含 `sqlx` 与 P1 自身代码）。
+
 ## 13. 一个域的最小落地清单（checklist）
 
 新增一个采集域需要动的地方（照此逐项打勾，缺一项就会在现场表现为「没数据」或「假数据」）：
