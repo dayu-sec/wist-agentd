@@ -41,7 +41,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Cargo build
-        # ring 等 C 依赖按 target 取 CC；Rust 侧链接器指向 musl-gcc 才能真静态。
+        # aws-lc-sys（rustls 的加密后端）等 C 依赖按 target 取 CC；Rust 侧链接器指向 musl-gcc
+        # 才能真静态。macOS 交叉构建见 docs/design/metrics-collection-runtime.md §12.3。
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
           AR_x86_64_unknown_linux_musl: ar

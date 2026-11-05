@@ -1,6 +1,6 @@
 # 采集运行时：统一调度与 async / blocking 双执行器
 
-> 状态：**设计（P0 已落地；P1 待做）**。决策记录见 §12（1/2/3/4/6/8 已定，5/7 待定）。
+> 状态：**设计（P0 已落地；P1 待做）**。决策记录见 §12（5 之外都已定）。
 > P0 的落地范围与验收见 §10。
 >
 > 范围：**指标采集**（主机 / 进程 / 容器 / Kafka / 关系型数据库 / Doris …）。
@@ -483,10 +483,12 @@ let outcomes = scheduler::collect_all(view);    // 主机三域 + Kafka（最近
 
 ### P2：Doris（复用 transport）
 
-- `doris_metrics`：`SHOW BACKENDS`（BE 存活/磁盘/tablet 数）、`SHOW PROC '/backends'`（compaction/rowset）、
-  FE 的 `information_schema`（表/分区基数）；
+- **P0 范围（已定，见 §12.1-7）**：`doris_metrics` 只做 BE 存活 / 容量 / tablet —— `SHOW BACKENDS`
+  与 `SHOW PROC '/backends'`，不依赖审计日志；
+- P1 扩展：`SHOW PROC '/backends'` 的 compaction/rowset、FE 的 `information_schema`（表/分区基数）、
+  查询延迟类（需与 Doris 版本对齐）；
 - 与 MySQL 共用连接池实现，但 SQL 与指标映射独立；
-- 验收：BE 宕机 → 该 BE 的序列消失（不补 0）；compaction 积压可观测。
+- 验收：BE 宕机 → 该 BE 的序列消失（不补 0）；容量满 / tablet 不均 可观测。
 
 ### P3（可选）：Kafka 协议 async 化
 
@@ -515,13 +517,13 @@ let outcomes = scheduler::collect_all(view);    // 主机三域 + Kafka（最近
 | 6 | **contracts 分批收口** | 每个域在其网关开始派发时才进 `wist-contracts`；P0/P1 都先在 agentd 内定义，四个仓不同时动 |
 | 8 | **主机指标也进 collector 线程** | P0 一并搬；上送侧要接受「快照最多比 tick 晚一拍」 |
 | 3 | **DB 驱动用 `sqlx`**（2026-11-05 探针通过） | `default-features = false` + `runtime-tokio` + `tls-rustls-aws-lc-rs` + `mysql`，不启 `macros`；musl 静态发布下**不引入新的 C 依赖**（复用已在树上的 `aws-lc-sys`）。证据见 §12.3 |
+| 7 | **Doris P0 指标子集 = BE 存活 / 容量 / tablet** | 只用 `SHOW BACKENDS` / `SHOW PROC '/backends'`（不依赖审计日志）；compaction/rowset、FE 的 `information_schema` 基数、查询延迟类推到 P1 |
 
 ### 12.2 待定（P1 启动前定）
 
 | # | 待定 | 默认倾向 / 需要的输入 |
 |---|---|---|
-| 5 | **凭据目录的 `<target-key>`** | 倾向复用自探身份的稳定摘要（如 `port-3306` / 集群 id），保证「可预测、可脚本投放」；多实例命名冲突时再调整 |
-| 7 | **Doris 的 P0 指标子集** | 倾向先做 BE 存活/容量/tablet（不依赖审计日志）；查询延迟类指标等与 Doris 版本对齐后再定 |
+| 5 | **凭据目录的 `<target-key>`** | 倾向 `port-<port>`（如 `/etc/wist-agentd/secrets/mysql/port-3306/password`），保证「可预测、可脚本投放」 |
 
 ### 12.3 探针记录：`sqlx` × `x86_64-unknown-linux-musl`（2026-11-05）
 
@@ -597,4 +599,5 @@ cargo build --offline --release --target x86_64-unknown-linux-musl
 - 完成标志：§10 P0 验收 5 条全过，Kafka 真集群 `kafka_live` 9/9；
 - 回填本文 §10 的验收，并在 `CHANGELOG.md` 记一行「采集运行时 P0（行为不变）」。
 
-**P0 之后**：先定 §12.2 的 5 / 7（驱动已在 §12.1-3 定为 `sqlx`），再开 P1（MySQL/TiDB）。
+**P0 之后**：只剩 §12.2 的 5（凭据目录 `<target-key>` 命名，驱动与 Doris 子集已定），
+定了就开 P1（MySQL/TiDB）。
