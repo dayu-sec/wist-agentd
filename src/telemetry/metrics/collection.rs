@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 
 use super::kafka::{GroupCache, KafkaProbeConfig};
+use super::mysql::MysqlProbeConfig;
 use super::runtime::{MetricsCollectionOutcome, MetricsCollectionTargetSample};
 use super::target_view::{MetricsTargetView, MetricsTargetViewEntry};
 
@@ -26,6 +27,8 @@ pub(super) enum Collector {
         config: Box<KafkaProbeConfig>,
         groups: GroupCache,
     },
+    /// MySQL / TiDB：作业内部自己开连接（不进调度器状态）。
+    Mysql(Box<MysqlProbeConfig>),
 }
 
 /// 一轮采集的产物。
@@ -40,6 +43,9 @@ pub(super) enum CollectorOutput {
         /// 消费组缓存跟着作业走，回来时交还调度器（下一轮继续用）。
         groups: GroupCache,
     },
+    Mysql {
+        result: ProbeResult,
+    },
 }
 
 impl Collector {
@@ -47,16 +53,22 @@ impl Collector {
         match self {
             Self::Host(_) => "host_metrics",
             Self::Kafka { .. } => super::kafka::COLLECTION_KIND,
+            Self::Mysql(_) => super::mysql::COLLECTION_KIND,
         }
     }
 
     /// 异步执行一轮。
     ///
-    /// 现在两个实现都是同步的，所以统一丢到 `spawn_blocking`：采集线程上的 async 执行器
-    /// 不能被 `/proc` 读取或 Kafka 握手的阻塞调用霸住。P1 的 async 采集器（MySQL / Doris）
-    /// 直接在 future 里跑，不经过这一步（设计文档 §6.4）。
+    /// 同步实现统一丢到 `spawn_blocking`：采集线程上的 async 执行器不能被 `/proc`
+    /// 读取或 Kafka 握手的阻塞调用霸住。**SQL 采集器不经过这一步** —— 它整个就是
+    /// async 的（`sqlx` + tokio），丢进阻塞池反而是倒退。
     pub(super) async fn collect(self) -> CollectorOutput {
         let domain = self.domain();
+        if let Self::Mysql(config) = self {
+            return CollectorOutput::Mysql {
+                result: super::mysql::probe_once(config.as_ref()).await,
+            };
+        }
         tokio::task::spawn_blocking(move || match self {
             Self::Host(view) => {
                 let used = view.targets.clone();
@@ -69,6 +81,8 @@ impl Collector {
                 let result = super::kafka::probe_once(config.as_ref(), &mut groups);
                 CollectorOutput::Kafka { result, groups }
             }
+            // 上面已经拦住；这里只是让匹配穷尽。
+            Self::Mysql(_) => CollectorOutput::panicked(domain),
         })
         .await
         .unwrap_or_else(|err| {
@@ -80,6 +94,15 @@ impl Collector {
 }
 
 impl CollectorOutput {
+    /// 产物的域（分派错误时的留痕用）。
+    pub(super) fn domain_name(&self) -> &'static str {
+        match self {
+            Self::Host { .. } => "host_metrics",
+            Self::Kafka { .. } => super::kafka::COLLECTION_KIND,
+            Self::Mysql { .. } => super::mysql::COLLECTION_KIND,
+        }
+    }
+
     fn panicked(domain: &str) -> Self {
         if domain == super::kafka::COLLECTION_KIND {
             Self::Kafka {
@@ -91,6 +114,16 @@ impl CollectorOutput {
                     warnings: Vec::new(),
                 },
                 groups: GroupCache::default(),
+            }
+        } else if domain == super::mysql::COLLECTION_KIND {
+            Self::Mysql {
+                result: ProbeResult {
+                    targets: Vec::new(),
+                    attempted: 1,
+                    failed: 1,
+                    last_error: Some("采集任务 panic（已丢弃这一轮）".to_string()),
+                    warnings: Vec::new(),
+                },
             }
         } else {
             Self::Host {
@@ -163,7 +196,8 @@ pub(super) fn host_outcomes(view: &MetricsTargetView) -> Vec<MetricsCollectionOu
 /// - 同一台机器可能跑多个 broker（每个进程一条候选），而每轮 Metadata 都会返回
 ///   **整个集群**的 broker 列表 —— 必须按 `resource_ref` 去重，否则同一个 broker
 ///   会产出重复序列。
-pub(super) fn kafka_outcome<'a>(
+pub(super) fn probe_outcome<'a>(
+    collection_kind: &str,
     configured: bool,
     results: impl Iterator<Item = &'a ProbeResult>,
 ) -> Option<MetricsCollectionOutcome> {
@@ -191,7 +225,7 @@ pub(super) fn kafka_outcome<'a>(
 
     if !any_result {
         return Some(MetricsCollectionOutcome {
-            collection_kind: super::kafka::COLLECTION_KIND.to_string(),
+            collection_kind: collection_kind.to_string(),
             status: "pending".to_string(),
             attempted_targets: 0,
             succeeded_targets: 0,
@@ -209,7 +243,7 @@ pub(super) fn kafka_outcome<'a>(
         .filter(|target| target.status != "failed")
         .count();
     Some(MetricsCollectionOutcome {
-        collection_kind: super::kafka::COLLECTION_KIND.to_string(),
+        collection_kind: collection_kind.to_string(),
         status: if failed == 0 && succeeded > 0 {
             "succeeded".to_string()
         } else if succeeded == 0 {
@@ -364,13 +398,18 @@ mod tests {
     }
 
     #[test]
-    fn kafka_outcome_is_absent_without_a_grant() {
-        assert!(kafka_outcome(false, std::iter::empty()).is_none());
+    fn a_probe_outcome_is_absent_without_a_grant() {
+        assert!(
+            probe_outcome("kafka_broker_metrics", false, std::iter::empty()).is_none(),
+            "没授权就不能凭空出一个域"
+        );
     }
 
     #[test]
-    fn kafka_outcome_is_pending_before_the_first_round() {
-        let outcome = kafka_outcome(true, std::iter::empty()).expect("授权了就有域");
+    fn a_probe_outcome_is_pending_before_the_first_round() {
+        let outcome =
+            probe_outcome("mysql_metrics", true, std::iter::empty()).expect("授权了就有域");
+        assert_eq!(outcome.collection_kind, "mysql_metrics");
         assert_eq!(outcome.status, "pending");
         assert_eq!(outcome.attempted_targets, 0);
         assert!(outcome.sample_targets.is_empty());

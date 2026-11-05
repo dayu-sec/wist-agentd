@@ -29,6 +29,12 @@ pub struct AgentConfig {
     /// 设计见 `wist-design/doc/design/telemetry/kafka-broker-metrics-spec.md`。
     #[serde(default)]
     pub kafka: KafkaSection,
+    /// MySQL / TiDB 应用指标（`[mysql]`）：SQL 直采，只读。
+    ///
+    /// 这里**只有调优旋钮**：采集开关由采集面授权决定，端口由自探决定，
+    /// 凭据在 `/etc/wist-agentd/secrets/mysql/port-<port>/`。
+    #[serde(default)]
+    pub mysql: MysqlSection,
     /// 本进程**运行日志**的 `[log]` 段（与 `telemetry.logs` 的“被采集日志”不同）。
     ///
     /// 直接内嵌共享 crate 的单类型 [`wist_log::LogSection`]（同名同义，单一事实来源），
@@ -54,6 +60,7 @@ impl AgentConfig {
             discovery: DiscoverySection::default(),
             metrics: MetricsSection::default(),
             kafka: KafkaSection::default(),
+            mysql: MysqlSection::default(),
             log: wist_log::LogSection::default(),
         }
     }
@@ -175,6 +182,27 @@ impl KafkaSection {
             ignored.push("tls_ca_file");
         }
         ignored
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Discovery", module = "Discovery.Config")]
+#[serde(deny_unknown_fields)]
+pub struct MysqlSection {
+    /// 采集周期（毫秒）。默认 30s：三条 `SHOW` 很便宜，但没必要更快。
+    #[serde(default = "default_mysql_interval_ms")]
+    pub interval_ms: u64,
+    /// 单轮总超时（毫秒）。默认 5s：连接 + 三条 `SHOW` 超这个数就是库忙或网络不通。
+    #[serde(default = "default_mysql_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for MysqlSection {
+    fn default() -> Self {
+        Self {
+            interval_ms: default_mysql_interval_ms(),
+            timeout_ms: default_mysql_timeout_ms(),
+        }
     }
 }
 
@@ -695,6 +723,14 @@ fn default_kafka_interval_ms() -> u64 {
 }
 
 fn default_kafka_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_mysql_interval_ms() -> u64 {
+    30_000
+}
+
+fn default_mysql_timeout_ms() -> u64 {
     5_000
 }
 

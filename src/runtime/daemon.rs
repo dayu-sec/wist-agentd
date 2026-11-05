@@ -91,6 +91,11 @@ const TICK_INTERVAL: Duration = Duration::from_secs(3);
 /// 这里只是“快照一直不变”时的保底刷新。
 const KAFKA_SCAN_INTERVAL: Duration = Duration::from_secs(300);
 
+/// SQL 实例自探的节流：与 Kafka 同一个量级。
+///
+/// 实例上线的节奏是分钟级（重启、扩缩容），扫得太频只会白白吃 `/proc` 与握手。
+const MYSQL_SCAN_INTERVAL: Duration = Duration::from_secs(300);
+
 /// 凭据续期的检查周期：没必要每 3s 都查，1 小时足够，而续期窗是 30 天。
 const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
@@ -1875,6 +1880,9 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     let mut last_kafka_scan: Option<Instant> = None;
     let mut last_kafka_revision: Option<i64> = None;
     let mut kafka_authorized = false;
+    let mut last_sql_scan: Option<Instant> = None;
+    let mut last_sql_revision: Option<i64> = None;
+    let mut sql_authorized = false;
     // 数据面上送启用同样跨 tick 活着：上一次已应用的 grant 就在里面（拉取失败保留它）。
     let mut uplink_runtime = AppliedUplink::default();
     let mut last_uplink_fetch: Option<Instant> = None;
@@ -2245,6 +2253,39 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                     kafka_authorized = false;
                     last_kafka_scan = None;
                     last_kafka_revision = None;
+                }
+            }
+        }
+        // MySQL / TiDB：与 Kafka 同一套——授权来自采集面（`MysqlInstance/auto`），
+        // 端口与凭据来自本机自探。扫描同样不在这里做。
+        match work_runtime.mysql_grant() {
+            Some(grant) => {
+                sql_authorized = true;
+                let snapshot = discovery_runtime.latest_snapshot();
+                let snapshot_key = snapshot.map(|snapshot| snapshot.revision);
+                let changed = snapshot_key != last_sql_revision;
+                let due = last_sql_scan.is_none_or(|at| at.elapsed() >= MYSQL_SCAN_INTERVAL);
+                if changed || due {
+                    let settings = crate::telemetry::metrics::mysql::MysqlTargetSettings {
+                        timeout: Duration::from_millis(loop_ctx.config.mysql.timeout_ms),
+                        interval: grant
+                            .interval
+                            .unwrap_or(Duration::from_millis(loop_ctx.config.mysql.interval_ms)),
+                    };
+                    crate::telemetry::metrics::scheduler::request_sql_scan(
+                        snapshot.cloned(),
+                        settings,
+                    );
+                    last_sql_scan = Some(Instant::now());
+                    last_sql_revision = snapshot_key;
+                }
+            }
+            None => {
+                if sql_authorized {
+                    crate::telemetry::metrics::scheduler::revoke_sql();
+                    sql_authorized = false;
+                    last_sql_scan = None;
+                    last_sql_revision = None;
                 }
             }
         }

@@ -26,6 +26,7 @@ use tokio::task::JoinSet;
 
 use super::collection::{Collector, CollectorOutput, ProbeResult, WarningGate};
 use super::kafka::{self, GroupCache, KafkaProbeConfig, KafkaTargetSettings};
+use super::mysql::MysqlProbeConfig;
 use super::runtime::MetricsCollectionOutcome;
 use super::target_view::{MetricsTargetView, MetricsTargetViewEntry};
 
@@ -37,6 +38,10 @@ const HOST_ROUND_BUDGET: Duration = Duration::from_secs(30);
 
 /// Kafka 一轮的看门狗阈值：比内部预算（容量 10s + 消费组 20s）宽裕一档。
 const KAFKA_ROUND_BUDGET: Duration = Duration::from_secs(60);
+
+/// SQL 一轮的看门狗阈值：内部已经按 `timeout`（默认 5s）包了三层超时，
+/// 到 30s 说明连接卡在 TCP 层（ASYNC 采集器本该可取消，这里先报出来）。
+const SQL_ROUND_BUDGET: Duration = Duration::from_secs(30);
 
 /// 同时在跑的采集作业上限（一个目标一轮算一个）。
 ///
@@ -77,6 +82,34 @@ struct KafkaState {
     stalled_logged: bool,
 }
 
+/// 一个待采的 SQL 实例。
+///
+/// 与 Kafka 的区别只有一处：作业里不再带缓存（每轮独立），因为 `sqlx` 的连接
+/// 不进调度器状态——连接在作业内部开、作业内部关，卡住时不会把状态带脏。
+struct SqlState {
+    config: MysqlProbeConfig,
+    next_at: Instant,
+    gate: WarningGate,
+    latest: Option<ProbeResult>,
+    inflight: bool,
+    started_at: Option<Instant>,
+    stalled_logged: bool,
+}
+
+impl SqlState {
+    fn new(config: MysqlProbeConfig) -> Self {
+        Self {
+            next_at: Instant::now(),
+            config,
+            gate: WarningGate::default(),
+            latest: None,
+            inflight: false,
+            started_at: None,
+            stalled_logged: false,
+        }
+    }
+}
+
 /// 一次待执行的自探扫描。
 ///
 /// 自探要读 `/proc` 并做有界 TCP 探测（每端点 ≤300ms），不能在 3s 主循环里跑：
@@ -85,7 +118,22 @@ struct PendingScan {
     /// 投递时的代号；期间撤过授权 / 又投递了新扫描就对不上，结果直接丢弃。
     epoch: u64,
     snapshot: Option<wist_contracts::discovery::DiscoverySnapshot>,
-    settings: KafkaTargetSettings,
+    kind: ScanKind,
+}
+
+/// 这次扫描探的是哪个域。
+///
+/// 两个域共用一套扫描机制（同一个 epoch、同一个在飞标记）：它们都只是「读 `/proc` +
+/// 有界握手」，一套就够，多一套只会多一处代号不同步的机会。
+enum ScanKind {
+    Kafka(KafkaTargetSettings),
+    Mysql(super::mysql::MysqlTargetSettings),
+}
+
+/// 扫描作业的产物。
+enum ScanProduct {
+    Kafka(Vec<KafkaProbeConfig>),
+    Mysql(Vec<MysqlProbeConfig>),
 }
 
 /// 调度器状态。一个进程一份（见 [`scheduler`]）；测试可以自己造一份。
@@ -94,12 +142,19 @@ struct Scheduler {
     host: HostState,
     /// key = bootstrap 列表的稳定串（目前就是自探出来的那一个端点地址）。
     kafka: BTreeMap<String, KafkaState>,
+    /// key = `mysql:<host>:<port>`（与指标 `instance` 同形）。
+    sql: BTreeMap<String, SqlState>,
     pending_scan: Option<PendingScan>,
     scan_inflight: bool,
     /// 自探代次：每次投递 / 撤授权 +1，用来丢弃晚到的扫描结果。
+    ///
+    /// Kafka 与 SQL 各自一份：撤 Kafka 授权不该连带作废一个刚投递的 SQL 扫描。
     scan_epoch: u64,
+    sql_scan_epoch: u64,
     /// 已授权但本机没有可达端点：只打一条，端点回来时复位。
     no_endpoint_logged: bool,
+    /// SQL 侧的同一条口径。
+    sql_no_endpoint_logged: bool,
     /// 上一次对账后生效的集群集合（变化才打日志）。
     log_signature: String,
     /// 采集线程是否已经拉起（由**调用方**维护，线程自己不碰）。
@@ -125,21 +180,84 @@ impl Scheduler {
     fn request_scan(
         &mut self,
         snapshot: Option<wist_contracts::discovery::DiscoverySnapshot>,
-        settings: KafkaTargetSettings,
+        kind: ScanKind,
     ) -> bool {
-        self.scan_epoch = self.scan_epoch.wrapping_add(1);
+        let epoch = match &kind {
+            ScanKind::Kafka(_) => {
+                self.scan_epoch = self.scan_epoch.wrapping_add(1);
+                self.scan_epoch
+            }
+            ScanKind::Mysql(_) => {
+                self.sql_scan_epoch = self.sql_scan_epoch.wrapping_add(1);
+                self.sql_scan_epoch
+            }
+        };
         self.pending_scan = Some(PendingScan {
-            epoch: self.scan_epoch,
+            epoch,
             snapshot,
-            settings,
+            kind,
         });
         self.start_worker()
+    }
+
+    /// 投递 SQL 目标集合（自探 + 授权对账后才调）。幂等、非阻塞。
+    ///
+    /// 与 Kafka 不同，这里**不保留**已撤销实例的任何读数：连接断了就是断了，
+    /// 拿旧值接着上报会让「库已经停了」看不出来。
+    fn apply_sql_targets(&mut self, targets: Vec<MysqlProbeConfig>) -> bool {
+        let before: Vec<String> = self.sql.keys().cloned().collect();
+        let mut next = BTreeMap::new();
+        for config in targets {
+            let key = config.instance();
+            match self.sql.remove(&key) {
+                // 保留周期 / 闸门 / 在飞状态：目标集合刷新不等于重启采集。
+                Some(existing) => {
+                    next.insert(key, SqlState { config, ..existing });
+                }
+                None => {
+                    log::info!(
+                        "event=MysqlTargetAdded target=\"{}\" interval_ms={}",
+                        key,
+                        config.interval.as_millis()
+                    );
+                    next.insert(key, SqlState::new(config));
+                }
+            }
+        }
+        for removed in &before {
+            if !next.contains_key(removed) {
+                log::info!("event=MysqlTargetRemoved target=\"{removed}\"");
+            }
+        }
+        self.sql = next;
+        self.start_worker()
+    }
+
+    /// 撤授权：停采 SQL（下个 tick 内序列消失），并作废在途的 SQL 扫描。
+    fn revoke_sql(&mut self) {
+        self.sql_scan_epoch = self.sql_scan_epoch.wrapping_add(1);
+        if matches!(
+            self.pending_scan.as_ref().map(|scan| &scan.kind),
+            Some(ScanKind::Mysql(_))
+        ) {
+            self.pending_scan = None;
+        }
+        self.sql_no_endpoint_logged = false;
+        if !self.sql.is_empty() {
+            log::info!("event=MysqlTargetRemoved targets={}", self.sql.len());
+        }
+        self.sql.clear();
     }
 
     /// 撤授权：停采、作废待执行 / 在途的扫描。
     fn revoke(&mut self) {
         self.scan_epoch = self.scan_epoch.wrapping_add(1);
-        self.pending_scan = None;
+        if matches!(
+            self.pending_scan.as_ref().map(|scan| &scan.kind),
+            Some(ScanKind::Kafka(_))
+        ) {
+            self.pending_scan = None;
+        }
         self.no_endpoint_logged = false;
         self.reconcile(Vec::new());
     }
@@ -176,6 +294,22 @@ impl Scheduler {
 
     fn scan_can_start(&self) -> bool {
         !self.scan_inflight && self.pending_scan.is_some()
+    }
+
+    /// 取一个到期的 SQL 实例（排好下一轮时间、置在飞标记）。
+    fn begin_next_due_sql(&mut self) -> Option<(String, Collector)> {
+        let now = Instant::now();
+        let key = self
+            .sql
+            .iter()
+            .find(|(_, state)| !state.inflight && state.next_at <= now)
+            .map(|(key, _)| key.clone())?;
+        let state = self.sql.get_mut(&key)?;
+        state.next_at = now + state.config.interval;
+        state.inflight = true;
+        state.started_at = Some(now);
+        state.stalled_logged = false;
+        Some((key, Collector::Mysql(Box::new(state.config.clone()))))
     }
 
     fn begin_scan(&mut self) -> Option<PendingScan> {
@@ -252,6 +386,22 @@ impl Scheduler {
         state.latest = Some(result);
     }
 
+    fn finish_sql(&mut self, key: &str, result: ProbeResult) {
+        let Some(state) = self.sql.get_mut(key) else {
+            // 实例在采集期间被撤销：结果直接丢弃。
+            return;
+        };
+        state.inflight = false;
+        state.started_at = None;
+        state.stalled_logged = false;
+        if state.gate.changed(&result.warnings) {
+            for warning in &result.warnings {
+                log::warn!("event=MysqlProbeWarning target=\"{key}\" detail=\"{warning}\"");
+            }
+        }
+        state.latest = Some(result);
+    }
+
     /// 作业异常（JoinError）：清掉所有在飞标记，下一轮重新排。
     ///
     /// 宁可多采一轮，也不要让一个目标因为一次意外永远不再被调度。
@@ -260,6 +410,10 @@ impl Scheduler {
         self.host.started_at = None;
         self.scan_inflight = false;
         for state in self.kafka.values_mut() {
+            state.inflight = false;
+            state.started_at = None;
+        }
+        for state in self.sql.values_mut() {
             state.inflight = false;
             state.started_at = None;
         }
@@ -293,6 +447,21 @@ impl Scheduler {
                     "event=CollectorTargetStalled domain={} target=\"{key}\" budget_ms={}",
                     kafka::COLLECTION_KIND,
                     KAFKA_ROUND_BUDGET.as_millis()
+                );
+            }
+        }
+        for (key, state) in self.sql.iter_mut() {
+            if state.inflight
+                && !state.stalled_logged
+                && state
+                    .started_at
+                    .is_some_and(|at| now.duration_since(at) > SQL_ROUND_BUDGET)
+            {
+                state.stalled_logged = true;
+                log::warn!(
+                    "event=CollectorTargetStalled domain={} target=\"{key}\" budget_ms={}",
+                    super::mysql::COLLECTION_KIND,
+                    SQL_ROUND_BUDGET.as_millis()
                 );
             }
         }
@@ -376,31 +545,55 @@ impl Scheduler {
     ///
     /// 代号对不上（期间撤过授权 / 又投递了新扫描）就 **丢弃**：否则撤授权后晚一步
     /// 回来的扫描会把集群加回去，而主循环不会再调一次撤授权（它只在状态切换时调）。
-    fn finish_scan(&mut self, epoch: u64, targets: Option<Vec<KafkaProbeConfig>>) {
+    fn finish_scan(&mut self, epoch: u64, product: Option<ScanProduct>) {
         self.scan_inflight = false;
-        let Some(targets) = targets else {
+        let Some(product) = product else {
             // 扫描作业异常（panic / JoinError）：留一行，别把「没扫到」当成「没有端点」。
-            log::warn!("event=KafkaDiscoveryScanFailed detail=\"扫描作业异常，本轮不更新端点\"");
+            log::warn!("event=DiscoveryScanFailed detail=\"扫描作业异常，本轮不更新端点\"");
             return;
         };
-        if epoch != self.scan_epoch {
+        // 代号按域比对：Kafka 的扫描结果不能拿 SQL 的代次来判有效。
+        let current = match &product {
+            ScanProduct::Kafka(_) => self.scan_epoch,
+            ScanProduct::Mysql(_) => self.sql_scan_epoch,
+        };
+        if epoch != current {
             return;
         }
-        if targets.is_empty() {
-            if !self.no_endpoint_logged {
-                log::info!(
-                    "event=KafkaProbeNoEndpoint detail=\"已授权，但本机没有可达的 Kafka 端点（非 broker 节点，或端点不可达）\""
-                );
-                self.no_endpoint_logged = true;
+        match product {
+            ScanProduct::Kafka(targets) => {
+                if targets.is_empty() {
+                    if !self.no_endpoint_logged {
+                        log::info!(
+                            "event=KafkaProbeNoEndpoint detail=\"已授权，但本机没有可达的 Kafka 端点（非 broker 节点，或端点不可达）\""
+                        );
+                        self.no_endpoint_logged = true;
+                    }
+                } else {
+                    self.no_endpoint_logged = false;
+                }
+                self.reconcile(targets);
             }
-        } else {
-            self.no_endpoint_logged = false;
+            ScanProduct::Mysql(targets) => {
+                if targets.is_empty() {
+                    if !self.sql_no_endpoint_logged {
+                        log::info!(
+                            "event=MysqlProbeNoEndpoint detail=\"已授权，但本机没有通过握手的 MySQL 实例\""
+                        );
+                        self.sql_no_endpoint_logged = true;
+                    }
+                } else {
+                    self.sql_no_endpoint_logged = false;
+                    log::debug!("event=MysqlDiscoveryResolved targets={}", targets.len());
+                }
+                self.apply_sql_targets(targets);
+            }
         }
-        self.reconcile(targets);
     }
 
     fn kafka_outcome(&self) -> Option<MetricsCollectionOutcome> {
-        super::collection::kafka_outcome(
+        super::collection::probe_outcome(
+            kafka::COLLECTION_KIND,
             !self.kafka.is_empty(),
             self.kafka
                 .values()
@@ -408,12 +601,23 @@ impl Scheduler {
         )
     }
 
-    /// 快照读取：主机三域 + Kafka。没有授权时 Kafka 不出现。
+    fn sql_outcome(&self) -> Option<MetricsCollectionOutcome> {
+        super::collection::probe_outcome(
+            super::mysql::COLLECTION_KIND,
+            !self.sql.is_empty(),
+            self.sql.values().filter_map(|state| state.latest.as_ref()),
+        )
+    }
+
+    /// 快照读取：主机三域 + Kafka + SQL。没有授权的域不出现。
     fn collect_all_for(&mut self, view: &MetricsTargetView) -> Vec<MetricsCollectionOutcome> {
         self.ensure_host_for(view);
         let mut outcomes = self.host.outcomes.clone();
         if let Some(kafka) = self.kafka_outcome() {
             outcomes.push(kafka);
+        }
+        if let Some(sql) = self.sql_outcome() {
+            outcomes.push(sql);
         }
         outcomes
     }
@@ -428,38 +632,47 @@ fn probe_key(config: &KafkaProbeConfig) -> String {
 enum JobOutcome {
     Scan {
         epoch: u64,
-        targets: Option<Vec<KafkaProbeConfig>>,
+        product: Option<ScanProduct>,
     },
-    /// `key` 为 `None` 表示主机轮次。
+    /// `key` 为目标身份。
     Collected {
-        key: Option<String>,
+        key: JobKey,
         output: CollectorOutput,
     },
+}
+
+/// 作业的目标身份：主机轮次 / 某个 Kafka 集群 / 某个 SQL 实例。
+enum JobKey {
+    Host,
+    Kafka(String),
+    Sql(String),
 }
 
 impl Scheduler {
     /// 把一个完成的作业落到状态里。
     fn apply(&mut self, outcome: JobOutcome) {
         match outcome {
-            JobOutcome::Scan { epoch, targets } => self.finish_scan(epoch, targets),
-            JobOutcome::Collected { key: None, output } => match output {
-                CollectorOutput::Host { used, outcomes } => self.finish_host_round(used, outcomes),
-                CollectorOutput::Kafka { .. } => {
-                    log::error!("event=CollectorOutputMismatch domain=host_metrics");
-                    self.clear_inflight();
+            JobOutcome::Scan { epoch, product } => self.finish_scan(epoch, product),
+            JobOutcome::Collected { key, output } => match (key, output) {
+                (JobKey::Host, CollectorOutput::Host { used, outcomes }) => {
+                    self.finish_host_round(used, outcomes)
                 }
-            },
-            JobOutcome::Collected {
-                key: Some(key),
-                output,
-            } => match output {
-                CollectorOutput::Kafka { result, groups } => {
+                (JobKey::Kafka(key), CollectorOutput::Kafka { result, groups }) => {
                     self.finish_kafka(&key, result, groups)
                 }
-                CollectorOutput::Host { .. } => {
+                (JobKey::Sql(key), CollectorOutput::Mysql { result }) => {
+                    self.finish_sql(&key, result)
+                }
+                (key, output) => {
+                    // 分派错了（只可能是改代码时接错分支）：留痕并清标记，别把目标卡死。
+                    let domain = output.domain_name();
+                    let expected = match key {
+                        JobKey::Host => "host_metrics",
+                        JobKey::Kafka(_) => kafka::COLLECTION_KIND,
+                        JobKey::Sql(_) => super::mysql::COLLECTION_KIND,
+                    };
                     log::error!(
-                        "event=CollectorOutputMismatch domain={}",
-                        kafka::COLLECTION_KIND
+                        "event=CollectorOutputMismatch expected={expected} actual={domain}"
                     );
                     self.clear_inflight();
                 }
@@ -495,7 +708,18 @@ pub fn request_scan(
     snapshot: Option<wist_contracts::discovery::DiscoverySnapshot>,
     settings: KafkaTargetSettings,
 ) {
-    let start = scheduler().request_scan(snapshot, settings);
+    let start = scheduler().request_scan(snapshot, ScanKind::Kafka(settings));
+    if start {
+        spawn_worker();
+    }
+}
+
+/// 投递一次 SQL 自探扫描（**不等结果**）。
+pub fn request_sql_scan(
+    snapshot: Option<wist_contracts::discovery::DiscoverySnapshot>,
+    settings: super::mysql::MysqlTargetSettings,
+) {
+    let start = scheduler().request_scan(snapshot, ScanKind::Mysql(settings));
     if start {
         spawn_worker();
     }
@@ -504,6 +728,11 @@ pub fn request_scan(
 /// 撤授权：停采（下个 tick 内序列消失），并作废待执行 / 在途的自探扫描。
 pub fn revoke() {
     scheduler().revoke();
+}
+
+/// 撤 SQL 授权：停采（下个 tick 内序列消失），并作废在途的 SQL 扫描。
+pub fn revoke_sql() {
+    scheduler().revoke_sql();
 }
 
 /// 最近一次完成的采集结果：主机三域 + Kafka（没有授权就没有 Kafka）。
@@ -610,12 +839,18 @@ fn start_due(jobs: &mut JoinSet<JobOutcome>, permits: &Arc<Semaphore>) -> bool {
         let epoch = scan.epoch;
         jobs.spawn(async move {
             let _permit = permit;
-            let targets = tokio::task::spawn_blocking(move || {
-                kafka::targets_from_discovery(scan.snapshot.as_ref(), &scan.settings)
+            let product = tokio::task::spawn_blocking(move || match &scan.kind {
+                ScanKind::Kafka(settings) => ScanProduct::Kafka(kafka::targets_from_discovery(
+                    scan.snapshot.as_ref(),
+                    settings,
+                )),
+                ScanKind::Mysql(settings) => ScanProduct::Mysql(
+                    super::mysql::targets_from_discovery(scan.snapshot.as_ref(), settings),
+                ),
             })
             .await
             .ok();
-            JobOutcome::Scan { epoch, targets }
+            JobOutcome::Scan { epoch, product }
         });
         started = true;
     }
@@ -628,7 +863,7 @@ fn start_due(jobs: &mut JoinSet<JobOutcome>, permits: &Arc<Semaphore>) -> bool {
         jobs.spawn(async move {
             let _permit = permit;
             JobOutcome::Collected {
-                key: None,
+                key: JobKey::Host,
                 output: collector.collect().await,
             }
         });
@@ -646,7 +881,25 @@ fn start_due(jobs: &mut JoinSet<JobOutcome>, permits: &Arc<Semaphore>) -> bool {
         jobs.spawn(async move {
             let _permit = permit;
             JobOutcome::Collected {
-                key: Some(key),
+                key: JobKey::Kafka(key),
+                output: collector.collect().await,
+            }
+        });
+        started = true;
+    }
+
+    // SQL：同 Kafka，但作业本身是 async（不占阻塞池）。
+    loop {
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            break;
+        };
+        let Some((key, collector)) = scheduler().begin_next_due_sql() else {
+            break;
+        };
+        jobs.spawn(async move {
+            let _permit = permit;
+            JobOutcome::Collected {
+                key: JobKey::Sql(key),
                 output: collector.collect().await,
             }
         });
@@ -792,11 +1045,11 @@ mod tests {
     fn a_scan_is_queued_and_starts_the_worker_even_without_clusters() {
         let mut runtime = Scheduler::default();
         assert!(
-            runtime.request_scan(None, target_settings()),
+            runtime.request_scan(None, ScanKind::Kafka(target_settings())),
             "没有集群也要拉采集线程"
         );
         assert!(
-            !runtime.request_scan(None, target_settings()),
+            !runtime.request_scan(None, ScanKind::Kafka(target_settings())),
             "线程不重复起"
         );
 
@@ -810,12 +1063,15 @@ mod tests {
         let mut runtime = Scheduler::default();
         let epoch = runtime.scan_epoch;
 
-        runtime.finish_scan(epoch, Some(Vec::new()));
+        runtime.finish_scan(epoch, Some(ScanProduct::Kafka(Vec::new())));
         assert!(runtime.no_endpoint_logged);
-        runtime.finish_scan(epoch, Some(Vec::new()));
+        runtime.finish_scan(epoch, Some(ScanProduct::Kafka(Vec::new())));
         assert!(runtime.no_endpoint_logged, "同一状态不重复说");
 
-        runtime.finish_scan(epoch, Some(vec![cluster_config("a:9092")]));
+        runtime.finish_scan(
+            epoch,
+            Some(ScanProduct::Kafka(vec![cluster_config("a:9092")])),
+        );
         assert!(!runtime.no_endpoint_logged, "端点回来要复位");
         assert_eq!(runtime.kafka.len(), 1);
     }
@@ -823,11 +1079,14 @@ mod tests {
     #[test]
     fn a_scan_result_that_arrives_after_revocation_is_dropped() {
         let mut runtime = Scheduler::default();
-        runtime.request_scan(None, target_settings());
+        runtime.request_scan(None, ScanKind::Kafka(target_settings()));
         let scan = runtime.begin_scan().expect("scan");
 
         runtime.revoke();
-        runtime.finish_scan(scan.epoch, Some(vec![cluster_config("a:9092")]));
+        runtime.finish_scan(
+            scan.epoch,
+            Some(ScanProduct::Kafka(vec![cluster_config("a:9092")])),
+        );
 
         assert!(
             runtime.kafka.is_empty(),
@@ -839,16 +1098,22 @@ mod tests {
     #[test]
     fn only_the_latest_scan_result_is_applied() {
         let mut runtime = Scheduler::default();
-        runtime.request_scan(None, target_settings());
+        runtime.request_scan(None, ScanKind::Kafka(target_settings()));
         let first = runtime.begin_scan().expect("first");
-        runtime.request_scan(None, target_settings());
+        runtime.request_scan(None, ScanKind::Kafka(target_settings()));
         let second = runtime.begin_scan().expect("second");
         assert!(second.epoch > first.epoch);
 
-        runtime.finish_scan(first.epoch, Some(vec![cluster_config("a:9092")]));
+        runtime.finish_scan(
+            first.epoch,
+            Some(ScanProduct::Kafka(vec![cluster_config("a:9092")])),
+        );
         assert!(runtime.kafka.is_empty(), "旧扫描要丢弃");
 
-        runtime.finish_scan(second.epoch, Some(vec![cluster_config("b:9092")]));
+        runtime.finish_scan(
+            second.epoch,
+            Some(ScanProduct::Kafka(vec![cluster_config("b:9092")])),
+        );
         assert_eq!(runtime.kafka.len(), 1, "最新扫描生效");
         assert!(runtime.kafka.contains_key("b:9092"));
     }
@@ -880,6 +1145,109 @@ mod tests {
         assert!(
             runtime.begin_next_due_kafka().is_none(),
             "在飞时不能给同一个目标再排一轮"
+        );
+    }
+
+    fn sql_config(port: u16) -> super::super::mysql::MysqlProbeConfig {
+        super::super::mysql::MysqlProbeConfig::new("127.0.0.1", port, 1_000, 30_000)
+    }
+
+    #[test]
+    fn a_sql_instance_is_scheduled_and_reported() {
+        let mut runtime = Scheduler::default();
+        runtime.apply_sql_targets(vec![sql_config(3306)]);
+
+        let (key, _collector) = runtime.begin_next_due_sql().expect("到期");
+        assert_eq!(key, "mysql:127.0.0.1:3306");
+        runtime.finish_sql(&key, probe_result(1, 0, "mysql:127.0.0.1:3306"));
+
+        let outcome = runtime.sql_outcome().expect("域存在");
+        assert_eq!(
+            outcome.collection_kind,
+            super::super::mysql::COLLECTION_KIND
+        );
+        assert_eq!(outcome.status, "succeeded");
+        assert_eq!(outcome.succeeded_targets, 1);
+    }
+
+    #[test]
+    fn revoking_sql_drops_the_domain_instead_of_freezing_it() {
+        let mut runtime = Scheduler::default();
+        runtime.apply_sql_targets(vec![sql_config(3306)]);
+        runtime.finish_sql(
+            "mysql:127.0.0.1:3306",
+            probe_result(1, 0, "mysql:127.0.0.1:3306"),
+        );
+        assert!(runtime.sql_outcome().is_some());
+
+        runtime.revoke_sql();
+
+        assert!(runtime.sql_outcome().is_none(), "撤授权后域消失");
+        assert!(runtime.begin_next_due_sql().is_none(), "不再安排新的轮次");
+    }
+
+    #[test]
+    fn an_in_flight_sql_round_is_not_scheduled_twice() {
+        let mut runtime = Scheduler::default();
+        runtime.apply_sql_targets(vec![sql_config(3306)]);
+
+        let _ = runtime.begin_next_due_sql().expect("到期");
+
+        assert!(runtime.begin_next_due_sql().is_none(), "在飞时不重复排轮");
+    }
+
+    #[test]
+    fn refreshing_sql_targets_keeps_the_in_flight_state() {
+        let mut runtime = Scheduler::default();
+        runtime.apply_sql_targets(vec![sql_config(3306)]);
+        let _ = runtime.begin_next_due_sql().expect("到期");
+
+        // 目标集合正在被重复投递（每次发现刷新都会投一次）。
+        runtime.apply_sql_targets(vec![sql_config(3306)]);
+
+        assert!(
+            runtime.begin_next_due_sql().is_none(),
+            "刷新目标集合不等于重启采集"
+        );
+    }
+
+    #[test]
+    fn a_mysql_scan_product_lands_in_the_sql_domain() {
+        let mut runtime = Scheduler::default();
+        runtime.request_scan(None, ScanKind::Mysql(Default::default()));
+        let epoch = runtime.sql_scan_epoch;
+
+        runtime.finish_scan(epoch, Some(ScanProduct::Mysql(vec![sql_config(3307)])));
+
+        assert_eq!(runtime.sql.len(), 1);
+        assert!(runtime.sql.contains_key("mysql:127.0.0.1:3307"));
+    }
+
+    #[test]
+    fn a_stale_mysql_scan_result_is_dropped_after_revocation() {
+        let mut runtime = Scheduler::default();
+        runtime.request_scan(None, ScanKind::Mysql(Default::default()));
+        let epoch = runtime.sql_scan_epoch;
+
+        runtime.revoke_sql();
+        runtime.finish_scan(epoch, Some(ScanProduct::Mysql(vec![sql_config(3306)])));
+
+        assert!(
+            runtime.sql.is_empty(),
+            "撤授权后晚一步回来的扫描不能把实例加回去"
+        );
+    }
+
+    #[test]
+    fn a_kafka_revocation_does_not_cancel_a_pending_sql_scan() {
+        let mut runtime = Scheduler::default();
+        runtime.request_scan(None, ScanKind::Mysql(Default::default()));
+
+        runtime.revoke();
+
+        assert!(
+            runtime.begin_scan().is_some(),
+            "撤 Kafka 授权不该连带丢掉 SQL 扫描"
         );
     }
 

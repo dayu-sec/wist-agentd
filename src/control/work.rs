@@ -58,6 +58,22 @@ pub(crate) fn is_kafka_cluster_source(kind: &str, target: &str) -> bool {
     target.is_empty() || target.eq_ignore_ascii_case(KAFKA_SOURCE_TARGET_AUTO)
 }
 
+/// MySQL / TiDB 采集来源的 `kind`（与 Kafka 同理，先放 agentd）。
+pub(crate) const MYSQL_INSTANCE_SOURCE_KIND: &str = "MysqlInstance";
+/// `MysqlInstance` 唯一支持的 `target`。
+pub(crate) const MYSQL_SOURCE_TARGET_AUTO: &str = "auto";
+
+/// 这条来源是不是「允许在本机采集 MySQL / TiDB」。
+///
+/// 同 Kafka：只认 `auto`，端点只来自本机自探。
+pub(crate) fn is_mysql_instance_source(kind: &str, target: &str) -> bool {
+    if kind != MYSQL_INSTANCE_SOURCE_KIND {
+        return false;
+    }
+    let target = target.trim();
+    target.is_empty() || target.eq_ignore_ascii_case(MYSQL_SOURCE_TARGET_AUTO)
+}
+
 /// 工作里没写清指标周期时的上送间隔（与采集目录里 `MetricInterval` 的策展值同值）。
 ///
 /// 为什么要有默认：`collect_metrics` 单元理论上都带一条 `MetricInterval` 来源，
@@ -71,6 +87,12 @@ pub const DEFAULT_METRICS_UPLINK_SECONDS: u64 = 15;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KafkaGrant {
     /// 授权里的采集周期（取 `MetricInterval` 的最小值）；没写 = 用本机默认。
+    pub interval: Option<Duration>,
+}
+
+/// MySQL / TiDB 采集授权（与 [`KafkaGrant`] 同形）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MysqlGrant {
     pub interval: Option<Duration>,
 }
 
@@ -707,6 +729,39 @@ impl AppliedWorkGrant {
         granted.then_some(KafkaGrant { interval })
     }
 
+    /// MySQL / TiDB 采集授权（采集面）。
+    ///
+    /// 判据是「有一份在干活的工作，它的 `collect_metrics` 单元里带了一条
+    /// `MysqlInstance/auto` 来源」。端点与端口不在这里 —— 那是 agentd 自探的事。
+    pub fn mysql_grant(&self) -> Option<MysqlGrant> {
+        let mut interval: Option<Duration> = None;
+        let mut granted = false;
+        for work in self.works.values() {
+            if !work.is_working() {
+                continue;
+            }
+            let Some(spec) = work.spec.as_ref() else {
+                continue;
+            };
+            let authorized = spec.units.iter().any(|unit| {
+                unit.capability == "collect_metrics"
+                    && unit
+                        .sources
+                        .iter()
+                        .any(|source| is_mysql_instance_source(&source.kind, &source.target))
+            });
+            if !authorized {
+                continue;
+            }
+            granted = true;
+            if let Some(secs) = spec.metric_interval_seconds() {
+                let current = Duration::from_secs(secs.max(1) as u64);
+                interval = Some(interval.map_or(current, |existing| existing.min(current)));
+            }
+        }
+        granted.then_some(MysqlGrant { interval })
+    }
+
     /// 折算不了的单元（`Exporter` / `UnifiedLogPredicate` …）。
     pub fn unsupported_units(&self) -> Vec<UnsupportedUnit> {
         let mut unsupported = Vec::new();
@@ -724,6 +779,7 @@ impl AppliedWorkGrant {
                     // 已经能采的单元误报成 unsupported。
                     if wist_contracts::work::is_executable_source(&source.kind, &source.target)
                         || is_kafka_cluster_source(&source.kind, &source.target)
+                        || is_mysql_instance_source(&source.kind, &source.target)
                     {
                         continue;
                     }
@@ -755,15 +811,23 @@ impl AppliedWorkGrant {
             },
             None => "off".to_string(),
         };
+        let mysql = match self.mysql_grant() {
+            Some(grant) => match grant.interval {
+                Some(interval) => format!("on({}s)", interval.as_secs()),
+                None => "on".to_string(),
+            },
+            None => "off".to_string(),
+        };
         let unsupported = self.unsupported_units().len();
         format!(
-            "held={} working={} log_inputs={} exporters={} metrics={} kafka={} unsupported_units={} one_shot_pending={}",
+            "held={} working={} log_inputs={} exporters={} metrics={} kafka={} mysql={} unsupported_units={} one_shot_pending={}",
             self.works.len(),
             working,
             log_inputs,
             exporters,
             metrics,
             kafka,
+            mysql,
             unsupported,
             self.unexecutable_one_shot.len()
         )
@@ -797,6 +861,12 @@ fn unsupported_reason(source: &WorkSpecSource) -> String {
         KAFKA_CLUSTER_SOURCE_KIND => format!(
             "KafkaCluster target {:?} is not supported on this agent \
              (only `auto`: endpoints are self-discovered on the broker host)",
+            source.target
+        ),
+        // MySQL / TiDB 同口径。
+        MYSQL_INSTANCE_SOURCE_KIND => format!(
+            "MysqlInstance target {:?} is not supported on this agent \
+             (only `auto`: endpoints are self-discovered on the database host)",
             source.target
         ),
         _ => format!(
@@ -1089,6 +1159,72 @@ mod tests {
         assert!(applied.log_inputs().is_empty());
         assert_eq!(applied.metrics_interval(), None);
         assert!(applied.is_empty());
+    }
+
+    #[test]
+    fn mysql_collection_requires_a_mysql_instance_source() {
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![standing(
+                "w-mysql",
+                "MysqlHealth",
+                1,
+                "active",
+                &spec(&[
+                    ("mysql", "collect_metrics", "MysqlInstance:auto"),
+                    ("interval", "collect_metrics", "MetricInterval:30s"),
+                ]),
+            )],
+        ));
+
+        assert_eq!(
+            applied.mysql_grant(),
+            Some(MysqlGrant {
+                interval: Some(Duration::from_secs(30))
+            })
+        );
+        assert!(
+            applied.unsupported_units().is_empty(),
+            "能接的 SQL 来源不该报 unsupported：{:?}",
+            applied.unsupported_units()
+        );
+    }
+
+    #[test]
+    fn a_kafka_grant_is_not_a_mysql_grant() {
+        // 两个域各自判据：Kafka 授权不能把 MySQL 也拉起来。
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![standing(
+                "w-kafka",
+                "KafkaBrokerHealth",
+                1,
+                "active",
+                &spec(&[("kafka", "collect_metrics", "KafkaCluster:auto")]),
+            )],
+        ));
+
+        assert!(applied.kafka_grant().is_some());
+        assert!(applied.mysql_grant().is_none());
+    }
+
+    #[test]
+    fn a_mysql_source_with_a_concrete_target_is_unsupported() {
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![standing(
+                "w-mysql",
+                "MysqlHealth",
+                1,
+                "active",
+                &spec(&[("mysql", "collect_metrics", "MysqlInstance:10.0.0.1:3306")]),
+            )],
+        ));
+
+        assert!(applied.mysql_grant().is_none(), "端点只来自自探");
     }
 
     #[test]

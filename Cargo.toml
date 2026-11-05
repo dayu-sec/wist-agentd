@@ -55,6 +55,14 @@ sha2 = "0.10"
 base64 = "0.22"
 # 没配 `tls_ca_file` 时用系统根做校验（reqwest 的 rustls 通道用的也是它）。
 rustls-platform-verifier = "0.7"
+# MySQL / TiDB 指标采集（只读）。musl 静态发布下已探针验证：不引入新的 C 依赖
+# （复用已在树上的 aws-lc-sys），见 docs/design/metrics-collection-runtime.md §12.3。
+# 不启 `macros`：没有编译期连库，也没有额外 proc-macro。
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-aws-lc-rs",
+    "mysql",
+] }
 wist-log = { version = "0.1" }
 #wist-log = { version = "0.1", path = "../wist-log" }
 wist-validate = { version = "0.8" }

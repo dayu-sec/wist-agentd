@@ -8,6 +8,8 @@ pub mod kafka_groups;
 /// 真 broker 验收（`dev/kafka-sasl`）：全部 `#[ignore]`，只在起了 broker 时才跑。
 #[cfg(test)]
 mod kafka_live;
+/// MySQL / TiDB 指标采集（SQL 直采，只读）。
+pub mod mysql;
 pub mod runtime;
 pub mod samples;
 pub mod scheduler;
