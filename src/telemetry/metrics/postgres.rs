@@ -578,6 +578,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_emitted_fact_has_a_metric_spec() {
+        let (server, activity) = primary();
+        let mut primary_transport = Fake::default()
+            .with(SERVER_SQL, server)
+            .with(ACTIVITY_SQL, activity)
+            .with(DATABASE_SQL, database());
+        let mut replica_transport = Fake::default()
+            .with(
+                SERVER_SQL,
+                Ok(vec![row(&[
+                    ("uptime", "10"),
+                    ("max_connections", "100"),
+                    ("in_recovery", "true"),
+                ])]),
+            )
+            .with(ACTIVITY_SQL, Ok(vec![row(&[("connections", "1")])]))
+            .with(DATABASE_SQL, database())
+            .with(REPLICA_SQL, Ok(vec![row(&[("lag_seconds", "2.5")])]));
+
+        for (tag, transport) in [
+            ("primary", &mut primary_transport),
+            ("replica", &mut replica_transport),
+        ] {
+            let result = collect_with(transport, &config()).await;
+            assert_eq!(result.failed, 0, "{tag}");
+            for fact in &result.targets[0].runtime_facts {
+                let spec = wist_metrics::spec::find_metric_spec(COLLECTION_KIND, &fact.key)
+                    .unwrap_or_else(|| panic!("{tag}: fact `{}` 没有指标声明", fact.key));
+                assert!(
+                    spec.name.starts_with("pg_"),
+                    "`{}` 必须落在 pg 命名空间",
+                    spec.name
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn a_replica_reports_lag_and_running() {
         let mut transport = Fake::default()
             .with(

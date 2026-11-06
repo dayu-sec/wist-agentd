@@ -11,7 +11,11 @@
   `doris_be_capacity_bytes` / `doris_be_available_bytes` / `doris_be_tablets`，全部带 `be` label。
   只从**本机 FE** 读 `SHOW BACKENDS`（只有 BE 的机器采不了，`doctor` 会说清楚）；
   掉线的 BE 只报 `up=0`，不报容量（不伪造）。授权 `DorisCluster/auto`，
-  凭据 `secrets/doris/<key>/password`。设计见 `docs/design/doris-metrics.md`。
+  凭据 `secrets/doris/<key>/password`。`be` label 已贯通到上送行
+  （`VmMetricLabels` 有对应字段，缺了会被「声明 label 必须到达线上」的门禁挡住）。
+  设计见 `docs/design/doris-metrics.md`。
+- **依赖升级**：`wist-metrics` 0.14 → **0.17**（`mysql_metrics` / `pg_metrics` /
+  `doris_metrics` 三个域上线；之前这些 fact 查不到 spec，会被规范化层静默丢弃）。
 - **数据库自探改看 netns（host / docker-compose / k8s）**：端口读 `/proc/<pid>/net/tcp`
   （该进程 netns 的监听表，宿主表里看不到 pod 的），地址按「回环 → 该 netns 的非回环地址」
   逐个握手；凭据 key 分运行时：`port-<port>` / `pod-<ns>-<pod>` / `container-<name>` /

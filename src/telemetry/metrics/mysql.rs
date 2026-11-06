@@ -741,6 +741,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_emitted_fact_has_a_metric_spec() {
+        // 与 Kafka 同一条纪律：新增 fact 忘了在 wist-metrics 注册，上游会静默丢掉整条序列，
+        // 现场只表现为「这个指标没数据」。两轮覆盖基础事实与复制事实。
+        let mut healthy = Fake::default()
+            .with(STATUS_SQL, healthy_status())
+            .with(VARIABLES_SQL, healthy_variables());
+        let mut replica = Fake::default()
+            .with(STATUS_SQL, healthy_status())
+            .with(VARIABLES_SQL, healthy_variables())
+            .with(REPLICA_SQL[0], healthy_replica());
+
+        for (tag, transport) in [("healthy", &mut healthy), ("replica", &mut replica)] {
+            let result = collect_with(transport, &config()).await;
+            assert_eq!(result.failed, 0, "{tag}");
+            for fact in &result.targets[0].runtime_facts {
+                let spec = wist_metrics::spec::find_metric_spec(COLLECTION_KIND, &fact.key)
+                    .unwrap_or_else(|| panic!("{tag}: fact `{}` 没有指标声明", fact.key));
+                assert!(
+                    spec.name.starts_with("mysql_"),
+                    "`{}` 必须落在 mysql 命名空间",
+                    spec.name
+                );
+            }
+            assert!(
+                result.targets[0].runtime_facts.len() >= 13,
+                "{tag}: 只产出 {} 条事实，场景没覆盖到",
+                result.targets[0].runtime_facts.len()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_failed_status_query_fails_the_whole_round() {
         let mut transport = Fake::default().with(STATUS_SQL, Err("denied".to_string()));
 

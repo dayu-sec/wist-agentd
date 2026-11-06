@@ -531,6 +531,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_labeled_fact_has_a_metric_spec_and_matching_labels() {
+        let mut transport = Fake::with(two_backends());
+
+        let result = collect_with(&mut transport, &config()).await;
+
+        assert!(
+            !result.targets[0].labeled_facts.is_empty(),
+            "场景没产出事实"
+        );
+        for fact in &result.targets[0].labeled_facts {
+            let spec = wist_metrics::spec::find_metric_spec(COLLECTION_KIND, &fact.key)
+                .unwrap_or_else(|| panic!("fact `{}` 没有指标声明", fact.key));
+            assert!(
+                spec.name.starts_with("doris_"),
+                "`{}` 必须落在 doris 命名空间",
+                spec.name
+            );
+            // label 与声明必须一一对应：多一个上游丢弃维度，少一个所有 BE 会叠成一条线。
+            let mut declared: Vec<&str> = spec.dynamic_labels.to_vec();
+            let mut produced: Vec<&str> =
+                fact.labels.iter().map(|label| label.key.as_str()).collect();
+            declared.sort_unstable();
+            produced.sort_unstable();
+            assert_eq!(produced, declared, "`{}` 的 label 与声明不一致", spec.name);
+        }
+    }
+
+    #[tokio::test]
     async fn a_dead_backend_reports_only_up_zero() {
         let mut transport = Fake::with(two_backends());
 

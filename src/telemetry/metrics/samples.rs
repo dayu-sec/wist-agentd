@@ -101,6 +101,9 @@ pub struct VmMetricLabels {
     /// Kafka topic（`kafka_consumergroup_lag`）：定位积压落在哪条流上。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
+    /// Doris BE（`doris_be_*`）：`ip:heartbeat_port`，一台 FE 管多台 BE。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub be: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -158,6 +161,7 @@ pub fn build_vm_metric_lines_with(
                     state: label_value(&sample.labels, label::STATE).map(str::to_string),
                     group: label_value(&sample.labels, label::GROUP).map(str::to_string),
                     topic: label_value(&sample.labels, label::TOPIC).map(str::to_string),
+                    be: label_value(&sample.labels, label::BE).map(str::to_string),
                     target_kind: label_value(&sample.labels, label::TARGET_KIND)
                         .map(str::to_string),
                     outcome: label_value(&sample.labels, label::OUTCOME).map(str::to_string),

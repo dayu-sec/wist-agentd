@@ -39,7 +39,7 @@ tokio = { version = "1.48", features = ["full"] }
 wist-contracts = "0.10.1"
 # 跨进程 seam 报文（enrollment / agent_status / gateway / work / agent_uplink）。CI/发布走 registry；本地联调可临时切 path。
 wist-api = "0.10.4"
-wist-metrics = "0.14"
+wist-metrics = "0.17"
 # 本地联调：按 rust-gx 约定切 path 指向本地 registry；发布前切回 registry（见 docs/design/metrics-spec-rollout.md）。
 wist-shared = { version = "0.2" }
 # 运行日志：`log` 门面 + 共享 crate `wist-log`（级别 / 格式 / 落点 / 轮转 统一口径）。
@@ -92,7 +92,7 @@ path = "src/bin/wist-upgrader.rs"
 
 # 本地联调：与 `wist-contracts` / `wist-api` 同期改动时启用 —— `[patch]` 放在这里（而不是逐条改
 # 依赖行），是为了让 api/metrics/validate 也解析到本地版本（否则会同时存在两份 contracts，
-# 类型互不认识）。**发布态不要留**；wist-metrics 0.14.0 已发布，这一轮已切回 registry：
+# 类型互不认识）。**发布态不要留**；wist-metrics 0.17.0 已发布，这一轮已切回 registry：
 # [patch.crates-io]
 # wist-contracts = { path = "../wist-contracts" }
 # wist-api = { path = "../wist-api" }
