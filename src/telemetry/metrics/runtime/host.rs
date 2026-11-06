@@ -5,6 +5,7 @@
 use std::collections::HashSet;
 #[cfg(target_os = "linux")]
 use std::fs;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::Path;
 
 use sysinfo::{Disks, System};
@@ -128,35 +129,111 @@ fn collect_host_info(labeled_facts: &mut Vec<MetricsLabeledFact>) {
     });
 }
 
-/// 主 IP：非回环 IPv4，按接口名排序取第一条（与日志链路 `host_ip` 同一口径）。
+/// 主 IP：优先「到平台的源地址」，其次默认路由口，最后字典序（跳过虚拟网卡）。
 ///
-/// 多网卡机器只能有一个 `host_ip`，否则同一主机会裂出多条 info 序列；取不到就不写
-/// （不补 `127.0.0.1`，也不写空串）。
+/// 一台主机天然有多个地址（物理网卡 / 容器网桥 / VPN / 虚拟化），没有一个天然是「唯一」的。
+/// 对平台来说唯一有意义的定义是「平台到达这台主机时用的那个源地址」—— 所以先按控制面
+/// endpoint 做一次**零报文**的路由探测（UDP connect 不发包，只让内核按路由表选源地址）。
 fn primary_host_ip() -> Option<String> {
-    primary_host_ip_from(crate::discovery::network::local_ip_addresses())
+    choose_primary_host_ip(
+        super::platform_endpoint().and_then(platform_source_ip),
+        crate::discovery::network::host_addresses(),
+    )
 }
 
-/// 纯函数：从 `<iface> <addr>/<prefix>` 列表里选主 IP。
-///
-/// 拆出来是为了能用合成数据单测：真实枚举依赖运行环境的网卡，测不稳定。
-fn primary_host_ip_from(entries: Vec<String>) -> Option<String> {
-    let mut candidates: Vec<(String, String)> = entries
-        .into_iter()
-        .filter_map(|entry| {
-            // 用 `split_whitespace` 而不是 `split_once(' ')`：多一个空格也不至于整台机器丢 IP。
-            let mut parts = entry.split_whitespace();
-            let iface = parts.next()?;
-            let spec = parts.next()?;
-            let addr = spec.split('/').next()?;
-            let parsed: std::net::Ipv4Addr = addr.parse().ok()?;
-            if parsed.is_loopback() {
-                return None;
-            }
-            Some((iface.to_string(), addr.to_string()))
-        })
+/// 纯函数：三种来源的优先级（拆出来是为了能用合成数据单测）。
+fn choose_primary_host_ip(
+    platform_ip: Option<String>,
+    addresses: Vec<crate::discovery::network::HostAddress>,
+) -> Option<String> {
+    // 1) 内核按路由表给出的「去平台」源地址：最贴近「平台眼里的这台机器」。
+    if let Some(ip) = platform_ip {
+        return Some(ip);
+    }
+
+    // 同优先级内保持确定性：按 (接口名, 地址) 排序，不依赖枚举顺序。
+    fn first_by_name(items: Vec<&crate::discovery::network::HostAddress>) -> Option<String> {
+        let mut items = items;
+        items.sort_by(|left, right| {
+            left.iface
+                .cmp(&right.iface)
+                .then_with(|| left.ip.cmp(&right.ip))
+        });
+        items.first().map(|address| address.ip.clone())
+    }
+
+    // 2) 默认路由口（Linux `/proc/net/route` 已经解析出来并挂在地址上）。
+    let default_route: Vec<_> = addresses
+        .iter()
+        .filter(|address| address.default_route)
         .collect();
-    candidates.sort();
-    candidates.into_iter().next().map(|(_, addr)| addr)
+    if let Some(ip) = first_by_name(default_route) {
+        return Some(ip);
+    }
+
+    // 3) 兜底：字典序，跳过容器网桥 / veth / VPN / 虚拟化接口。
+    let physical: Vec<_> = addresses
+        .iter()
+        .filter(|address| !crate::discovery::network::is_virtual_interface(&address.iface))
+        .collect();
+    if let Some(ip) = first_by_name(physical) {
+        return Some(ip);
+    }
+
+    // 4) 只剩虚拟网卡（例如容器里只有 eth0/veth）：宁可给个地址，也不要空着。
+    first_by_name(addresses.iter().collect())
+}
+
+/// 控制面 endpoint → 内核按路由表选出的本地源 IPv4（**不发包**）。
+///
+/// `UdpSocket::connect` 在 UDP 上只设对端、不做握手；取到的 `local_addr` 就是
+/// 内核去往该地址时会给包用的源地址。拿不到（没配置 / 解析失败 / 无路由 / 选到回环）→ `None`，
+/// 由调用方走默认路由兜底。
+fn platform_source_ip(endpoint: &str) -> Option<String> {
+    let authority = endpoint_authority(endpoint)?;
+    // `host_ip` 的契约是 IPv4：优先 v4；只有 v6 时不给（不写一条 v6 的 host_ip）。
+    let target = authority
+        .to_socket_addrs()
+        .ok()?
+        .find(|address| address.is_ipv4())?;
+    let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).ok()?;
+    socket.connect(target).ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() && !ip.is_link_local() => {
+            Some(ip.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// `https://host:3100/api` → `host:3100`；没写端口时按 scheme 补（`http`→80，其余→443）。
+fn endpoint_authority(endpoint: &str) -> Option<String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return None;
+    }
+    let (scheme, rest) = match endpoint.split_once("://") {
+        Some((scheme, rest)) => (scheme.to_ascii_lowercase(), rest),
+        None => (String::new(), endpoint),
+    };
+    let authority = rest.split('/').next()?.trim();
+    if authority.is_empty() {
+        return None;
+    }
+    // IPv6 字面量必须带端口（`[::1]:443`），原样交给 `to_socket_addrs`。
+    if authority.starts_with('[') {
+        return Some(authority.to_string());
+    }
+    let has_port = authority
+        .rsplit_once(':')
+        .is_some_and(|(_, port)| port.parse::<u16>().is_ok());
+    if has_port {
+        return Some(authority.to_string());
+    }
+    Some(format!(
+        "{authority}:{}",
+        if scheme == "http" { 80 } else { 443 }
+    ))
 }
 
 pub(super) fn collect_host_disk_usage(disks: &Disks, facts: &mut Vec<StringKeyValue>) {
@@ -745,47 +822,138 @@ pub(super) fn memory_usage_ratio(total: u64, available: u64) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::primary_host_ip_from;
+    use super::{choose_primary_host_ip, endpoint_authority, platform_source_ip};
+    use crate::discovery::network::HostAddress;
 
-    fn entries(items: &[&str]) -> Vec<String> {
-        items.iter().map(|item| item.to_string()).collect()
+    fn addr(iface: &str, ip: &str, default_route: bool) -> HostAddress {
+        HostAddress {
+            iface: iface.to_string(),
+            ip: ip.to_string(),
+            default_route,
+        }
     }
 
     #[test]
-    fn primary_host_ip_picks_first_ipv4_by_interface_name() {
+    fn platform_route_wins_over_everything() {
+        // 平台路由是「内核去平台时会用的源地址」：哪怕网卡字典序更小的存在，也用它。
         assert_eq!(
-            primary_host_ip_from(entries(&[
-                "utun100 100.64.0.9/32",
-                "en1 10.0.0.7/24",
-                "en0 192.168.1.5/24",
-            ])),
+            choose_primary_host_ip(
+                Some("10.0.0.7".to_string()),
+                vec![
+                    addr("br-1a2b3c4d", "172.19.0.1", false),
+                    addr("eth0", "10.0.0.5", true),
+                ],
+            ),
+            Some("10.0.0.7".to_string())
+        );
+    }
+
+    #[test]
+    fn default_route_interface_wins_without_a_platform_route() {
+        // 没有平台路由时，选承担默认路由的接口（Linux `/proc/net/route`）。
+        assert_eq!(
+            choose_primary_host_ip(
+                None,
+                vec![
+                    addr("br-1a2b3c4d", "172.19.0.1", false),
+                    addr("docker0", "172.17.0.1", false),
+                    addr("eth0", "10.0.0.5", true),
+                ],
+            ),
+            Some("10.0.0.5".to_string())
+        );
+    }
+
+    #[test]
+    fn virtual_interfaces_are_skipped_in_the_fallback() {
+        // 既没平台路由也没默认路由：字典序会先命中文档网桥，必须跳过。
+        assert_eq!(
+            choose_primary_host_ip(
+                None,
+                vec![
+                    addr("bridge100", "192.168.139.3", false),
+                    addr("docker0", "172.17.0.1", false),
+                    addr("en0", "192.168.1.128", false),
+                    addr("utun100", "100.64.0.9", false),
+                ],
+            ),
+            Some("192.168.1.128".to_string())
+        );
+    }
+
+    #[test]
+    fn fallback_still_answers_when_every_interface_is_virtual() {
+        // 容器里只有 eth0/veth 这类接口：宁可回一个地址，也不留空。
+        assert_eq!(
+            choose_primary_host_ip(
+                None,
+                vec![
+                    addr("veth12ab", "172.19.0.2", false),
+                    addr("docker0", "172.17.0.1", false),
+                ],
+            ),
+            Some("172.17.0.1".to_string())
+        );
+    }
+
+    #[test]
+    fn no_addresses_means_no_host_ip() {
+        // 取不到就不写（不补 127.0.0.1，也不写空串）。
+        assert_eq!(choose_primary_host_ip(None, Vec::new()), None);
+    }
+
+    #[test]
+    fn chooses_deterministically_by_interface_name_within_a_tier() {
+        // 同为「非虚拟」：按接口名字典序，不依赖枚举顺序。
+        assert_eq!(
+            choose_primary_host_ip(
+                None,
+                vec![
+                    addr("en1", "10.0.0.7", false),
+                    addr("en0", "192.168.1.5", true),
+                ],
+            ),
             Some("192.168.1.5".to_string())
         );
     }
 
     #[test]
-    fn primary_host_ip_skips_loopback_and_ipv6() {
+    fn endpoint_authority_strips_scheme_path_and_defaults_the_port() {
         assert_eq!(
-            primary_host_ip_from(entries(&[
-                "lo0 127.0.0.1/8",
-                "en0 fd00::1/64",
-                "en1 10.0.0.7/24",
-            ])),
-            Some("10.0.0.7".to_string())
+            endpoint_authority("https://c-dev01.test.gw:3100/api/v1").as_deref(),
+            Some("c-dev01.test.gw:3100")
         );
         assert_eq!(
-            primary_host_ip_from(entries(&["lo0 127.0.0.1/8", "en0 fd00::1/64"])),
-            None
+            endpoint_authority("http://10.0.0.5").as_deref(),
+            Some("10.0.0.5:80")
         );
+        assert_eq!(
+            endpoint_authority("https://gateway.example").as_deref(),
+            Some("gateway.example:443")
+        );
+        assert_eq!(
+            endpoint_authority("10.0.0.5:3000").as_deref(),
+            Some("10.0.0.5:3000")
+        );
+        // 大写 scheme 一样按 http/https 判断默认端口。
+        assert_eq!(
+            endpoint_authority("HTTP://10.0.0.5").as_deref(),
+            Some("10.0.0.5:80")
+        );
+        // IPv6 字面量带端口时原样透传（必须带端口，否则 `to_socket_addrs` 无法解析）。
+        assert_eq!(
+            endpoint_authority("https://[fd00::1]:443").as_deref(),
+            Some("[fd00::1]:443")
+        );
+        assert_eq!(endpoint_authority("  "), None);
+        assert_eq!(endpoint_authority("https://"), None);
     }
 
     #[test]
-    fn primary_host_ip_tolerates_extra_whitespace() {
-        // 枚举侧万一多拼了空格，也不能整台机器丢 `host_ip`。
-        assert_eq!(
-            primary_host_ip_from(entries(&["  eth0   10.1.2.3/24  "])),
-            Some("10.1.2.3".to_string())
-        );
-        assert_eq!(primary_host_ip_from(entries(&["malformed"])), None);
+    fn platform_probe_rejects_loopback_and_unparseable_endpoints() {
+        // 回环不是「平台眼里的这台机器」；解析不了 / 没端口也直接放弃（由默认路由兜底）。
+        assert_eq!(platform_source_ip("http://127.0.0.1:9"), None);
+        assert_eq!(platform_source_ip("[::1]:9"), None);
+        assert_eq!(platform_source_ip(""), None);
     }
 }

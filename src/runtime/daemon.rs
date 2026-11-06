@@ -1804,6 +1804,11 @@ pub struct DaemonLoop<'a> {
 }
 
 pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
+    // 指标里的 `host_ip` 要选「到平台的源地址」：启动时把控制面 endpoint 交给采集侧。
+    // 只取第一次；控制面地址变更本来就要求重启。
+    crate::telemetry::metrics::runtime::init_platform_endpoint(
+        loop_ctx.config.control_plane.endpoint.clone(),
+    );
     // 运行时**跨 tick 活着**：观测频率的调度记忆就在它里面（内存态，不落盘）。
     let mut discovery_runtime = DiscoveryRuntime::new(discovery_probes(loop_ctx.config));
     // Kafka 协议探针：未启用时不启动线程，快照里也不会出现这个采集域。

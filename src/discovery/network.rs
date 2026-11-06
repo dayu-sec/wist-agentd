@@ -228,6 +228,83 @@ fn discover_network_inventory() -> io::Result<Vec<ObservedNetworkInterface>> {
     unix_interfaces_from_getifaddrs(&BTreeMap::new())
 }
 
+/// 一条「本机地址」候选：接口名 + IPv4（已滤掉回环 / 链路本地 / 未指定）。
+///
+/// 与 [`local_ip_addresses`]（给管理面展示全量 `<iface> <cidr>`）分工不同：这里只回答
+/// 「哪个地址能代表这台主机」，所以保留接口名与「该接口是否承担默认路由」两条判据。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostAddress {
+    pub iface: String,
+    pub ip: String,
+    /// 该地址所在接口承担默认路由（Linux 从 `/proc/net/route` 来；其它平台恒为 `false`）。
+    pub default_route: bool,
+}
+
+/// 枚举可用作「主机身份」的 IPv4 地址（已滤掉回环 / 链路本地 / 未指定）。
+///
+/// 一台主机天然有多个地址（物理网卡 / 容器网桥 / VPN / 虚拟化）。这里**只枚举不选择** ——
+/// 选哪个由调用方的策略决定（见 `telemetry::metrics::runtime::host`）。
+pub(crate) fn host_addresses() -> Vec<HostAddress> {
+    let Ok(interfaces) = discover_network_inventory() else {
+        return Vec::new();
+    };
+    host_addresses_from(interfaces)
+}
+
+/// 纯函数：从网卡枚举里挑出「能用亽主机身份」的 IPv4，并标出默认路由口。
+///
+/// 拆出来是为了能用合成数据单测：真实枚举依赖运行环境的网卡，测不稳定。
+fn host_addresses_from(interfaces: Vec<ObservedNetworkInterface>) -> Vec<HostAddress> {
+    let mut addresses = Vec::new();
+    for iface in interfaces {
+        for address in iface.addresses {
+            if address.ip.parse::<Ipv4Addr>().is_err() || is_meaningless_address(&address.ip) {
+                continue;
+            }
+            addresses.push(HostAddress {
+                iface: iface.name.clone(),
+                ip: address.ip,
+                default_route: address.gateway_ip.is_some(),
+            });
+        }
+    }
+    addresses
+}
+
+/// 「不适合当主机身份」的接口名前缀：容器网桥 / veth / VPN / 虚拟化 / k8s CNI。
+///
+/// 只在**兜底**里用（既拿不到平台路由、也没有默认路由时）。按名字判断是启发式：
+/// 这些接口的地址随容器 / 隧道 / 虚拟机生命周期变化，而且每台装 Docker 的机器
+/// 都有相同的 `.1` 网关地址（`172.17.0.1` / `172.19.0.1` …），拿它当身份会指错机器。
+/// 特意不写 `br`（会误伤真实的 `br0` 网桥）：容器网桥的名字是 `br-<hash>`。
+pub(crate) fn is_virtual_interface(name: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "docker",
+        "br-",
+        "veth",
+        "virbr",
+        "cni",
+        "flannel",
+        "tunl",
+        "vxlan",
+        "genev",
+        "utun",
+        "tailscale",
+        "wg",
+        "zt",
+        "vmnet",
+        "vmenet",
+        "bridge",
+        "awdl",
+        "llw",
+        "lxc",
+        "lxd",
+        "podman",
+    ];
+    let name = name.to_ascii_lowercase();
+    PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+}
+
 /// 本机网卡地址列表（形如 `en0 192.168.1.5/24`），供机器画像 / 状态上报在管理面展示。
 ///
 /// 与发现探针共用同一份枚举（`discover_network_inventory`，已跳过回环）。**只保留有信息量的地址**：
@@ -409,6 +486,8 @@ fn discover_network_inventory() -> io::Result<Vec<ObservedNetworkInterface>> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use super::ObservedIpAddress;
     use super::ObservedNetworkInterface;
     #[cfg(target_os = "linux")]
@@ -582,5 +661,71 @@ mod tests {
             gateways.get("wlan0").map(String::as_str),
             Some("192.168.1.1")
         );
+    }
+
+    #[test]
+    fn host_addresses_keep_the_interface_and_flag_the_default_route() {
+        // `eth0` 承担默认路由（网关来自 `/proc/net/route`），网桥不承担；
+        // 回环与 IPv6 一律不进入候选。
+        let mut ethernet = iface("eth0", &[("10.0.0.5", 24), ("fe80::1", 64)]);
+        ethernet.addresses[0].gateway_ip = Some("10.0.0.1".to_string());
+        let bridge = iface("br-1a2b3c4d", &[("172.19.0.1", 16)]);
+        let loopback = iface("lo0", &[("127.0.0.1", 8)]);
+
+        let addresses = super::host_addresses_from(vec![ethernet, bridge, loopback]);
+
+        assert_eq!(
+            addresses,
+            vec![
+                super::HostAddress {
+                    iface: "eth0".to_string(),
+                    ip: "10.0.0.5".to_string(),
+                    default_route: true,
+                },
+                super::HostAddress {
+                    iface: "br-1a2b3c4d".to_string(),
+                    ip: "172.19.0.1".to_string(),
+                    default_route: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn virtual_interface_names_cover_bridges_and_keep_real_nics() {
+        for name in [
+            "docker0",
+            "br-1a2b3c4d",
+            "veth12ab",
+            "virbr0",
+            "bridge100",
+            "utun100",
+            "tailscale0",
+            "wg0",
+            "cni0",
+            "flannel.1",
+            "vmnet8",
+            "vmenet0",
+        ] {
+            assert!(super::is_virtual_interface(name), "{name} 应被当作虚拟接口");
+        }
+        // 真实网卡（包括 `br0` 这种**真网桥**）不能误伤。
+        for name in ["en0", "en1", "eth0", "eth1", "ens18", "br0", "bond0"] {
+            assert!(
+                !super::is_virtual_interface(name),
+                "{name} 是真实网卡，不该被跳过"
+            );
+        }
+    }
+
+    #[test]
+    fn real_host_addresses_are_usable_identity_candidates() {
+        // 真实枚举只验不变量（不依赖这台机器有几块网卡）。
+        for address in super::host_addresses() {
+            let ip: Ipv4Addr = address.ip.parse().expect("候选必须是 IPv4");
+            assert!(!ip.is_loopback(), "不得给回环地址: {ip}");
+            assert!(!ip.is_link_local(), "不得给链路本地地址: {ip}");
+            assert!(!address.iface.is_empty(), "接口名不能为空");
+        }
     }
 }

@@ -11,6 +11,7 @@ use super::kafka;
 
 use std::io;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use wist_contracts::discovery::StringKeyValue;
@@ -27,6 +28,26 @@ pub use wist_metrics::provider::{
 #[cfg(test)]
 use super::target_view::path_for as target_view_path_for;
 use super::target_view::{MetricsTargetView, MetricsTargetViewEntry};
+
+/// 控制面（平台）endpoint：`system_host_info` 的 `host_ip` 用它选「到平台的源地址」。
+///
+/// 为什么是进程级配置而不是参数：`MetricProvider` 是 `wist-metrics` 里的 trait，签名不带
+/// 采集上下文，为它改 trait 会牵动一个独立发版的 crate。与 `kafka` 探针同一个做法
+/// （`kafka::init` 也是启动时写一次配置）。由 `run_forever_async` 写入；控制面地址变了
+/// 本来就要求重启。
+static PLATFORM_ENDPOINT: OnceLock<String> = OnceLock::new();
+
+/// 由 daemon 启动时调用一次；`None` / 空串 = 未配置（选 IP 时按默认路由兜底）。
+pub fn init_platform_endpoint(endpoint: Option<String>) {
+    if let Some(endpoint) = endpoint.filter(|value| !value.trim().is_empty()) {
+        let _ = PLATFORM_ENDPOINT.set(endpoint);
+    }
+}
+
+/// 供 `host_ip` 选源地址用；未初始化时返回 `None`。
+pub(crate) fn platform_endpoint() -> Option<&'static str> {
+    PLATFORM_ENDPOINT.get().map(String::as_str)
+}
 #[cfg(test)]
 use wist_shared::fs::read_json;
 

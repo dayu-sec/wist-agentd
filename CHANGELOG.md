@@ -3,6 +3,18 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.26.1-alpha] - 2026-11-06
+
+### 修复
+
+- **`system_host_info.host_ip` 会取到 Docker 网桥地址**（如 `172.19.0.1`）：原来按接口名
+  字典序取第一个非回环 IPv4，`br-*` / `docker0` / `utun*` / `bridge*` 排在 `eth0` / `en0`
+  前面，等于把「宿主在某个容器网络里的网关地址」当成了主机身份（每台装了 Docker 的机器
+  都有相同的 `.1`，按它分组/排障会指错机器）。
+  现在按「**平台到达这台主机用的源地址**」选：先用控制面 endpoint 做一次**零报文**的路由
+  探测（UDP connect，不发包），拿不到就取默认路由口的地址，最后才回落字典序并跳过
+  容器网桥 / veth / VPN / 虚拟化接口。
+
 ## [0.26.0-alpha] - 2026-11-06
 
 ### 新增
