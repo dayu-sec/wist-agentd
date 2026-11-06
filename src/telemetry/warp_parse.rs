@@ -1046,6 +1046,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn investigation_frame_envelope_carries_the_command_id() {
+        // 信封里必须有一份：数据面（WPL/OML）解不了 body 里的 JSON，证据服务的
+        // 幂等键只能从信封取。正文那份保留给网关用，两份必须一致。
+        let envelope = DataFrame::new("agent-001", "2026-10-30T00:00:00Z", 45)
+            .with_command_id("cmd_agent-001_investigate_45");
+        let body = br#"{"command":"investigate","topic":"disk","command_id":"cmd_agent-001_investigate_45"}"#;
+
+        let frame = super::build_investigation_frame(&envelope, body).expect("build frame");
+        let text = String::from_utf8_lossy(&frame);
+        let (env, parsed_body) = text.split_once(" IVSREP: ").expect("IVSREP marker");
+        let parsed_env: serde_json::Value = serde_json::from_str(env).expect("valid envelope");
+
+        assert_eq!(parsed_env["command_id"], "cmd_agent-001_investigate_45");
+        // 正文仍然字节级不变（网关按 `body` 读报告）。
+        assert_eq!(parsed_body, String::from_utf8_lossy(body));
+    }
+
+    #[test]
+    fn only_investigation_frames_carry_a_command_id() {
+        // 事实/快照帧共用同一个 `DataFrame`：`command_id` 是调查专用关联键，
+        // 出现在别的帧上会被数据面当成调查产物。
+        let envelope = DataFrame::new("agent-001", "2026-10-30T00:00:00Z", 46);
+        let body = br#"{"kind":"x"}"#;
+        for (marker, frame) in [
+            (
+                " OBSFACT: ",
+                super::build_fact_frame(&envelope, body).expect("fact frame"),
+            ),
+            (
+                " DSNAP: ",
+                super::build_discovery_frame(&envelope, body).expect("discovery frame"),
+            ),
+        ] {
+            let text = String::from_utf8_lossy(&frame);
+            let (env, _) = text.split_once(marker).expect("frame marker");
+            let parsed_env: serde_json::Value = serde_json::from_str(env).expect("valid envelope");
+            assert!(
+                parsed_env.get("command_id").is_none(),
+                "{marker}帧不该带 command_id: {env}"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn only_the_tcp_sink_carries_investigation_frames() {
         let file = super::TelemetryRecordSink::File(super::FileRecordSink::new(

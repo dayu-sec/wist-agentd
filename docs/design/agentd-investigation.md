@@ -286,15 +286,17 @@
 而**数据面本来就有一条通道**（`LOGREC` / `METRICS` / `OBSFACT` / `DSNAP` 同一批帧），
 它就是为「agent → 平台的结构化记录」建的。
 
-帧形状（与事实/快照帧同构）：
+帧形状（与事实/快照帧同构；信封多一个**可选**的 `command_id`）：
 
 ```
-{"schema":"v1","agent":"<agent_id>","ts":"<RFC3339>","seq":<n>} IVSREP: <Report JSON + command_id>
+{"schema":"v1","agent":"<agent_id>","ts":"<RFC3339>","seq":<n>,"command_id":"<cmd>"} IVSREP: <Report JSON + command_id>
 ```
 
-几条规矩：
+两条规矩：
 
 * **`command_id` 是唯一关联键**：报告与 ack 走两条路，网关靠它 join（迟到/乱序都要容忍）。
+  **信封里那份是给数据面用的**（证据服务的 `cmd_id` 幂等键）：正文是原样字符串，
+  WPL/OML 解不了 JSON，而解析正文会丢掉网关用的 `body` 原文。
 * **闸跟事实帧一致**：只有 `kind = tcp` 能承载；**待命（`enabled = false`）也发** —— 调查是诊断
   元数据，不是主机内容。`kind = file` 时静默跳过，ack 里写「报告只在本机」。
 * **`seq` 与日志/指标/事实共用一个空间**（`(agent, seq)` 是数据面的去重键）。先落高水位再发。

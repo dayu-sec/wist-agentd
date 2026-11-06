@@ -108,7 +108,9 @@
 
 约定：
 
-- JSON 信封只承载通用字段（`schema/agent/ts/seq`），**不含 raw**；
+- JSON 信封只承载通用字段（`schema/agent/ts/seq`）与**可选的路由/关联字段**
+  （`family`/`unit`/`node_name`/`namespace`/`pod_name`/`pod_uid`/`service`/`log_path`/`container`，
+  以及 ` IVSREP: ` 帧的 `command_id`），**不含 raw**；可选字段为空时**不出现在帧里**；
 - `LOGRAW:` 是行尾固定前缀，之后到行尾为原始内容；原始内容**保持原样，不转义**，避免体积膨胀并便于审计核对；
 - 因此 `line` 分帧只适用于**单行**记录。正文可能含换行时（如按缩进归并出的多行记录、`.ips`/panic 文本）必须用 `len` 分帧（`{字节长度} {帧内容}`）—— 否则接收端会按 `\n` 把续行当独立行，那些行没有信封、匹配不上任何规则，**静默掉进 miss**（已实测复现）。协议依据见 `telemetry-uplink-protocol.md` §3。
 - **不靠人去配对配置**：agentd 在本轮有输入声明的读法是 `indented` 时，自动把上送升到 `len` 并打 `event=UplinkFramingEscalated`（配置写 `len` 时不重复报）。

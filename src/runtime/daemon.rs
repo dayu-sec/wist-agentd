@@ -1493,7 +1493,11 @@ async fn send_investigation_frame(
     log_seq_state::store_async(seq_path, *next_seq)
         .await
         .map_err(|err| err.to_string())?;
-    let envelope = DataFrame::new(agent_id, report.observed_at.clone(), seq);
+    let envelope = DataFrame::new(agent_id, report.observed_at.clone(), seq)
+        // 命令 id 进**帧信封**：ack 走控制面、正文走数据面，两边靠它 join；计算区
+        // 证据服务也拿它当幂等键。不能指望数据面从 `body` 里取 —— 正文是原样字符串，
+        // WPL/OML 要解 JSON 就得先把 `body` 原文拆掉，而网关读报告用的正是 `body`。
+        .with_command_id(command_id);
     sink.write_investigation(&envelope, &body)
         .await
         .map_err(|err| err.to_string())
@@ -6075,6 +6079,9 @@ mod tests {
             .expect("IVSREP marker");
         let envelope: serde_json::Value = serde_json::from_str(envelope).expect("envelope");
         assert_eq!(envelope["agent"], "agent-x");
+        // 信封里也必须带 `command_id`：数据面（WPL/OML）解不了正文里的 JSON，
+        // 证据服务的幂等键只能从这里取；只写在 body 里等于没给数据面。
+        assert_eq!(envelope["command_id"], "cmd-inv");
         let body: serde_json::Value = serde_json::from_str(body).expect("report body");
         // `command_id` 是把数据面报告接回控制面 ack 的唯一关联键。
         assert_eq!(body["command_id"], "cmd-inv");

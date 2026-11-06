@@ -3,6 +3,16 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.26.0-alpha] - 2026-11-06
+
+### 新增
+
+- **调查报告帧（` IVSREP: `）的信封新增 `command_id`**：报告走数据面、ack 走控制面，
+  两边靠它 join；计算区证据服务也拿它当幂等键。正文里的 `command_id` 保留不变（网关按
+  `body` 读报告），信封这份是给数据面的 —— WPL/OML 解不了正文里的 JSON，解了就会
+  丢 `body` 原文。旧数据面忽略这个键；新数据面对旧 agentd 的帧回落事件 id。
+- 依赖 `wist-contracts` **0.10.2**（信封字段定义）。
+
 ## [0.25.0-alpha] - 2026-11-05
 
 ### 新增（k8s 容器日志：身份与多行合并，issue #32）
