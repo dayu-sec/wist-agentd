@@ -3,11 +3,12 @@ name: Build & Test
 on:
   push:
     branches:
-      - "*"
+      # `*` 不匹配 `/`：写成 `*` 时 `feat/xxx` / `fix/xxx` 这些分支**不会**触发。
+      - "**"
   pull_request:
     types: [opened, reopened]
     branches:
-      - "*"
+      - "**"
   workflow_dispatch:
 
 permissions:
