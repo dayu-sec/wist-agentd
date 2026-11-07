@@ -23,7 +23,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::collection::ProbeResult;
-use super::{doris, mysql, postgres};
+use super::{doris, kafka, mysql, postgres};
 use crate::error::{AgentdReason, AgentdResult};
 
 /// 单次请求的默认超时（与各域默认值一致）。
@@ -35,6 +35,7 @@ pub(crate) enum ProbeDomain {
     Postgres,
     Mysql,
     Doris,
+    Kafka,
 }
 
 impl ProbeDomain {
@@ -44,12 +45,13 @@ impl ProbeDomain {
             "pg" | "postgres" | "postgresql" => Some(Self::Postgres),
             "mysql" | "tidb" => Some(Self::Mysql),
             "doris" => Some(Self::Doris),
+            "kafka" => Some(Self::Kafka),
             _ => None,
         }
     }
 
     pub(crate) fn supported() -> &'static str {
-        "pg | mysql | doris"
+        "pg | mysql | doris | kafka"
     }
 
     /// 文件名里用的短名（也用于 stderr/stdout 提示）。
@@ -58,6 +60,7 @@ impl ProbeDomain {
             Self::Postgres => "pg",
             Self::Mysql => "mysql",
             Self::Doris => "doris",
+            Self::Kafka => "kafka",
         }
     }
 
@@ -67,6 +70,7 @@ impl ProbeDomain {
             Self::Postgres => postgres::COLLECTION_KIND,
             Self::Mysql => mysql::COLLECTION_KIND,
             Self::Doris => doris::COLLECTION_KIND,
+            Self::Kafka => kafka::COLLECTION_KIND,
         }
     }
 
@@ -75,6 +79,7 @@ impl ProbeDomain {
             Self::Postgres => 5432,
             Self::Mysql => 3306,
             Self::Doris => 9030,
+            Self::Kafka => 9092,
         }
     }
 
@@ -84,10 +89,15 @@ impl ProbeDomain {
             Self::Postgres => postgres::PG_SECRET_ROOT,
             Self::Mysql => mysql::MYSQL_SECRET_ROOT,
             Self::Doris => doris::DORIS_SECRET_ROOT,
+            // Kafka 是单实例域：密码文件是 `secrets/kafka/probe`，没有 `<key>` 这一层。
+            Self::Kafka => kafka::KAFKA_SECRET_DIR,
         }
     }
 
     fn ca_path(self, key: &str) -> String {
+        if self == Self::Kafka {
+            return format!("{}/ca.pem", self.secrets_root());
+        }
         format!("{}/{key}/ca.pem", self.secrets_root())
     }
 }
@@ -104,6 +114,22 @@ pub(crate) struct ProbeRequest {
     pub out: Option<PathBuf>,
     pub timeout_ms: u64,
     pub json: bool,
+    /// 只看自探候选，不采集（不需要凭据）。
+    pub list: bool,
+    /// 四个域一起跑（自探或列候选）；不能与 `--addr` 同用。
+    pub all: bool,
+    /// Kafka：`PLAINTEXT` / `SSL` / `SASL_PLAINTEXT` / `SASL_SSL`。
+    pub security_protocol: Option<String>,
+    /// Kafka：SASL 用户名（密码仍走文件）。
+    pub username: Option<String>,
+    /// Kafka：私有 CA（不给则用系统根）。
+    pub ca_file: Option<PathBuf>,
+    /// Kafka：只发这些消费组（逗号分隔），空 = 按阈值过滤。
+    pub group_allowlist: Vec<String>,
+    /// Kafka：单轮最多查多少个组。
+    pub max_groups: Option<usize>,
+    /// Kafka：白名单为空时只发总 lag 超过该值的组。
+    pub lag_threshold: Option<i64>,
 }
 
 impl ProbeRequest {
@@ -115,6 +141,14 @@ impl ProbeRequest {
             out: None,
             timeout_ms: DEFAULT_TIMEOUT_MS,
             json: false,
+            list: false,
+            all: false,
+            security_protocol: None,
+            username: None,
+            ca_file: None,
+            group_allowlist: Vec::new(),
+            max_groups: None,
+            lag_threshold: None,
         }
     }
 }
@@ -127,14 +161,32 @@ enum TargetConfig {
     Pg(postgres::PgProbeConfig),
     Mysql(mysql::MysqlProbeConfig),
     Doris(doris::DorisProbeConfig),
+    Kafka(kafka::KafkaProbeConfig),
 }
 
 impl TargetConfig {
+    fn domain(&self) -> ProbeDomain {
+        match self {
+            Self::Pg(_) => ProbeDomain::Postgres,
+            Self::Mysql(_) => ProbeDomain::Mysql,
+            Self::Doris(_) => ProbeDomain::Doris,
+            Self::Kafka(_) => ProbeDomain::Kafka,
+        }
+    }
+
     fn instance(&self) -> String {
         match self {
             Self::Pg(config) => config.instance(),
             Self::Mysql(config) => config.instance(),
             Self::Doris(config) => config.instance(),
+            Self::Kafka(config) => format!(
+                "kafka:{}",
+                config
+                    .bootstrap_servers
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string())
+            ),
         }
     }
 
@@ -143,6 +195,7 @@ impl TargetConfig {
             Self::Pg(config) => format!("{}:{}", config.host, config.port),
             Self::Mysql(config) => format!("{}:{}", config.host, config.port),
             Self::Doris(config) => format!("{}:{}", config.host, config.port),
+            Self::Kafka(config) => config.bootstrap_servers.join(","),
         }
     }
 
@@ -151,6 +204,8 @@ impl TargetConfig {
             Self::Pg(config) => &config.credential_key,
             Self::Mysql(config) => &config.credential_key,
             Self::Doris(config) => &config.credential_key,
+            // Kafka 是单实例域，密码固定 `secrets/kafka/probe`，没有 key 这一层。
+            Self::Kafka(_) => "probe",
         }
     }
 
@@ -159,6 +214,7 @@ impl TargetConfig {
             Self::Pg(config) => &config.password_file,
             Self::Mysql(config) => &config.password_file,
             Self::Doris(config) => &config.password_file,
+            Self::Kafka(config) => config.security.password_file.as_deref().unwrap_or(""),
         }
     }
 
@@ -167,6 +223,26 @@ impl TargetConfig {
             Self::Pg(config) => postgres::probe_once(config).await,
             Self::Mysql(config) => mysql::probe_once(config).await,
             Self::Doris(config) => doris::probe_once(config).await,
+            // Kafka 采集器是**阻塞**的（手写协议 + 同步 TLS），且需要一份组缓存：
+            // 放进 blocking 池里跑，不要堵在异步执行器上。
+            Self::Kafka(config) => {
+                let config = config.clone();
+                match tokio::task::spawn_blocking(move || {
+                    let mut groups = kafka::GroupCache::default();
+                    kafka::probe_once(&config, &mut groups)
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(err) => ProbeResult {
+                        targets: Vec::new(),
+                        attempted: 1,
+                        failed: 1,
+                        last_error: Some(format!("Kafka 采集任务失败：{err}")),
+                        warnings: Vec::new(),
+                    },
+                }
+            }
         }
     }
 }
@@ -254,11 +330,49 @@ fn explicit_target(
             }
             TargetConfig::Doris(config)
         }
+        ProbeDomain::Kafka => {
+            let mut config = kafka::KafkaProbeConfig::new(
+                vec![format!("{host}:{port}")],
+                "wist-agentd-probe".to_string(),
+                timeout,
+                interval,
+            );
+            config.security.protocol = request
+                .security_protocol
+                .clone()
+                .unwrap_or_else(|| "PLAINTEXT".to_string());
+            config.security.username = request.username.clone();
+            config.security.password_file = Some(
+                request
+                    .password_file
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| format!("{}/probe", kafka::KAFKA_SECRET_DIR)),
+            );
+            if let Some(ca) = &request.ca_file {
+                config.security.tls_ca_file = Some(ca.display().to_string());
+            }
+            apply_group_policy(&mut config, request);
+            TargetConfig::Kafka(config)
+        }
+    }
+}
+
+fn apply_group_policy(config: &mut kafka::KafkaProbeConfig, request: &ProbeRequest) {
+    if !request.group_allowlist.is_empty() {
+        config.groups.allowlist = request.group_allowlist.clone();
+    }
+    if let Some(max_groups) = request.max_groups {
+        config.groups.max_groups = max_groups;
+    }
+    if let Some(lag_threshold) = request.lag_threshold {
+        config.groups.lag_threshold = lag_threshold;
     }
 }
 
 /// 本机自探 → 采集目标。自探读 `/proc`，在非 Linux 上永远是空列表（报告里会说明）。
-fn discovered_targets(domain: ProbeDomain, timeout_ms: u64) -> Vec<TargetConfig> {
+fn discovered_targets(domain: ProbeDomain, request: &ProbeRequest) -> Vec<TargetConfig> {
+    let timeout_ms = request.timeout_ms;
     let timeout = Duration::from_millis(timeout_ms.max(1));
     let interval = Duration::from_secs(30);
     match domain {
@@ -283,17 +397,73 @@ fn discovered_targets(domain: ProbeDomain, timeout_ms: u64) -> Vec<TargetConfig>
         .into_iter()
         .map(TargetConfig::Doris)
         .collect(),
+        ProbeDomain::Kafka => crate::discovery::kafka_source::resolve_live()
+            .into_iter()
+            .filter_map(|cluster| {
+                // 优先用实测可达的端点；一条都不通时也保留（错误会如实报）。
+                let mut addrs: Vec<String> = cluster
+                    .endpoints
+                    .iter()
+                    .filter(|endpoint| endpoint.reachable)
+                    .map(|endpoint| endpoint.addr.clone())
+                    .collect();
+                if addrs.is_empty() {
+                    addrs = cluster
+                        .endpoints
+                        .iter()
+                        .map(|endpoint| endpoint.addr.clone())
+                        .collect();
+                }
+                if addrs.is_empty() {
+                    return None;
+                }
+                let protocol = cluster
+                    .endpoints
+                    .iter()
+                    .find(|endpoint| endpoint.kafka_api)
+                    .or_else(|| cluster.endpoints.first())
+                    .map(|endpoint| endpoint.protocol.clone())
+                    .filter(|protocol| protocol != "unknown")
+                    .unwrap_or_else(|| "PLAINTEXT".to_string());
+                let mut config = kafka::KafkaProbeConfig::new(
+                    addrs,
+                    "wist-agentd-probe".to_string(),
+                    timeout_ms,
+                    30_000,
+                );
+                config.security.protocol = protocol;
+                config.security.password_file = Some(format!("{}/probe", kafka::KAFKA_SECRET_DIR));
+                apply_group_policy(&mut config, request);
+                Some(TargetConfig::Kafka(config))
+            })
+            .collect(),
     }
 }
 
-fn resolve_targets(request: &ProbeRequest) -> AgentdResult<Vec<TargetConfig>> {
+fn resolve_targets(domain: ProbeDomain, request: &ProbeRequest) -> AgentdResult<Vec<TargetConfig>> {
     match &request.addr {
         Some(addr) => {
-            let (host, port) = parse_addr(addr, request.domain.default_port())
+            let (host, port) = parse_addr(addr, domain.default_port())
                 .map_err(|detail| AgentdReason::InvalidArgs.to_err().with_detail(detail))?;
-            Ok(vec![explicit_target(request.domain, &host, port, request)])
+            Ok(vec![explicit_target(domain, &host, port, request)])
         }
-        None => Ok(discovered_targets(request.domain, request.timeout_ms)),
+        None => Ok(discovered_targets(domain, request)),
+    }
+}
+
+/// `--all` 时的域顺序：先本机库，再 broker（Kafka 最贵）。
+const ALL_DOMAINS: [ProbeDomain; 4] = [
+    ProbeDomain::Postgres,
+    ProbeDomain::Mysql,
+    ProbeDomain::Doris,
+    ProbeDomain::Kafka,
+];
+
+fn request_domains(request: &ProbeRequest) -> Vec<ProbeDomain> {
+    if request.all {
+        ALL_DOMAINS.to_vec()
+    } else {
+        vec![request.domain]
     }
 }
 
@@ -305,6 +475,7 @@ fn resolve_targets(request: &ProbeRequest) -> AgentdResult<Vec<TargetConfig>> {
 struct Report {
     tool: &'static str,
     version: &'static str,
+    /// `--all` 时是 `all`，否则是对应的 `*_metrics`。
     domain: &'static str,
     mode: &'static str,
     generated_at: String,
@@ -312,11 +483,42 @@ struct Report {
     /// 没有目标时的原因（自探为空 / 非 Linux），给人看的一句话。
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
+    summary: Summary,
+    /// `--list` 模式下的自探候选（不采集）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    candidates: Vec<CandidateReport>,
     targets: Vec<TargetReport>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct Summary {
+    targets: usize,
+    /// `--list` 列出的自探候选数。
+    candidates: usize,
+    succeeded: usize,
+    failed: usize,
+    facts: usize,
+    /// 能在 `wist-metrics` 注册表里查到的指标数。
+    registered_facts: usize,
+    /// 采到了但没声明（规范化层会丢弃）—— 非 0 就说明 agentd 与 wist-metrics 版本不匹配。
+    unregistered_facts: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct CandidateReport {
+    domain: &'static str,
+    instance: String,
+    addr: String,
+    credential_key: String,
+    evidence: String,
+    confidence: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct TargetReport {
+    domain: &'static str,
     instance: String,
     addr: String,
     source: &'static str,
@@ -346,6 +548,9 @@ struct FactReport {
     unit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     value_type: Option<String>,
+    /// `key=value` 形式的动态 label（Kafka 的 `group` / `topic` 等）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    labels: Vec<String>,
 }
 
 struct TargetRun<'a> {
@@ -366,20 +571,54 @@ fn status_of(result: &ProbeResult, succeeded: usize) -> &'static str {
 }
 
 fn fact_reports(domain: ProbeDomain, result: &ProbeResult) -> Vec<FactReport> {
+    let kind = domain.collection_kind();
+    let push = |key: &str, value: &str, labels: Vec<String>| {
+        let spec = wist_metrics::spec::find_metric_spec(kind, key);
+        FactReport {
+            fact: key.to_string(),
+            value: value.to_string(),
+            metric: spec.map(|spec| spec.name.to_string()),
+            unit: spec.map(|spec| spec.unit.to_string()),
+            value_type: spec.map(|spec| spec.value_type.to_string()),
+            labels,
+        }
+    };
+
     let mut out = Vec::new();
     for sample in &result.targets {
         for fact in &sample.runtime_facts {
-            let spec = wist_metrics::spec::find_metric_spec(domain.collection_kind(), &fact.key);
-            out.push(FactReport {
-                fact: fact.key.clone(),
-                value: fact.value.clone(),
-                metric: spec.map(|spec| spec.name.to_string()),
-                unit: spec.map(|spec| spec.unit.to_string()),
-                value_type: spec.map(|spec| spec.value_type.to_string()),
-            });
+            out.push(push(&fact.key, &fact.value, Vec::new()));
+        }
+        // Kafka 的组读数（lag / state）挂在 `labeled_facts` 上，label 是组名与 topic：
+        // 诊断时最需要的正是这两维，不能只看 runtime_facts。
+        for fact in &sample.labeled_facts {
+            let labels = fact
+                .labels
+                .iter()
+                .map(|label| format!("{}={}", label.key, label.value))
+                .collect();
+            out.push(push(&fact.key, &fact.value, labels));
         }
     }
     out
+}
+
+fn mode_of(request: &ProbeRequest) -> &'static str {
+    if request.list {
+        "list"
+    } else if request.addr.is_some() {
+        "explicit"
+    } else {
+        "discovery"
+    }
+}
+
+fn domain_label(request: &ProbeRequest) -> &'static str {
+    if request.all {
+        "all"
+    } else {
+        request.domain.collection_kind()
+    }
 }
 
 fn build_report(
@@ -387,19 +626,22 @@ fn build_report(
     generated_at: OffsetDateTime,
     total: Duration,
     runs: &[TargetRun<'_>],
+    candidates: Vec<CandidateReport>,
     note: Option<String>,
 ) -> Report {
-    let targets = runs
+    let targets: Vec<TargetReport> = runs
         .iter()
         .map(|run| {
             let succeeded = run.result.attempted.saturating_sub(run.result.failed);
             TargetReport {
+                domain: run.target.domain().collection_kind(),
                 instance: run.target.instance(),
                 addr: run.target.addr(),
                 source: run.source,
                 credential_key: run.target.credential_key().to_string(),
                 password_file: run.target.password_file().to_string(),
-                password_file_present: Path::new(run.target.password_file()).is_file(),
+                password_file_present: !run.target.password_file().is_empty()
+                    && Path::new(run.target.password_file()).is_file(),
                 status: status_of(&run.result, succeeded),
                 duration_ms: run.elapsed.as_millis() as u64,
                 attempted: run.result.attempted,
@@ -407,25 +649,41 @@ fn build_report(
                 failed: run.result.failed,
                 last_error: run.result.last_error.clone(),
                 warnings: run.result.warnings.clone(),
-                facts: fact_reports(request.domain, &run.result),
+                facts: fact_reports(run.target.domain(), &run.result),
             }
         })
         .collect();
 
+    let mut summary = Summary {
+        targets: targets.len(),
+        candidates: candidates.len(),
+        ..Summary::default()
+    };
+    for target in &targets {
+        summary.succeeded += target.succeeded;
+        summary.failed += target.failed;
+        summary.facts += target.facts.len();
+        let registered = target
+            .facts
+            .iter()
+            .filter(|fact| fact.metric.is_some())
+            .count();
+        summary.registered_facts += registered;
+        summary.unregistered_facts += target.facts.len() - registered;
+    }
+
     Report {
         tool: "wist-agentd",
         version: env!("CARGO_PKG_VERSION"),
-        domain: request.domain.collection_kind(),
-        mode: if request.addr.is_some() {
-            "explicit"
-        } else {
-            "discovery"
-        },
+        domain: domain_label(request),
+        mode: mode_of(request),
         generated_at: generated_at
             .format(&Rfc3339)
             .unwrap_or_else(|_| "unknown".to_string()),
         duration_ms: total.as_millis() as u64,
         note,
+        summary,
+        candidates,
         targets,
     }
 }
@@ -441,7 +699,14 @@ fn report_path(request: &ProbeRequest, generated_at: OffsetDateTime) -> PathBuf 
         generated_at.minute(),
         generated_at.second()
     );
-    let file = format!("probe-{}-{stamp}.json", request.domain.label());
+    let file = format!(
+        "probe-{}-{stamp}.json",
+        if request.all {
+            "all"
+        } else {
+            request.domain.label()
+        }
+    );
     match &request.out {
         Some(path) if path.is_dir() || path.to_string_lossy().ends_with('/') => path.join(file),
         Some(path) => path.clone(),
@@ -479,14 +744,44 @@ fn print_human(report: &Report, path: &Path) {
         report.duration_ms,
         path.display()
     );
+    println!(
+        "  summary  targets={} succeeded={} failed={} facts={}（已注册 {} / 未注册 {}） candidates={}",
+        report.summary.targets,
+        report.summary.succeeded,
+        report.summary.failed,
+        report.summary.facts,
+        report.summary.registered_facts,
+        report.summary.unregistered_facts,
+        report.summary.candidates
+    );
     if let Some(note) = &report.note {
         println!("  {note}");
     }
+    if !report.candidates.is_empty() {
+        println!("\n自探候选：");
+        for candidate in &report.candidates {
+            println!(
+                "  [{}] {}  ({})  key={}  evidence={} confidence={}",
+                candidate.domain,
+                candidate.instance,
+                candidate.addr,
+                candidate.credential_key,
+                candidate.evidence,
+                candidate.confidence
+            );
+            if let Some(detail) = &candidate.detail
+                && !detail.is_empty()
+            {
+                println!("        {detail}");
+            }
+        }
+    }
     for (index, target) in report.targets.iter().enumerate() {
         println!(
-            "\n[{}/{}] {}  ({})  status={}  {}ms",
+            "\n[{}/{}] {} {}  ({})  status={}  {}ms",
             index + 1,
             report.targets.len(),
+            target.domain,
             target.instance,
             target.addr,
             target.status,
@@ -512,13 +807,18 @@ fn print_human(report: &Report, path: &Path) {
         } else {
             println!("      facts       {}", target.facts.len());
             for fact in &target.facts {
+                let labels = if fact.labels.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {{{}}}", fact.labels.join(","))
+                };
                 match (&fact.metric, &fact.unit, &fact.value_type) {
                     (Some(metric), Some(unit), Some(value_type)) => println!(
-                        "        {:<30} {:<14} -> {metric} ({value_type}, {unit})",
+                        "        {:<30} {:<14} -> {metric} ({value_type}, {unit}){labels}",
                         fact.fact, fact.value
                     ),
                     _ => println!(
-                        "        {:<30} {:<14} -> 指标未注册（会被规范化层丢弃）",
+                        "        {:<30} {:<14} -> 指标未注册（会被规范化层丢弃）{labels}",
                         fact.fact, fact.value
                     ),
                 }
@@ -528,24 +828,135 @@ fn print_human(report: &Report, path: &Path) {
 }
 
 // ---------------------------------------------------------------------------
+// 自探候选
+// ---------------------------------------------------------------------------
+
+/// `--list`：只跑自探并列出候选，不采集、不需要凭据。
+fn collect_candidates(domains: &[ProbeDomain], _timeout_ms: u64) -> Vec<CandidateReport> {
+    let mut out = Vec::new();
+    for domain in domains {
+        match domain {
+            ProbeDomain::Postgres => {
+                for entry in crate::discovery::pg_source::resolve_live() {
+                    out.push(CandidateReport {
+                        domain: domain.collection_kind(),
+                        instance: entry.instance(),
+                        addr: format!("{}:{}", entry.host, entry.port),
+                        credential_key: entry.credential_key.clone(),
+                        evidence: entry.evidence.clone(),
+                        confidence: entry.confidence,
+                        detail: Some(entry.detail.clone()),
+                    });
+                }
+            }
+            ProbeDomain::Mysql => {
+                for entry in crate::discovery::mysql_source::resolve_live() {
+                    out.push(CandidateReport {
+                        domain: domain.collection_kind(),
+                        instance: entry.instance(),
+                        addr: format!("{}:{}", entry.host, entry.port),
+                        credential_key: entry.credential_key.clone(),
+                        evidence: entry.evidence.clone(),
+                        confidence: entry.confidence,
+                        detail: Some(entry.detail.clone()),
+                    });
+                }
+            }
+            ProbeDomain::Doris => {
+                for entry in crate::discovery::doris_source::resolve_live() {
+                    out.push(CandidateReport {
+                        domain: domain.collection_kind(),
+                        instance: entry.instance(),
+                        addr: format!("{}:{}", entry.host, entry.port),
+                        credential_key: entry.credential_key.clone(),
+                        evidence: entry.evidence.clone(),
+                        confidence: entry.confidence,
+                        detail: Some(entry.detail.clone()),
+                    });
+                }
+            }
+            ProbeDomain::Kafka => {
+                for cluster in crate::discovery::kafka_source::resolve_live() {
+                    for endpoint in &cluster.endpoints {
+                        out.push(CandidateReport {
+                            domain: domain.collection_kind(),
+                            instance: cluster.source_ref.clone(),
+                            addr: endpoint.addr.clone(),
+                            credential_key: "probe".to_string(),
+                            evidence: cluster.evidence.clone(),
+                            confidence: cluster.confidence,
+                            detail: Some(format!(
+                                "protocol={} reachable={} kafka_api={}",
+                                endpoint.protocol, endpoint.reachable, endpoint.kafka_api
+                            )),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // 入口
 // ---------------------------------------------------------------------------
 
 pub(crate) async fn run(request: ProbeRequest) -> AgentdResult<i32> {
     let started = Instant::now();
     let generated_at = OffsetDateTime::now_utc();
-    let targets = resolve_targets(&request)?;
+    let domains = request_domains(&request);
+
+    // `--list`：只看自探能看到什么，不碰任何凭据。
+    if request.list {
+        let candidates = collect_candidates(&domains, request.timeout_ms);
+        let note = if candidates.is_empty() {
+            Some(format!(
+                "自探没有找到候选（{}）：自探只认 /proc 里的进程证据，本机没有在跑的实例就不会有；\
+                 非 Linux 平台永远为空。",
+                domains
+                    .iter()
+                    .map(|domain| domain.label())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            ))
+        } else {
+            None
+        };
+        let report = build_report(
+            &request,
+            generated_at,
+            started.elapsed(),
+            &[],
+            candidates,
+            note,
+        );
+        let path = report_path(&request, generated_at);
+        write_report(&report, &path)?;
+        emit(&request, &report, &path);
+        return Ok(exit_code(&report));
+    }
+
     let source = if request.addr.is_some() {
         "explicit"
     } else {
         "discovery"
     };
 
+    let mut targets = Vec::new();
+    for domain in &domains {
+        targets.extend(resolve_targets(*domain, &request)?);
+    }
+
     let note = if targets.is_empty() {
         Some(format!(
-            "自探没有找到 {} 候选：自探只认 /proc 里的进程证据（本机没有在跑的实例就不会有候选；\
-             非 Linux 平台永远是空）。先用 --addr <host:port> 指定一台验采集。",
-            request.domain.label()
+            "自探没有找到候选（{}）：自探只认 /proc 里的进程证据（本机没有在跑的实例就不会有候选；\
+             非 Linux 平台永远是空）。先用 --addr <host:port> 指定一台验采集，或用 --list 看候选。",
+            domains
+                .iter()
+                .map(|domain| domain.label())
+                .collect::<Vec<_>>()
+                .join("/")
         ))
     } else {
         None
@@ -563,30 +974,43 @@ pub(crate) async fn run(request: ProbeRequest) -> AgentdResult<i32> {
         });
     }
 
-    let report = build_report(&request, generated_at, started.elapsed(), &runs, note);
+    let report = build_report(
+        &request,
+        generated_at,
+        started.elapsed(),
+        &runs,
+        Vec::new(),
+        note,
+    );
     let path = report_path(&request, generated_at);
     write_report(&report, &path)?;
-
-    if request.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
-        );
-    } else {
-        print_human(&report, &path);
-    }
+    emit(&request, &report, &path);
 
     Ok(exit_code(&report))
 }
 
-/// 退出码：全部目标成功且至少有一个目标 = 0；任一轮失败或没找到候选 = 1。
-fn exit_code(report: &Report) -> i32 {
-    let failed: usize = report.targets.iter().map(|target| target.failed).sum();
-    if failed == 0 && !report.targets.is_empty() {
-        0
+fn emit(request: &ProbeRequest, report: &Report, path: &Path) {
+    if request.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string())
+        );
     } else {
-        1
+        print_human(report, path);
     }
+}
+
+/// 退出码：0 = 全部成功（`--list` 时为「至少有一个候选」）；
+/// 1 = 采集失败；2 = 没有候选 / 没找到目标。
+fn exit_code(report: &Report) -> i32 {
+    if report.mode == "list" {
+        return if report.candidates.is_empty() { 2 } else { 0 };
+    }
+    if report.targets.is_empty() {
+        return 2;
+    }
+    let failed: usize = report.targets.iter().map(|target| target.failed).sum();
+    if failed == 0 { 0 } else { 1 }
 }
 
 #[cfg(test)]
@@ -629,7 +1053,112 @@ mod tests {
         }
         assert_eq!(ProbeDomain::parse("tidb"), Some(ProbeDomain::Mysql));
         assert_eq!(ProbeDomain::parse("doris"), Some(ProbeDomain::Doris));
-        assert_eq!(ProbeDomain::parse("kafka"), None);
+        assert_eq!(ProbeDomain::parse("kafka"), Some(ProbeDomain::Kafka));
+        assert_eq!(ProbeDomain::parse("elasticsearch"), None);
+    }
+
+    #[test]
+    fn kafka_targets_use_the_single_instance_credential_convention() {
+        let request = ProbeRequest::new(ProbeDomain::Kafka);
+        let target = explicit_target(ProbeDomain::Kafka, "10.0.0.9", 9094, &request);
+
+        assert_eq!(target.domain(), ProbeDomain::Kafka);
+        assert_eq!(target.credential_key(), "probe");
+        assert_eq!(target.addr(), "10.0.0.9:9094");
+        assert_eq!(
+            target.password_file(),
+            "/etc/wist-agentd/secrets/kafka/probe"
+        );
+        assert_eq!(ProbeDomain::Kafka.default_port(), 9092);
+    }
+
+    #[test]
+    fn summary_counts_registered_and_unregistered_facts() {
+        let request = ProbeRequest {
+            addr: Some("127.0.0.1:5432".to_string()),
+            ..ProbeRequest::new(ProbeDomain::Postgres)
+        };
+        let report = report_for(
+            &request,
+            sample(&[("pg.up", "1"), ("pg.not.registered", "9")]),
+        );
+
+        assert_eq!(report.summary.targets, 1);
+        assert_eq!(report.summary.succeeded, 1);
+        assert_eq!(report.summary.failed, 0);
+        assert_eq!(report.summary.facts, 2);
+        assert_eq!(report.summary.registered_facts, 1);
+        assert_eq!(report.summary.unregistered_facts, 1);
+        assert_eq!(report.targets[0].domain, "pg_metrics");
+    }
+
+    #[test]
+    fn labeled_facts_from_kafka_keep_their_group_and_topic() {
+        let request = ProbeRequest {
+            addr: Some("10.0.0.9:9094".to_string()),
+            ..ProbeRequest::new(ProbeDomain::Kafka)
+        };
+        let mut result = sample(&[]);
+        result.targets[0].labeled_facts = vec![
+            wist_metrics::provider::MetricsLabeledFact {
+                key: "kafka.consumergroup.lag".to_string(),
+                value: "17".to_string(),
+                labels: vec![
+                    wist_contracts::discovery::StringKeyValue::new("group", "g1"),
+                    wist_contracts::discovery::StringKeyValue::new("topic", "t1"),
+                ],
+            },
+            wist_metrics::provider::MetricsLabeledFact {
+                key: "kafka.not.registered".to_string(),
+                value: "1".to_string(),
+                labels: Vec::new(),
+            },
+        ];
+        let report = report_for(&request, result);
+
+        let fact = &report.targets[0].facts[0];
+        assert_eq!(fact.value, "17");
+        assert_eq!(fact.labels, vec!["group=g1", "topic=t1"]);
+        assert_eq!(report.summary.registered_facts, 1);
+        assert_eq!(report.summary.unregistered_facts, 1);
+    }
+
+    #[test]
+    fn list_mode_exits_zero_only_with_candidates() {
+        let request = ProbeRequest {
+            list: true,
+            ..ProbeRequest::new(ProbeDomain::Postgres)
+        };
+
+        let with_candidate = build_report(
+            &request,
+            OffsetDateTime::now_utc(),
+            Duration::from_millis(2),
+            &[],
+            vec![CandidateReport {
+                domain: "pg_metrics",
+                instance: "postgres:10.0.0.1:5432".to_string(),
+                addr: "10.0.0.1:5432".to_string(),
+                credential_key: "port-5432".to_string(),
+                evidence: "config".to_string(),
+                confidence: 90,
+                detail: None,
+            }],
+            None,
+        );
+        assert_eq!(with_candidate.mode, "list");
+        assert_eq!(with_candidate.summary.candidates, 1);
+        assert_eq!(exit_code(&with_candidate), 0);
+
+        let empty = build_report(
+            &request,
+            OffsetDateTime::now_utc(),
+            Duration::ZERO,
+            &[],
+            Vec::new(),
+            Some("没找到".to_string()),
+        );
+        assert_eq!(exit_code(&empty), 2);
     }
 
     #[test]
@@ -675,6 +1204,7 @@ mod tests {
             OffsetDateTime::now_utc(),
             Duration::from_millis(7),
             &[run],
+            Vec::new(),
             None,
         );
         let json = serde_json::to_string(&report).unwrap();
@@ -739,6 +1269,7 @@ mod tests {
             OffsetDateTime::now_utc(),
             Duration::from_millis(3),
             &[run],
+            Vec::new(),
             None,
         )
     }
@@ -762,9 +1293,10 @@ mod tests {
             OffsetDateTime::now_utc(),
             Duration::ZERO,
             &[],
+            Vec::new(),
             Some("没找到".to_string()),
         );
-        assert_eq!(exit_code(&empty), 1);
+        assert_eq!(exit_code(&empty), 2, "没候选是 2，不是 1");
     }
 
     #[test]

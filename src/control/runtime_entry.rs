@@ -375,10 +375,15 @@ where
                     index += 1;
                     continue;
                 }
+                Command::Probe(request) => {
+                    request.all = true;
+                    index += 1;
+                    continue;
+                }
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "--all is only supported with refresh",
+                        "--all is only supported with refresh / probe",
                     ));
                 }
             }
@@ -558,10 +563,65 @@ where
                     };
                     request.timeout_ms = timeout_ms;
                 }
+                "--security-protocol" => {
+                    let protocol = text.trim().to_ascii_uppercase();
+                    if !matches!(
+                        protocol.as_str(),
+                        "PLAINTEXT" | "SSL" | "SASL_PLAINTEXT" | "SASL_SSL"
+                    ) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "--security-protocol must be PLAINTEXT | SSL | SASL_PLAINTEXT | SASL_SSL",
+                        ));
+                    }
+                    request.security_protocol = Some(protocol);
+                }
+                "--username" => request.username = Some(text.into_owned()),
+                "--ca-file" => request.ca_file = Some(PathBuf::from(value)),
+                "--group" => {
+                    for group in text.split(',').map(str::trim).filter(|g| !g.is_empty()) {
+                        request.group_allowlist.push(group.to_string());
+                    }
+                }
+                "--max-groups" => {
+                    let parsed = text.parse::<usize>().ok();
+                    let Some(max_groups) = parsed.filter(|value| *value > 0) else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "--max-groups needs a positive integer",
+                        ));
+                    };
+                    request.max_groups = Some(max_groups);
+                }
+                "--lag-threshold" => {
+                    let parsed = text.parse::<i64>().ok();
+                    let Some(lag_threshold) = parsed.filter(|value| *value >= 0) else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "--lag-threshold needs a non-negative integer",
+                        ));
+                    };
+                    request.lag_threshold = Some(lag_threshold);
+                }
                 _ => unreachable!("PROBE_VALUE_FLAGS 与分支必须一一对应"),
             }
             index += 2;
             continue;
+        }
+        if arg == "--list" {
+            match &mut command {
+                Command::Probe(request) => {
+                    request.list = true;
+                    index += 1;
+                    continue;
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--list is only supported with probe",
+                    ));
+                }
+            }
         }
         if arg == "--json" {
             match &mut command {
@@ -614,7 +674,7 @@ where
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "unknown argument or command: {display}{suggestion} (supported: help | version | init-config [--stdout] | service <print|install|uninstall|status> | enroll | diagnose [--json] [--offline] | refresh-facts [--wait <secs> | --no-wait] | refresh <--all | --only policies,work,facts,metrics-labels[,credentials[,uplink]]> [--wait <secs> | --no-wait] | metrics-labels <show|refresh|clear-cache> | investigate [topic] [--path <dir>] [--top <n>] [--min-size <size>] [--depth <n>] [--max-seconds <n>] [--json] | probe <pg|mysql|doris> [--addr <host:port>] [--password-file <path>] [--out <dir|file>] [--timeout-ms <n>] [--json] | --config-dir <path>)",
+                "unknown argument or command: {display}{suggestion} (supported: help | version | init-config [--stdout] | service <print|install|uninstall|status> | enroll | diagnose [--json] [--offline] | refresh-facts [--wait <secs> | --no-wait] | refresh <--all | --only policies,work,facts,metrics-labels[,credentials[,uplink]]> [--wait <secs> | --no-wait] | metrics-labels <show|refresh|clear-cache> | investigate [topic] [--path <dir>] [--top <n>] [--min-size <size>] [--depth <n>] [--max-seconds <n>] [--json] | probe <pg|mysql|doris|kafka> [--addr <host:port>] [--password-file <path>] [--out <dir|file>] [--timeout-ms <n>] [--list] [--all] [--security-protocol <p>] [--username <u>] [--ca-file <path>] [--json] | --config-dir <path>)",
             ),
         ));
     }
@@ -626,6 +686,17 @@ where
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "refresh needs a scope: --all or --only <sources>",
+        ));
+    }
+
+    // `--addr` 是「只看这一台」，与「看全部 / 只看自探候选」互斥。
+    if let Command::Probe(request) = &command
+        && request.addr.is_some()
+        && (request.all || request.list)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--addr cannot be combined with --list or --all",
         ));
     }
 
@@ -659,7 +730,18 @@ const INVESTIGATE_VALUE_FLAGS: &[&str] =
     &["--path", "--top", "--min-size", "--depth", "--max-seconds"];
 
 /// `probe` 的取值参数（单次采集）。
-const PROBE_VALUE_FLAGS: &[&str] = &["--addr", "--password-file", "--out", "--timeout-ms"];
+const PROBE_VALUE_FLAGS: &[&str] = &[
+    "--addr",
+    "--password-file",
+    "--out",
+    "--timeout-ms",
+    "--security-protocol",
+    "--username",
+    "--ca-file",
+    "--group",
+    "--max-groups",
+    "--lag-threshold",
+];
 
 /// 把一个 `investigate` 选项写到请求上（并且**当场夹紧**，与 `--wait` 同一做法）。
 fn apply_investigate_option(
@@ -1793,8 +1875,10 @@ fn usage_message() -> &'static str {
         "  wist-agentd investigate [disk|load|accounts|persistence|exposure] [--path <dir>]\n",
         "                                 [--top <n>] [--min-size <size>] [--depth <n>]\n",
         "                                 [--max-seconds <n>] [--json] [--config-dir <path>]\n",
-        "  wist-agentd probe <pg|mysql|doris> [--addr <host:port>] [--password-file <path>]\n",
+        "  wist-agentd probe <pg|mysql|doris|kafka> [--addr <host:port>] [--password-file <path>]\n",
         "                                 [--out <dir|file>] [--timeout-ms <n>] [--json]\n",
+        "                                 [--list] [--all] [--security-protocol <p>]\n",
+        "                                 [--username <u>] [--ca-file <path>]\n",
         "\n",
         "Commands:\n",
         "  help                 Show this help message.\n",
@@ -1827,9 +1911,11 @@ fn usage_message() -> &'static str {
         "                       Exits nonzero when anything FAILs.\n",
         "  probe <domain>       Run ONE collection round and write a JSON report (no service,\n",
         "                       no enrollment, no gateway authorization needed).\n",
-        "                       Domains: pg | mysql | doris.\n",
+        "                       Domains: pg | mysql | doris | kafka.\n",
         "                       No --addr: use this host's discovery (Linux only, reads /proc).\n",
-        "                       Exits nonzero when the round fails or no target was found.\n",
+        "                       --list: only list discovery candidates (no credentials needed).\n",
+        "                       --all: probe/list every domain.\n",
+        "                       Exits 0 = all ok, 1 = collection failed, 2 = no target found.\n",
         "\n",
         "Refresh options (refresh / refresh-facts):\n",
         "  --wait <secs>        Wait up to <secs> for the daemon to finish (default 15, max 120).\n",
@@ -1848,6 +1934,14 @@ fn usage_message() -> &'static str {
         "                       /etc/wist-agentd/secrets/<domain>/<key>/password path).\n",
         "  --out <dir|file>     Where to write the JSON report (default: ./probe-<domain>-<UTC>.json).\n",
         "  --timeout-ms <n>     Per-request timeout (default 5000).\n",
+        "  --list               Only list what discovery found; do not connect or collect.\n",
+        "  --all                Run every domain (pg, mysql, doris, kafka). Not with --addr.\n",
+        "  --security-protocol  Kafka only: PLAINTEXT | SSL | SASL_PLAINTEXT | SASL_SSL.\n",
+        "  --username <u>       Kafka only: SASL username (password still comes from the file).\n",
+        "  --ca-file <path>     Kafka only: private CA bundle (default: system roots).\n",
+        "  --group <names>      Kafka only: only report these consumer groups (comma-separated).\n",
+        "  --max-groups <n>     Kafka only: cap how many groups are queried per round (default 200).\n",
+        "  --lag-threshold <n>  Kafka only: with no --group, only report groups above this lag (default 1000).\n",
         "\n",
         "Service options (Linux uses systemd, macOS uses launchd):\n",
         "  --bin <path>         Installed path of the wist-agentd binary (default: current executable).\n",

@@ -662,23 +662,43 @@ wist-agentd investigate load --top 20 --json             # 列前 20 个进程
 `probe` 就跑**一轮**采集并把结果写成 JSON，不需要注册、不需要网关派活、不用起守护进程。
 
 ```bash
-# 指定一台库（最常用；缺省端口按域取 5432 / 3306 / 9030）
+# 指定一台库（最常用；缺省端口按域取 5432 / 3306 / 9030 / 9092）
 wist-agentd probe pg --addr 127.0.0.1:5432 --password-file /tmp/pg-pw --out ./probe
 
-# 用本机自探（Linux）：自己找 pg / mysql / doris 候选
+# 用本机自探（Linux）：自己找 pg / mysql / doris / kafka 候选
 wist-agentd probe pg --out ./probe
+
+# 只看自探看到了什么（不连库、不需要凭据）
+wist-agentd probe pg --list
+wist-agentd probe pg --all --list        # 四个域一起列
+
+# 四个域一起采（自探到几个采几个）
+wist-agentd probe pg --all
+
+# Kafka（凭据与协议也可以显式给）
+wist-agentd probe kafka --addr 10.0.0.145:30001 \
+  --security-protocol SASL_SSL --username wist-probe \
+  --password-file /tmp/kafka-pw --ca-file /tmp/ca.pem
+
+# Kafka 消费组：默认只发「总 lag > 1000」的组；白名单里的组全发（即使 lag=0）
+wist-agentd probe kafka --addr 10.0.0.145:30001 --group g1,g2
+wist-agentd probe kafka --addr 10.0.0.145:30001 --lag-threshold 0 --max-groups 500
 ```
 
-支持的域：`pg` / `mysql` / `doris`。人读输出会逐条列出 fact → 指标名，看到
-`指标未注册` 就说明采到了但 `wist-metrics` 里没声明（规范化层会丢弃，属于版本对不上）；
-`status=failed` 时 `error` 一行就是原因（连不上 / 认证失败 / 密码文件缺失）。
+支持的域：`pg` / `mysql` / `doris` / `kafka`。`--list` 只跑自探并列出候选
+（地址 / 凭据 key / 证据 / 置信度 / 可达性与协议），不采集、不读凭据，适合回答「这台机器 agentd 到底看到了什么」。
+
+人读输出先给一行 `summary`（目标数 / 成功数 / 失败数 / 事实数 / **已注册 vs 未注册**指标数 / 候选数），
+再逐条列 fact → 指标名。看到 `指标未注册` 就说明采到了但 `wist-metrics` 里没声明
+（规范化层会丢弃，属于版本对不上）；Kafka 的组读数会带上 `{group=...,topic=...}` 标签。
 
 落盘的 JSON（默认 `./probe-<域>-<UTC>.json`）里有：域、模式（explicit / discovery）、
 每个目标的地址/凭据 key/耗时/attempted/succeeded/failed、`last_error`、`warnings`、
 逐条 fact 与它对应的指标（名字/单位/类型）。**密码不读进内存、也不进报告**，
 只记 `password_file` 路径与 `password_file_present`。
 
-退出码：全部成功且至少有一个目标 = 0；任一轮失败或自探没找到候选 = 1（可直接用于脚本门禁）。
+退出码：`0` = 全部成功（`--list` 时 = 至少有一个候选）；`1` = 采集失败；
+`2` = 没找到候选 / 目标（可直接用于脚本门禁，且能与「失败」区分开）。
 
 两个容易踩的点：
 

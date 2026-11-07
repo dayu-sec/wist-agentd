@@ -693,3 +693,21 @@ fn option_valued_properties_flags_are_not_positional_config_paths() {
     ]);
     assert_eq!(config_path(&argv), None);
 }
+
+#[test]
+fn a_node_port_advertised_endpoint_keeps_its_listener_protocol() {
+    // NodePort 下 advertised 端口（30001）与 bind 端口（9095）不同；
+    // 按端口回查 listeners 会落空，把协议判成 unknown —— 采集侧会因此不敢走明文握手。
+    let props = "\
+listeners=EXTERNAL://:9095\n\
+advertised.listeners=EXTERNAL://10.168.0.145:30001\n\
+listener.security.protocol.map=EXTERNAL:PLAINTEXT\n";
+    let cluster = from_properties(props).expect("props");
+    let advertised = cluster
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.addr == "10.168.0.145:30001")
+        .expect("advertised endpoint");
+    assert_eq!(advertised.protocol.as_deref(), Some("PLAINTEXT"));
+    assert_eq!(advertised.source, "advertised");
+}

@@ -3,6 +3,22 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布] - 2026-11-07
+
+### 新增
+
+- **`probe` 能力增强**：
+  - 新增 **Kafka 域**（`probe kafka`）：走真实 admin 采集（拓扑 / 消费组 lag / 状态 / 日志目录可用空间），
+    支持 `--security-protocol` / `--username` / `--ca-file`，密码仍只从文件读；
+  - **`--list`**：只跑自探列候选（地址 / 凭据 key / 证据 / 置信度），不采集、不读凭据；
+  - **`--all`**：四个域一起跑（可与 `--list` 组合）；
+  - **分级退出码**：`0` 全成功（`--list` = 有候选）、`1` 采集失败、`2` 没找到候选/目标；
+  - 报告新增 `summary`（目标/成功/失败/事实数 + **已注册 vs 未注册**指标数 + 候选数），
+    并让 `--all` 的每条目标带 `domain`；Kafka 组读数的 `group` / `topic` label 进报告；
+  - Kafka 消费组策略可临时覆盖：`--group <a,b>` / `--max-groups <n>` / `--lag-threshold <n>`；
+  - Kafka 自探：**NodePort 等「advertised 端口 ≠ bind 端口」的端点现在能拿到监听器协议**
+    （原来按端口回查会落成 `unknown`，采集侧因此不敢走明文握手）。
+
 ## [0.27.0-alpha] - 2026-11-07
 
 ### 新增

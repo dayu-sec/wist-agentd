@@ -242,11 +242,21 @@ fn resolve(
 }
 
 /// 把证据整理成一条候选（**还没探测端点**）。
+/// 一条端点假设（还没探测）。
+struct RawEndpoint {
+    addr: String,
+    source: &'static str,
+    /// 发布该端点的监听器的安全协议。`advertised` 的端口可能和 bind 端口不同
+    /// （NodePort / 端口映射），按**端口**回查 `listeners` 会落空判成 `unknown`，
+    /// 所以协议在构造端点时就带上。
+    protocol: Option<String>,
+}
+
 struct RawCluster {
     broker_id: Option<i32>,
     listeners: Vec<KafkaListenerEntry>,
     mechanisms: Vec<String>,
-    endpoints: Vec<(String, String)>, // (addr, source)
+    endpoints: Vec<RawEndpoint>,
     evidence: &'static str,
     detail: String,
     confidence: i64,
@@ -294,7 +304,7 @@ fn cluster_from_evidence(
             port: *port,
         })
         .collect();
-    let endpoints: Vec<(String, String)> = listening
+    let endpoints: Vec<RawEndpoint> = listening
         .iter()
         .map(|(ip, port)| {
             let host = if is_concrete_host(ip) {
@@ -302,7 +312,11 @@ fn cluster_from_evidence(
             } else {
                 "127.0.0.1"
             };
-            (endpoint_addr(host, *port), "loopback".to_string())
+            RawEndpoint {
+                addr: endpoint_addr(host, *port),
+                source: "loopback",
+                protocol: None,
+            }
         })
         .collect();
     Some(RawCluster {
@@ -323,19 +337,23 @@ fn finalize(
 ) -> KafkaClusterEntry {
     let mut seen = BTreeSet::new();
     let mut endpoints: Vec<KafkaEndpointEntry> = Vec::new();
-    for (addr, source) in cluster.endpoints {
-        if !seen.insert(addr.clone()) {
+    for endpoint in cluster.endpoints {
+        if !seen.insert(endpoint.addr.clone()) {
             continue;
         }
         if endpoints.len() >= MAX_ENDPOINTS_PER_CLUSTER {
             break;
         }
-        let protocol = protocol_of(&cluster.listeners, &addr);
-        let outcome = reach.probe(&addr, protocol);
+        // 端点自带协议（NodePort 等端口不一致的情况）；没带才按端口回查。
+        let protocol = endpoint
+            .protocol
+            .clone()
+            .unwrap_or_else(|| protocol_of(&cluster.listeners, &endpoint.addr).to_string());
+        let outcome = reach.probe(&endpoint.addr, &protocol);
         endpoints.push(KafkaEndpointEntry {
-            addr,
-            source,
-            protocol: protocol.to_string(),
+            addr: endpoint.addr,
+            source: endpoint.source.to_string(),
+            protocol,
             reachable: outcome.tcp,
             kafka_api: outcome.kafka_api,
         });
@@ -678,27 +696,33 @@ fn build_cluster(
             .unwrap_or_default();
         entries.push(KafkaListenerEntry {
             name: name.clone(),
-            protocol,
+            protocol: protocol.clone(),
             port,
         });
 
         // 端点假设 ①：broker 自己告诉客户端用的地址
         if let Some(public) = public.filter(|listener| is_concrete_host(&listener.host)) {
-            endpoints.push((
-                endpoint_addr(&public.host, public.port),
-                "advertised".to_string(),
-            ));
+            endpoints.push(RawEndpoint {
+                addr: endpoint_addr(&public.host, public.port),
+                source: "advertised",
+                protocol: known_or_none(&protocol),
+            });
         }
         // 端点假设 ②：bind 在具体 IP 上时，它本身就是可达地址
         if let Some(listener) = listening.filter(|listener| is_concrete_host(&listener.host)) {
-            endpoints.push((
-                endpoint_addr(&listener.host, listener.port),
-                "listener".to_string(),
-            ));
+            endpoints.push(RawEndpoint {
+                addr: endpoint_addr(&listener.host, listener.port),
+                source: "listener",
+                protocol: known_or_none(&protocol),
+            });
         }
         // 端点假设 ③：本机回环（hostNetwork / hostPort / NodePort 场景）
         if port > 0 {
-            endpoints.push((endpoint_addr("127.0.0.1", port), "loopback".to_string()));
+            endpoints.push(RawEndpoint {
+                addr: endpoint_addr("127.0.0.1", port),
+                source: "loopback",
+                protocol: known_or_none(&protocol),
+            });
         }
     }
 
@@ -780,6 +804,11 @@ fn endpoint_addr(host: &str, port: u16) -> String {
     } else {
         format!("{host}:{port}")
     }
+}
+
+/// 把监听器协议记到端点上；`unknown` 视为「不知道」，留给端口回查。
+fn known_or_none(protocol: &str) -> Option<String> {
+    (protocol != "unknown").then(|| protocol.to_string())
 }
 
 /// 这条端点的监听器协议（用于决定能不能做完整握手）。

@@ -1504,9 +1504,62 @@ fn probe_parses_domain_and_value_flags() {
             out: Some(PathBuf::from("/tmp/out/")),
             timeout_ms: 3000,
             json: true,
+            ..ProbeRequest::new(ProbeDomain::Postgres)
         })
     );
     assert_eq!(parsed.config_dir, None);
+}
+
+#[test]
+fn probe_accepts_list_and_all_and_kafka_security_flags() {
+    use crate::telemetry::metrics::probe_cli::{ProbeDomain, ProbeRequest};
+
+    let parsed = parse_command(["probe", "pg", "--list"]).expect("parse");
+    let Command::Probe(request) = parsed.command else {
+        panic!("expected probe");
+    };
+    assert!(request.list && !request.all);
+
+    let parsed = parse_command(["probe", "kafka", "--all"]).expect("parse");
+    let Command::Probe(request) = parsed.command else {
+        panic!("expected probe");
+    };
+    assert!(request.all && !request.list);
+
+    let parsed = parse_command([
+        "probe",
+        "kafka",
+        "--addr",
+        "10.0.0.1:9092",
+        "--security-protocol",
+        "SASL_SSL",
+        "--username",
+        "wist-probe",
+        "--ca-file",
+        "/tmp/ca.pem",
+    ])
+    .expect("parse");
+    assert_eq!(
+        parsed.command,
+        Command::Probe(ProbeRequest {
+            addr: Some("10.0.0.1:9092".to_string()),
+            security_protocol: Some("SASL_SSL".to_string()),
+            username: Some("wist-probe".to_string()),
+            ca_file: Some(PathBuf::from("/tmp/ca.pem")),
+            ..ProbeRequest::new(ProbeDomain::Kafka)
+        })
+    );
+}
+
+#[test]
+fn probe_rejects_addr_with_list_or_all() {
+    for argv in [
+        ["probe", "pg", "--list", "--addr", "127.0.0.1:5432"],
+        ["probe", "pg", "--addr", "127.0.0.1:5432", "--all"],
+    ] {
+        let err = parse_command(argv).expect_err("should reject");
+        assert!(err.to_string().contains("--addr"), "{err}");
+    }
 }
 
 #[test]
@@ -1514,7 +1567,7 @@ fn probe_misparses_are_explained() {
     let err = parse_command(["probe"]).expect_err("missing domain");
     assert!(err.to_string().contains("probe needs a domain"), "{err}");
 
-    let err = parse_command(["probe", "kafka"]).expect_err("unknown domain");
+    let err = parse_command(["probe", "elasticsearch"]).expect_err("unknown domain");
     assert!(err.to_string().contains("unknown probe domain"), "{err}");
 
     let err = parse_command(["probe", "pg", "--timeout-ms", "0"]).expect_err("zero timeout");
@@ -1526,4 +1579,30 @@ fn probe_misparses_are_explained() {
             .contains("--addr is only supported with probe"),
         "{err}"
     );
+}
+
+#[test]
+fn probe_accepts_kafka_group_policy_flags() {
+    let parsed = parse_command([
+        "probe",
+        "kafka",
+        "--addr",
+        "10.0.0.1:9092",
+        "--group",
+        "a,b",
+        "--group",
+        "c",
+        "--max-groups",
+        "50",
+        "--lag-threshold",
+        "0",
+    ])
+    .expect("parse");
+
+    let Command::Probe(request) = parsed.command else {
+        panic!("expected probe");
+    };
+    assert_eq!(request.group_allowlist, vec!["a", "b", "c"]);
+    assert_eq!(request.max_groups, Some(50));
+    assert_eq!(request.lag_threshold, Some(0));
 }
