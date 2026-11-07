@@ -13,6 +13,7 @@ use crate::service::{
     self, ServiceCommand, ServiceCommandOutcome, ServiceLayout, ServicePlatform, ServiceSpec,
 };
 use crate::state_store;
+use crate::telemetry::metrics::probe_cli::{ProbeDomain, ProbeRequest};
 use wist_shared::time::now_ts_ms;
 
 const CONFIG_DIR: &str = "wist-agentd";
@@ -66,6 +67,8 @@ enum Command {
         request: crate::investigate::InvestigateRequest,
         json: bool,
     },
+    /// 单次采集 + 落文件：不启服务、不进授权链路（见 [`crate::telemetry::metrics::probe_cli`]）。
+    Probe(ProbeRequest),
 }
 
 /// `metrics-labels` 子命令的动作。
@@ -204,6 +207,7 @@ where
             };
             crate::investigate::run(config_root.as_deref(), request, json).await
         }
+        Command::Probe(request) => crate::telemetry::metrics::probe_cli::run(request).await,
     }
 }
 
@@ -449,6 +453,35 @@ where
             command_explicit = true;
             continue;
         }
+        if arg == "probe" {
+            if command_explicit {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "multiple commands are not supported",
+                ));
+            }
+            index += 1;
+            let Some(candidate) = args.get(index) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("probe needs a domain: {}", ProbeDomain::supported()),
+                ));
+            };
+            let text = candidate.to_string_lossy();
+            let Some(domain) = ProbeDomain::parse(&text) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "unknown probe domain {text:?} (supported: {})",
+                        ProbeDomain::supported()
+                    ),
+                ));
+            };
+            command = Command::Probe(ProbeRequest::new(domain));
+            command_explicit = true;
+            index += 1;
+            continue;
+        }
         if arg == "--no-wait" {
             match &mut command {
                 Command::RefreshFacts { wait_secs } | Command::Refresh { wait_secs, .. } => {
@@ -502,6 +535,34 @@ where
             index += 2;
             continue;
         }
+        if let Some(flag) = arg.to_str().filter(|text| PROBE_VALUE_FLAGS.contains(text)) {
+            let value = option_value(&args, index + 1, flag)?;
+            let Command::Probe(request) = &mut command else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{flag} is only supported with probe"),
+                ));
+            };
+            let text = value.to_string_lossy();
+            match flag {
+                "--addr" => request.addr = Some(text.into_owned()),
+                "--password-file" => request.password_file = Some(PathBuf::from(value)),
+                "--out" => request.out = Some(PathBuf::from(value)),
+                "--timeout-ms" => {
+                    let parsed = text.parse::<u64>().ok();
+                    let Some(timeout_ms) = parsed.filter(|value| *value > 0) else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "--timeout-ms needs a positive integer number of milliseconds",
+                        ));
+                    };
+                    request.timeout_ms = timeout_ms;
+                }
+                _ => unreachable!("PROBE_VALUE_FLAGS 与分支必须一一对应"),
+            }
+            index += 2;
+            continue;
+        }
         if arg == "--json" {
             match &mut command {
                 Command::Doctor { json, .. } => {
@@ -514,10 +575,15 @@ where
                     index += 1;
                     continue;
                 }
+                Command::Probe(request) => {
+                    request.json = true;
+                    index += 1;
+                    continue;
+                }
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "--json is only supported with diagnose / investigate",
+                        "--json is only supported with diagnose / investigate / probe",
                     ));
                 }
             }
@@ -548,7 +614,7 @@ where
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "unknown argument or command: {display}{suggestion} (supported: help | version | init-config [--stdout] | service <print|install|uninstall|status> | enroll | diagnose [--json] [--offline] | refresh-facts [--wait <secs> | --no-wait] | refresh <--all | --only policies,work,facts,metrics-labels[,credentials[,uplink]]> [--wait <secs> | --no-wait] | metrics-labels <show|refresh|clear-cache> | investigate [topic] [--path <dir>] [--top <n>] [--min-size <size>] [--depth <n>] [--max-seconds <n>] [--json] | --config-dir <path>)",
+                "unknown argument or command: {display}{suggestion} (supported: help | version | init-config [--stdout] | service <print|install|uninstall|status> | enroll | diagnose [--json] [--offline] | refresh-facts [--wait <secs> | --no-wait] | refresh <--all | --only policies,work,facts,metrics-labels[,credentials[,uplink]]> [--wait <secs> | --no-wait] | metrics-labels <show|refresh|clear-cache> | investigate [topic] [--path <dir>] [--top <n>] [--min-size <size>] [--depth <n>] [--max-seconds <n>] [--json] | probe <pg|mysql|doris> [--addr <host:port>] [--password-file <path>] [--out <dir|file>] [--timeout-ms <n>] [--json] | --config-dir <path>)",
             ),
         ));
     }
@@ -585,11 +651,15 @@ const KNOWN_COMMANDS: &[&str] = &[
     "refresh",
     "metrics-labels",
     "investigate",
+    "probe",
 ];
 
 /// `investigate` 的取值参数（题目本身的选项）。
 const INVESTIGATE_VALUE_FLAGS: &[&str] =
     &["--path", "--top", "--min-size", "--depth", "--max-seconds"];
+
+/// `probe` 的取值参数（单次采集）。
+const PROBE_VALUE_FLAGS: &[&str] = &["--addr", "--password-file", "--out", "--timeout-ms"];
 
 /// 把一个 `investigate` 选项写到请求上（并且**当场夹紧**，与 `--wait` 同一做法）。
 fn apply_investigate_option(
@@ -1723,6 +1793,8 @@ fn usage_message() -> &'static str {
         "  wist-agentd investigate [disk|load|accounts|persistence|exposure] [--path <dir>]\n",
         "                                 [--top <n>] [--min-size <size>] [--depth <n>]\n",
         "                                 [--max-seconds <n>] [--json] [--config-dir <path>]\n",
+        "  wist-agentd probe <pg|mysql|doris> [--addr <host:port>] [--password-file <path>]\n",
+        "                                 [--out <dir|file>] [--timeout-ms <n>] [--json]\n",
         "\n",
         "Commands:\n",
         "  help                 Show this help message.\n",
@@ -1753,6 +1825,11 @@ fn usage_message() -> &'static str {
         "                       Topics: disk (default) | load | accounts | persistence | exposure\n",
         "                       (the last three are Linux-only for now).\n",
         "                       Exits nonzero when anything FAILs.\n",
+        "  probe <domain>       Run ONE collection round and write a JSON report (no service,\n",
+        "                       no enrollment, no gateway authorization needed).\n",
+        "                       Domains: pg | mysql | doris.\n",
+        "                       No --addr: use this host's discovery (Linux only, reads /proc).\n",
+        "                       Exits nonzero when the round fails or no target was found.\n",
         "\n",
         "Refresh options (refresh / refresh-facts):\n",
         "  --wait <secs>        Wait up to <secs> for the daemon to finish (default 15, max 120).\n",
@@ -1764,6 +1841,13 @@ fn usage_message() -> &'static str {
         "  --min-size <size>    Only list files at least this big (e.g. 8MiB; default 0).\n",
         "  --depth <n>          Descend at most N levels (default 16, max 64).\n",
         "  --max-seconds <n>    Time budget for the scan (default 5, max 30).\n",
+        "\n",
+        "Probe options (one-shot collection; the password is read from a file, never printed):\n",
+        "  --addr <host:port>   Probe this instance instead of discovery (omit port = domain default).\n",
+        "  --password-file <p>  Read the probe password from <p> (default: the documented\n",
+        "                       /etc/wist-agentd/secrets/<domain>/<key>/password path).\n",
+        "  --out <dir|file>     Where to write the JSON report (default: ./probe-<domain>-<UTC>.json).\n",
+        "  --timeout-ms <n>     Per-request timeout (default 5000).\n",
         "\n",
         "Service options (Linux uses systemd, macOS uses launchd):\n",
         "  --bin <path>         Installed path of the wist-agentd binary (default: current executable).\n",

@@ -1475,3 +1475,55 @@ fn metrics_labels_subcommands_parse_and_misparses_are_explained() {
         "{err}"
     );
 }
+
+#[test]
+fn probe_parses_domain_and_value_flags() {
+    use crate::telemetry::metrics::probe_cli::{ProbeDomain, ProbeRequest};
+
+    let parsed = parse_command([
+        "probe",
+        "pg",
+        "--addr",
+        "127.0.0.1:55439",
+        "--password-file",
+        "/tmp/pw",
+        "--out",
+        "/tmp/out/",
+        "--timeout-ms",
+        "3000",
+        "--json",
+    ])
+    .expect("parse");
+
+    assert_eq!(
+        parsed.command,
+        Command::Probe(ProbeRequest {
+            domain: ProbeDomain::Postgres,
+            addr: Some("127.0.0.1:55439".to_string()),
+            password_file: Some(PathBuf::from("/tmp/pw")),
+            out: Some(PathBuf::from("/tmp/out/")),
+            timeout_ms: 3000,
+            json: true,
+        })
+    );
+    assert_eq!(parsed.config_dir, None);
+}
+
+#[test]
+fn probe_misparses_are_explained() {
+    let err = parse_command(["probe"]).expect_err("missing domain");
+    assert!(err.to_string().contains("probe needs a domain"), "{err}");
+
+    let err = parse_command(["probe", "kafka"]).expect_err("unknown domain");
+    assert!(err.to_string().contains("unknown probe domain"), "{err}");
+
+    let err = parse_command(["probe", "pg", "--timeout-ms", "0"]).expect_err("zero timeout");
+    assert!(err.to_string().contains("--timeout-ms"), "{err}");
+
+    let err = parse_command(["diagnose", "--addr", "127.0.0.1:5432"]).expect_err("wrong command");
+    assert!(
+        err.to_string()
+            .contains("--addr is only supported with probe"),
+        "{err}"
+    );
+}

@@ -112,7 +112,6 @@ fn resolve(
         if !is_server(&process.exe, &argv) {
             continue;
         }
-        inspected += 1;
 
         let hint = port_hint(&process, &argv, proc);
         let same_netns = proc.same_netns(process.pid);
@@ -136,6 +135,13 @@ fn resolve(
                 candidates.push(port);
             }
         }
+
+        // 没任何候选端口的进程不占名额：`MAX_INSPECTED_PROCESSES` 限的是**握手**，
+        // 不是「看过多少个进程」（改过进程名的 postmaster 拿不到证据端口，靠监听端口兜底）。
+        if candidates.is_empty() {
+            continue;
+        }
+        inspected += 1;
 
         for port in candidates {
             let Some(host) = addrs
@@ -305,21 +311,32 @@ fn may_be_server(exe: &str) -> bool {
         .any(|needle| exe.contains(needle))
 }
 
-/// 是不是**服务端**进程（排除客户端、备份工具、连接池）。
+/// 是不是**服务端**进程（排除客户端、备份工具、连接池、连接后端）。
 fn is_server(exe: &str, argv: &[String]) -> bool {
-    let name = if exe.is_empty() {
-        argv.first()
-            .map(|arg| {
-                std::path::Path::new(arg)
-                    .file_name()
-                    .map(|name| name.to_string_lossy().to_string())
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default()
+    // 进程名统一取 **basename**：Linux 上 `exe` 是完整路径
+    // （`/usr/lib/postgresql/16/bin/postgres`），直接 `starts_with("postgres")`
+    // 会把真实部署全判成「不是服务端」—— 一个候选都发现不了。
+    let raw = if exe.is_empty() {
+        argv.first().cloned().unwrap_or_default()
     } else {
         exe.to_string()
     };
-    let name = name.to_ascii_lowercase();
+    let name = std::path::Path::new(&raw)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or(raw)
+        .to_ascii_lowercase();
+
+    // PG 的连接后端会把 argv[0] 改写成 `postgres: <cluster>: <user> <db> <addr> <state>`
+    // （`ps` 的 COMMAND 列就是这个）。它们不监听端口，而且数量随连接数增长 ——
+    // 不排除的话会把 `MAX_INSPECTED_PROCESSES` 名额吃光，真正的 postmaster 轮不到。
+    if argv.first().is_some_and(|arg| {
+        arg.trim_start()
+            .to_ascii_lowercase()
+            .starts_with("postgres:")
+    }) {
+        return false;
+    }
 
     // 连接池与客户端：它们说 PG 协议但不是数据库本身，
     // 采它们会把「池子的统计」当成「数据库的统计」。
@@ -570,6 +587,70 @@ mod tests {
     }
 
     #[test]
+    fn a_real_binary_path_is_still_the_server() {
+        // Linux 的 `process.executable.name` 是 `/proc/<pid>/exe` 的**完整路径**；
+        // 按完整路径做前缀匹配会让真实部署一个候选都发现不了。
+        assert!(is_server("/usr/lib/postgresql/16/bin/postgres", &[]));
+        assert!(is_server(
+            "/usr/lib/postgresql/16/bin/postgres",
+            &[
+                "/usr/lib/postgresql/16/bin/postgres".to_string(),
+                "-D".to_string(),
+                "/home/postgres/pgdata".to_string()
+            ]
+        ));
+        // 同样的规则也要把客户端路径排除掉。
+        assert!(!is_server("/usr/lib/postgresql/16/bin/psql", &[]));
+    }
+
+    #[test]
+    fn connection_backends_do_not_consume_the_inspection_budget() {
+        // PG 把连接后端的 argv[0] 改写成 `postgres: <cluster>: <user> <db> ...`，
+        // 数量随连接数增长。不排除的话，排在前面的 8 个后端就把名额吃光，
+        // 真正的 postmaster（pid 更大、启动更晚）永远轮不到 —— 现场表现就是「有库但一个实例都发现不了」。
+        let backend_argv = vec![
+            "postgres: pg-ha-cluster: appuser ai_platform 10.244.154.237(37234) idle".to_string(),
+        ];
+        assert!(!is_server(
+            "/usr/lib/postgresql/16/bin/postgres",
+            &backend_argv
+        ));
+
+        // 12 个后端连接 + 1 个 postmaster：后者必须还能被发现。
+        let mut resources = Vec::new();
+        let mut proc = FakeProc::default();
+        for backend in 1..=12u32 {
+            resources.push(process(backend, "/usr/lib/postgresql/16/bin/postgres"));
+            proc.cmdlines.insert(backend, backend_argv.clone());
+            proc.listen.insert(backend, vec![5432]);
+            proc.addrs
+                .insert(backend, vec!["10.244.154.232".to_string()]);
+        }
+        resources.push(process(999, "/usr/lib/postgresql/16/bin/postgres"));
+        proc.cmdlines.insert(
+            999,
+            vec![
+                "/usr/lib/postgresql/16/bin/postgres".to_string(),
+                "-D".to_string(),
+                "/home/postgres/pgdata/pgroot/data".to_string(),
+            ],
+        );
+        proc.listen.insert(999, vec![5432]);
+        proc.addrs.insert(999, vec!["10.244.154.232".to_string()]);
+
+        let snapshot = snapshot(resources);
+        let handshake = FakeHandshake {
+            accepting: vec!["10.244.154.232:5432".to_string()],
+        };
+
+        let found = resolve(&snapshot, &proc, &handshake);
+
+        assert_eq!(found.len(), 1, "postmaster 必须被发现：{found:?}");
+        assert_eq!(found[0].host, "10.244.154.232");
+        assert_eq!(found[0].port, 5432);
+    }
+
+    #[test]
     fn the_port_line_ignores_comments_and_quotes() {
         assert_eq!(port_from_conf("port = 5432"), Some(5432));
         assert_eq!(port_from_conf("# port = 5432\nport = 6543"), Some(6543));
@@ -589,5 +670,62 @@ mod tests {
         assert_eq!(argv_datadir(&argv).as_deref(), Some("/data2"));
         let argv = vec!["postgres".to_string(), "-D/data3".to_string()];
         assert_eq!(argv_datadir(&argv).as_deref(), Some("/data3"));
+    }
+
+    #[test]
+    fn a_server_found_only_by_argv_is_still_recognized() {
+        // exe 读不到时（权限 / 内核线程兜底路径）走 argv[0]：同样要取 basename。
+        assert!(is_server(
+            "",
+            &["/usr/lib/postgresql/16/bin/postgres".to_string()]
+        ));
+        assert!(is_server("", &["postgres".to_string()]));
+        // 连接后端的 argv 形态在没 exe 时也要被排除。
+        assert!(!is_server(
+            "",
+            &["postgres: pg: u db 10.0.0.1(1234) idle".to_string()]
+        ));
+    }
+
+    #[test]
+    fn the_inspection_budget_still_bounds_handshakes() {
+        use std::cell::Cell;
+
+        struct Counting {
+            calls: Cell<usize>,
+            accept: Vec<String>,
+        }
+        impl Handshake for Counting {
+            fn postgres_greeting(&self, addr: &str) -> bool {
+                self.calls.set(self.calls.get() + 1);
+                self.accept.iter().any(|item| item == addr)
+            }
+        }
+
+        // 20 个各监听一个独立端口的实例：最多检查 8 个（每次一个握手），不能无限探。
+        let mut resources = Vec::new();
+        let mut proc = FakeProc::default();
+        let mut accept = Vec::new();
+        for index in 0..20u32 {
+            let pid = 1000 + index;
+            resources.push(process(pid, "/usr/lib/postgresql/16/bin/postgres"));
+            proc.listen.insert(pid, vec![5432]);
+            let addr = format!("10.244.0.{}", index + 1);
+            proc.addrs.insert(pid, vec![addr.clone()]);
+            accept.push(format!("{addr}:5432"));
+        }
+
+        let handshake = Counting {
+            calls: Cell::new(0),
+            accept,
+        };
+        let found = resolve(&snapshot(resources), &proc, &handshake);
+
+        assert_eq!(found.len(), MAX_INSPECTED_PROCESSES, "{found:?}");
+        assert_eq!(
+            handshake.calls.get(),
+            MAX_INSPECTED_PROCESSES,
+            "预算限定的是握手次数"
+        );
     }
 }

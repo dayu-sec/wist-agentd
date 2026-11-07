@@ -282,6 +282,34 @@ mod tests {
     }
 
     #[test]
+    fn a_java_fe_with_a_long_classpath_is_still_discovered() {
+        // 真实 FE 的 cmdline：classpath 很长，主类在末尾；4 KiB 封顶会把它截掉。
+        let snapshot = snapshot(vec![process(42, "/usr/lib/jvm/jdk-17/bin/java")]);
+        let mut proc = FakeProc::default();
+        let classpath = "/opt/doris/fe/lib/fe-common.jar:/opt/doris/fe/lib/fe-core.jar:/opt/doris/fe/lib/doris-fe.jar";
+        proc.cmdlines.insert(
+            42,
+            vec![
+                "/usr/lib/jvm/jdk-17/bin/java".to_string(),
+                "-Xmx8g".to_string(),
+                "-cp".to_string(),
+                classpath.to_string(),
+                "org.apache.doris.DorisFE".to_string(),
+            ],
+        );
+        proc.same_netns.insert(42);
+        proc.listen.insert(42, vec![9030, 8030]);
+        let handshake = FakeHandshake {
+            accepting: vec!["127.0.0.1:9030".to_string()],
+        };
+
+        let found = resolve(&snapshot, &proc, &handshake);
+
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].port, 9030);
+    }
+
+    #[test]
     fn a_backend_is_not_a_frontend() {
         let snapshot = snapshot(vec![process(42, "doris_be")]);
         let mut proc = FakeProc::default();

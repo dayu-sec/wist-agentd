@@ -7,6 +7,12 @@
 
 ### 新增
 
+- **`wist-agentd probe <pg|mysql|doris>`：单次采集自检**。跑**一轮**采集并把结果写成
+  JSON（`--out`，默认 `./probe-<域>-<UTC>.json`），**不需要注册、不需要网关派活、不起服务**。
+  人读输出逐条列出 fact → 指标名（看到「指标未注册」说明 `wist-metrics` 版本对不上）；
+  JSON 里有地址 / 凭据 key / 耗时 / attempted·succeeded·failed / `last_error` / `warnings`。
+  支持 `--addr` 显式指定（本机运维用；守护进程仍只认自探 + 授权）与不带 `--addr` 走自探
+  （Linux 专有，读 `/proc`）。退出码：成功 0，失败或没找到候选 1。密码只读文件、不进报告。
 - **Doris 指标采集（P2 P0 子集）**：新采集域 `doris_metrics` —— `doris_be_up` /
   `doris_be_capacity_bytes` / `doris_be_available_bytes` / `doris_be_tablets`，全部带 `be` label。
   只从**本机 FE** 读 `SHOW BACKENDS`（只有 BE 的机器采不了，`doctor` 会说清楚）；
@@ -75,6 +81,31 @@
 
 ### 修复
 
+- **PostgreSQL 自探在真实部署上一个实例都发现不了**（两个叠加原因）：
+  ① `is_server` 拿 **完整路径**（`/usr/lib/postgresql/16/bin/postgres`）去 `starts_with("postgres")`，
+  单测用的是裸名所以一路绿；现在统一取 basename。
+  ② PG 把连接后端的 `argv[0]` 改成 `postgres: <cluster>: <user> …`，它们不监听端口却会
+  吃满 8 个检查名额；现在排除后端，且名额只统计「真有候选端口」的进程。
+- **Kafka 自探在有 broker 的机器上说「没有发现」**（三个原因）：
+  ① Bitnami 等发行版把 `zookeeper-*.jar` 放在 `-cp` 里，按整串 argv 排除 zookeeper 会把
+  **KRaft broker** 判成 ZooKeeper；现在只匹配主类/启动脚本，不看 classpath。
+  ② `cmdline` 读取上限 4 KiB：Java broker 的 classpath 就有 6–30 KiB，`kafka.Kafka` 与
+  配置路径都在末尾被截掉；上限提到 64 KiB（`db_source` 同步，Doris FE 同病）。
+  ③ 配置路径取「第一个 `.properties`」，先命中 `-Dlog4j.configuration=…/log4j.properties`；
+  现在只从位置参数取**最后一个**。
+- **PG 采集告警按原因聚合**：`pg_stat_database` / `pg_stat_activity` 返回 0 行时，原来会逐列
+  打 7 条「查询结果缺少 X」，现在一条原因级告警；且不补 0。
+- **MySQL 自探的检查名额同样只统计有候选端口的进程**（`--skip-networking` 的实例不再
+  白占名额，否则多实例机器上后面的真库轮不到）。
+- **PostgreSQL 采集在真库上根本连不上**：连接没有指定 `dbname`，libpq / sqlx 按**用户名**
+  找库，于是每轮都是 `database "wist-probe" does not exist` —— 按文档只建 `wist-probe`
+  账号的机器会一直没数据。现在固定连维护库 `postgres`。
+- **`pg_database_size_bytes` 在真库上直接丢**：`sum(bigint)` 在 PG 里返回 `numeric`，
+  采集侧的类型解析只认 text/bigint/float/bool，列被静默丢弃。SQL 里补了 `::bigint`。
+- **PG 的事务 / IO / 库大小改成按实例汇总**（`pg_stat_database` 除模板库求和）：
+  指标名没有 `database` label，原来只看 `current_database()`（= 维护库）会少一个量级。
+- 新增真库验收：`src/telemetry/metrics/postgres_live.rs`（`#[ignore]`）+ 一键脚本
+  `dev/verify-pg-metrics.sh`（起一次性 PG → 建只读账号 → 跑三条用例）。
 - `DescribeLogDirs v2+` 是 flexible 版本：请求头 tagged fields、compact `topics`、响应逐结构
   tagged fields 都已支持（v0-v4），v3+ 的顶层 `error_code` 不再被当成「0 个日志目录」。
 - `Metadata v1+` 的 nullable `rack`：漏读会让后续字段整体错位。

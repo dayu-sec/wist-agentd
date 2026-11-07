@@ -38,7 +38,12 @@ const MAX_INSPECTED_PROCESSES: usize = 8;
 /// 单个集群最多保留多少条端点假设。
 const MAX_ENDPOINTS_PER_CLUSTER: usize = 6;
 /// `cmdline` / `environ` 的读取上限。
-const MAX_PROC_BYTES: usize = 4096;
+///
+/// **不能是 4 KiB**：Java broker 的 cmdline 里 classpath 就常有 6–30 KiB，
+/// `kafka.Kafka` 与 `server.properties` 都在**末尾**。截断后 argv 里看不到主类，
+/// 真 broker 会被判成「不是 Kafka」（现场表现：进程在、自探一个都没有）。
+/// `KAFKA_CFG_*` 也可能很长（Bitnami 把整份配置放环境变量）。
+const MAX_PROC_BYTES: usize = 64 * 1024;
 /// 配置文件读取上限：`server.properties` 一般几 KB。
 const MAX_EVIDENCE_BYTES: u64 = 64 * 1024;
 /// 单次 TCP / 握手探测的超时。
@@ -398,21 +403,74 @@ fn may_be_broker(exe: &str) -> bool {
 
 /// 是不是 Kafka **broker**。
 ///
-/// 排除项很重要：同一个机器上通常还跑着 exporter、Connect worker、ZooKeeper ——
-/// 它们也会出现在进程列表里，但都不是 broker。
+/// 只看「命令与主类」，**不看 classpath**：Bitnami 等发行版把 zookeeper / connect 的 jar
+/// 也塞进 `-cp`，按整串 argv 匹配会把 KRaft broker 误判成 ZooKeeper（现场表现：
+/// 「本机没有发现 Kafka broker」，而进程就在那儿）。
 fn is_broker(exe: &str, argv: &[String]) -> bool {
-    let joined = argv.join(" ");
-    let lowered = joined.to_ascii_lowercase();
-    if lowered.contains("zookeeper")
-        || lowered.contains("kafka-exporter")
-        || lowered.contains("connect-standalone")
-        || lowered.contains("connect-distributed")
-    {
+    let tokens: Vec<String> = command_tokens(argv)
+        .into_iter()
+        .map(|token| token.to_ascii_lowercase())
+        .collect();
+
+    // 排除项：ZooKeeper / Connect / exporter 的**主类或启动脚本**，不是它们的 jar 名。
+    if tokens.iter().any(|token| {
+        token.contains("quorumpeermain")
+            || token.contains("zookeeper-server-start")
+            || token.contains("kafkaconnect")
+            || token.contains("connect-distributed")
+            || token.contains("connect-standalone")
+            || token.contains("connectstandalone")
+            || token.contains("connectdistributed")
+            || token.contains("kafka-exporter")
+    }) {
         return false;
     }
-    joined.contains("kafka.Kafka")
-        || joined.contains("kafka-server-start")
-        || matches!(exe, "kafka" | "kafka-server")
+
+    if tokens
+        .iter()
+        .any(|token| token == "kafka.kafka" || token.ends_with(".kafka"))
+    {
+        return true;
+    }
+    if tokens
+        .iter()
+        .any(|token| token.contains("kafka-server-start"))
+    {
+        return true;
+    }
+
+    // 拿不到 argv 时的兜底：看可执行名（同样只取 basename，Linux 上是完整路径）。
+    let name = std::path::Path::new(exe)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(name.as_str(), "kafka" | "kafka-server")
+}
+
+/// 去掉 JVM 选项与 classpath 之后的「真命令」：`-cp <一大串 jar>` / `-Dkey=value`。
+fn command_tokens(argv: &[String]) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut skip_next = false;
+    for token in argv {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        let token = token.trim();
+        if matches!(token, "-cp" | "-classpath" | "--class-path") {
+            skip_next = true;
+            continue;
+        }
+        if token.contains(".jar")
+            || token.starts_with("-D")
+            || token.starts_with("-X")
+            || token.starts_with("-javaagent")
+        {
+            continue;
+        }
+        out.push(token);
+    }
+    out
 }
 
 /// 配置路径线索：`-Dkafka.config.file=…` 或 `kafka-server-start.sh <path>`。
@@ -425,8 +483,16 @@ fn config_path(argv: &[String]) -> Option<String> {
             }
         }
     }
+    // 只从**位置参数**里找，并且取最后一个：
+    // - `-Dlog4j.configuration=file:…/log4j.properties` 也以 `.properties` 结尾，
+    //   先命中会让 `from_properties` 去读 log4j 配置 —— 里面一个监听器都没有；
+    // - 启动脚本把 broker 配置放在命令末尾（`kafka.Kafka <path>`）。
     argv.iter()
-        .find(|token| token.ends_with(".properties"))
+        .rev()
+        .find(|token| {
+            let token = token.trim();
+            !token.starts_with('-') && token.ends_with(".properties")
+        })
         .map(|token| token.trim().to_string())
 }
 

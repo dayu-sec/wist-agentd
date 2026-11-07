@@ -597,3 +597,99 @@ fn identity_prefers_the_smallest_port() {
     assert_eq!(identity(&ports, 42), "port:9092");
     assert_eq!(identity(&ports, 99), "pid:99");
 }
+
+#[test]
+fn a_bitnami_broker_keeps_its_zookeeper_jars_on_the_classpath() {
+    // Bitnami 的 KRaft 镜像把 zookeeper-*.jar 也放进 `-cp`。按整串 argv 排除 "zookeeper"
+    // 会把真 broker 判成 ZooKeeper —— 现场表现就是「有 broker 但自探一个都没有」。
+    let argv = args(&[
+        "/opt/bitnami/java/bin/java",
+        "-Xmx1024m",
+        "-Dkafka.logs.dir=/opt/bitnami/kafka/bin/../logs",
+        "-cp",
+        "/opt/bitnami/kafka/bin/../libs/zookeeper-3.8.3.jar:/opt/bitnami/kafka/bin/../libs/zookeeper-jute-3.8.3.jar:/opt/bitnami/kafka/bin/../libs/kafka_2.12-3.6.1.jar",
+        "kafka.Kafka",
+        "/opt/bitnami/kafka/config/server.properties",
+    ]);
+    assert!(is_broker("/opt/bitnami/java/bin/java", &argv));
+
+    // 同样的 classpath，但主类是 ZooKeeper：仍然不是 broker。
+    let zoo = args(&[
+        "/opt/bitnami/java/bin/java",
+        "-cp",
+        "/opt/bitnami/kafka/bin/../libs/zookeeper-3.8.3.jar",
+        "org.apache.zookeeper.server.quorum.QuorumPeerMain",
+        "/opt/bitnami/kafka/config/zookeeper.properties",
+    ]);
+    assert!(!is_broker("/opt/bitnami/java/bin/java", &zoo));
+}
+
+#[test]
+fn proc_cmdline_cap_leaves_room_for_a_java_classpath() {
+    // 进程参数读取上限必须盖得住 Java 的 cmdline：classpath 一项就常 6–30 KiB，
+    // 主类（kafka.Kafka）与配置文件路径排在它后面。
+    assert!(
+        std::hint::black_box(MAX_PROC_BYTES) >= 32 * 1024,
+        "MAX_PROC_BYTES={MAX_PROC_BYTES} 会把 Java broker 的 cmdline 截断到看不到主类"
+    );
+}
+
+#[test]
+fn the_log4j_property_file_is_not_mistaken_for_the_broker_config() {
+    // Bitnami 的启动参数里有 `-Dlog4j.configuration=file:.../log4j.properties`；
+    // 按「第一个 .properties」取会读错文件，自探就没有监听器可报。
+    let argv = args(&[
+        "/opt/bitnami/java/bin/java",
+        "-Dlog4j.configuration=file:/opt/bitnami/kafka/bin/../config/log4j.properties",
+        "-cp",
+        "/opt/bitnami/kafka/bin/../libs/kafka_2.12-3.6.1.jar",
+        "kafka.Kafka",
+        "/opt/bitnami/kafka/config/server.properties",
+    ]);
+    assert_eq!(
+        config_path(&argv).as_deref(),
+        Some("/opt/bitnami/kafka/config/server.properties")
+    );
+}
+
+#[test]
+fn the_explicit_config_file_option_wins_over_positional_paths() {
+    let argv = args(&[
+        "java",
+        "-Dkafka.config.file=/etc/kafka/broker.properties",
+        "-cp",
+        "kafka_2.12.jar",
+        "kafka.Kafka",
+        "/opt/kafka/config/server.properties",
+    ]);
+    assert_eq!(
+        config_path(&argv).as_deref(),
+        Some("/etc/kafka/broker.properties")
+    );
+}
+
+#[test]
+fn the_last_positional_properties_file_wins() {
+    // `kafka-server-start.sh -daemon /opt/kafka/config/server.properties`
+    let argv = args(&[
+        "kafka-server-start.sh",
+        "-daemon",
+        "/opt/kafka/config/server.properties",
+    ]);
+    assert_eq!(
+        config_path(&argv).as_deref(),
+        Some("/opt/kafka/config/server.properties")
+    );
+}
+
+#[test]
+fn option_valued_properties_flags_are_not_positional_config_paths() {
+    // Spring / JVM 风格的长选项虽然以 .properties 结尾，但不是 broker 配置文件。
+    let argv = args(&[
+        "java",
+        "--spring.config.location=file:/app/application.properties",
+        "-Dlog4j.configuration=file:/opt/kafka/config/log4j.properties",
+        "app.jar",
+    ]);
+    assert_eq!(config_path(&argv), None);
+}

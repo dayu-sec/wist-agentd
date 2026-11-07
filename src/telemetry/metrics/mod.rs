@@ -14,6 +14,11 @@ mod kafka_live;
 pub mod mysql;
 /// PostgreSQL 指标采集（SQL 直采，只读；与 mysql 共用查询通道）。
 pub mod postgres;
+/// 真 PostgreSQL 验收：全部 `#[ignore]`，只有给了 `WIST_PG_LIVE*` 才跑。
+#[cfg(test)]
+mod postgres_live;
+/// `wist-agentd probe`：单次采集 + 落文件，给「装服务之前先验采集」用。
+pub(crate) mod probe_cli;
 pub mod runtime;
 pub mod samples;
 pub mod scheduler;

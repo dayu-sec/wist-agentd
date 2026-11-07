@@ -67,6 +67,14 @@ host    all    "wist-probe"    10.0.0.0/8      scram-sha-256   # 按你的节点
 > 容器 / k8s 下 agentd 从**宿主侧**连 pod IP，PG 看到的来源不是 `127.0.0.1`。
 > 只写 `127.0.0.1/32` 会出现「密码对、还是连不上」——和 MySQL 那边是同一类坑。
 
+两点实现口径（真库跑出来的，别改回去）：
+
+- **连接库固定为 `postgres`（维护库）**：探针账号不属于任何业务库，不指定 `dbname` 时
+  libpq / sqlx 会按**用户名**找库，直接 `database "wist-probe" does not exist` 整轮失败；
+- **事务 / IO / 库大小按实例汇总**（`pg_stat_database` 里除 `template0/1` 的行求和）：
+  指标名没有 `database` label，若只看 `current_database()`（= 维护库），读数会少一个量级。
+  `sum(bigint)` 在 PG 里是 `numeric`，SQL 里必须显式 `::bigint`，否则采集侧的类型解析会丢列。
+
 ## 4. 证据与握手
 
 - 证据：`-D <datadir>/postgresql.conf` 的 `port =`（最权威）→ 常见发行版路径
@@ -92,4 +100,14 @@ host    all    "wist-probe"    10.0.0.0/8      scram-sha-256   # 按你的节点
   统计查询失败 / 缺列（`max_connections`）/ 密码文件缺失；
 - 自探：假 `DbProc` + 假握手，覆盖 `-D` 配置端口、argv 端口、pod IP + pod key、pooler 排除、
   conf 解析（注释 / 引号）；
-- **真库未跑**：本机没有 PostgreSQL，客户环境暂不可达；有开发库时补 `#[ignore]` live 用例。
+- **真库 live**（`src/telemetry/metrics/postgres_live.rs`，默认 `#[ignore]`）：一条命令起库、
+  建只读账号、跑三条用例（实采指标 / 错误密码不伪造 0 / SSLRequest 指纹）：
+
+  ```bash
+  dev/verify-pg-metrics.sh                  # 用完保留容器，WIST_PG_KEEP=0 自动删
+  ```
+
+  `2026-11-07` 实测（Docker `postgres:16`，账号 `wist-probe` + `pg_monitor`）：3/3 通过；
+  采集层只需要能连到 PG，**不需要 Linux、不需要网关、不需要安装包**。
+- **未覆盖**：自探读 `/proc/<pid>/net/tcp`，只有 Linux 有 —— 在 macOS 上跑 agentd 时
+  PG 不会被自探发现（采集逻辑本身没问题，是「找不到候选」）。

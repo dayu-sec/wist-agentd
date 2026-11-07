@@ -20,7 +20,11 @@ pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(300);
 /// 单个 netns 最多试几个地址（回环 + 少量 veth / pod IP + 绑定地址）。
 pub(crate) const MAX_ADDRS_PER_NETNS: usize = 4;
 /// `cmdline` 的读取上限。
-pub(crate) const MAX_PROC_BYTES: usize = 4096;
+///
+/// **不能是 4 KiB**：Doris FE 是 Java，classpath 常 6–30 KiB，主类（`org.apache.doris.DorisFE`）
+/// 与 `fe.conf` 路径都在末尾；截断后 `is_fe` 会把真 FE 判成「不是 FE」。
+/// PostgreSQL / MySQL 的 argv 很短，抬高的只是候选进程的读量（多数进程会被 `may_be_server` 先筛掉）。
+pub(crate) const MAX_PROC_BYTES: usize = 64 * 1024;
 /// 配置文件读取上限（`my.cnf` / `postgresql.conf` 一般几 KB）。
 pub(crate) const MAX_EVIDENCE_BYTES: u64 = 64 * 1024;
 
@@ -519,5 +523,15 @@ mod tests {
    3: 0A00000A:0CEA 0A00000B:1234 01 00000000:00000000 00:00000000 00000000   999        0 4 1
 ";
         assert_eq!(bound_addrs_in_table(table), vec!["10.0.0.10".to_string()]);
+    }
+
+    #[test]
+    fn proc_cmdline_cap_leaves_room_for_a_java_classpath() {
+        // 这个上限是 PG / MySQL / Doris 共用的。Doris FE 是 Java，classpath 就是几 KiB，
+        // 主类在末尾；4 KiB 的封顶会让真 FE 被判成“不是 FE”。
+        assert!(
+            std::hint::black_box(MAX_PROC_BYTES) >= 32 * 1024,
+            "MAX_PROC_BYTES={MAX_PROC_BYTES} 会把 Java FE 的 cmdline 截断到看不到主类"
+        );
     }
 }

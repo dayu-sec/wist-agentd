@@ -656,6 +656,41 @@ wist-agentd investigate load --top 20 --json             # 列前 20 个进程
 `event=CommandHandled`（已完）两条。
 设计取舍见 [`../design/agentd-investigation.md`](../design/agentd-investigation.md)。
 
+### 7.7 单次采集自检（`probe`）
+
+装服务之前先回答一个更早的问题：**这台机器上的库，agentd 到底采不采得到？**
+`probe` 就跑**一轮**采集并把结果写成 JSON，不需要注册、不需要网关派活、不用起守护进程。
+
+```bash
+# 指定一台库（最常用；缺省端口按域取 5432 / 3306 / 9030）
+wist-agentd probe pg --addr 127.0.0.1:5432 --password-file /tmp/pg-pw --out ./probe
+
+# 用本机自探（Linux）：自己找 pg / mysql / doris 候选
+wist-agentd probe pg --out ./probe
+```
+
+支持的域：`pg` / `mysql` / `doris`。人读输出会逐条列出 fact → 指标名，看到
+`指标未注册` 就说明采到了但 `wist-metrics` 里没声明（规范化层会丢弃，属于版本对不上）；
+`status=failed` 时 `error` 一行就是原因（连不上 / 认证失败 / 密码文件缺失）。
+
+落盘的 JSON（默认 `./probe-<域>-<UTC>.json`）里有：域、模式（explicit / discovery）、
+每个目标的地址/凭据 key/耗时/attempted/succeeded/failed、`last_error`、`warnings`、
+逐条 fact 与它对应的指标（名字/单位/类型）。**密码不读进内存、也不进报告**，
+只记 `password_file` 路径与 `password_file_present`。
+
+退出码：全部成功且至少有一个目标 = 0；任一轮失败或自探没找到候选 = 1（可直接用于脚本门禁）。
+
+两个容易踩的点：
+
+* **自探读 `/proc`，只有 Linux 有**。macOS 上 `probe pg` 不带 `--addr` 永远是
+  `自探没有找到候选` —— 不是采集坏了，是发现不了；用 `--addr` 指定即可。
+* **`--addr` 只在本机运维时用**。守护进程的采集仍然只认「自探 + 网关授权」
+  （端点不来自配置/工作单元），这条命令不会改变那个边界。
+
+凭据默认按约定路径读（`/etc/wist-agentd/secrets/<域>/<key>/password`，key 形如
+`port-5432`）；`--password-file` 只是本机验证时覆盖它。设计见
+[`../design/pg-metrics.md`](../design/pg-metrics.md) §6。
+
 ## 8. 验收清单
 
 一键验收（需要 root 的**一次性验收机**，会自动安装→断言→清理）：

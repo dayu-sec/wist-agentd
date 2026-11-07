@@ -124,7 +124,6 @@ fn resolve(
         if !is_server(&process.exe, &argv) {
             continue;
         }
-        inspected += 1;
 
         let Some(hint) = port_hint(&process, &argv, proc) else {
             // `--skip-networking`：只能走 socket，SQL 采不了。
@@ -158,6 +157,13 @@ fn resolve(
                 candidates.push(port);
             }
         }
+
+        // 没任何候选端口的进程不占名额：预算限的是握手，不是「看过多少个进程」
+        // （`--skip-networking` 的实例不该把名额吃光）。
+        if candidates.is_empty() {
+            continue;
+        }
+        inspected += 1;
 
         for port in candidates {
             let Some(host) = addrs
@@ -804,5 +810,38 @@ port = 3306
         assert!(parsed.skip_networking);
         let parsed = from_my_cnf("[mysqld]\nskip-networking = 1\n");
         assert!(parsed.skip_networking);
+    }
+
+    #[test]
+    fn socket_only_instances_do_not_consume_the_inspection_budget() {
+        // 8 个 `--skip-networking` 的 mysqld 排在前面：它们根本没有 TCP 候选，
+        // 不该占名额；否则后面那个真监听 3306 的实例永远轮不到。
+        let mut resources = Vec::new();
+        let mut proc = FakeProc::default();
+        for index in 0..8u32 {
+            let pid = 100 + index;
+            resources.push(process(pid, "/usr/sbin/mysqld"));
+            proc.cmdlines.insert(
+                pid,
+                vec![
+                    "/usr/sbin/mysqld".to_string(),
+                    "--skip-networking".to_string(),
+                ],
+            );
+            proc.same_netns.insert(pid);
+        }
+        resources.push(process(999, "/usr/sbin/mysqld"));
+        proc.cmdlines
+            .insert(999, vec!["/usr/sbin/mysqld".to_string()]);
+        proc.listen.insert(999, vec![3306]);
+        proc.same_netns.insert(999);
+
+        let handshake = FakeHandshake {
+            accepting: vec!["127.0.0.1:3306".to_string()],
+        };
+        let found = resolve(&snapshot(resources), &proc, &handshake);
+
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].port, 3306);
     }
 }

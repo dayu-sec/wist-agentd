@@ -46,6 +46,12 @@ pub fn ca_file_for_key(key: &str) -> String {
     format!("{}/ca.pem", secret_dir_for_key(key))
 }
 
+/// 一套实例的连接库名：探针账号不带任何业务库，连维护库（每套 PG 都有）。
+///
+/// 不指定 `dbname` 时 libpq / sqlx 会按**用户名**找库，而 `wist-probe` 不是业务库，
+/// 于是每次采集都会以 `database "wist-probe" does not exist` 整轮失败。
+const DEFAULT_CONNECT_DATABASE: &str = "postgres";
+
 /// TLS 策略（与 MySQL 同义）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlsMode {
@@ -58,6 +64,8 @@ pub enum TlsMode {
 pub struct PgProbeConfig {
     pub host: String,
     pub port: u16,
+    /// 连接库名：只作为「登进去的入口」，读数按实例汇总（见 `DATABASE_SQL`）。
+    pub database: String,
     pub timeout: Duration,
     pub interval: Duration,
     pub tls: TlsMode,
@@ -79,6 +87,7 @@ impl PgProbeConfig {
             instance_id: format!("postgres:{host}:{port}"),
             port,
             host,
+            database: DEFAULT_CONNECT_DATABASE.to_string(),
             timeout: Duration::from_millis(timeout_ms.max(1)),
             interval: Duration::from_millis(interval_ms.max(1)),
         }
@@ -174,9 +183,19 @@ pub fn targets_from_instances(
 const SERVER_SQL: &str = "SELECT extract(epoch from now() - pg_postmaster_start_time())::bigint AS uptime, \
      current_setting('max_connections') AS max_connections, pg_is_in_recovery() AS in_recovery";
 const ACTIVITY_SQL: &str = "SELECT count(*) AS connections FROM pg_stat_activity";
-const DATABASE_SQL: &str = "SELECT xact_commit, xact_rollback, deadlocks, temp_bytes, blks_read, blks_hit, \
-     pg_database_size(current_database()) AS size_bytes \
-     FROM pg_stat_database WHERE datname = current_database()";
+/// 事务 / IO / 库大小：按**实例**汇总（除模板库外），不带库 label。
+///
+/// 探针账号不属于任何业务库，指标也没有 `database` label；若只看 `current_database()`
+/// （就是连接用的维护库），事务与 IO 会变成 `postgres` 这个小库的读数 —— 看着正常、
+/// 实际错了一个量级。列名保持不变，映射与单测不用动。
+const DATABASE_SQL: &str = "SELECT COALESCE(sum(xact_commit), 0)::bigint AS xact_commit, \
+     COALESCE(sum(xact_rollback), 0)::bigint AS xact_rollback, \
+     COALESCE(sum(deadlocks), 0)::bigint AS deadlocks, \
+     COALESCE(sum(temp_bytes), 0)::bigint AS temp_bytes, \
+     COALESCE(sum(blks_read), 0)::bigint AS blks_read, \
+     COALESCE(sum(blks_hit), 0)::bigint AS blks_hit, \
+     COALESCE(sum(pg_database_size(datname)), 0)::bigint AS size_bytes \
+     FROM pg_stat_database WHERE datname NOT IN ('template0', 'template1')";
 const REPLICA_SQL: &str =
     "SELECT extract(epoch from now() - pg_last_xact_replay_timestamp()) AS lag_seconds";
 
@@ -208,20 +227,30 @@ pub(super) async fn collect_with(
         };
     };
 
-    let activity = match transport.query(ACTIVITY_SQL).await {
-        Ok(rows) => first_row(rows).unwrap_or_default(),
+    let (activity, activity_missing) = match transport.query(ACTIVITY_SQL).await {
+        // 0 行与“读失败”同一个后果（本轮没有连接数），但原因不同：只说一句，
+        // 不要留给逐列的 `查询结果缺少 connections`。
+        Ok(rows) if rows.is_empty() => {
+            warnings.push("pg_stat_activity 没有返回行（连接数本轮缺失）".to_string());
+            (Row::new(), true)
+        }
+        Ok(rows) => (first_row(rows).unwrap_or_default(), false),
         Err(err) => {
             warnings.push(format!("pg_stat_activity 不可读：{err}（连接数本轮缺失）"));
-            Row::new()
+            (Row::new(), true)
         }
     };
-    let database = match transport.query(DATABASE_SQL).await {
-        Ok(rows) => first_row(rows).unwrap_or_default(),
+    let (database, database_missing) = match transport.query(DATABASE_SQL).await {
+        Ok(rows) if rows.is_empty() => {
+            warnings.push("pg_stat_database 没有返回行（事务 / IO / 库大小本轮缺失）".to_string());
+            (Row::new(), true)
+        }
+        Ok(rows) => (first_row(rows).unwrap_or_default(), false),
         Err(err) => {
             warnings.push(format!(
                 "pg_stat_database 不可读：{err}（事务与 IO 指标本轮缺失）"
             ));
-            Row::new()
+            (Row::new(), true)
         }
     };
 
@@ -229,40 +258,44 @@ pub(super) async fn collect_with(
     facts.push("pg.up", "1");
     int_fact(&mut facts, &server, "uptime", "pg.uptime.seconds");
     int_fact(&mut facts, &server, "max_connections", "pg.connections.max");
-    int_fact(
-        &mut facts,
-        &activity,
-        "connections",
-        "pg.connections.current",
-    );
-    int_fact(&mut facts, &database, "xact_commit", "pg.xact.commit.total");
-    int_fact(
-        &mut facts,
-        &database,
-        "xact_rollback",
-        "pg.xact.rollback.total",
-    );
-    int_fact(&mut facts, &database, "deadlocks", "pg.deadlocks.total");
-    int_fact(&mut facts, &database, "temp_bytes", "pg.temp.bytes.total");
-    int_fact(
-        &mut facts,
-        &database,
-        "size_bytes",
-        "pg.database.size_bytes",
-    );
-    // 块计数换算成字节：消费方不需要知道 `BLCKSZ`。
-    bytes_from_blocks(
-        &mut facts,
-        &database,
-        "blks_read",
-        "pg.disk.read_bytes.total",
-    );
-    bytes_from_blocks(
-        &mut facts,
-        &database,
-        "blks_hit",
-        "pg.cache.hit_bytes.total",
-    );
+    if !activity_missing {
+        int_fact(
+            &mut facts,
+            &activity,
+            "connections",
+            "pg.connections.current",
+        );
+    }
+    if !database_missing {
+        int_fact(&mut facts, &database, "xact_commit", "pg.xact.commit.total");
+        int_fact(
+            &mut facts,
+            &database,
+            "xact_rollback",
+            "pg.xact.rollback.total",
+        );
+        int_fact(&mut facts, &database, "deadlocks", "pg.deadlocks.total");
+        int_fact(&mut facts, &database, "temp_bytes", "pg.temp.bytes.total");
+        int_fact(
+            &mut facts,
+            &database,
+            "size_bytes",
+            "pg.database.size_bytes",
+        );
+        // 块计数换算成字节：消费方不需要知道 `BLCKSZ`。
+        bytes_from_blocks(
+            &mut facts,
+            &database,
+            "blks_read",
+            "pg.disk.read_bytes.total",
+        );
+        bytes_from_blocks(
+            &mut facts,
+            &database,
+            "blks_hit",
+            "pg.cache.hit_bytes.total",
+        );
+    }
 
     // 复制：只在备库上有意义。主库不出这两条（不补 0）。
     let in_recovery = match server.get("in_recovery") {
@@ -366,6 +399,7 @@ pub(super) async fn probe_once(config: &PgProbeConfig) -> ProbeResult {
     let mut options = sqlx::postgres::PgConnectOptions::new()
         .host(&config.host)
         .port(config.port)
+        .database(&config.database)
         .username(PG_PROBE_USERNAME)
         .password(&password)
         .application_name("wist-agentd");
@@ -777,5 +811,36 @@ mod tests {
             "/etc/wist-agentd/secrets/postgres/pod-data-pg-0/ca.pem"
         );
         assert_eq!(config().instance(), "postgres:127.0.0.1:5432");
+    }
+
+    #[tokio::test]
+    async fn an_empty_stats_row_does_not_fake_zeroes() {
+        // `pg_stat_database` 没有行（权限被拒 / 视图为空）时不补 0：
+        // 那些序列必须**消失**，而不是变成看着像“库很空”的 0；告警也要按原因聚合成一条。
+        let mut transport = Fake::default()
+            .with(
+                SERVER_SQL,
+                Ok(vec![row(&[
+                    ("uptime", "10"),
+                    ("max_connections", "100"),
+                    ("in_recovery", "false"),
+                ])]),
+            )
+            .with(ACTIVITY_SQL, Ok(vec![row(&[("connections", "3")])]))
+            .with(DATABASE_SQL, Ok(Vec::new()));
+
+        let result = collect_with(&mut transport, &config()).await;
+
+        assert_eq!(result.failed, 0);
+        assert_eq!(fact_value(&result, "pg.up"), Some("1"));
+        assert_eq!(fact_value(&result, "pg.connections.current"), Some("3"));
+        assert_eq!(fact_value(&result, "pg.xact.commit.total"), None);
+        assert_eq!(fact_value(&result, "pg.database.size_bytes"), None);
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert!(
+            result.warnings[0].contains("pg_stat_database"),
+            "{:?}",
+            result.warnings
+        );
     }
 }
