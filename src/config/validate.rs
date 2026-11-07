@@ -343,6 +343,7 @@ mod tests {
             snapshot_uplink_enabled: false,
             snapshot_uplink_interval_seconds: 300,
             source_resolve: true,
+            kafka_discovery: true,
         };
         assert_code(validate_config(&config), "missing_discovery_probe");
     }
@@ -366,6 +367,7 @@ mod tests {
                 snapshot_uplink_enabled: false,
                 snapshot_uplink_interval_seconds: 300,
                 source_resolve: true,
+                kafka_discovery: true,
             };
             set_enabled(&mut discovery);
             let mut config = base_config();
@@ -537,13 +539,16 @@ mod tests {
 /// `[kafka]` 段：启用时地址必须齐、周期不能为零。
 ///
 /// 这些错了不会在启动时暴露 —— 表现为「每 30s 一条连接失败日志」，运维很难看出是配置问题。
+/// `[kafka]` 现在只剩**调优旋钮**：采集由采集面授权驱动，端点 / 协议 / 凭据由自探与
+/// 固定约定（`/etc/wist-agentd/secrets/kafka`）决定。因此：
+///
+/// - 调优项**始终**校验（不在乎 `enabled`）—— 它们一直在生效；
+/// - 传输类遗留字段（`bootstrap_servers` / `security_protocol` / `sasl_*`）只在
+///   **写了**时做形式校验，不再要求它们存在：让一个已经不起作用的字段把 agentd
+///   拦在启动前，比字段失效本身更糟（旧配置里写了 `enabled = true` 而没有地址的机器
+///   会直接起不来）。
 fn validate_kafka_section(kafka: &KafkaSection) -> Result<(), ValidationError> {
-    if !kafka.enabled {
-        return Ok(());
-    }
-    if kafka.bootstrap_servers.is_empty() {
-        return Err(ValidationError::new("missing_kafka_bootstrap_servers"));
-    }
+    // —— 遗留传输字段：只校形式 ——
     for server in &kafka.bootstrap_servers {
         let (host, port) = server
             .rsplit_once(':')
@@ -564,32 +569,30 @@ fn validate_kafka_section(kafka: &KafkaSection) -> Result<(), ValidationError> {
     ) {
         return Err(ValidationError::new("invalid_kafka_sasl_mechanism"));
     }
-    if kafka.security_protocol.starts_with("SASL_") {
-        // 认证材料缺一个都只会在连接期失败，而且是"认证失败"这种最没信息量的报错。
-        if kafka
-            .username
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or_default()
-            .is_empty()
-        {
-            return Err(ValidationError::new("missing_kafka_username"));
-        }
-        if kafka
-            .password_file
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or_default()
-            .is_empty()
-        {
-            return Err(ValidationError::new("missing_kafka_password_file"));
-        }
-    }
+
+    // —— 调优旋钮：一直生效，与 `enabled` 无关 ——
     if kafka.interval_ms < 1_000 {
         return Err(ValidationError::new("invalid_kafka_interval"));
     }
     if kafka.timeout_ms == 0 {
         return Err(ValidationError::new("invalid_kafka_timeout"));
+    }
+    if kafka.lag_interval_ms < 1_000 {
+        // lag 一轮要连每组 + 每个 leader，低于 1s 等于自己给集群加负载。
+        return Err(ValidationError::new("invalid_kafka_lag_interval"));
+    }
+    if kafka.max_groups == 0 {
+        return Err(ValidationError::new("invalid_kafka_max_groups"));
+    }
+    if kafka.lag_threshold < 0 {
+        return Err(ValidationError::new("invalid_kafka_lag_threshold"));
+    }
+    if kafka
+        .lag_group_allowlist
+        .iter()
+        .any(|group| group.trim().is_empty())
+    {
+        return Err(ValidationError::new("invalid_kafka_lag_group_allowlist"));
     }
     Ok(())
 }
@@ -612,8 +615,28 @@ mod kafka_validation_tests {
     }
 
     #[test]
-    fn enabled_kafka_section_requires_servers() {
-        assert!(validate_kafka_section(&section(&[])).is_err());
+    fn bootstrap_servers_are_no_longer_required() {
+        // 端点来自自探：旧配置里只有 `enabled = true` 而不写地址的机器必须能启动
+        // （那个字段已经不起作用，不该再拿它拦人）。
+        assert!(validate_kafka_section(&section(&[])).is_ok());
+    }
+
+    #[test]
+    fn tuning_is_validated_even_when_the_section_is_disabled() {
+        // 旋钮一直在生效（lag 面不靠 `enabled` 启停），所以校验也不能跟 `enabled` 走。
+        let mut disabled = KafkaSection {
+            enabled: false,
+            ..KafkaSection::default()
+        };
+        disabled.max_groups = 0;
+        assert!(validate_kafka_section(&disabled).is_err());
+
+        let mut disabled = KafkaSection {
+            enabled: false,
+            ..KafkaSection::default()
+        };
+        disabled.interval_ms = 10;
+        assert!(validate_kafka_section(&disabled).is_err());
     }
 
     #[test]
@@ -635,15 +658,15 @@ mod kafka_validation_tests {
     }
 
     #[test]
-    fn sasl_modes_require_credentials() {
+    fn sasl_credentials_are_no_longer_required() {
         let mut sasl = section(&["kafka-0:9093"]);
         sasl.security_protocol = "SASL_SSL".to_string();
 
-        assert!(validate_kafka_section(&sasl).is_err(), "缺用户名/密码文件");
+        // 用户名 / 密码文件由自探约定决定（`wist-probe` + 固定路径），配置里这两个
+        // 字段已经失效；缺它们在连接期也不是问题（路径写死在代码里）。
+        assert!(validate_kafka_section(&sasl).is_ok());
 
         sasl.username = Some("wist-probe".to_string());
-        assert!(validate_kafka_section(&sasl).is_err(), "缺密码文件");
-
         sasl.password_file = Some("/etc/wist-agentd/kafka-password".to_string());
         assert!(validate_kafka_section(&sasl).is_ok());
     }
@@ -674,5 +697,32 @@ mod kafka_validation_tests {
         let mut zero_timeout = section(&["kafka-0:9092"]);
         zero_timeout.timeout_ms = 0;
         assert!(validate_kafka_section(&zero_timeout).is_err());
+    }
+
+    #[test]
+    fn kafka_group_settings_have_safe_bounds() {
+        // lag 一轮要连每组 + 每个 leader：低于 1s 等于自己给集群加负载。
+        let mut fast = section(&["kafka-0:9092"]);
+        fast.lag_interval_ms = 10;
+        assert!(validate_kafka_section(&fast).is_err());
+
+        // max_groups = 0 会让消费组面静默失能，不如直接拒绝。
+        let mut none = section(&["kafka-0:9092"]);
+        none.max_groups = 0;
+        assert!(validate_kafka_section(&none).is_err());
+
+        // 负阈值等于「什么都发」，与「阈值」的语义相反。
+        let mut negative = section(&["kafka-0:9092"]);
+        negative.lag_threshold = -1;
+        assert!(validate_kafka_section(&negative).is_err());
+
+        // 空白组名只会让白名单静默失效。
+        let mut blank = section(&["kafka-0:9092"]);
+        blank.lag_group_allowlist = vec![" ".to_string()];
+        assert!(validate_kafka_section(&blank).is_err());
+
+        let mut ok = section(&["kafka-0:9092"]);
+        ok.lag_group_allowlist = vec!["orders".to_string()];
+        assert!(validate_kafka_section(&ok).is_ok());
     }
 }

@@ -3,13 +3,25 @@
 pub mod cache;
 pub mod cgroup;
 pub mod container;
+// 数据库自探的公共层（MySQL / PostgreSQL / Doris 共用）：netns 视角的端口/地址、
+// 运行时判据、凭据 key。
+pub mod db_source;
 pub mod endpoint;
 pub mod host;
 pub mod k8s;
+// Kafka 集群自探：从进程证据 + broker 配置推出端点/协议/机制，作为候选上报。
+// 只发现、不下发采集任务；授权与限流仍由采集面（网关 + 知识策略）决定。
+pub mod kafka_source;
 // 日志源定位（v1 只做 PostgreSQL）：从发现快照的进程证据推出日志目录，作为候选上报。
 // 采不采、采哪个仍由网关判定（见 `wist-design/doc/design/edge/log-source-resolution.md`）。
 pub mod log_source;
+// MySQL / TiDB 实例自探：从进程证据 + my.cnf + 监听端口推出候选（只发现，不下发采集）。
+pub mod mysql_source;
 pub mod network;
+// PostgreSQL 实例自探（证据 + SSLRequest 握手），运行时交给 db_source。
+pub mod pg_source;
+// Doris FE 自探（只找 FE：SHOW BACKENDS 是 FE 的命令）。
+pub mod doris_source;
 pub mod policy;
 pub mod process;
 pub mod runtime;

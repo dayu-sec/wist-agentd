@@ -29,6 +29,18 @@ pub struct AgentConfig {
     /// 设计见 `wist-design/doc/design/telemetry/kafka-broker-metrics-spec.md`。
     #[serde(default)]
     pub kafka: KafkaSection,
+    /// MySQL / TiDB 应用指标（`[mysql]`）：SQL 直采，只读。
+    ///
+    /// 这里**只有调优旋钮**：采集开关由采集面授权决定，端口由自探决定，
+    /// 凭据在 `/etc/wist-agentd/secrets/mysql/<key>/`。
+    #[serde(default)]
+    pub mysql: MysqlSection,
+    /// PostgreSQL 应用指标（`[postgres]`）：与 `[mysql]` 同形。
+    #[serde(default)]
+    pub postgres: PgSection,
+    /// Doris 应用指标（`[doris]`）：与 `[mysql]` 同形。
+    #[serde(default)]
+    pub doris: PgSection,
     /// 本进程**运行日志**的 `[log]` 段（与 `telemetry.logs` 的“被采集日志”不同）。
     ///
     /// 直接内嵌共享 crate 的单类型 [`wist_log::LogSection`]（同名同义，单一事实来源），
@@ -54,6 +66,9 @@ impl AgentConfig {
             discovery: DiscoverySection::default(),
             metrics: MetricsSection::default(),
             kafka: KafkaSection::default(),
+            mysql: MysqlSection::default(),
+            postgres: PgSection::default(),
+            doris: PgSection::default(),
             log: wist_log::LogSection::default(),
         }
     }
@@ -74,36 +89,35 @@ pub struct MetricsSection {
     pub labels: std::collections::BTreeMap<String, String>,
 }
 
-/// `[kafka]`：Kafka 协议探针。
+/// `[kafka]`：Kafka 协议探针的**调优旋钮**。
 ///
-/// 默认**关**：没有任何 broker 地址时启动它只会在日志里刷失败。
+/// 采集不再由本段启停：授权来自采集面（`collect_metrics` + `KafkaCluster/auto`），
+/// 端点 / 协议由本机自探（`discovery::kafka_source`），凭据固定在
+/// `/etc/wist-agentd/secrets/kafka`。下面的连通性字段**能加载但不生效**
+/// （见 [`KafkaSection::ignored_legacy_fields`]），保留只为旧配置不至于启动失败。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ::jumo_derive::Jumo)]
 #[jumo(kind = "struct", domain = "Discovery", module = "Discovery.Config")]
 #[serde(deny_unknown_fields)]
 pub struct KafkaSection {
+    /// 兼容字段：**不再**决定是否采集（采集由采集面授权驱动）。
     #[serde(default)]
     pub enabled: bool,
-    /// `host:port` 列表。
+    /// 兼容字段：端点由自探决定（这里写了也不会有任何效果）。
     #[serde(default)]
     pub bootstrap_servers: Vec<String>,
-    /// `PLAINTEXT` / `SSL` / `SASL_PLAINTEXT` / `SASL_SSL`（默认 `PLAINTEXT`）。
-    ///
-    /// **不自动降级**：从 TLS 回落到明文是安全降级，只能显式选。
+    /// 兼容字段：协议由自探的监听器决定（这里写了也不会有任何效果）。
     #[serde(default = "default_kafka_security_protocol")]
     pub security_protocol: String,
-    /// `auto` / `SCRAM-SHA-512` / `SCRAM-SHA-256` / `PLAIN`（默认 `auto`）。
-    ///
-    /// `auto` 在**同一加密等级内**按 `SCRAM-SHA-512 > SCRAM-SHA-256 > PLAIN` 挑，
-    /// 依据是 broker 在 `SaslHandshake` 里回的机制列表 —— 不猜、不跨等级。
+    /// 兼容字段：机制固定为 `auto`（同一加密等级内由 broker 的列表选）。
     #[serde(default = "default_kafka_sasl_mechanism")]
     pub sasl_mechanism: String,
-    /// SASL 用户名；`SASL_*` 模式必填。
+    /// 兼容字段：用户名固定为 `wist-probe`。
     #[serde(default)]
     pub username: Option<String>,
-    /// SASL 密码文件（`0600`）。密码不写进配置、不进日志、不进退诊断包。
+    /// 兼容字段：密码固定从 `/etc/wist-agentd/secrets/kafka/probe` 读。
     #[serde(default)]
     pub password_file: Option<String>,
-    /// 覆盖系统根证书的 CA（PEM）；`SSL` / `SASL_SSL` 可选。
+    /// 兼容字段：私有 CA 固定从 `/etc/wist-agentd/secrets/kafka/ca.pem` 读（存在才用）。
     #[serde(default)]
     pub tls_ca_file: Option<String>,
     /// 采集周期（毫秒）。默认 30s：metadata 一次拿全集群，很便宜。
@@ -112,6 +126,21 @@ pub struct KafkaSection {
     /// 单次请求超时（毫秒）。默认 5s。
     #[serde(default = "default_kafka_timeout_ms")]
     pub timeout_ms: u64,
+    /// 消费组采集周期（毫秒）。默认 60s（规范 §6 建议 60–300s）。
+    ///
+    /// lag 是成本主项（每个组要 `DescribeGroups` + `OffsetFetch` + 每 leader 一次
+    /// `ListOffsets`），所以它有自己的节奏，不跟拓扑面（30s）跑。
+    #[serde(default = "default_kafka_lag_interval_ms")]
+    pub lag_interval_ms: u64,
+    /// 只发这些组（非空时忽略阈值）。空 = 按阈值过滤（规范 §5）。
+    #[serde(default)]
+    pub lag_group_allowlist: Vec<String>,
+    /// 单轮最多查多少个组。默认 200（超出按组名稳定截断，丢弃数计入 warnings）。
+    #[serde(default = "default_kafka_max_groups")]
+    pub max_groups: usize,
+    /// 白名单为空时，只发总 lag 超过该值的组。默认 1000。
+    #[serde(default = "default_kafka_lag_threshold")]
+    pub lag_threshold: i64,
 }
 
 impl Default for KafkaSection {
@@ -126,6 +155,81 @@ impl Default for KafkaSection {
             tls_ca_file: None,
             interval_ms: default_kafka_interval_ms(),
             timeout_ms: default_kafka_timeout_ms(),
+            lag_interval_ms: default_kafka_lag_interval_ms(),
+            lag_group_allowlist: Vec::new(),
+            max_groups: default_kafka_max_groups(),
+            lag_threshold: default_kafka_lag_threshold(),
+        }
+    }
+}
+
+impl KafkaSection {
+    /// 旧版 `[kafka]` 里**已经不起作用**的字段。
+    ///
+    /// 端点 / 协议 / 凭据全部由自探与固定约定（`secrets/kafka/probe`）决定，这几个
+    /// 字段仍然能加载（不能让旧配置把 agentd 拦在门外），但改了也不会有任何效果。
+    /// 启动日志据此点名，避免「一处配置、两处真相」。
+    pub fn ignored_legacy_fields(&self) -> Vec<&'static str> {
+        let mut ignored = Vec::new();
+        if !self.bootstrap_servers.is_empty() {
+            ignored.push("bootstrap_servers");
+        }
+        if self.security_protocol != default_kafka_security_protocol() {
+            ignored.push("security_protocol");
+        }
+        if self.sasl_mechanism != default_kafka_sasl_mechanism() {
+            ignored.push("sasl_mechanism");
+        }
+        if self.username.is_some() {
+            ignored.push("username");
+        }
+        if self.password_file.is_some() {
+            ignored.push("password_file");
+        }
+        if self.tls_ca_file.is_some() {
+            ignored.push("tls_ca_file");
+        }
+        ignored
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Discovery", module = "Discovery.Config")]
+#[serde(deny_unknown_fields)]
+pub struct MysqlSection {
+    /// 采集周期（毫秒）。默认 30s：三条 `SHOW` 很便宜，但没必要更快。
+    #[serde(default = "default_mysql_interval_ms")]
+    pub interval_ms: u64,
+    /// 单轮总超时（毫秒）。默认 5s：连接 + 三条 `SHOW` 超这个数就是库忙或网络不通。
+    #[serde(default = "default_mysql_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for MysqlSection {
+    fn default() -> Self {
+        Self {
+            interval_ms: default_mysql_interval_ms(),
+            timeout_ms: default_mysql_timeout_ms(),
+        }
+    }
+}
+
+/// PostgreSQL 的调优旋钮（与 [`MysqlSection`] 同形）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Discovery", module = "Discovery.Config")]
+#[serde(deny_unknown_fields)]
+pub struct PgSection {
+    #[serde(default = "default_mysql_interval_ms")]
+    pub interval_ms: u64,
+    #[serde(default = "default_mysql_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for PgSection {
+    fn default() -> Self {
+        Self {
+            interval_ms: default_mysql_interval_ms(),
+            timeout_ms: default_mysql_timeout_ms(),
         }
     }
 }
@@ -169,6 +273,13 @@ pub struct DiscoverySection {
     /// 常数成本、不遍历文件系统。关掉只是不报，不影响其它采集。
     #[serde(default = "default_discovery_source_resolve_enabled")]
     pub source_resolve: bool,
+    /// 是否自探本机的 **Kafka broker**（只发现、只上报候选，不下发采集任务）。
+    ///
+    /// 默认**开**：读到的是 broker 自己的 `server.properties`（只读白名单键，密码类键一律不碰）
+    /// 或容器里的 `KAFKA_CFG_*`，再加一次有界可达性探测（≤6 端点 × 300ms）。
+    /// 关掉 = 不自动发现（也就不会有可用的端点/协议：端点只来自自探）。
+    #[serde(default = "default_discovery_kafka_discovery_enabled")]
+    pub kafka_discovery: bool,
 }
 
 impl Default for DiscoverySection {
@@ -182,6 +293,7 @@ impl Default for DiscoverySection {
             snapshot_uplink_enabled: default_discovery_snapshot_uplink_enabled(),
             snapshot_uplink_interval_seconds: default_discovery_snapshot_uplink_interval_seconds(),
             source_resolve: default_discovery_source_resolve_enabled(),
+            kafka_discovery: default_discovery_kafka_discovery_enabled(),
         }
     }
 }
@@ -630,12 +742,36 @@ fn default_discovery_source_resolve_enabled() -> bool {
     true
 }
 
+fn default_discovery_kafka_discovery_enabled() -> bool {
+    true
+}
+
 fn default_kafka_interval_ms() -> u64 {
     30_000
 }
 
 fn default_kafka_timeout_ms() -> u64 {
     5_000
+}
+
+fn default_mysql_interval_ms() -> u64 {
+    30_000
+}
+
+fn default_mysql_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_kafka_lag_interval_ms() -> u64 {
+    60_000
+}
+
+fn default_kafka_max_groups() -> usize {
+    200
+}
+
+fn default_kafka_lag_threshold() -> i64 {
+    1_000
 }
 
 fn default_kafka_security_protocol() -> String {
@@ -649,6 +785,43 @@ fn default_kafka_sasl_mechanism() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ignored_legacy_kafka_fields_are_named() {
+        // 端点 / 协议 / 凭据现在全由自探与固定约定决定；旧配置仍能加载，
+        // 但启动日志必须把「写了也不生效」的键点名，否则就是一处配置两处真相。
+        assert!(KafkaSection::default().ignored_legacy_fields().is_empty());
+
+        let legacy = KafkaSection {
+            enabled: true,
+            bootstrap_servers: vec!["kafka-0:9093".to_string()],
+            security_protocol: "SASL_SSL".to_string(),
+            sasl_mechanism: "SCRAM-SHA-512".to_string(),
+            username: Some("wist-probe".to_string()),
+            password_file: Some("/etc/wist-agentd/kafka-password".to_string()),
+            tls_ca_file: Some("/etc/wist-agentd/kafka-ca.pem".to_string()),
+            ..KafkaSection::default()
+        };
+        assert_eq!(
+            legacy.ignored_legacy_fields(),
+            vec![
+                "bootstrap_servers",
+                "security_protocol",
+                "sasl_mechanism",
+                "username",
+                "password_file",
+                "tls_ca_file",
+            ]
+        );
+
+        // 只调旋钮时不应误报。
+        let tuning = KafkaSection {
+            max_groups: 50,
+            lag_interval_ms: 120_000,
+            ..KafkaSection::default()
+        };
+        assert!(tuning.ignored_legacy_fields().is_empty());
+    }
 
     #[test]
     fn a_file_input_without_startup_position_starts_from_the_tail() {

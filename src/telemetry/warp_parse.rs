@@ -731,22 +731,32 @@ mod tests {
     /// **被内核再次分配**给别人（同一轮测试里另一个 bind、或机器上任何新连接），
     /// 于是 connect 有时会成功 —— 这就是这个用例偶发失败的原因。
     ///
-    /// 这里改用 **ephemeral 段之外**的固定端口（Linux 典型 32768-60999，macOS 49152-65535）：
-    /// 内核不会自动分配它们，drop 之后只有显式 bind 才能占到，概率可以忽略。
+    /// 所以先试 **ephemeral 段之外**的固定端口，并且**绑一次、关一次、真的 connect 一次确认拒连**
+    /// 才用。两者都失败的候选直接跳过（并行用例 / 系统服务占着就换下一个）。
     async fn closed_port() -> u16 {
-        // 取几不在两个平台的 ephemeral 区间里的值；绑不上（被真实服务占用）就换下一个。
-        for candidate in [29_417u16, 29_531, 29_611] {
-            if let Ok(listener) = TcpListener::bind(("127.0.0.1", candidate)).await {
-                let port = listener.local_addr().expect("addr").port();
+        let mut candidates: Vec<u16> = (0..24).map(|step| 29_417 + step * 2).collect();
+        for _ in 0..8 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            candidates.push(listener.local_addr().expect("addr").port());
+            drop(listener);
+        }
+
+        for candidate in candidates {
+            {
+                let Ok(listener) = TcpListener::bind(("127.0.0.1", candidate)).await else {
+                    continue; // 有人占着
+                };
                 drop(listener);
-                return port;
+            }
+            // connect 失败才算「确定拒连」；成功说明刚被别的连接抢到了。
+            if tokio::net::TcpStream::connect(("127.0.0.1", candidate))
+                .await
+                .is_err()
+            {
+                return candidate;
             }
         }
-        // 极端环境下全部被占：退回 ephemeral（接受极小概率的竞态，不让用例直接失败）。
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        drop(listener);
-        port
+        panic!("找不到一个确实拒连的端口");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -979,6 +989,9 @@ mod tests {
                 cpu: None,
                 mode: None,
                 state: None,
+                group: None,
+                topic: None,
+                be: None,
                 target_kind: None,
                 outcome: None,
                 host_name: None,
@@ -991,7 +1004,6 @@ mod tests {
             values: vec![serde_json::Number::from_f64(0.25).expect("finite")],
             timestamps: vec![1_234_567_890_000],
         };
-
         let frame = super::build_metrics_frame(&envelope, &metrics).expect("build frame");
         let text = String::from_utf8_lossy(&frame);
         let (env, body) = text.split_once(" METRICS: ").expect("METRICS marker");
@@ -1266,6 +1278,9 @@ mod tests {
                 cpu: None,
                 mode: None,
                 state: None,
+                group: None,
+                topic: None,
+                be: None,
                 target_kind: None,
                 outcome: None,
                 host_name: None,

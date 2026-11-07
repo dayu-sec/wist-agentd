@@ -1,6 +1,6 @@
 [package]
 name = "wist-agentd"
-version = "0.26.1" #@gxl:set(version)
+version = "0.27.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -32,14 +32,14 @@ tokio-rustls = "0.26"
 # 而 `webpki-roots` 只是可选依赖的隐式 feature（reqwest 源码并不引用它），0.13.5 已把它去掉，
 # 留着会把本仓**钉死在 0.13.1**（任何 forward 更新都解析失败）。
 # 事实摘要的内容摘要（`fact-v1:sha256:…`）现在只有一份实现，在 `wist-contracts::fact_summary`
-# （sha2）。agentd 只转接，所以这里不再直依赖任何哈希库。
+# （sha2）。agentd 只转接，所以这里不为它直依赖哈希库；下面的 `sha2` 只服务 Kafka SCRAM。
 time = { version = "0.3", features = ["formatting", "parsing"] }
 toml = "1.1"
 tokio = { version = "1.48", features = ["full"] }
 wist-contracts = "0.10.2"
 # 跨进程 seam 报文（enrollment / agent_status / gateway / work / agent_uplink）。CI/发布走 registry；本地联调可临时切 path。
 wist-api = "0.10.4"
-wist-metrics = "0.13"
+wist-metrics = "0.17"
 # 本地联调：按 rust-gx 约定切 path 指向本地 registry；发布前切回 registry（见 docs/design/metrics-spec-rollout.md）。
 wist-shared = { version = "0.2" }
 # 运行日志：`log` 门面 + 共享 crate `wist-log`（级别 / 格式 / 落点 / 轮转 统一口径）。
@@ -49,6 +49,21 @@ log = "0.4"
 hmac = "0.12"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 rustls-pemfile = "2"
+# SCRAM 运行时要用 SHA-256/512（不再只是测试夹具）。
+sha2 = "0.10"
+# SCRAM 的 salt / nonce / proof 都是 base64；`/dev/urandom` 只提供随机字节。
+base64 = "0.22"
+# 没配 `tls_ca_file` 时用系统根做校验（reqwest 的 rustls 通道用的也是它）。
+rustls-platform-verifier = "0.7"
+# MySQL / TiDB 指标采集（只读）。musl 静态发布下已探针验证：不引入新的 C 依赖
+# （复用已在树上的 aws-lc-sys），见 docs/design/metrics-collection-runtime.md §12.3。
+# 不启 `macros`：没有编译期连库，也没有额外 proc-macro。
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-aws-lc-rs",
+    "mysql",
+    "postgres",
+] }
 wist-log = { version = "0.1" }
 #wist-log = { version = "0.1", path = "../wist-log" }
 wist-validate = { version = "0.8" }
@@ -73,12 +88,11 @@ path = "src/bin/wist-upgrader.rs"
 
 [dev-dependencies]
 # 只为 e2e 造**独立的**摘要夹具：测试里要有一个不经被测实现（现在在 `wist-artifact`）算出来的
-# 预期值，否则「两边用同一个错实现」会让测试白过。生产代码不用它。
-sha2 = "0.10"
+# 预期值，否则「两边用同一个错实现」会让测试白过。生产代码已因 SCRAM 依赖 `sha2`。
 
 # 本地联调：与 `wist-contracts` / `wist-api` 同期改动时启用 —— `[patch]` 放在这里（而不是逐条改
 # 依赖行），是为了让 api/metrics/validate 也解析到本地版本（否则会同时存在两份 contracts，
-# 类型互不认识）。**发布态不要留**：
+# 类型互不认识）。**发布态不要留**；wist-metrics 0.17.0 已发布，这一轮已切回 registry：
 # [patch.crates-io]
 # wist-contracts = { path = "../wist-contracts" }
 # wist-api = { path = "../wist-api" }

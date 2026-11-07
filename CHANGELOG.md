@@ -3,6 +3,118 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.27.0-alpha] - 2026-11-07
+
+### 新增
+
+- **Doris 指标采集（P2 P0 子集）**：新采集域 `doris_metrics` —— `doris_be_up` /
+  `doris_be_capacity_bytes` / `doris_be_available_bytes` / `doris_be_tablets`，全部带 `be` label。
+  只从**本机 FE** 读 `SHOW BACKENDS`（只有 BE 的机器采不了，`doctor` 会说清楚）；
+  掉线的 BE 只报 `up=0`，不报容量（不伪造）。授权 `DorisCluster/auto`，
+  凭据 `secrets/doris/<key>/password`。`be` label 已贯通到上送行
+  （`VmMetricLabels` 有对应字段，缺了会被「声明 label 必须到达线上」的门禁挡住）。
+  设计见 `docs/design/doris-metrics.md`。
+- **依赖升级**：`wist-metrics` 0.14 → **0.17**（`mysql_metrics` / `pg_metrics` /
+  `doris_metrics` 三个域上线；之前这些 fact 查不到 spec，会被规范化层静默丢弃）。
+- **数据库自探改看 netns（host / docker-compose / k8s）**：端口读 `/proc/<pid>/net/tcp`
+  （该进程 netns 的监听表，宿主表里看不到 pod 的），地址按「回环 → 该 netns 的非回环地址」
+  逐个握手；凭据 key 分运行时：`port-<port>` / `pod-<ns>-<pod>` / `container-<name>` /
+  `addr-<ip>-<port>`。`doctor` 新增 `discovery.mysql` / `discovery.postgres`，
+  直接列出「发现的实例 + 它期望的凭据文件路径」。
+- **PostgreSQL 指标采集（P1.2）**：新采集域 `pg_metrics`（13 条指标：存活 / 连接 /
+  事务与回滚 / 死锁 / 临时文件 / 磁盘读与缓存命中 / 库大小 / 复制）。授权
+  `collect_metrics` + `PostgresInstance/auto`，凭据 `secrets/postgres/<key>/password`
+  （用户名 `wist-probe`），握手用 `SSLRequest`。设计见 `docs/design/pg-metrics.md`。
+- **MySQL / TiDB 指标采集（P1）**：新采集域 `mysql_metrics`（15 条指标：存活 / 连接 / 线程 /
+  QPS·慢查询·异常连接·收发字节 / InnoDB buffer pool / 复制延迟与运行状态）。
+  采集由采集面授权驱动（`collect_metrics` + `MysqlInstance/auto`），撤授权下一个 tick 内停采；
+  本机配置只留 `[mysql] interval_ms / timeout_ms` 两个旋钮。
+  端口与凭据来自自探：`mysqld` 进程证据（`my.cnf` / argv / 监听端口）+ 协议 10 问候包握手，
+  密码固定走 `/etc/wist-agentd/secrets/mysql/port-<port>/password`（用户名 `wist-probe`）。
+  执行上走**真 async**（`sqlx` + tokio，不进阻塞池），与 Kafka 共用同一个调度器。
+  设计见 `docs/design/mysql-metrics.md`。
+- **采集运行时 P0.5（行为不变）**：采集作业改成 async —— `Collector::collect` 返回 future，
+  同步实现（主机三域 / Kafka）在作业里走 `spawn_blocking`；调度循环用 `JoinSet` + `Semaphore`
+  并发跑作业，同目标在飞时不重复排轮；超预算只打 `CollectorTargetStalled`（不终止阻塞调用）。
+  自探扫描也改成 blocking 作业，不再霸住异步执行器。
+- **采集运行时 P0（行为不变）**：把 Kafka 的单域线程抽象成统一调度器
+  （`src/telemetry/metrics/scheduler.rs`）：一条采集线程 + 自带 `current_thread` runtime，
+  同时管主机三域与 Kafka 的周期/预算/撤授权/自探扫描；`enum Collector` 分发，
+  Kafka 的协议实现（`probe_once`）原样保留。
+  主机指标不再在 3s tick 里采集：`process_metrics_tick` 改读调度器快照
+  （目标集合变化时同步补一轮），上送链路与指标口径不变。
+  设计见 `docs/design/metrics-collection-runtime.md`。
+
+- **Kafka 采集改为采集面授权驱动**：网关派一份工作
+  （`collect_metrics` + `source={kind:"KafkaCluster", target:"auto"}`）即启采，
+  撤授权下一个 tick 内停采；机器侧**不需要任何 Kafka 配置**。
+  `[kafka] enabled` 不再决定采集（保留字段兼容旧配置，启动时打一条 ignored）。
+- 采集端点/协议由 agentd 自探决定，凭据只认约定路径
+  （`/etc/wist-agentd/secrets/kafka/probe`，SASL；`ca.pem` 私有 CA 可选）。
+- **Kafka broker 自探**：agentd 从进程证据（`server.properties` /
+  容器 `KAFKA_CFG_*` / 监听端口）推出端点、协议、SASL 机制，并对每个端点实测可达性。
+  结果**只在本机使用**（采集选端点、`doctor` 诊断），不上报、不新增网关接口；
+  机器侧**不需要任何 Kafka 配置**。只读白名单键，密码类键一律不读不报。
+- `doctor` 新增 `discovery.kafka` 检查（与守护进程同一解析路径）。
+- `[discovery]` 新增 `kafka_discovery`（默认开）：自探的逃生开关。
+- **Kafka 消费积压（P0）**：`kafka_consumergroup_lag{group,topic}`
+  （`ListGroups → DescribeGroups → OffsetFetch → ListOffsets`）。
+  `lag = Σ max(0, log_end_offset - committed_offset)`，与 `kafka-consumer-groups.sh` 同口径。
+- **Kafka 消费组状态（P1）**：`kafka_consumergroup_state{group,state}`（一热），
+  取值 `stable` / `rebalancing` / `empty` / `dead`。
+- **Kafka 可用空间（P1）**：`kafka_log_dir_usable_bytes`，来自 `DescribeLogDirs v4`；
+  broker 不支持 v4 时缺序列（不伪造 0）。
+- 消费组基数上限：`[kafka]` 新增 `lag_group_allowlist` / `max_groups`（默认 200）/
+  `lag_threshold`（默认 1000）/ `lag_interval_ms`（默认 60s，lag 不跟拓扑面 30s 跑）。
+- Kafka SASL/TLS：`security_protocol` / `sasl_mechanism`（`auto` / `SCRAM-SHA-512` /
+  `SCRAM-SHA-256` / `PLAIN`）/ `username` / `password_file` / `tls_ca_file`，握手在
+  `kafka_auth.rs`（`ApiVersions` 在认证前发，凭据只从文件读、不进错误与日志）。
+- **采集失败日志**：`MetricsCollectionFailed` / `MetricsCollectionPartial` /
+  `MetricsCollectionRecovered` 只在状态变化时打，带 `collection` / `target` / `error`；
+  单 broker 级别的缺失走 `KafkaProbeWarning`。
+
+### 修复
+
+- `DescribeLogDirs v2+` 是 flexible 版本：请求头 tagged fields、compact `topics`、响应逐结构
+  tagged fields 都已支持（v0-v4），v3+ 的顶层 `error_code` 不再被当成「0 个日志目录」。
+- `Metadata v1+` 的 nullable `rack`：漏读会让后续字段整体错位。
+- `DescribeGroups v3+` 请求末尾的 `include_authorized_operations`：漏掉它 broker 直接断连接
+  （真集群跑出来的）；请求失败后不再复用已死的缓存连接。
+- 枚举类 fact（`state` 一热）不再丢掉同级 label：`kafka_consumergroup_state` 现在能带上 `group`。
+- **白名单先筛、再截断**：原先先按 `max_groups` 截断再筛白名单，大集群里白名单的组会被随机截掉。
+- **LEO 一轮只取一次**：`ListOffsets` 结果按 `(topic, partition)` 在本轮内共享给所有组，
+  请求数从「组数 × leader 数」降到「leader 数」（200 组 / 30 leader：6000 → 30），
+  同一轮各组的 lag 也基于同一时刻的 LEO。拿不到的分区本轮不再重试（但仍计入「lag 偏低」）。
+- **容量面总算有了总预算**（默认 10s）：单个 broker 失败早就不影响别人，但
+  「不可达 broker 数 × 单次超时」是串行叠加的 —— 现在超预算就少采尾部 broker 的容量 + 一条
+  warning；消费组面也已挪到容量面**之前**（lag 是 P0，不该被 P1 饿死）。
+- **日志目录级 `error_code` 不再静默**：`DescribeLogDirs` 某个目录读不出来时计入
+  `failed_dirs` 并留 warning；全部目录都失败时整条容量读数报错（**不发 0**，0 会被读成磁盘空）。
+- **采集计数同口径**：`kafka_broker_metrics` 的 `attempted_targets` 改用目标数
+  （每 broker 一个 + 集群级），不再用 bootstrap 地址数 —— 否则 3 broker 的集群会报出
+  `attempted=1 / succeeded=4`。
+- **`[kafka]` 的遗留连通性字段不再拦启动**：`enabled` / `bootstrap_servers` /
+  `security_protocol` / `sasl_*` / `username` / `password_file` / `tls_ca_file` 已不参与采集，
+  仍然能加载、只在写了时做形式校验；启动时以 `event=KafkaProbeConfigIgnored` 点名被忽略的键。
+  调优旋钮改为**始终**校验（原先 `enabled = false` 时 `max_groups = 0` 能静默通过）。
+- **自探扫描移出 3s 主循环**：主循环只判断时机并投递快照（`kafka::request_scan`），
+  读 `/proc` 与有界 TCP 探测都在探测线程上做。扫描带代号（epoch）：撤授权或又投递新扫描时，
+  晚一步回来的旧结果会被丢弃 —— 否则撤销授权后一个迟到的扫描会把集群又加回去。
+- **逐组告警按原因聚合**：大集群里「所有组都没权限 / 协调者都在迁移」以前会让一轮打 200 行
+  （`KafkaProbeWarning` 闸门按内容变化判断，组集合一变就重打一屏）。现在同一种原因只占一行：
+  单组保持原写法，多组写成 `N 个组（如 a, b, c…） DescribeGroups 失败：…`；
+  `DescribeGroups 返回的组是 X` 也不再带上请求的组名（否则每组的错误文本都不同，聚合失效）。
+- **分区级 `error_code` 不再静默丢**：`OffsetFetch` / `ListOffsets` 的分区级失败（无权限 /
+  `NOT_LEADER` / 元数据过期）计入 warnings（「lag 会偏低」）——它们本来就只能表现为「lag 看起来正常」。
+- VM 行 label 新增 `group` / `topic`（`wist-metrics::names::label` 同步登记）。
+
+### 依赖
+
+- `wist-metrics` 升到 `0.17`（新增 lag / state / usable_bytes 声明与 `GROUP` / `TOPIC`
+  label 常量，并注册 `mysql_metrics` / `pg_metrics` / `doris_metrics` 三个域）。
+  **发布顺序：先发 wist-metrics，再发 agentd** —— 否则 `find_metric_spec` 查不到声明，
+  序列会被静默丢弃。
+
 ## [0.26.1-alpha] - 2026-11-06
 
 ### 修复
@@ -24,7 +136,6 @@
   `body` 读报告），信封这份是给数据面的 —— WPL/OML 解不了正文里的 JSON，解了就会
   丢 `body` 原文。旧数据面忽略这个键；新数据面对旧 agentd 的帧回落事件 id。
 - 依赖 `wist-contracts` **0.10.2**（信封字段定义）。
-
 ## [0.25.0-alpha] - 2026-11-05
 
 ### 新增（k8s 容器日志：身份与多行合并，issue #32）

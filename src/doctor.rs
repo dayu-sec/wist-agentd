@@ -311,6 +311,10 @@ async fn diagnose(config_root: &Path, offline: bool) -> Report {
     checks.extend(service_checks(config_root, &config));
     checks.extend(exporter_tool_checks(&config));
     checks.push(log_source_check(&config));
+    checks.push(kafka_discovery_check(&config));
+    checks.push(mysql_discovery_check(&config));
+    checks.push(pg_discovery_check(&config));
+    checks.push(doris_discovery_check(&config));
 
     if offline {
         checks.push(Check::warn(
@@ -1005,6 +1009,196 @@ fn log_source_check(config: &AgentConfig) -> Check {
         "discovery.log_sources",
         "没有可解析的实例",
         format!("{detail}；服务词表：postgresql / mysql / redis / mongodb"),
+    )
+}
+
+/// Kafka 自探：本机到底有没有 broker、端点通没通。
+///
+/// 与守护进程走**同一条**解析路径（[`crate::discovery::kafka_source::resolve_live`]），
+/// 所以不会出现「工具说发现了、进程没上报」。
+fn kafka_discovery_check(config: &AgentConfig) -> Check {
+    if !config.discovery.kafka_discovery {
+        return Check::ok(
+            "discovery.kafka",
+            "Kafka 自探已关闭",
+            "kafka_discovery = false；端点只来自自探，关着就采集不到",
+        );
+    }
+    if !config.discovery.process_enabled {
+        return Check::warn(
+            "discovery.kafka",
+            "自探开着，但进程发现是关的",
+            "process_enabled = false；自探靠进程证据，关着时必然什么都找不到",
+        )
+        .hint("把 [discovery] 的 `process_enabled` 打开");
+    }
+
+    let clusters = crate::discovery::kafka_source::resolve_live();
+    if clusters.is_empty() {
+        return Check::ok(
+            "discovery.kafka",
+            "本机没有发现 Kafka broker",
+            "只读进程证据：argv 里的 kafka.Kafka / kafka-server-start.sh",
+        );
+    }
+    let reachable = clusters
+        .iter()
+        .flat_map(|cluster| &cluster.endpoints)
+        .filter(|endpoint| endpoint.reachable)
+        .count();
+    let detail = format!(
+        "clusters={} reachable_endpoints={} evidence=[{}]",
+        clusters.len(),
+        reachable,
+        clusters
+            .iter()
+            .map(|cluster| cluster.evidence.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    if reachable == 0 {
+        return Check::warn(
+            "discovery.kafka",
+            "发现了 broker 进程，但没有一个端点可达",
+            detail,
+        )
+        .hint(
+            "常见原因：advertised.listeners 用的是集群内 DNS（宿主机解析不了）、\
+             监听只绑在容器网络里、或 broker 只开了 TLS/SASL 而这里只做了 TCP 探测",
+        );
+    }
+    Check::ok(
+        "discovery.kafka",
+        "已发现可达的 Kafka 端点",
+        format!("{detail}；采集时直接用它，不需要本机配置"),
+    )
+}
+
+/// MySQL / TiDB 自探：本机（含 docker / pod）到底有没有实例、握手通没通，
+/// 以及**凭据该放哪个文件** —— 最后这句是运维真正需要的。
+///
+/// 与守护进程走同一条解析路径（[`crate::discovery::mysql_source::resolve_live`]），
+/// 所以不会出现「工具说发现了、进程没采」。
+fn mysql_discovery_check(config: &AgentConfig) -> Check {
+    if !config.discovery.process_enabled {
+        return Check::warn(
+            "discovery.mysql",
+            "自探开着，但进程发现是关的",
+            "process_enabled = false；自探靠进程证据，关着时必然什么都找不到",
+        )
+        .hint("把 [discovery] 的 `process_enabled` 打开");
+    }
+
+    let instances = crate::discovery::mysql_source::resolve_live();
+    if instances.is_empty() {
+        return Check::ok(
+            "discovery.mysql",
+            "本机没有发现 MySQL 实例",
+            "只读进程证据 + 协议 10 握手；库跑在容器 / pod 里时，agentd 要能看见宿主进程（k8s 需 hostPID: true）",
+        );
+    }
+
+    let detail = instances
+        .iter()
+        .map(|instance| {
+            format!(
+                "{} => {}:{}（证据 {}，凭据 {}）",
+                instance.instance(),
+                instance.host,
+                instance.port,
+                instance.evidence,
+                crate::telemetry::metrics::mysql::password_file_for_key(&instance.credential_key)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Check::ok(
+        "discovery.mysql",
+        "已发现 MySQL 实例",
+        format!("{detail}；采集还要采集面授权（MysqlInstance/auto）"),
+    )
+}
+
+/// PostgreSQL 自探（与 MySQL 同一套口径）。
+fn pg_discovery_check(config: &AgentConfig) -> Check {
+    if !config.discovery.process_enabled {
+        return Check::warn(
+            "discovery.postgres",
+            "自探开着，但进程发现是关的",
+            "process_enabled = false；自探靠进程证据",
+        )
+        .hint("把 [discovery] 的 `process_enabled` 打开");
+    }
+
+    let instances = crate::discovery::pg_source::resolve_live();
+    if instances.is_empty() {
+        return Check::ok(
+            "discovery.postgres",
+            "本机没有发现 PostgreSQL 实例",
+            "只读进程证据 + SSLRequest 握手；库跑在容器 / pod 里时，agentd 要能看见宿主进程（k8s 需 hostPID: true）",
+        );
+    }
+
+    let detail = instances
+        .iter()
+        .map(|instance| {
+            format!(
+                "{} => {}:{}（证据 {}，凭据 {}）",
+                instance.instance(),
+                instance.host,
+                instance.port,
+                instance.evidence,
+                crate::telemetry::metrics::postgres::password_file_for_key(
+                    &instance.credential_key
+                )
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Check::ok(
+        "discovery.postgres",
+        "已发现 PostgreSQL 实例",
+        format!("{detail}；采集还要采集面授权（PostgresInstance/auto）"),
+    )
+}
+
+/// Doris FE 自探（只有 FE 能跑 `SHOW BACKENDS`）。
+fn doris_discovery_check(config: &AgentConfig) -> Check {
+    if !config.discovery.process_enabled {
+        return Check::warn(
+            "discovery.doris",
+            "自探开着，但进程发现是关的",
+            "process_enabled = false；自探靠进程证据",
+        )
+        .hint("把 [discovery] 的 `process_enabled` 打开");
+    }
+
+    let fes = crate::discovery::doris_source::resolve_live();
+    if fes.is_empty() {
+        return Check::ok(
+            "discovery.doris",
+            "本机没有发现 Doris FE",
+            "只有 BE 的机器采不了：`SHOW BACKENDS` 是 FE 的命令（这是已知边界，不是故障）",
+        );
+    }
+
+    let detail = fes
+        .iter()
+        .map(|fe| {
+            format!(
+                "{} => {}:{}（凭据 {}）",
+                fe.instance(),
+                fe.host,
+                fe.port,
+                crate::telemetry::metrics::doris::password_file_for_key(&fe.credential_key)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Check::ok(
+        "discovery.doris",
+        "已发现 Doris FE",
+        format!("{detail}；采集还要采集面授权（DorisCluster/auto）"),
     )
 }
 
@@ -2982,6 +3176,23 @@ mod tests {
             check.detail.contains("process_enabled = false"),
             "{check:?}"
         );
+    }
+
+    #[test]
+    fn kafka_discovery_check_reports_the_two_gates() {
+        let mut config = template_config();
+        config.discovery.kafka_discovery = false;
+        let check = kafka_discovery_check(&config);
+        assert_eq!(check.id, "discovery.kafka");
+        assert_eq!(check.status, Status::Ok, "关掉不是故障");
+        assert!(check.detail.contains("kafka_discovery = false"));
+
+        // 开关开着但进程发现关掉：自探一定什么都看不到，要明说。
+        config.discovery.kafka_discovery = true;
+        config.discovery.process_enabled = false;
+        let check = kafka_discovery_check(&config);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("process_enabled = false"));
     }
 
     #[test]
