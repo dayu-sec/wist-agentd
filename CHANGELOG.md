@@ -3,6 +3,15 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布] - 2026-11-07
+
+### 变更
+
+- **采集来源 kind 改用 `wist-contracts 0.10.3`**（`KafkaCluster` / `MysqlInstance` /
+  `PostgresInstance` / `DorisCluster` 不再由 agentd 自定义字符串）：两侧共用一份词汇表，
+  `target` 只认 `auto` 的规则也收敛到契约的 `accepts_target`。无行为变化。
+
+
 ## [0.28.0-alpha] - 2026-11-07
 
 ### 新增

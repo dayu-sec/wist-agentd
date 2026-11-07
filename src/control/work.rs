@@ -25,7 +25,8 @@ use wist_api::work::{
     WorkAccepted, WorkGrant, WorkResultAccepted,
 };
 use wist_contracts::work::{
-    OneShotWork, StandingWork, WorkSpec, WorkSpecSource, is_known_exporter, parse_exporter_target,
+    CollectionSourceKind, OneShotWork, StandingWork, WorkSpec, WorkSpecSource, is_known_exporter,
+    parse_exporter_target,
 };
 use wist_shared::time::now_rfc3339;
 
@@ -36,67 +37,38 @@ use crate::control::enrollment::enrollment_http_client;
 /// 两条路径都在主循环里排在采集之前，必须自己封顶 —— 否则网关卡住会连采集一起停。
 const WORK_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Kafka 采集来源的 `kind`（工作 spec 里的值）。
-///
-/// 为什么先放在 agentd：`wist-contracts 0.10` 里还没有它，而改 contracts 要连带
-/// `wist-api` / `wist-metrics` / `wist-validate` 四个仓一起切 path（否则会出现两份
-/// contracts，类型互不认识）。等网关开始派发这种单元时，再把它收进 `wist-contracts`
-/// 的 [`is_executable_source`](wist_contracts::work::is_executable_source)，两边同口径。
-pub(crate) const KAFKA_CLUSTER_SOURCE_KIND: &str = "KafkaCluster";
-/// `KafkaCluster` 唯一支持的 `target`（空串等同 `auto`）。
-pub(crate) const KAFKA_SOURCE_TARGET_AUTO: &str = "auto";
-
-/// 这条来源是不是「允许在本机采集 Kafka」。
+/// Kafka 采集来源的 `kind`（与 `wist-contracts` 同一份定义，不再各写一个字符串）。
+pub(crate) const KAFKA_CLUSTER_SOURCE_KIND: &str = CollectionSourceKind::KafkaCluster.as_str();
+/// 「这条来源是不是某个自探域」：`kind` 严格相等 + `target` 只认 `auto`。
 ///
 /// 只认 `auto`：端点/协议/机制全部由 agentd 自探。允许工作里写具体地址会把
 /// 「猜地址」的活搬回控制面，也会给探针开一个「连网关指定地址」的口子。
-pub(crate) fn is_kafka_cluster_source(kind: &str, target: &str) -> bool {
-    if kind != KAFKA_CLUSTER_SOURCE_KIND {
-        return false;
-    }
-    let target = target.trim();
-    target.is_empty() || target.eq_ignore_ascii_case(KAFKA_SOURCE_TARGET_AUTO)
+fn is_self_discovered_source(expected: CollectionSourceKind, kind: &str, target: &str) -> bool {
+    kind == expected.as_str() && expected.accepts_target(target)
 }
 
-/// MySQL / TiDB 采集来源的 `kind`（与 Kafka 同理，先放 agentd）。
-pub(crate) const MYSQL_INSTANCE_SOURCE_KIND: &str = "MysqlInstance";
-/// `MysqlInstance` 唯一支持的 `target`。
-pub(crate) const MYSQL_SOURCE_TARGET_AUTO: &str = "auto";
+/// 这条来源是不是「允许在本机采集 Kafka」。
+pub(crate) fn is_kafka_cluster_source(kind: &str, target: &str) -> bool {
+    is_self_discovered_source(CollectionSourceKind::KafkaCluster, kind, target)
+}
 
+/// MySQL / TiDB 采集来源的 `kind`。
+pub(crate) const MYSQL_INSTANCE_SOURCE_KIND: &str = CollectionSourceKind::MysqlInstance.as_str();
 /// 这条来源是不是「允许在本机采集 MySQL / TiDB」。
-///
-/// 同 Kafka：只认 `auto`，端点只来自本机自探。
 pub(crate) fn is_mysql_instance_source(kind: &str, target: &str) -> bool {
-    if kind != MYSQL_INSTANCE_SOURCE_KIND {
-        return false;
-    }
-    let target = target.trim();
-    target.is_empty() || target.eq_ignore_ascii_case(MYSQL_SOURCE_TARGET_AUTO)
+    is_self_discovered_source(CollectionSourceKind::MysqlInstance, kind, target)
 }
 
 /// PostgreSQL 采集来源的 `kind`。
-pub(crate) const PG_INSTANCE_SOURCE_KIND: &str = "PostgresInstance";
-/// `PostgresInstance` 唯一支持的 `target`。
-pub(crate) const PG_SOURCE_TARGET_AUTO: &str = "auto";
-
+pub(crate) const PG_INSTANCE_SOURCE_KIND: &str = CollectionSourceKind::PostgresInstance.as_str();
 pub(crate) fn is_pg_instance_source(kind: &str, target: &str) -> bool {
-    if kind != PG_INSTANCE_SOURCE_KIND {
-        return false;
-    }
-    let target = target.trim();
-    target.is_empty() || target.eq_ignore_ascii_case(PG_SOURCE_TARGET_AUTO)
+    is_self_discovered_source(CollectionSourceKind::PostgresInstance, kind, target)
 }
 
 /// Doris 采集来源的 `kind`。
-pub(crate) const DORIS_CLUSTER_SOURCE_KIND: &str = "DorisCluster";
-pub(crate) const DORIS_SOURCE_TARGET_AUTO: &str = "auto";
-
+pub(crate) const DORIS_CLUSTER_SOURCE_KIND: &str = CollectionSourceKind::DorisCluster.as_str();
 pub(crate) fn is_doris_cluster_source(kind: &str, target: &str) -> bool {
-    if kind != DORIS_CLUSTER_SOURCE_KIND {
-        return false;
-    }
-    let target = target.trim();
-    target.is_empty() || target.eq_ignore_ascii_case(DORIS_SOURCE_TARGET_AUTO)
+    is_self_discovered_source(CollectionSourceKind::DorisCluster, kind, target)
 }
 
 /// 工作里没写清指标周期时的上送间隔（与采集目录里 `MetricInterval` 的策展值同值）。
@@ -2633,5 +2605,54 @@ mod tests {
         );
         assert!(report_work_result(&test_config(endpoint), "w1", "succeeded", "").await);
         server.join().expect("join server");
+    }
+
+    #[test]
+    fn self_discovered_source_predicates_stay_in_sync_with_the_contracts_crate() {
+        use wist_contracts::work::CollectionSourceKind;
+
+        // kind 字符串只有契约一份：agentd 这边的常量必须是它的别名。
+        assert_eq!(
+            KAFKA_CLUSTER_SOURCE_KIND,
+            CollectionSourceKind::KafkaCluster.as_str()
+        );
+        assert_eq!(
+            MYSQL_INSTANCE_SOURCE_KIND,
+            CollectionSourceKind::MysqlInstance.as_str()
+        );
+        assert_eq!(
+            PG_INSTANCE_SOURCE_KIND,
+            CollectionSourceKind::PostgresInstance.as_str()
+        );
+        assert_eq!(
+            DORIS_CLUSTER_SOURCE_KIND,
+            CollectionSourceKind::DorisCluster.as_str()
+        );
+
+        // 四个域：只认 auto（空串兼容旧网关），写具体地址一律拒绝。
+        type Predicate = fn(&str, &str) -> bool;
+        let predicates: [(&str, Predicate); 4] = [
+            (KAFKA_CLUSTER_SOURCE_KIND, is_kafka_cluster_source),
+            (MYSQL_INSTANCE_SOURCE_KIND, is_mysql_instance_source),
+            (PG_INSTANCE_SOURCE_KIND, is_pg_instance_source),
+            (DORIS_CLUSTER_SOURCE_KIND, is_doris_cluster_source),
+        ];
+        for (kind, accepted) in predicates {
+            for target in ["", "auto", "AUTO", " Auto "] {
+                assert!(accepted(kind, target), "{kind} / {target:?}");
+            }
+            for target in ["10.0.0.5:5432", "db.intra:9092", "auto "] {
+                let expected = target == "auto ";
+                assert_eq!(accepted(kind, target), expected, "{kind} / {target:?}");
+            }
+            // 别的域不能交叉命中。
+            for other in [
+                CollectionSourceKind::FileGlob,
+                CollectionSourceKind::Exporter,
+                CollectionSourceKind::MetricInterval,
+            ] {
+                assert!(!accepted(other.as_str(), "auto"), "{kind} vs {other:?}");
+            }
+        }
     }
 }
