@@ -3,7 +3,7 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布] - 2026-11-07
+## [0.28.1-alpha] - 2026-11-08
 
 ### 变更
 
@@ -11,6 +11,22 @@
   `PostgresInstance` / `DorisCluster` 不再由 agentd 自定义字符串）：两侧共用一份词汇表，
   `target` 只认 `auto` 的规则也收敛到契约的 `accepts_target`。无行为变化。
 
+### 内部重构（无行为变化）
+
+- **执行状态查重**：`running/` / `reporting/` / `history/` 三处重复的目录扫描收敛为
+  `scan_state_dir` / `scan_state_dir_async`；判定口径（只认 `*.json`、跳过上报信封、
+  坏文件当不命中、目录本身读不了才报错）原样保留。
+- **日志文件选取**：抽出 `SelectionGate`（排除 glob + 结构化过滤 + 自观测计数）与
+  `split_pattern` / `walk_components` / `walk_entry` 等骨架；k8s 与名字两维度的
+  三态（命中 / 剔除 / 身份未知）降级方向不变。
+- **spool 回放**：抽出 `replay_batches` / `next_record` / `flush_batch`；
+  坏行隔离后继续、sink 失败不清空 spool 的语义不变。
+
+### 文档
+
+- `docs/usage`：「重跑安装」改为钉**脚本摘要**（不再是 `--pinnedpubkey` 钉网关证书指纹）——
+  换证书后旧写法反而会挡路。
+- `dev/` 两个验证脚本：变量引用统一成 `${name}` 形式（与仓库其余脚本一致）。
 
 ## [0.28.0-alpha] - 2026-11-07
 
