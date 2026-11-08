@@ -3,6 +3,17 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.29.0-beta] - 2026-11-08
+
+与 `0.29.0-alpha` **内容相同**（采集面结果上报 + 运行时 P0），推进到 beta 通道。
+
+### 构建
+
+- **发布流水线自证 musl 制品是静态链接**：打包前逐个检查 `wist-agentd` / `wist-exec` /
+  `wist-upgrader`，不是 `statically linked` 就**当场拒发**。制品会被抽到宿主原生运行，
+  一旦绑上构建机或宿主的动态库（glibc、`libgcc_s`），现场就是容器起来又倒、日志里只有
+  一行加载器错误 —— 这种问题不该靠人事后下载产物复核。
+
 ## [0.29.0-alpha] - 2026-11-08
 
 ### 变更

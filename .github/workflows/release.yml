@@ -53,6 +53,9 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package artifacts
+        env:
+          # 只有 musl 目标要求静态；macOS 制品按系统 dylib 动态链接是正常的。
+          TARGET_IS_MUSL: ${{ contains(matrix.target, 'musl') }}
         run: |
           set -euo pipefail
           ARTIFACT="wist-agentd-${{ github.ref_name }}-${{ matrix.target }}"
@@ -67,6 +70,21 @@ jobs:
             test -x "${BIN_DIR}/${bin}" || { echo "拒绝打出漏件制品：${BIN_DIR}/${bin} 缺失或不可执行" >&2; exit 1; }
             cp -av "${BIN_DIR}/${bin}" "${ARTIFACT}/"
           done
+          # musl 制品必须是**静态**链接。制品会被抽到宿主原生运行，一旦绑上构建机或宿主的
+          # 任何动态库（glibc、libgcc_s…），现场就是 `Restarting (127)`：容器起来又倒、日志里
+          # 只有一行加载器错误。0.40.9 的 libgcc_s 事故正是这么漏出去的。
+          # 这件事必须由 CI 对**当次产物**自证：事后人工下载复核依赖网络、也依赖人没忘。
+          # 不用 `file … | grep -q`（命中即退出会关掉管道，配 pipefail 会变成误判）；
+          # 与下面 LISTED 同口径：先整份取回再 case 匹配。
+          if [ "${TARGET_IS_MUSL}" = "true" ]; then
+            for bin in ${BINS}; do
+              desc="$(file -b "${BIN_DIR}/${bin}")"
+              case "${desc}" in
+                *"statically linked"*) echo "静态链接 ${bin} ✓（${desc}）" ;;
+                *) echo "拒绝发布：${bin} 不是静态链接 —— ${desc}" >&2; exit 1 ;;
+              esac
+            done
+          fi
           # 升级兼容声明随包走（网关录入时读它；缺了只是“兼容性未知”，有它才能拦住旧网关）。
           test -f compat.json || { echo "拒绝发布：仓根缺 compat.json" >&2; exit 1; }
           cp -av compat.json "${ARTIFACT}/compat.json"
