@@ -8,8 +8,9 @@
 - **采集面 26 个**：22 个有采集单元，4 个已废弃（保留 id 仅为历史数据可解释）。
 - **采集单元 37 个**：`active` **23 个**（可派活）、`draft` **14 个**（网关不派）。
 - **能力层与授权层是两件事**：agentd 侧探针是否可用（`executable`）由代码决定；能不能派下去（`collect_ready`）由知识库单元的 `status` 决定。两者不一致时，现场表现为「配好了却没有任何指标」。
-- **本轮实测（真实服务）**：PostgreSQL **11 facts / 69ms**、Kafka **9 facts / 3ms**、Doris **4 facts / 3ms**
-  —— 三个域都能出数。Doris 首轮暴露了一个真实缺陷（见 4.3、5.2），已修复。
+- **本轮实测（真实服务）**：PostgreSQL **11 facts / 69ms**、MySQL **13 facts / 113ms**、
+  Kafka **9 facts / 3ms**、Doris **4 facts / 3ms** —— **四个域全部能出数**。
+  Doris 首轮暴露了一个真实缺陷（见 4.3），已修复并补 5 条保护用例。
 ## 二、采集面总览
 
 | 面 | 平台 | 单元数 | active | draft | 对外状态 |
@@ -93,7 +94,8 @@
 | PostgreSQL | ✅ | 69ms | 11 | 建只读账号 + `pg_read_all_stats` |
 | Kafka | ✅ | 3ms | 9 | PLAINTEXT，**不需要凭据** |
 | Doris | ⚠️→✅ | 3ms | 4 | 首轮 facts=0，修复后通过（见 4.3）|
-| MySQL / TiDB | 未验证 | — | — | 探针已实现，集群内有 `apollo-mysql-0` 可验 |
+| MySQL | ✅ | 113ms | 13 | MySQL 8.0.32，`PROCESS` + `REPLICATION CLIENT` |
+| TiDB | 未验证 | — | — | 走同一个 `MysqlInstance` 来源，协议兼容（未实测）|
 
 ### 4.1 PostgreSQL（✅ 11 facts）
 
@@ -177,6 +179,41 @@ probe doris_metrics  mode=explicit  3ms
   该账号实际权限只有默认的 `internal.information_schema: Select_priv` / `internal.mysql: Select_priv` /
   `Usage_priv` —— **Doris 4.x 不需要 ADMIN_PRIV**。（2.x/3.x 可能仍需实例级特权，按版本确认。）
 
+### 4.4 MySQL（✅ 13 facts）
+
+```
+probe mysql_metrics  mode=explicit  113ms
+  summary  targets=1 succeeded=1 failed=0 facts=13（已注册 13 / 未注册 0）
+
+[1/1] mysql_metrics mysql:10.244.154.250:3306  status=succeeded  113ms
+        mysql.up                                 1          -> mysql_up
+        mysql.uptime.seconds                     4607278    -> mysql_uptime_seconds
+        mysql.connections.current                31         -> mysql_connections_current
+        mysql.connections.max                    151        -> mysql_connections_max
+        mysql.threads.running                    2          -> mysql_threads_running
+        mysql.queries.total                      63333876   -> mysql_queries_total
+        mysql.slow_queries.total                 0          -> mysql_slow_queries_total
+        mysql.aborted_connects.total             14         -> mysql_aborted_connects_total
+        mysql.bytes_received.total               11115137897 -> mysql_received_bytes_total
+        mysql.bytes_sent.total                   16565983458 -> mysql_sent_bytes_total
+        mysql.innodb.buffer_pool.page_count      8192       -> mysql_innodb_buffer_pool_pages
+        mysql.innodb.buffer_pool.page_free_count 6518       -> mysql_innodb_buffer_pool_pages_free
+        mysql.innodb.buffer_pool.size_bytes      134217728  -> mysql_innodb_buffer_pool_size_bytes
+```
+
+- 实例：**MySQL 8.0.32**（`apollo-mysql-0`，k8s 内 3306）；
+- 授权（实测够用）：
+
+  ```sql
+  CREATE USER 'wist-probe'@'%' IDENTIFIED BY '<password>';
+  GRANT PROCESS, REPLICATION CLIENT ON *.* TO 'wist-probe'@'%';
+  ```
+
+  - `PROCESS` → `SHOW GLOBAL STATUS` / `SHOW GLOBAL VARIABLES`
+  - `REPLICATION CLIENT` → `SHOW REPLICA STATUS`
+- TiDB 走同一个 `MysqlInstance` 来源（协议兼容），但**本轮未实测**。
+
+
 ## 五、缺口分析
 
 ### 5.1 未就绪的单元（14 个）
@@ -208,7 +245,7 @@ probe doris_metrics  mode=explicit  3ms
 
 1. **数据库三件套逐个真库验收**：
    - ✅ PostgreSQL（已验，11 facts）
-   - ⬜ MySQL / TiDB（未验；集群内有 `apollo-mysql-0` 可用）
+   - ✅ MySQL 8.0（已验，13 facts）；⬜ TiDB（未验）
    - ✅ Doris 4.1（已验，修复探针后 4 facts）
    - 每验通一个，把对应单元改 `active`，`catalog_version` +1；三个可分开发包，不必等齐。
    - 注意：MySQL / TiDB 需要 `PROCESS` + `REPLICATION CLIENT`；Doris 4.x 实测**不需要特权**。
