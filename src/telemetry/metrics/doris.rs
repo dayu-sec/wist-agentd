@@ -164,7 +164,7 @@ pub(super) async fn collect_with(
     let mut alive = 0usize;
     for row in &rows {
         let Some(be) = be_label(row) else {
-            warnings.push("SHOW BACKENDS 的行缺少 IP/HeartbeatPort".to_string());
+            warnings.push("SHOW BACKENDS 的行缺少 Host/IP（主机列）".to_string());
             continue;
         };
         // 缺 `Alive` 不等于「掉线」：那只是这条行没读全，不能凭空发一个 0。
@@ -222,11 +222,14 @@ pub(super) async fn collect_with(
 fn be_label(row: &Row) -> Option<String> {
     // 列名在 Doris 版本间不一致：2.x 是 `IP`，**4.x 起改成 `Host`**（4.1 实测）。
     // 只认一个会让**每一行**都被跳过 —— 现象是 probe 报 success 但 `facts` 为 0，
-    // 只附一条「行缺少 IP/HeartbeatPort」的 warning，很容易被当成集群问题。
-    let host = row.get("Host").or_else(|| row.get("IP"))?.trim();
-    if host.is_empty() {
-        return None;
-    }
+    // 只附一条「行缺少 Host/IP」的 warning，很容易被当成集群问题。
+    //
+    // 空值也要回落：某些代理/中间层会带一个空的 `Host` 列，把有值的 `IP` 挡住。
+    let host = ["Host", "IP"]
+        .into_iter()
+        .filter_map(|column| row.get(column))
+        .map(|value| value.trim())
+        .find(|value| !value.is_empty())?;
     match row.get("HeartbeatPort").map(|port| port.trim()) {
         Some(port) if !port.is_empty() => Some(format!("{host}:{port}")),
         _ => Some(host.to_string()),
@@ -483,7 +486,7 @@ mod tests {
         );
         assert!(
             result.warnings.is_empty(),
-            "新列名不该再报「缺少 IP/HeartbeatPort」：{:?}",
+            "新列名不该再报「缺少 Host/IP」：{:?}",
             result.warnings
         );
     }
@@ -505,6 +508,88 @@ mod tests {
 
         assert_eq!(labeled(&result, "doris.be.up", "10.0.0.9:9050"), Some("1"));
         assert_eq!(labeled(&result, "doris.be.up", "10.9.9.9:9050"), None);
+    }
+
+    /// `Host` 列存在但为**空**（某些代理 / 中间层会带一个空列）：必须回落到 `IP`，
+    /// 不能因为「列在但没值」就把这一行（连同它的容量 / tablet）丢掉。
+    #[tokio::test]
+    async fn an_empty_host_falls_back_to_ip() {
+        let mut transport = Fake::with(vec![row(&[
+            ("Host", "  "),
+            ("IP", "10.0.0.5"),
+            ("HeartbeatPort", "9050"),
+            ("Alive", "true"),
+            ("TotalCapacity", "1.000 TB"),
+            ("AvailCapacity", "512.000 GB"),
+            ("TabletNum", "9"),
+        ])]);
+
+        let result = collect_with(&mut transport, &config()).await;
+
+        assert_eq!(labeled(&result, "doris.be.up", "10.0.0.5:9050"), Some("1"));
+        assert_eq!(
+            labeled(&result, "doris.be.tablets", "10.0.0.5:9050"),
+            Some("9")
+        );
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    /// 两列都没有可用值：跳过这一行并留痕，**不能**发一条 `up=0`（那是伪造）。
+    #[tokio::test]
+    async fn a_row_without_any_usable_host_is_skipped_with_a_warning() {
+        let mut transport = Fake::with(vec![row(&[
+            ("Host", ""),
+            ("IP", "   "),
+            ("HeartbeatPort", "9050"),
+            ("Alive", "true"),
+        ])]);
+
+        let result = collect_with(&mut transport, &config()).await;
+
+        assert!(
+            result.targets[0].labeled_facts.is_empty(),
+            "没有主机列时不能凭空发 fact：{:?}",
+            result.targets[0].labeled_facts
+        );
+        assert!(
+            result.warnings.iter().any(|w| w.contains("Host/IP")),
+            "跳过要留痕：{:?}",
+            result.warnings
+        );
+    }
+
+    /// 滚动升级期间可能**新旧列名同时存在**：不能只认一种就把另一批 BE 丢掉。
+    #[tokio::test]
+    async fn mixed_ip_and_host_rows_are_both_reported() {
+        let rows = vec![
+            row(&[
+                ("Host", "10.0.1.1"),
+                ("HeartbeatPort", "9050"),
+                ("Alive", "true"),
+                ("TotalCapacity", "1.000 TB"),
+                ("AvailCapacity", "512.000 GB"),
+                ("TabletNum", "1"),
+            ]),
+            row(&[
+                ("IP", "10.0.1.2"),
+                ("HeartbeatPort", "9050"),
+                ("Alive", "true"),
+                ("TotalCapacity", "1.000 TB"),
+                ("AvailCapacity", "512.000 GB"),
+                ("TabletNum", "2"),
+            ]),
+        ];
+        let mut transport = Fake::with(rows);
+
+        let result = collect_with(&mut transport, &config()).await;
+
+        assert_eq!(labeled(&result, "doris.be.up", "10.0.1.1:9050"), Some("1"));
+        assert_eq!(labeled(&result, "doris.be.up", "10.0.1.2:9050"), Some("1"));
+        assert_eq!(
+            labeled(&result, "doris.be.tablets", "10.0.1.2:9050"),
+            Some("2")
+        );
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     }
 
     #[tokio::test]
