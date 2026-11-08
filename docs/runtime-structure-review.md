@@ -269,7 +269,7 @@
 | # | 项 | 说明 |
 |---|---|---|
 | R1 | ✅ **已完成** —— 删掉 `[patch.crates-io] wist-contracts = { path = "../wist-contracts" }` | 已验证前提：crates.io 上的 `wist-contracts 0.10.4` 源码里确有 `pub collection: Option<AgentLocalCollection>`（`local_work.rs:91`）。依赖下限已从 `0.10.3` 提到 `0.10.4`（写 `0.10.3` 时最小版本解析会挑到编译不过的版本）。核对方式：`Cargo.lock` 已指向 `registry+...crates.io-index` 带 checksum，`cargo clean -p wist-contracts && cargo build` 能纯从 registry 重编通过 |
-| R2 | 核对 agentd 发布产物引入 `socket2` 后仍为纯静态 | `socket2` 已在依赖树（tokio / hyper-util 传递），不新增 C 依赖；本地 musl 交叉编译已验证（`file` → `statically linked`, 19M），但**发布前用当次 CI 产物**再确认一次（参 0.40.9 的 `libgcc_s` 事故） |
+| R2 | ✅ **已完成（已自动化）** —— 发布产物静态链接受 CI 自证 | `release.yml` 的打包步骤现在逐个检查三件产物，不是 `statically linked` / `static-pie linked` 就当场拒发。首放（v0.29.0-beta）就抓到了判据写窄：x86_64-musl 产物是 `static-pie linked`（Rust 默认开 PIE），而 aarch64-musl 是 `statically linked`。本地 zigbuild 产物与 CI musl-gcc 产物形态不同，所以“本地验过”不能代替这道闸 |
 
 ### P1（结构性；不改就会在弱网 / 大机器上成瓶颈）
 
