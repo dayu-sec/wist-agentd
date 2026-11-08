@@ -865,6 +865,21 @@ impl AppliedWorkGrant {
         unsupported
     }
 
+    /// 参数解析失败的工作（`work_id` → 原因）。
+    ///
+    /// 与 [`Self::unsupported_units`] 分开：那个是「来源类型接不了」，这个是「工作参数本身
+    /// 就坏了」。两者在管理面上都表现为“这个面一条也采不到”，但下一步动作不同。
+    pub fn spec_failures(&self) -> Vec<(String, String)> {
+        self.works
+            .iter()
+            .filter_map(|(work_id, work)| {
+                work.spec_detail
+                    .clone()
+                    .map(|detail| (work_id.clone(), detail))
+            })
+            .collect()
+    }
+
     /// 一行可读状态（日志用）。刻意包含"几份在干活、几条任务、指标开没开"，
     /// 因为运维问的第一个问题就是这些，不该逼人从别处的数字反推。
     pub fn summary(&self) -> String {

@@ -630,6 +630,62 @@ enum RenewOutcome {
 pub(crate) fn enrollment_http_client(
     config: &AgentConfig,
 ) -> Result<reqwest::Client, EnrollmentError> {
+    let key = client_cache_key(config);
+    let cache = CLIENT_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(guard) = cache.lock()
+        && let Some((cached_key, client)) = guard.as_ref()
+        && *cached_key == key
+    {
+        return Ok(client.clone());
+    }
+    let client = build_enrollment_http_client(config)?;
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((key, client.clone()));
+    }
+    Ok(client)
+}
+
+/// 复用的 `reqwest::Client`：它自带**连接池与 TLS 会话缓存**，`clone()` 是廉价句柄拷贝。
+///
+/// 以前每个请求都 `Client::builder()...build()`（状态上报每 3 秒一次）：
+/// 每拍重新读两遍证书 PEM、解两遍 X.509、再做一次完整 TCP+TLS 握手。
+static CLIENT_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(String, reqwest::Client)>>> =
+    std::sync::OnceLock::new();
+
+/// 缓存 key：覆盖所有会影响构造的输入。
+///
+/// 证书/私钥只取 **mtime + 长度**作为指纹 —— 判断“证书换过没有”不需要解析 X.509，
+/// 而解析正是这里想省掉的成本。
+fn client_cache_key(config: &AgentConfig) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let stamp = |path: &Path| match std::fs::metadata(path) {
+        Ok(meta) => format!("{:?}:{}", meta.modified().ok(), meta.len()),
+        Err(_) => "-".to_string(),
+    };
+    let state_dir = PathBuf::from(&config.paths.state_dir);
+    let paths = state_store::client_identity::ClientIdentityPaths::under(&state_dir);
+
+    // trust_bundle 是 PEM **内容**（可能几 KB），哈希进 key 而不是整串拼接。
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    config
+        .control_plane
+        .trust_bundle
+        .as_deref()
+        .unwrap_or_default()
+        .hash(&mut hasher);
+
+    format!(
+        "{}|{}|{:x}|{}|{}",
+        config.control_plane.endpoint.as_deref().unwrap_or_default(),
+        config.control_plane.tls_mode.as_deref().unwrap_or_default(),
+        hasher.finish(),
+        stamp(&paths.cert_file),
+        stamp(&paths.key_file),
+    )
+}
+
+fn build_enrollment_http_client(config: &AgentConfig) -> Result<reqwest::Client, EnrollmentError> {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(ENROLLMENT_CONNECT_TIMEOUT)
         .timeout(ENROLLMENT_REQUEST_TIMEOUT);
@@ -935,9 +991,9 @@ mod tests {
 
     use super::{
         EnrollmentDecision, EnrollmentReason, build_enrollment_request, build_host_profile,
-        enroll_from_config, enroll_with_token, enroll_with_token_forced, enrollment_http_client,
-        ensure_enrolled, ensure_enrolled_with_config_path, is_registered_agent_id, post_enrollment,
-        renew_credential, restore_runtime_identity,
+        client_cache_key, enroll_from_config, enroll_with_token, enroll_with_token_forced,
+        enrollment_http_client, ensure_enrolled, ensure_enrolled_with_config_path,
+        is_registered_agent_id, post_enrollment, renew_credential, restore_runtime_identity,
     };
 
     #[test]
@@ -1005,6 +1061,63 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wist-agentd-enrollment-{name}-{suffix}"));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    /// 缓存 key 必须覆盖**所有**影响 client 构造的输入。
+    ///
+    /// 漏项的后果不是“多用一次旧 client”，而是更坏的那种：**证书轮换后永远拿旧证书去握手**，
+    /// 服务端在握手期直接拒，而两侧报错都只说“连不上”——根因完全排不到。
+    #[test]
+    fn the_client_cache_key_covers_every_input_that_shapes_the_client() {
+        let state_dir = temp_dir("client-cache-key");
+        let mut base = config();
+        base.paths.state_dir = state_dir.display().to_string();
+
+        let key = client_cache_key(&base);
+        // 同一份配置必须得到同一个 key，否则每 3 秒重建一次 client，缓存等于没有。
+        assert_eq!(client_cache_key(&base), key, "配置没变就不能换 key");
+
+        let mut moved_endpoint = base.clone();
+        moved_endpoint.control_plane.endpoint = Some("http://127.0.0.1:2".to_string());
+        assert_ne!(
+            client_cache_key(&moved_endpoint),
+            key,
+            "换端点必须重建 client（连接池是端点的）"
+        );
+
+        let mut other_tls = base.clone();
+        other_tls.control_plane.tls_mode = Some("server-auth".to_string());
+        assert_ne!(
+            client_cache_key(&other_tls),
+            key,
+            "换 TLS 模式必须重建 client（决定根证书怎么用）"
+        );
+
+        let mut other_trust = base.clone();
+        other_trust.control_plane.trust_bundle = Some("-----BEGIN CERTIFICATE-----A".to_string());
+        assert_ne!(
+            client_cache_key(&other_trust),
+            key,
+            "换信任锚必须重建 client"
+        );
+
+        // 身份材料出现/变化：轮换后必须重握手。判定只用 mtime + 长度，
+        // 所以这里用**不同长度**验证——同一秒内写入时 mtime 可能分不出先后。
+        let paths = crate::state_store::client_identity::ClientIdentityPaths::under(&state_dir);
+        fs::create_dir_all(paths.cert_file.parent().expect("cert parent")).expect("create dir");
+        fs::write(&paths.cert_file, b"-----BEGIN CERTIFICATE-----A").expect("cert");
+        fs::write(&paths.key_file, b"-----BEGIN PRIVATE KEY-----K").expect("key");
+        let with_identity = client_cache_key(&base);
+        assert_ne!(with_identity, key, "出现证书/私钥后必须重建 client");
+
+        fs::write(&paths.cert_file, b"-----BEGIN CERTIFICATE-----BB").expect("cert v2");
+        assert_ne!(
+            client_cache_key(&base),
+            with_identity,
+            "证书换了必须重建 client（否则一直拿旧证书握手，服务端只会报连不上）"
+        );
+
+        let _ = fs::remove_dir_all(state_dir);
     }
 
     #[test]

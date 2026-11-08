@@ -76,27 +76,44 @@ impl RecordSink for TelemetryRecordSink {
     }
 }
 
-impl TelemetryRecordSink {
-    /// `framing` 给了就**覆盖**配置里的值：调用方已经算出「实际必须用哪种分帧」。
+/// sink 的**身份**：写到哪里 + 怎么分帧。
+///
+/// 两个 sink 身份相同即行为相同，因此可以在 tick 之间复用同一个实例 —— 连接与退避状态
+/// 都挂在实例上（见 [`TcpRecordSink`]），复用的收益全在“保留这些状态”。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SinkIdentity {
+    File {
+        path: String,
+    },
+    Tcp {
+        addr: String,
+        port: u16,
+        framing: TcpFraming,
+    },
+}
+
+impl SinkIdentity {
+    /// 唯一构造点：`SinkIdentity` 与跨 tick 复用键都走这里，避免两处判定漂移。
     ///
+    /// `framing` 给了就**覆盖**配置里的值：调用方已经算出「实际必须用哪种分帧」。
     /// 为什么要能覆盖：分帧合不合法取决于**记录是否可能含多行**（协议 §3：`line` 只适用于
     /// 单行记录），而那取决于本轮采什么（授权工作），不是静态配置能表达全的。
-    pub(crate) fn from_logs_output(
+    pub(crate) fn resolve(
         output: &LogsOutputSection,
         framing: Option<TcpFraming>,
     ) -> io::Result<Self> {
         match output.kind.as_str() {
-            "file" => Ok(Self::File(FileRecordSink::new(PathBuf::from(
-                &output.file.path,
-            )))),
-            "tcp" => Ok(Self::Tcp(TcpRecordSink::new(
-                output.tcp.addr.clone(),
-                output.tcp.port,
-                match framing {
+            "file" => Ok(Self::File {
+                path: output.file.path.clone(),
+            }),
+            "tcp" => Ok(Self::Tcp {
+                addr: output.tcp.addr.clone(),
+                port: output.tcp.port,
+                framing: match framing {
                     Some(framing) => framing,
                     None => TcpFraming::parse(&output.tcp.framing)?,
                 },
-            ))),
+            }),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("unsupported telemetry output kind: {other}"),
@@ -104,6 +121,21 @@ impl TelemetryRecordSink {
         }
     }
 
+    pub(crate) fn sink(&self) -> TelemetryRecordSink {
+        match self {
+            Self::File { path } => {
+                TelemetryRecordSink::File(FileRecordSink::new(PathBuf::from(path)))
+            }
+            Self::Tcp {
+                addr,
+                port,
+                framing,
+            } => TelemetryRecordSink::Tcp(TcpRecordSink::new(addr.clone(), *port, *framing)),
+        }
+    }
+}
+
+impl TelemetryRecordSink {
     /// 上送一帧指标帧。指标走 TCP uplink，与日志复用同一连接、靠 ` METRICS:` 帧标记区分；
     /// 文件输出仅承载日志（本地调试），不承载指标，返回 Ok 跳过。
     pub(crate) async fn write_metrics(
@@ -247,6 +279,15 @@ impl TcpFraming {
 
 /// TCP 连接超时：避免死网卡/黑洞地址让 tick 永久挂起。
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// 上送连接的空闲探测周期。
+///
+/// 原来不需要：连接每 tick 都重建，永远不会“老”。现在 sink 跨 tick 复用（见
+/// `TelemetrySinkSlot`），一条连接会活几小时 —— 而它中间一旦被 NAT / 防火墙 /
+/// 对端重启静默弄死，**本端第一次写仍会成功**（数据进了对端内核缓冲，甚至可能是
+/// 已被 RST 的一个哑连接），要等下一次写才 EPIPE。开 kernel keepalive 就是把这个
+/// “静默窗口”从无限缩短到分钟级：连接死了，写就会失败，于是落 spool 重放。
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// TCP 写超时窗口：判的是**没有进展**，不是整次写的时长。
 ///
 /// 为什么必须是「无进展」而不是 `timeout(_, write_all)`：后者会把一个**慢但一直在推进**的
@@ -268,6 +309,22 @@ const TCP_WRITE_FINISH_TIMEOUT: Duration = Duration::from_secs(60);
 /// 退避初始时长与上限（失败翻倍、成功重置）。
 const TCP_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const TCP_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// 给上送连接开 kernel keepalive（理由见 [`TCP_KEEPALIVE_IDLE`]）。
+///
+/// 只设空闲时长与探测间隔，不设重试次数：各平台默认值足够，而 `with_retries`
+/// 在非 Linux 上会被默默忽略——写一个“看起来生效但没生效”的参数比不写更坏。
+///
+/// 失败不影响功能（拿不到 keepalive 只是回到「靠 write 发现死连接」），所以要看得见。
+fn enable_keepalive(stream: &TcpStream) {
+    let socket = socket2::SockRef::from(stream);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_IDLE)
+        .with_interval(TCP_KEEPALIVE_INTERVAL);
+    if let Err(err) = socket.set_tcp_keepalive(&keepalive) {
+        log::warn!("event=UplinkKeepaliveUnavailable detail=\"{err}\"");
+    }
+}
 
 #[derive(Debug, ::jumo_derive::Jumo)]
 #[jumo(kind = "struct", domain = "Discovery", module = "Discovery.Collect")]
@@ -327,6 +384,7 @@ impl TcpRecordSink {
         }
         match timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(&self.target_addr)).await {
             Ok(Ok(stream)) => {
+                enable_keepalive(&stream);
                 self.stream = Some(stream);
                 self.backoff = TCP_BACKOFF_INITIAL;
                 self.next_attempt_at = None;
@@ -432,6 +490,16 @@ impl TcpRecordSink {
     fn with_backoff(mut self, initial: Duration) -> Self {
         self.backoff = initial;
         self
+    }
+
+    /// 测试用：当前连接上的 `SO_KEEPALIVE`。没连接时为 `None`。
+    ///
+    /// 需要这个缝隙是因为 keepalive 只能在**真连上**之后才能回答——
+    /// 单测 `enable_keepalive` 本身盖不住“`ensure_connected` 到底调没调它”。
+    #[cfg(test)]
+    fn stream_keepalive(&self) -> Option<bool> {
+        let stream = self.stream.as_ref()?;
+        socket2::SockRef::from(stream).keepalive().ok()
     }
 }
 
@@ -647,11 +715,12 @@ mod tests {
     use tokio::time::Instant;
 
     use super::{
-        FileRecordSink, RecordSink, TCP_BACKOFF_INITIAL, TCP_BACKOFF_MAX, TcpFraming,
+        FileRecordSink, RecordSink, SinkIdentity, TCP_BACKOFF_INITIAL, TCP_BACKOFF_MAX, TcpFraming,
         TcpRecordSink, build_payload_bytes,
     };
 
     use crate::telemetry::metrics::samples::{VmMetricLabels, VmMetricLine};
+    use crate::telemetry::warp_parse::LogsOutputSection;
     use wist_contracts::telemetry_record::{DataFrame, TelemetryRecord};
 
     fn record(body: &str) -> TelemetryRecord {
@@ -972,6 +1041,65 @@ mod tests {
     fn payload_builder_matches_line_and_len_contract() {
         assert_eq!(build_payload_bytes(b"abc", TcpFraming::Line), b"abc\n");
         assert_eq!(build_payload_bytes(b"hello", TcpFraming::Len), b"5 hello");
+    }
+
+    /// 连上之后必须开 kernel keepalive。
+    ///
+    /// 这条钉子跟的是“连接跨 tick 存活”带来的新风险：一条活了小时的连接被中间设备静默
+    /// 弄死时，本端**第一次写仍会成功**，下一次才 EPIPE —— 至多丢一帧且发现得晚。
+    /// 有 keepalive，kernel 会在分钟级把连接判死，写随即失败，数据落 spool。
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_connected_uplink_socket_has_tcp_keepalive_enabled() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 1024];
+            // 读到一帧就够：本用例只关心连接建立时 socket 的选项。
+            let _ = socket.read(&mut buf).await;
+        });
+
+        let mut sink = TcpRecordSink::new("127.0.0.1".to_string(), port, TcpFraming::Line);
+        assert_eq!(sink.stream_keepalive(), None, "还没连，没有连接可选");
+        sink.write_fact(&DataFrame::new("agent-1", "2026-11-08T00:00:00Z", 1), b"{}")
+            .await
+            .expect("write fact");
+        assert_eq!(
+            sink.stream_keepalive(),
+            Some(true),
+            "连接建立时必须开 keepalive（否则跨 tick 的长连接死了没人知道）"
+        );
+
+        drop(sink);
+        server.await.expect("server task");
+    }
+
+    /// 分帧是 sink **身份**的一部分。
+    ///
+    /// 跨 tick 复用按身份判重建：若分帧不进身份，“本轮有输入要求升 `len`”就不会触发重建，
+    /// 旧连接会接着按 `line` 分帧——含换行的正文被切成多行，续行掉进 miss（协议 §3）。
+    #[test]
+    fn sink_identity_folds_framing_into_the_reuse_key() {
+        let output = LogsOutputSection {
+            kind: "tcp".to_string(),
+            tcp: crate::config::agent_config::LogsTcpOutputSection {
+                addr: "10.0.0.1".to_string(),
+                port: 9000,
+                framing: "line".to_string(),
+            },
+            ..Default::default()
+        };
+        let from_config = SinkIdentity::resolve(&output, None).expect("line sink");
+        assert_eq!(
+            from_config,
+            SinkIdentity::resolve(&output, None).expect("same config, same identity"),
+            "配置没变，身份必须逐字相同（否则每拍都会重建）"
+        );
+        assert_ne!(
+            from_config,
+            SinkIdentity::resolve(&output, Some(TcpFraming::Len)).expect("len sink"),
+            "分帧升级必须让身份变——否则不会重建，旧连接会接着按 line 切帧"
+        );
     }
 
     #[test]

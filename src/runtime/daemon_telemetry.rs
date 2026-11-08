@@ -17,17 +17,17 @@ use crate::telemetry::logs::files::{
 };
 use crate::telemetry::logs::gate::Withheld;
 use crate::telemetry::warp_parse::{
-    RecordSink, TcpFraming, TelemetryRecordSink, uplink_write_detail,
+    RecordSink, SinkIdentity, TcpFraming, TelemetryRecordSink, uplink_write_detail,
 };
 
 #[path = "daemon_telemetry_support.rs"]
 mod support;
 
 use support::{
-    build_file_input_config, build_record_sink, capacity_failure, headless_lines_failure,
-    invalid_output_failure, missing_input_failure, noise_dropped_failure, processing_failure,
-    replay_spool_only, selection_filtered_failure, spool_paused_reason, truncated_failure,
-    unsupported_target, uplink_failure, withheld_failure,
+    build_file_input_config, capacity_failure, headless_lines_failure, invalid_output_failure,
+    missing_input_failure, noise_dropped_failure, processing_failure, replay_spool_only,
+    selection_filtered_failure, spool_paused_reason, truncated_failure, unsupported_target,
+    uplink_failure, withheld_failure,
 };
 
 // 生效输出解析要给主循环用（它在短路前算），所以在同一层再导出一次；
@@ -219,15 +219,78 @@ pub(super) fn build_telemetry_sink(
     work: &AppliedWorkGrant,
     output: &LogsOutputSection,
 ) -> io::Result<TelemetryRecordSink> {
+    let (identity, escalated) = resolve_sink_identity(work, output)?;
+    log_framing_escalation(escalated.as_deref());
+    Ok(identity.sink())
+}
+
+/// 跨 tick 复用的 sink 槽位。
+///
+/// **为什么必须复用**：`TcpRecordSink` 的连接、退避截止点与当前退避时长全在实例上。
+/// 以前每轮 tick 都重新构造，于是：
+///   * 健康链路每 3 秒重连一次（对端看到“连接抖动”，本机多一次 TCP 握手）；
+///   * 断网时的指数退避（`1s..30s`）**跨不过 tick** —— 每拍都从 0 重来，
+///     5 秒连接超时把 3 秒的节奏拉成 8 秒。
+///
+/// 重建条件只有一个：身份变了（本机配置与 grant 合流后的 `kind` / 目标 / 分帧）。
+/// 目标换了还留着旧连接是错的；同一目标上的退避与连接则应该活到下一轮。
+#[derive(Default)]
+pub(super) struct TelemetrySinkSlot {
+    identity: Option<SinkIdentity>,
+    sink: Option<TelemetryRecordSink>,
+}
+
+impl TelemetrySinkSlot {
+    /// 取本轮可用的 sink：身份没变就复用上一轮的实例（连接 + 退避状态都在）。
+    pub(super) fn get_or_build(
+        &mut self,
+        work: &AppliedWorkGrant,
+        output: &LogsOutputSection,
+    ) -> io::Result<&mut TelemetryRecordSink> {
+        let (identity, escalated) = resolve_sink_identity(work, output)?;
+        if self.identity.as_ref() != Some(&identity) {
+            // 只在分帧真的刚升上来的那一拍报一次；单纯换目标（例如网关改下发地址）
+            // 不算“升级”，别把同一句话重复说。
+            let already_len = matches!(
+                self.identity.as_ref(),
+                Some(SinkIdentity::Tcp {
+                    framing: TcpFraming::Len,
+                    ..
+                })
+            );
+            if !already_len {
+                log_framing_escalation(escalated.as_deref());
+            }
+            // 上一帧已经写完（写失败会交给后台收尾，见 `finish_in_background`），
+            // 所以这里直接丢弃旧实例是干净的。
+            self.identity = Some(identity);
+            self.sink = None;
+        }
+        if self.sink.is_none() {
+            self.sink = Some(self.identity.as_ref().expect("identity set above").sink());
+        }
+        Ok(self.sink.as_mut().expect("just built"))
+    }
+}
+
+/// 算出本轮的 sink 身份，以及「是哪个输入把分帧升到 `len`」（仅用于日志）。
+fn resolve_sink_identity(
+    work: &AppliedWorkGrant,
+    output: &LogsOutputSection,
+) -> io::Result<(SinkIdentity, Option<String>)> {
     let from_work = work.log_inputs();
     let required = len_framing_required(output, from_work.iter().map(|entry| &entry.input));
-    let Some(input_id) = required else {
-        return build_record_sink(output, None);
+    let identity = SinkIdentity::resolve(output, required.map(|_| TcpFraming::Len))?;
+    Ok((identity, required.map(str::to_string)))
+}
+
+fn log_framing_escalation(input_id: Option<&str>) {
+    let Some(input_id) = input_id else {
+        return;
     };
     log::info!(
         "event=UplinkFramingEscalated from=line to=len input_id={input_id} reason=\"该输入声明多行读法，折叠出的正文可能含换行（协议 §3：line 只用于单行）\""
     );
-    build_record_sink(output, Some(TcpFraming::Len))
 }
 
 /// 当 sink 无法构建（非法输出配置）时，为每个输入生成一条 `InvalidOutput` 失败。
@@ -293,6 +356,29 @@ pub(super) async fn process_telemetry_inputs(
     tick
 }
 
+/// 一次导出器运行的失败（本轮没采成 / 没送达）。
+///
+/// 单独一条而不并进 [`TelemetryFailure`]：导出器按运行而不是按文件句柄计，
+/// 且 `input_id` 带 `-exporter` 后缀、不落在工作视图的 `tasks` 里。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ExporterFailure {
+    pub(super) work_id: String,
+    pub(super) input_id: String,
+    pub(super) exporter_id: String,
+    pub(super) detail: String,
+}
+
+/// 一轮导出器运行的结果。
+///
+/// 同时给成功项：失败要跨 tick 记忆到下一次**成功**，否则一个 60s 周期的导出器失败后，
+/// 中间 59 秒的 tick 都会显示「正常」—— 那是假健康。
+#[derive(Debug, Default)]
+pub(super) struct ExporterReport {
+    pub(super) failures: Vec<ExporterFailure>,
+    /// 本轮真跑成功（含「跑成功但窗口里没条目」）的 `input_id`。
+    pub(super) succeeded: Vec<String>,
+}
+
 /// 跑一轮**到点**的导出器（`Exporter` 来源），把输出当记录上送。
 ///
 /// 与 [`process_telemetry_inputs`] 平行，但导出器不是「读一个文件」而是「**周期跑一条固定命令**」：
@@ -300,7 +386,8 @@ pub(super) async fn process_telemetry_inputs(
 ///   * 调度上**无论成败都推进下次时间**（失败不每 tick 重试，避免刷屏）；
 ///   * 但**有状态导出器的游标只在数据交出去之后才推进**：上送失败时下一轮重读同一段
 ///     （至少一次），宁可重复也不把没送达的一段永久跳过；
-///   * 失败/写失败都如实打到自观测（`agentd.err`），不静默。
+///   * 失败/写失败都如实打到自观测（`agentd.err`），不静默；
+///   * 同时交还本轮失败/成功项，供采集健康汇总（`ExporterReport`）。
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn process_exporters(
     work: &AppliedWorkGrant,
@@ -309,9 +396,10 @@ pub(super) async fn process_exporters(
     global_seq_path: &Path,
     sink: &mut TelemetryRecordSink,
     next_seq: &mut u64,
-) {
+) -> ExporterReport {
     let runs = work.exporter_runs();
     let mut state = exporters::load_state(state_dir);
+    let mut report = ExporterReport::default();
     let mut changed = false;
     // 剪掉不在本次授权里的缺件记录（面撤了，记录不该留着误导）。
     let before = state.missing.len();
@@ -325,7 +413,7 @@ pub(super) async fn process_exporters(
         if changed {
             exporters::save_state(state_dir, &state);
         }
-        return;
+        return report;
     }
 
     let now = exporters::now_ms();
@@ -350,6 +438,12 @@ pub(super) async fn process_exporters(
             Ok(argv) => argv,
             Err(err) => {
                 log::error!("wist-agentd exporter {} failed: {err}", run.exporter_id);
+                report.failures.push(ExporterFailure {
+                    work_id: run.work_id,
+                    input_id: run.input_id,
+                    exporter_id: run.exporter_id,
+                    detail: err.to_string(),
+                });
                 continue;
             }
         };
@@ -359,6 +453,12 @@ pub(super) async fn process_exporters(
         if !exporters::tool_present(&tool) {
             let newly = state.missing.get(&run.exporter_id) != Some(&tool);
             state.missing.insert(run.exporter_id.clone(), tool.clone());
+            report.failures.push(ExporterFailure {
+                work_id: run.work_id.clone(),
+                input_id: run.input_id.clone(),
+                exporter_id: run.exporter_id.clone(),
+                detail: format!("工具缺失：{tool}（装上后自动恢复）"),
+            });
             if newly {
                 changed = true;
                 log::warn!(
@@ -427,8 +527,16 @@ pub(super) async fn process_exporters(
                         "wist-agentd exporter {} uplink failed: {err}",
                         run.exporter_id
                     );
+                    report.failures.push(ExporterFailure {
+                        work_id: run.work_id.clone(),
+                        input_id: run.input_id.clone(),
+                        exporter_id: run.exporter_id.clone(),
+                        detail: format!("上送失败：{err}"),
+                    });
                 }
                 if delivered {
+                    // 真跑成功（含「窗口里没条目」）：清掉跨 tick 的失败记忆。
+                    report.succeeded.push(run.input_id.clone());
                     persist_cursor(state_dir, &run, &output, fell_back);
                 } else {
                     log::warn!(
@@ -469,6 +577,7 @@ pub(super) async fn process_exporters(
     if ran_any && let Err(err) = log_seq_state::store_async(global_seq_path, *next_seq).await {
         log::error!("wist-agentd exporter seq persist failed: {err}");
     }
+    report
 }
 
 /// 把本轮取到的游标落盘；取不到就如实说，不静默丢下一段。
@@ -750,10 +859,14 @@ async fn process_input_with_sink<S: RecordSink>(
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{CatchupBudget, InputTickReports, UplinkHealth, len_framing_required};
+    use super::{
+        CatchupBudget, InputTickReports, TelemetrySinkSlot, UplinkHealth, len_framing_required,
+    };
     use crate::config::agent_config::LogsSection;
+    use crate::control::work::AppliedWorkGrant;
     use crate::telemetry::logs::files::file::{FamilyCapacity, ProcessOutcome, ProcessOutcomeKind};
     use crate::telemetry::logs::gate::Withheld;
+    use wist_contracts::telemetry_record::DataFrame;
 
     /// 一个“本批读了 N 行”的来源批次；其余字段默认空，用例按需覆盖。
     fn outcome(read_lines: usize) -> ProcessOutcome {
@@ -1018,5 +1131,177 @@ mod tests {
         // file sink 逐条 JSON 编码，换行天然安全 —— 没有“被切开”这回事。
         let output = output("file", "line");
         assert_eq!(required(&output, &[input("a", "indented")]), None);
+    }
+
+    // ------------------------------------------------------------------
+    // 跨 tick 复用（P0）：连接与退避状态必须活过一拍
+    // ------------------------------------------------------------------
+
+    fn tcp_output(port: u16) -> LogsOutputSection {
+        LogsOutputSection {
+            kind: "tcp".to_string(),
+            tcp: LogsTcpOutputSection {
+                addr: "127.0.0.1".to_string(),
+                port,
+                framing: "line".to_string(),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// 数一数字节流里出现了几次某个帧标记。
+    fn marker_count(bytes: &[u8], marker: &[u8]) -> usize {
+        bytes
+            .windows(marker.len())
+            .filter(|window| *window == marker)
+            .count()
+    }
+
+    /// 同一目标上的两拍必须共用**一条**连接。
+    ///
+    /// 这是 `TcpRecordSink` 的连接与指数退避能活过一拍的前提：每拍重连既是对端的连接抖动，
+    /// 也会让 `1s..30s` 的退避跨不过 tick（断网时 3s 节奏被 5s 连接超时拉成 8s）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_sink_slot_reuses_one_connection_across_ticks() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        // 只 accept 一次：第二拍若重连，就会在 backlog 里另起一条连接，这里只能看到一条。
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let read = socket.read(&mut buf).await.expect("read");
+                if read == 0 {
+                    break;
+                }
+                seen.extend_from_slice(&buf[..read]);
+            }
+            seen
+        });
+
+        let output = tcp_output(port);
+        let grant = AppliedWorkGrant::default();
+        let mut slot = TelemetrySinkSlot::default();
+        for seq in [1u64, 2] {
+            let sink = slot.get_or_build(&grant, &output).expect("sink");
+            sink.write_fact(
+                &DataFrame::new("agent-1", "2026-11-08T00:00:00Z", seq),
+                b"{}",
+            )
+            .await
+            .expect("write fact");
+        }
+        // 丢掉槽位 → 连接关闭 → server 读到 EOF 收尾。
+        drop(slot);
+
+        let seen = server.await.expect("server task");
+        assert_eq!(
+            marker_count(&seen, b" OBSFACT:"),
+            2,
+            "两拍的两帧必须落在同一条连接上"
+        );
+    }
+
+    /// 复用的真正目的：**指数退避必须活过一拍**。
+    ///
+    /// 以前 sink 每 tick 重建，`next_attempt_at` / `backoff` 跟着实例一起丢——
+    /// 断网时每拍都从 0 重来，5 秒连接超时把 3 秒节奏拉成 8 秒。
+    /// 本用例不验“连接被复用”（那是另一个用例），验的是**退避状态没被扔**：
+    /// 第二拍必须直接按退避失败，而不是再发起一次连接。
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_sink_slot_keeps_the_backoff_window_across_ticks() {
+        // 拿一个确定没人监听的端口：bind 成功后立刻释放。
+        let port = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            listener.local_addr().expect("addr").port()
+        };
+        let output = tcp_output(port);
+        let grant = AppliedWorkGrant::default();
+        let mut slot = TelemetrySinkSlot::default();
+
+        // 第一拍：真的去连，被拒 → 进退避。
+        let first = slot
+            .get_or_build(&grant, &output)
+            .expect("第一拍要能构造 sink")
+            .write_fact(&DataFrame::new("agent-1", "2026-11-08T00:00:00Z", 1), b"{}")
+            .await
+            .expect_err("没人监听，必须失败");
+        assert!(
+            !first.to_string().contains("backoff"),
+            "第一次是**真连接失败**，不是退避: {first}"
+        );
+
+        // 第二拍（同一目标）：**不得再连一次**，直接按退避失败。
+        let second = slot
+            .get_or_build(&grant, &output)
+            .expect("第二拍要能取回同一份 sink")
+            .write_fact(&DataFrame::new("agent-1", "2026-11-08T00:00:00Z", 2), b"{}")
+            .await
+            .expect_err("退避窗口内必须失败");
+        assert!(
+            second.to_string().contains("tcp uplink in backoff"),
+            "退避状态必须活过一拍（否则每拍重连，退避等于没有）: {second}"
+        );
+    }
+
+    /// 目标变了必须重建：留着指向旧地址的连接是错的（那是上一份授权的出口）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_sink_slot_rebuilds_when_the_target_changes() {
+        use tokio::io::AsyncReadExt;
+
+        let first = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind first");
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind second");
+        let first_port = first.local_addr().expect("addr").port();
+        let second_port = second.local_addr().expect("addr").port();
+        let reader = |listener: tokio::net::TcpListener| {
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 1024];
+                loop {
+                    let read = socket.read(&mut buf).await.expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    seen.extend_from_slice(&buf[..read]);
+                }
+                seen
+            })
+        };
+        let first_server = reader(first);
+        let second_server = reader(second);
+
+        let grant = AppliedWorkGrant::default();
+        let mut slot = TelemetrySinkSlot::default();
+        for (port, seq) in [(first_port, 1u64), (second_port, 2)] {
+            let sink = slot.get_or_build(&grant, &tcp_output(port)).expect("sink");
+            sink.write_fact(
+                &DataFrame::new("agent-1", "2026-11-08T00:00:00Z", seq),
+                b"{}",
+            )
+            .await
+            .expect("write fact");
+        }
+        drop(slot);
+
+        let to_first = first_server.await.expect("first server");
+        let to_second = second_server.await.expect("second server");
+        assert_eq!(marker_count(&to_first, b" OBSFACT:"), 1);
+        assert_eq!(
+            marker_count(&to_second, b" OBSFACT:"),
+            1,
+            "换了目标就必须新建连接，而不是继续往旧地址写"
+        );
     }
 }

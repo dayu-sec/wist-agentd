@@ -1,6 +1,6 @@
 [package]
 name = "wist-agentd"
-version = "0.28.1" #@gxl:set(version)
+version = "0.29.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -19,6 +19,10 @@ serde_json = "1.0"
 # 被管端只需要「拿下来 / 核摘要 / 判方向」，不该背发布域概念，也不该多出解包依赖（flate2/tar）。
 wist-artifact = { version = "0.1" }
 #wist-artifact = { version = "0.1" }
+# 上送 TCP 连接现在跨 tick 存活，需要开 kernel keepalive 才能发现被中间设备
+# 静默弄死的连接（`TelemetrySinkSlot` / `enable_keepalive`）。已在依赖树里
+# （tokio / hyper-util 的传递依赖），不是新增 C 依赖，musl 静态产物不受影响。
+socket2 = "0.6"
 # agent 本地身份材料（mTLS 客户端证书）：密钥对**本地生成、不出本机**，只把 CSR 交上去。
 rcgen = "0.13"
 # 从本地证书读 `notAfter` 做**本地**过期自检（服务端在握手期就拒过期证书，给不出错误码）。
@@ -36,7 +40,10 @@ tokio-rustls = "0.26"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 toml = "1.1"
 tokio = { version = "1.48", features = ["full"] }
-wist-contracts = "0.10.3"
+# 下限必须是 0.10.4：本仓用 `AgentLocalStandingWork.collection`（采集面采集结果），
+# 0.10.3 没这个字段。写成 `0.10.3` 时一个 `cargo update -Z minimal-versions`
+# 或 CI 的最小版本任务就能解析到编译不过的版本。
+wist-contracts = "0.10.4"
 # 跨进程 seam 报文（enrollment / agent_status / gateway / work / agent_uplink）。CI/发布走 registry；本地联调可临时切 path。
 wist-api = "0.10.4"
 wist-metrics = "0.17"
@@ -93,6 +100,8 @@ path = "src/bin/wist-upgrader.rs"
 # 本地联调：与 `wist-contracts` / `wist-api` 同期改动时启用 —— `[patch]` 放在这里（而不是逐条改
 # 依赖行），是为了让 api/metrics/validate 也解析到本地版本（否则会同时存在两份 contracts，
 # 类型互不认识）。**发布态不要留**；wist-metrics 0.17.0 已发布，这一轮已切回 registry：
+# 2026-11-08：`wist-contracts` 0.10.4（含 `AgentLocalStandingWork.collection`）已上
+# crates.io，下面的 contracts patch 已删；切回前核对过 registry 源码里确有该字段。
 # [patch.crates-io]
 # wist-contracts = { path = "../wist-contracts" }
 # wist-api = { path = "../wist-api" }

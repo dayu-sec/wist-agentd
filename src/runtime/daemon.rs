@@ -64,6 +64,8 @@ use crate::state_store::{
 };
 use crate::telemetry::metrics::target_view;
 
+#[path = "collection_health.rs"]
+mod collection_health;
 #[path = "daemon_metrics.rs"]
 mod metrics_support;
 #[path = "daemon_recovery.rs"]
@@ -239,7 +241,11 @@ use crate::telemetry::metrics::self_obs::{
 /// 没收到过任何授权快照时（`device_view` 返回 `None`）也要上报：授权那半为空
 /// （空 standing/one_shot、序号 0）—— 这本身就是一条信息。
 /// 这里没有可错的输入，构造**不会失败**，所以直接返回 `AgentLocalWork`。
-fn build_local_work(work: &AppliedWorkGrant, recorded_at: &str) -> AgentLocalWork {
+fn build_local_work(
+    work: &AppliedWorkGrant,
+    recorded_at: &str,
+    collection_health: Option<&CollectionHealth>,
+) -> AgentLocalWork {
     let view = work.device_view(recorded_at);
     let standing = view
         .as_ref()
@@ -263,6 +269,9 @@ fn build_local_work(work: &AppliedWorkGrant, recorded_at: &str) -> AgentLocalWor
                             startup_position: task.startup_position.clone(),
                         })
                         .collect(),
+                    collection: collection_health
+                        .and_then(|health| health.get(&work.work_id))
+                        .cloned(),
                 })
                 .collect()
         })
@@ -330,7 +339,62 @@ fn build_uplink_state(
 /// 只有本机能判：服务端在**握手期**就验完了证书，过期证书根本进不来，
 /// 所以「证书还剩多久 / 是不是该续了」只能由 agent 自己读 `notAfter` 上报。
 /// 读不出来就 `None` —— 不影响上报本身。
+/// 证书状态缓存：读盘 + 解 X.509 + 读续签台账，而状态上报**每 3 秒一次**。
+/// 证书到期/续签是「分钟」级事件（续期提前 30 天），60s 的滞后不影响任何判定。
+type CertStatusCache = std::sync::Mutex<
+    Option<(
+        String,
+        std::time::Instant,
+        Option<wist_api::status::AgentCertificateStatus>,
+    )>,
+>;
+
+static CERT_STATUS_CACHE: std::sync::OnceLock<CertStatusCache> = std::sync::OnceLock::new();
+
+const CERT_STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn local_certificate_status(
+    config: &AgentConfig,
+) -> Option<wist_api::status::AgentCertificateStatus> {
+    let key = certificate_status_cache_key(config);
+    let cache = CERT_STATUS_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(guard) = cache.lock()
+        && let Some((cached_key, at, status)) = guard.as_ref()
+        && *cached_key == key
+        && at.elapsed() < CERT_STATUS_TTL
+    {
+        return status.clone();
+    }
+    let status = read_local_certificate_status(config);
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((key, std::time::Instant::now(), status.clone()));
+    }
+    status
+}
+
+/// 证书换了（轮换）或续签台账更新了就立刻失效；否则靠 TTL。只 stat，不解析 PEM。
+///
+/// 两个输入都要进 key：`local_certificate_status` 读的就是「证书 + 续签台账」。
+/// 只盯证书会让「刚续签完」这一分钟内看不到新的 `last_renewal`（续签本身不改证书）。
+fn certificate_status_cache_key(config: &AgentConfig) -> String {
+    let state_dir = Path::new(&config.paths.state_dir);
+    let paths = crate::state_store::client_identity::ClientIdentityPaths::under(state_dir);
+    let stamp = |path: &Path| {
+        std::fs::metadata(path)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .map(|time| format!("{time:?}"))
+            .unwrap_or_else(|| "-".to_string())
+    };
+    format!(
+        "{}|{}|{}",
+        state_dir.display(),
+        stamp(&paths.cert_file),
+        stamp(&paths.renewal_file)
+    )
+}
+
+fn read_local_certificate_status(
     config: &AgentConfig,
 ) -> Option<wist_api::status::AgentCertificateStatus> {
     use crate::state_store::client_identity::{CertificateValidity, ClientIdentityPaths};
@@ -458,6 +522,8 @@ async fn report_status_to_control_plane(
     work: &AppliedWorkGrant,
     uplink: &AppliedUplink,
     uplink_health: &UplinkHealth,
+    // 本机对每个采集面的采集结果：`None` = 这条路径（终态重试）没有新鲜观测。
+    collection_health: Option<&CollectionHealth>,
     // 本次要回传的一次性命令结果（空 = 没有要确认的命令）。
     command_acks: &[AgentCommandAck],
     // 终态下的低频重试传 `true`：那次调用只为问一句「还认我吗」，失败**不打印**
@@ -474,7 +540,7 @@ async fn report_status_to_control_plane(
     let instance_id = config.agent.instance_name.as_deref().unwrap_or_default();
     // 本机工作视图是 best-effort：它只决定页面能不能看见「在采哪些文件」，
     // 构造不出来也不该影响状态上报本身，所以始终送 `Some(...)`（没快照时授权那半为空）。
-    let local_work = Some(build_local_work(work, &now_rfc3339()));
+    let local_work = Some(build_local_work(work, &now_rfc3339(), collection_health));
     // 生效上送状态同样是 best-effort 的**声明**：没有可错的输入，所以始终送 `Some(...)`
     // （`None` 的语义是「本次没带」，与本机工作视图同口径，留给旧版本 agent）。
     let uplink_state = Some(build_uplink_state(config, uplink, uplink_health));
@@ -627,6 +693,8 @@ async fn retry_terminal_probe(
         work,
         uplink,
         uplink_health,
+        // 终态重试没有新鲜的本轮采集观测：不编造采集结论（字段缺省）。
+        None,
         // 终态重试只为问「还认我吗」，不回传任何命令结果。
         &[],
         // 终态的「失败静默」：这条路径上所有非成功结果都不打日志。
@@ -1769,6 +1837,7 @@ async fn fetch_discovery_policies(config: &AgentConfig) -> Option<DiscoveryAspec
     }
 }
 
+use collection_health::CollectionHealth;
 use metrics_support::{
     emit_metrics_failure, emit_metrics_failures, emit_metrics_tick,
     failure_signatures as metrics_failure_signatures,
@@ -1782,9 +1851,9 @@ use runtime_state_support::{
     work_state_changes,
 };
 use telemetry_support::{
-    TelemetryFailureKind, TelemetryTick, TelemetryWorkState, UplinkHealth, WorkState,
-    build_telemetry_sink, effective_output, invalid_output_tick, process_exporters,
-    process_telemetry_inputs,
+    ExporterReport, TelemetryFailureKind, TelemetrySinkSlot, TelemetryTick, TelemetryWorkState,
+    UplinkHealth, WorkState, build_telemetry_sink, effective_output, invalid_output_tick,
+    process_exporters, process_telemetry_inputs,
 };
 
 fn to_agent_work_state_changes(changes: &[TelemetryWorkState]) -> Vec<AgentWorkStateChange> {
@@ -1934,6 +2003,10 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     let mut inflight_investigations: Vec<InflightInvestigation> = Vec::new();
     // 出口健康的跨 tick 记忆（只在「失败 → 恢复」时补一行）。
     let mut uplink_health = UplinkHealth::default();
+    // 每个采集面最近一轮的采集结果：随状态上报给网关，页面据此回答「这个面到底采成没采成」。
+    let mut collection_health = CollectionHealth::default();
+    // 遥测 sink 跨 tick 复用：连接与指数退避都活在里面（每 tick 重建会让退避失效）。
+    let mut telemetry_sink = TelemetrySinkSlot::default();
     let mut last_metrics_uplink: Option<Instant> = None;
     let mut last_discovery_uplink: Option<Instant> = None;
     // 只提醒一次：`snapshot_uplink_enabled = true` 搭配非 tcp 输出时，行为是
@@ -2427,6 +2500,8 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
             &work_runtime,
             &uplink_runtime,
             Some(&mut uplink_health),
+            Some(&mut collection_health),
+            &mut telemetry_sink,
             send_metrics,
             send_discovery_snapshot,
             force_refresh,
@@ -2538,6 +2613,8 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                 // 到这里那次可变借用早已结束，所以这里用 `&` 不会冲突。
                 &uplink_runtime,
                 &uplink_health,
+                // 最近一轮采集的健康结论：由 `run_once_with_failure_cache` 在每 tick 更新。
+                Some(&collection_health),
                 &pending_command_acks,
                 // 常规上报：失败要看得见（只有终态下的低频重试才静默）。
                 false,
@@ -2590,6 +2667,10 @@ async fn run_once_with_failure_cache(
     uplink: &AppliedUplink,
     // 出口健康的跨 tick 记忆（只在「失败 → 恢复」时补一行）；一次性路径传 `None`。
     uplink_health: Option<&mut UplinkHealth>,
+    // 每个采集面最近一轮的采集结果（随状态上报）；一次性路径传 `None`。
+    collection_health: Option<&mut CollectionHealth>,
+    // 跨 tick 复用的遥测 sink：连接与退避状态都在里面，每 tick 重建会让二者都失效。
+    telemetry_sink: &mut TelemetrySinkSlot,
     // 本轮要不要上送指标（由调用方按授权与周期定；一次性路径按授权定）。
     send_metrics: bool,
     // 本轮要不要上送原文发现快照（由调用方按配置与周期定；一次性路径不发）。
@@ -2610,7 +2691,7 @@ async fn run_once_with_failure_cache(
         .unwrap_or("unknown");
     let (discovery, fact_summary) =
         refresh_discovery_snapshot(state_dir, discovery_runtime, force_refresh).await;
-    let metrics_tick = process_metrics_tick(state_dir);
+    let metrics_tick = process_metrics_tick(state_dir).await;
     emit_metrics_tick(&metrics_tick);
     if let Some(previous) = previous_metrics_failures {
         for failure in filter_new_metrics_failures(&metrics_tick.failures, previous) {
@@ -2628,8 +2709,11 @@ async fn run_once_with_failure_cache(
     // 日志源候选跟着**事实摘要**上送（同一拍、同一份快照，见 `control::log_sources`）：
     // 摘要真发出去了才跟着发，不另造一套节流。
     let mut facts_reported = false;
-    let telemetry_tick = match build_telemetry_sink(work, &effective) {
-        Ok(mut sink) => {
+    // 本轮导出器失败（工作 id 仍会出现在健康汇总里）——
+    // 在 enabled 分支里填空；待命/构建失败时保持空。
+    let mut exporter_report = ExporterReport::default();
+    let telemetry_tick = match telemetry_sink.get_or_build(work, &effective) {
+        Ok(sink) => {
             if !effective.enabled {
                 // 待命（本机 `enabled = false`，或控制面 grant 明确 `enabled = false`）：
                 // 不读源、不写本地采集输出、不发指标/日志帧、不推进 log checkpoint。
@@ -2645,7 +2729,7 @@ async fn run_once_with_failure_cache(
                 // （旧实现每 5 分钟一行 `fact summary uplink failed` 的毛病，别再引回）。
                 if sink.carries_fact_frames() {
                     let outcome = send_fact_summary(
-                        &mut sink,
+                        &mut *sink,
                         loop_ctx.config,
                         state_dir,
                         &fact_summary,
@@ -2667,7 +2751,7 @@ async fn run_once_with_failure_cache(
                     && send_metrics
                 {
                     match write_metrics_uplink(
-                        &mut sink,
+                        &mut *sink,
                         agent_id,
                         snapshot,
                         &loop_ctx.config.metrics.labels,
@@ -2692,7 +2776,7 @@ async fn run_once_with_failure_cache(
                 // 事实摘要在**指标之后**发：同样共用这条连接与全局 `seq`，只是帧标记不同。
                 if sink.carries_fact_frames() {
                     let outcome = send_fact_summary(
-                        &mut sink,
+                        &mut *sink,
                         loop_ctx.config,
                         state_dir,
                         &fact_summary,
@@ -2706,7 +2790,7 @@ async fn run_once_with_failure_cache(
                 }
                 if send_discovery_snapshot && sink.carries_discovery_frames() {
                     send_discovery_snapshot_report(
-                        &mut sink,
+                        &mut *sink,
                         loop_ctx.config,
                         discovery_runtime.latest_snapshot(),
                         &mut next_seq,
@@ -2715,14 +2799,15 @@ async fn run_once_with_failure_cache(
                     .await;
                 }
                 let telemetry_tick =
-                    process_telemetry_inputs(loop_ctx.config, work, &mut sink, &mut next_seq).await;
+                    process_telemetry_inputs(loop_ctx.config, work, &mut *sink, &mut next_seq)
+                        .await;
                 // 导出器（`Exporter` 来源）与文件输入平行：到点的跑一条固定命令，输出当记录上送。
-                process_exporters(
+                exporter_report = process_exporters(
                     work,
                     state_dir,
                     agent_id,
                     &global_seq_path,
-                    &mut sink,
+                    &mut *sink,
                     &mut next_seq,
                 )
                 .await;
@@ -2743,6 +2828,18 @@ async fn run_once_with_failure_cache(
             }
         }
     };
+    // 本轮采集结果：用「工作视图 + 日志失败面 + 指标失败面 + 导出器失败」全量重算。
+    // 放在失败日志之后、状态上报之前 —— 上报读的是这一轮的结论，不隔一拍。
+    if let Some(health) = collection_health {
+        health.observe(
+            work,
+            &telemetry_tick,
+            &metrics_tick,
+            &exporter_report,
+            effective.enabled,
+            &now_rfc3339(),
+        );
+    }
     // 日志源候选：与事实摘要同拍。失败只进日志 —— 它是一条辅助信息，
     // 不该把发现 tick 变成故障（也不该让 `RuntimeHealthSnapshot` 多出一种失败）。
     if facts_reported {
@@ -3623,6 +3720,9 @@ async fn run_once_with_work_async(
     let send_metrics = work.metrics_interval().is_some();
     // 一次性路径不拉 grant：按「未下发」处理，输出完全由本机配置决定。
     let uplink = AppliedUplink::default();
+    // 一次性路径没有下一个 tick，但也要给 sink 一个槽位——它随本次调用一起丢弃，
+    // 语义与从前的「每次新建 sink」完全一致。
+    let mut telemetry_sink = TelemetrySinkSlot::default();
     run_once_with_failure_cache(
         loop_ctx,
         None,
@@ -3632,6 +3732,8 @@ async fn run_once_with_work_async(
         work,
         &uplink,
         None,
+        None,
+        &mut telemetry_sink,
         send_metrics,
         false,
         false,
@@ -3845,6 +3947,8 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             None,
+            None,
+            &mut TelemetrySinkSlot::default(),
             false,
             false,
             false,
@@ -3958,6 +4062,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             &UplinkHealth::default(),
+            None,
             &[],
             false,
         )
@@ -3993,6 +4098,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             &UplinkHealth::default(),
+            None,
             &[],
             false,
         )
@@ -4045,6 +4151,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             &UplinkHealth::default(),
+            None,
             &acks,
             false,
         )
@@ -4081,6 +4188,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             &UplinkHealth::default(),
+            None,
             &[],
             false,
         )
@@ -4118,6 +4226,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             &UplinkHealth::default(),
+            None,
             &[],
             false,
         )
@@ -4232,6 +4341,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &uplink,
             &UplinkHealth::default(),
+            None,
             &[],
             false,
         )
@@ -4313,6 +4423,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &uplink,
             &UplinkHealth::default(),
+            None,
             &[],
             false,
         )
@@ -4543,6 +4654,8 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             None,
+            None,
+            &mut TelemetrySinkSlot::default(),
             false,
             false,
             false,
@@ -4591,6 +4704,8 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             None,
+            None,
+            &mut TelemetrySinkSlot::default(),
             false,
             false,
             false,
@@ -5100,6 +5215,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             &UplinkHealth::default(),
+            None,
             &[],
             false,
         )
@@ -5145,6 +5261,33 @@ mod tests {
         AppliedWorkGrant::restore(&record)
     }
 
+    #[test]
+    fn build_local_work_attaches_collection_health_only_when_known() {
+        let grant = grant_with_a_log_task();
+        let without = build_local_work(&grant, "2026-11-08T00:00:00Z", None);
+        assert!(
+            without.standing[0].collection.is_none(),
+            "没观测就别编一个结论"
+        );
+
+        let mut health = collection_health::CollectionHealth::default();
+        health.insert_for_test(
+            "work-l",
+            wist_contracts::local_work::AgentLocalCollection {
+                status: wist_contracts::local_work::collection_status::DEGRADED.to_string(),
+                observed_at: "2026-11-08T00:00:00Z".to_string(),
+                detail: "1/2 个采集任务失败".to_string(),
+            },
+        );
+        let with = build_local_work(&grant, "2026-11-08T00:00:00Z", Some(&health));
+        let collection = with.standing[0].collection.as_ref().expect("collection");
+        assert_eq!(
+            collection.status,
+            wist_contracts::local_work::collection_status::DEGRADED
+        );
+        assert_eq!(collection.detail, "1/2 个采集任务失败");
+    }
+
     /// 状态上报必须带上**本机工作内容视图**（授权折算出的采集任务），
     /// 而本机 `file_inputs` 已废弃 —— 即使配置里写了，`local_inputs` 也必须恒为空。
     #[tokio::test]
@@ -5167,6 +5310,13 @@ mod tests {
                 request.contains("\"local_inputs\":[]"),
                 "file_inputs 已废弃，local_inputs 必须恒空：{request}"
             );
+            // 采集结果：和任务清单一起上报，页面才能回答「到底采成没采成」。
+            assert!(
+                request.contains(
+                    "\"collection\":{\"status\":\"failed\",\"observed_at\":\"2026-11-08T00:00:00Z\",\"detail\":\"source path does not exist\"}"
+                ),
+                "{request}"
+            );
             let response =
                 "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
             socket.write_all(response.as_bytes()).await.expect("write");
@@ -5185,6 +5335,15 @@ mod tests {
                 drop_if_contains: Vec::new(),
             }];
         let grant = grant_with_a_log_task();
+        let mut collection_health = CollectionHealth::default();
+        collection_health.insert_for_test(
+            "work-l",
+            wist_contracts::local_work::AgentLocalCollection {
+                status: wist_contracts::local_work::collection_status::FAILED.to_string(),
+                observed_at: "2026-11-08T00:00:00Z".to_string(),
+                detail: "source path does not exist".to_string(),
+            },
+        );
         let outcome = report_status_to_control_plane(
             &config,
             Some(12.5),
@@ -5194,6 +5353,7 @@ mod tests {
             &grant,
             &AppliedUplink::default(),
             &UplinkHealth::default(),
+            Some(&collection_health),
             &[],
             false,
         )
@@ -5216,6 +5376,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             &UplinkHealth::default(),
+            None,
             &[],
             false,
         )
@@ -5251,6 +5412,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             &UplinkHealth::default(),
+            None,
             &[],
             false,
         )
@@ -5292,6 +5454,7 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             &UplinkHealth::default(),
+            None,
             &[],
             false,
         )
@@ -6018,6 +6181,8 @@ mod tests {
             &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             None,
+            None,
+            &mut TelemetrySinkSlot::default(),
             false,
             false,
             true,

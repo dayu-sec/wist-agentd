@@ -14,7 +14,7 @@ use crate::telemetry::logs::files::{
 use crate::telemetry::logs::gate::Withheld;
 use crate::telemetry::logs::multiline::MultilineMode;
 use crate::telemetry::spool;
-use crate::telemetry::warp_parse::{RecordSink, TcpFraming, TelemetryRecordSink};
+use crate::telemetry::warp_parse::RecordSink;
 
 use super::{TelemetryFailure, TelemetryFailureKind};
 
@@ -66,13 +66,6 @@ pub fn effective_output(
         return output;
     }
     output
-}
-
-pub(super) fn build_record_sink(
-    output: &LogsOutputSection,
-    framing: Option<TcpFraming>,
-) -> io::Result<TelemetryRecordSink> {
-    TelemetryRecordSink::from_logs_output(output, framing)
 }
 
 pub(super) async fn replay_spool_only<S: RecordSink>(

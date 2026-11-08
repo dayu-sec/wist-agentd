@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 use wist_contracts::telemetry_record::DataFrame;
@@ -147,7 +148,36 @@ pub(super) async fn write_metrics_uplink(
     Ok(())
 }
 
-pub(super) fn process_metrics_tick(state_dir: &Path) -> MetricsTick {
+/// 指标 tick：读 `target_view` → 构建运行时快照 → （内容变了才）落盘。
+///
+/// **为什么是 `async`**：这一段里有两件事都不能占着主循环的线程 ——
+///   1. `build_runtime_snapshot_live` 会**同步扫主机进程**（目标集合变化时）；
+///   2. 落盘是 pretty JSON + tmp + fsync + rename + 目录 fsync。
+///
+/// 三秒一拍把它们钉在 async 主循环上，等于每拍都让日志采集、指标上送与心跳等磁盘/进程扫描。
+/// 整段丢进 blocking 池后，主循环只等一个 future（不动采集线程的状态机：
+/// 那需要把 scheduler 的锁跨线程搬来搬去，代价远大于收益）。
+pub(super) async fn process_metrics_tick(state_dir: &Path) -> MetricsTick {
+    let dir = state_dir.to_path_buf();
+    match tokio::task::spawn_blocking(move || process_metrics_tick_blocking(&dir)).await {
+        Ok(tick) => tick,
+        // blocking 侧 panic：不把整条链路拖死，报成一次快照构建失败（下一拍还会重试）。
+        Err(err) => MetricsTick {
+            snapshot: None,
+            failures: vec![metrics_failure(
+                MetricsFailureKind::RuntimeSnapshotLoad,
+                "runtime_snapshot_build",
+                state_dir,
+                io::Error::other(format!("metrics tick task failed: {err}")),
+            )],
+            target_view_loaded: false,
+            used_cached_snapshot: false,
+        },
+    }
+}
+
+/// 同步主体：**只在 blocking 线程里跑**（见 [`process_metrics_tick`]）。
+fn process_metrics_tick_blocking(state_dir: &Path) -> MetricsTick {
     let target_view_path = target_view::path_for(state_dir);
     let runtime_snapshot_path = runtime::path_for(state_dir);
 
@@ -155,7 +185,7 @@ pub(super) fn process_metrics_tick(state_dir: &Path) -> MetricsTick {
         Ok(view) => {
             let snapshot = runtime::build_runtime_snapshot_live(&view);
             let mut failures = Vec::new();
-            if let Err(err) = runtime::store(&runtime_snapshot_path, &snapshot) {
+            if let Err(err) = store_unless_unchanged(&runtime_snapshot_path, &snapshot) {
                 failures.push(metrics_failure(
                     MetricsFailureKind::RuntimeSnapshotStore,
                     "runtime_snapshot_store",
@@ -188,6 +218,58 @@ pub(super) fn process_metrics_tick(state_dir: &Path) -> MetricsTick {
             }
         }
     }
+}
+
+/// 上一次真正落盘的快照（路径 + 内容签名）。
+///
+/// 快照每 3 秒重建一次，而它的 `generated_at` **每拍都变**。不比对就是无条件重写：
+/// pretty JSON + tmp + fsync + rename + 目录 fsync。
+/// 真正省下来的那一类机器是「有授权但内容稳定」的（无目标的待命机器、主机指标不变的闲置机）；
+/// 采着几百个进程的机器每次内容都会变，一拍也不会少写 —— 那是应该写的。
+static LAST_STORED_SNAPSHOT: LazyLock<Mutex<Option<(PathBuf, u64)>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// 只在内容真的变了时才落盘。
+fn store_unless_unchanged(path: &Path, snapshot: &MetricsRuntimeSnapshot) -> io::Result<()> {
+    let Some(signature) = content_signature(snapshot) else {
+        // 算不出签名（序列化失败）就宁可多写一次 —— 与“为了省一次写而漏写”相反。
+        return runtime::store(path, snapshot);
+    };
+    {
+        let guard = match LAST_STORED_SNAPSHOT.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some((stored_path, stored_signature)) = guard.as_ref()
+            && stored_path == path
+            && *stored_signature == signature
+            // 文件被外部删了就不能再信缓存：否则这一份快照会**永远不再落盘**，
+            // 而 target_view 失败时正是靠它当 cache。一次 stat 换掉这个死局。
+            && path.exists()
+        {
+            return Ok(());
+        }
+    }
+    runtime::store(path, snapshot)?;
+    if let Ok(mut guard) = LAST_STORED_SNAPSHOT.lock() {
+        *guard = Some((path.to_path_buf(), signature));
+    }
+    Ok(())
+}
+
+/// 内容签名：**排除 `generated_at`**。
+///
+/// 那个字段每拍都换，但它不改变“内容”—— 把它算进签名，签名就永远在变，
+/// 「未变不写」就退化回「每次都写」。排除后，磁盘上的 `generated_at` 语义是
+/// “内容最后一次真变化的时间”：比“最后一次写”更有用；而真正新鲜的时间戳跟着
+/// 内存里的快照上送，不依赖这个文件。
+fn content_signature(snapshot: &MetricsRuntimeSnapshot) -> Option<u64> {
+    let mut probe = snapshot.clone();
+    probe.generated_at.clear();
+    let bytes = serde_json::to_vec(&probe).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
 }
 
 pub(super) fn emit_metrics_tick(tick: &MetricsTick) {
@@ -428,7 +510,7 @@ mod tests {
 
     use super::{
         MetricsFailure, MetricsFailureKind, collection_failures, failure_signature,
-        process_metrics_tick, write_metrics_uplink,
+        process_metrics_tick, store_unless_unchanged, write_metrics_uplink,
     };
     use crate::telemetry::metrics::runtime::{
         MetricsCollectionOutcome, MetricsCollectionTargetSample, MetricsRuntimeSnapshot,
@@ -618,8 +700,8 @@ mod tests {
         assert_eq!(failure_signature(&base), failure_signature(&base.clone()));
     }
 
-    #[test]
-    fn process_metrics_tick_builds_and_stores_runtime_snapshot_from_target_view() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_metrics_tick_builds_and_stores_runtime_snapshot_from_target_view() {
         let state_dir = temp_dir("build");
         let view = MetricsTargetView {
             generated_at: "2026-04-19T00:00:00Z".to_string(),
@@ -642,7 +724,7 @@ mod tests {
         };
         store(&target_view_path_for(&state_dir), &view).expect("store target view");
 
-        let tick = process_metrics_tick(&state_dir);
+        let tick = process_metrics_tick(&state_dir).await;
         let stored: MetricsRuntimeSnapshot =
             read_json(&runtime_path_for(&state_dir)).expect("load runtime snapshot");
 
@@ -656,8 +738,8 @@ mod tests {
         assert_eq!(stored.container_targets, 0);
     }
 
-    #[test]
-    fn process_metrics_tick_uses_cached_runtime_snapshot_when_target_view_is_missing() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_metrics_tick_uses_cached_runtime_snapshot_when_target_view_is_missing() {
         let state_dir = temp_dir("cached");
         let cached = MetricsRuntimeSnapshot {
             generated_at: "2026-04-19T00:00:00Z".to_string(),
@@ -707,13 +789,95 @@ mod tests {
         crate::telemetry::metrics::runtime::store(&runtime_path_for(&state_dir), &cached)
             .expect("store cached runtime snapshot");
 
-        let tick = process_metrics_tick(&state_dir);
+        let tick = process_metrics_tick(&state_dir).await;
 
         assert!(!tick.target_view_loaded);
         assert!(tick.used_cached_snapshot);
         assert_eq!(tick.snapshot, Some(cached));
         assert_eq!(tick.failures.len(), 1);
         assert_eq!(tick.failures[0].phase, "target_view_load");
+    }
+
+    /// 一批 `total_targets` 个主机目标的空快照，用于验「未变不写」。
+    fn snapshot_at(generated_at: &str, total_targets: usize) -> MetricsRuntimeSnapshot {
+        MetricsRuntimeSnapshot {
+            generated_at: generated_at.to_string(),
+            total_targets,
+            host_targets: total_targets,
+            process_targets: 0,
+            container_targets: 0,
+            outcomes: Vec::new(),
+        }
+    }
+
+    /// 稳态下 `generated_at` 每拍都变，但内容没变 —— 一个字也不该落盘。
+    ///
+    /// 这是 P0「未变不写」的钉子：若签名把 `generated_at` 算进去（或根本没比），
+    /// 每 3 秒就是一次 pretty JSON + tmp + fsync + rename + 目录 fsync。
+    #[test]
+    fn unchanged_content_is_not_rewritten_even_though_generated_at_moves() {
+        let state_dir = temp_dir("skip-unchanged");
+        let path = runtime_path_for(&state_dir);
+
+        let first = snapshot_at("2026-11-08T00:00:00Z", 1);
+        store_unless_unchanged(&path, &first).expect("first store");
+        let stored: MetricsRuntimeSnapshot = read_json(&path).expect("load first");
+        assert_eq!(stored.generated_at, "2026-11-08T00:00:00Z");
+
+        // 同一份内容、不同的时间：跳过写盘。
+        let second = snapshot_at("2026-11-08T00:00:03Z", 1);
+        store_unless_unchanged(&path, &second).expect("second store");
+        let stored: MetricsRuntimeSnapshot = read_json(&path).expect("load second");
+        assert_eq!(
+            stored.generated_at, "2026-11-08T00:00:00Z",
+            "内容没变就不该覆盖文件（磁盘上的时间就是「内容最后一次真变化」）"
+        );
+
+        // 内容真的变了：必须落盘。
+        let third = snapshot_at("2026-11-08T00:00:06Z", 2);
+        store_unless_unchanged(&path, &third).expect("third store");
+        let stored: MetricsRuntimeSnapshot = read_json(&path).expect("load third");
+        assert_eq!(stored.total_targets, 2, "内容变了必须写进去");
+        assert_eq!(stored.generated_at, "2026-11-08T00:00:06Z");
+    }
+
+    /// 内容里除了计数还有 `outcomes`：只改 `outcomes` 也必须落盘。
+    #[test]
+    fn a_change_confined_to_outcomes_is_still_written() {
+        let state_dir = temp_dir("skip-outcomes");
+        let path = runtime_path_for(&state_dir);
+
+        let base = snapshot_at("2026-11-08T00:00:00Z", 1);
+        store_unless_unchanged(&path, &base).expect("base store");
+
+        let mut changed = snapshot_at("2026-11-08T00:00:03Z", 1);
+        changed
+            .outcomes
+            .push(outcome("host_metrics", "succeeded", 1, 0, None, Vec::new()));
+        store_unless_unchanged(&path, &changed).expect("changed store");
+
+        let stored: MetricsRuntimeSnapshot = read_json(&path).expect("load");
+        assert_eq!(stored.outcomes.len(), 1, "只改了 outcomes 也必须写进去");
+    }
+
+    /// 缓存不能盲信：文件被外部删掉后必须重新落盘。
+    ///
+    /// 否则这份快照会**永远不再写**，而 `target_view` 读失败时正是靠这个文件兜底
+    /// （`load_cached_runtime_snapshot`）—— 兜底就变成了空的。
+    #[test]
+    fn a_vanished_snapshot_file_is_written_again() {
+        let state_dir = temp_dir("skip-vanished");
+        let path = runtime_path_for(&state_dir);
+        let snapshot = snapshot_at("2026-11-08T00:00:00Z", 1);
+
+        store_unless_unchanged(&path, &snapshot).expect("first store");
+        fs::remove_file(&path).expect("remove snapshot");
+        store_unless_unchanged(&path, &snapshot).expect("second store");
+
+        assert!(
+            path.exists(),
+            "文件被删了就必须重写，否则「未变不写」会把缓存永久钉死"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
