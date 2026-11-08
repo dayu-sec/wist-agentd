@@ -253,6 +253,26 @@ pub(super) fn discover_service_endpoints() -> io::Result<Vec<ObservedServiceEndp
     Ok(endpoints)
 }
 
+/// 某个 pid 自己的 TCP 监听端点（地址, 端口）。
+///
+/// 给数据库自探用：它要的不是「全机端点」，而是「**这个进程**在听哪些口」。
+/// 与 `discover_service_endpoints` 同源（`list_socket_fds` + `socket_listener`），
+/// 只是把「枚举所有 pid」换成「查一个 pid」——候选进程只有几个，没必要全量扫。
+pub(super) fn listening_tcp_for_pid(pid: u32) -> Vec<(String, u16)> {
+    let Ok(fds) = list_socket_fds(pid) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, u16)> = fds
+        .into_iter()
+        .filter_map(|fd| socket_listener(pid, fd))
+        .filter(|listener| listener.protocol == "tcp")
+        .map(|listener| (listener.local_ip, listener.local_port))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn discover_listening_sockets() -> io::Result<Vec<RawListener>> {
     let mut listeners = Vec::new();
     for pid in list_all_pids()? {

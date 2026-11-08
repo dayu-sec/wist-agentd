@@ -20,7 +20,7 @@ use wist_contracts::discovery::DiscoverySnapshot;
 
 use super::db_source::{
     DbProc, InstanceScope, ObservedProcess, RealProc, candidate_addrs, container_identities,
-    credential_key, processes, rooted, tcp_probe,
+    container_targets, credential_key, processes, rooted, tcp_probe,
 };
 
 /// 一次解析最多看多少个进程。
@@ -181,6 +181,32 @@ fn resolve(
         }
     }
 
+    // 容器里的库：宿主看不到进程，只能靠「镜像名粗筛 + 协议握手」。
+    for target in container_targets(snapshot, may_be_server, |addr| {
+        handshake.postgres_greeting(addr)
+    }) {
+        let detail = format!(
+            "容器镜像 {} 发布到宿主 {}:{}",
+            target.image, target.host, target.port
+        );
+        let entry = PgInstanceEntry {
+            source_ref: target.source_ref,
+            host: target.host,
+            port: target.port,
+            credential_key: target.credential_key,
+            scope: InstanceScope::Container,
+            evidence: "container_image".to_string(),
+            detail,
+            confidence: 70,
+        };
+        match by_target.get(&(entry.host.clone(), entry.port)) {
+            Some(existing) if existing.confidence >= entry.confidence => {}
+            _ => {
+                by_target.insert((entry.host.clone(), entry.port), entry);
+            }
+        }
+    }
+
     let mut out: Vec<PgInstanceEntry> = by_target.into_values().collect();
     out.sort_by_key(|entry| (entry.host.clone(), entry.port));
     out
@@ -239,6 +265,12 @@ fn config_files(argv: &[String]) -> Vec<String> {
     out.push("/var/lib/pgsql/data/postgresql.conf".to_string());
     out.push("/etc/postgresql/16/main/postgresql.conf".to_string());
     out.push("/etc/postgresql/15/main/postgresql.conf".to_string());
+    // macOS / Homebrew：`-D` 是主证据（brew 的 plist 会把 `-D /opt/homebrew/var/postgresql@N`
+    // 传进来），下面两个是不带版本号的遗留位置，当作兵底。
+    if cfg!(target_os = "macos") {
+        out.push("/opt/homebrew/var/postgres/postgresql.conf".to_string());
+        out.push("/usr/local/var/postgres/postgresql.conf".to_string());
+    }
     out
 }
 
@@ -368,6 +400,16 @@ mod tests {
     use std::collections::BTreeSet;
     use wist_contracts::discovery::DiscoveredResource;
 
+    /// Homebrew 的 postgresql.conf 位置只在 macOS 上列入候选（`-D` 仍是主证据）。
+    #[test]
+    fn homebrew_config_files_are_only_listed_on_macos() {
+        let files = config_files(&[]);
+        let has_homebrew = files.iter().any(|path| {
+            path.starts_with("/opt/homebrew/") || path == "/usr/local/var/postgres/postgresql.conf"
+        });
+        assert_eq!(has_homebrew, cfg!(target_os = "macos"));
+    }
+
     #[derive(Default)]
     struct FakeProc {
         cmdlines: BTreeMap<u32, Vec<String>>,
@@ -455,6 +497,31 @@ mod tests {
         snapshot
     }
 
+    /// 容器里的 PostgreSQL（macOS / Docker）：宿主看不到进程，靠容器探针给的发布端口。
+    #[test]
+    fn a_container_published_port_becomes_a_container_scoped_instance() {
+        let snapshot = snapshot(vec![crate::discovery::db_source::container_port_fixture(
+            "c1",
+            "pg-probe-test",
+            "postgres:16",
+            "0.0.0.0",
+            55999,
+        )]);
+        let proc = FakeProc::default();
+        let handshake = FakeHandshake {
+            accepting: vec!["127.0.0.1:55999".to_string()],
+        };
+
+        let found = resolve(&snapshot, &proc, &handshake);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].host, "127.0.0.1");
+        assert_eq!(found[0].port, 55999);
+        assert_eq!(found[0].scope, InstanceScope::Container);
+        assert_eq!(found[0].credential_key, "container-pg-probe-test");
+        assert_eq!(found[0].evidence, "container_image");
+    }
+
     #[test]
     fn a_host_postgres_is_reached_over_loopback() {
         let snapshot = snapshot(vec![process(42, "postgres")]);
@@ -487,7 +554,7 @@ mod tests {
         );
         proc.same_netns.insert(42);
         proc.files.insert(
-            "/proc/42/root/var/lib/pgsql/data/postgresql.conf".to_string(),
+            rooted(42, "/var/lib/pgsql/data/postgresql.conf"),
             "# port = 5432\nport = 5433\t\t# custom\n".to_string(),
         );
         let handshake = FakeHandshake {
@@ -528,7 +595,7 @@ mod tests {
         let mut proc = FakeProc::default();
         proc.same_netns.insert(42);
         proc.files.insert(
-            "/proc/42/root/var/lib/pgsql/data/postgresql.conf".to_string(),
+            rooted(42, "/var/lib/pgsql/data/postgresql.conf"),
             "port = 5432\n".to_string(),
         );
         proc.listen.insert(42, vec![6432]);

@@ -370,7 +370,11 @@ fn apply_group_policy(config: &mut kafka::KafkaProbeConfig, request: &ProbeReque
     }
 }
 
-/// 本机自探 → 采集目标。自探读 `/proc`，在非 Linux 上永远是空列表（报告里会说明）。
+/// 本机自探 → 采集目标。
+///
+/// 自探看两处：**本机进程**（Linux 读 `/proc`，能看到容器 netns 里的实例；
+/// macOS 读 libproc，只有宿主进程）与**容器发布端口**（macOS 的容器探针从 Docker API
+/// 拿容器名 + 发布端口，所以 Linux VM 里的库也能被找到）。两处都没有就是没候选。
 fn discovered_targets(domain: ProbeDomain, request: &ProbeRequest) -> Vec<TargetConfig> {
     let timeout_ms = request.timeout_ms;
     let timeout = Duration::from_millis(timeout_ms.max(1));
@@ -912,8 +916,9 @@ pub(crate) async fn run(request: ProbeRequest) -> AgentdResult<i32> {
         let candidates = collect_candidates(&domains, request.timeout_ms);
         let note = if candidates.is_empty() {
             Some(format!(
-                "自探没有找到候选（{}）：自探只认 /proc 里的进程证据，本机没有在跑的实例就不会有；\
-                 非 Linux 平台永远为空。",
+                "自探没有找到候选（{}）：自探看本机进程（Linux /proc、macOS libproc）与容器发布端口，\
+                 两处都没有就不会有候选。先用 --addr <host:port> 指定一台验采集，或检查容器是否\
+                 把数据库端口发布到了宿主。",
                 domains
                     .iter()
                     .map(|domain| domain.label())
@@ -950,8 +955,9 @@ pub(crate) async fn run(request: ProbeRequest) -> AgentdResult<i32> {
 
     let note = if targets.is_empty() {
         Some(format!(
-            "自探没有找到候选（{}）：自探只认 /proc 里的进程证据（本机没有在跑的实例就不会有候选；\
-             非 Linux 平台永远是空）。先用 --addr <host:port> 指定一台验采集，或用 --list 看候选。",
+            "自探没有找到候选（{}）：自探看本机进程（Linux /proc、macOS libproc）与容器发布端口，\
+             两处都没有就不会有候选。先用 --addr <host:port> 指定一台验采集，或检查容器是否把\
+             数据库端口发布到了宿主。",
             domains
                 .iter()
                 .map(|domain| domain.label())

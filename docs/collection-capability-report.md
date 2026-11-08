@@ -1,12 +1,17 @@
 # 采集能力评估报告
 
-> 数据快照：2026-11-08 · 网关 `0.40.8` / stack `0.10.9` / 知识包 `0.9.3-alpha`（`catalog_version=20`，`purpose_version=5`）
+> 数据快照：2026-11-08 · 网关 `0.40.11` / stack `0.10.12` / agentd `0.30.0` / 知识包 `0.10.0-alpha`（`catalog_version=23`，`purpose_version=5`）
 > 数据来源：`GET /api/v1/admin/content`（网关实际装载的内容目录）+ `wist-agentd probe` 实测
 
 ## 一、结论
 
-- **采集面 26 个**：22 个有采集单元，4 个已废弃（保留 id 仅为历史数据可解释）。
-- **采集单元 37 个**：`active` **23 个**（可派活）、`draft` **14 个**（网关不派）。
+- **采集面 22 个**：全部在词表内、都有采集单元（4 个已废弃的指标旧面已于 2026-11-08 从词表与网关闭集删除）。
+- **采集单元 40 个**：`active` **29 个**（可派活）、`draft` **11 个**（网关不派）；其中 macOS
+  数据库指标三个单元（`mac-postgres-metrics` / `mac-mysql-metrics` / `mac-doris-metrics`）为本轮新增。
+- **每个面真的采成没采成，现在有信号**：agentd 每 tick 重算并随状态心跳上报
+  `AgentLocalStandingWork.collection`（`ok` / `degraded` / `failed` / `unknown` / `paused`），
+  管理面「Agent 工作」卡片并列展示，摘要区单独统计「采集异常」。口径见
+  [`collection-families.md` §3.2](https://github.com/dayu-sec/wist-design)。
 - **能力层与授权层是两件事**：agentd 侧探针是否可用（`executable`）由代码决定；能不能派下去（`collect_ready`）由知识库单元的 `status` 决定。两者不一致时，现场表现为「配好了却没有任何指标」。
 - **本轮实测（真实服务）**：PostgreSQL **11 facts / 69ms**、MySQL **13 facts / 113ms**、
   Kafka **9 facts / 3ms**、Doris **4 facts / 3ms** —— **四个域全部能出数**。
@@ -19,21 +24,21 @@
 | ComputeWorkload | linux | 1 | 0 | 1 | 未就绪 |
 | ContainerWorkload | linux | 2 | 2 | 0 | 可用 |
 | CrashPanic | 全平台 | 2 | 1 | 1 | 可用 |
-| DatabaseMetrics | linux | 3 | 0 | 3 | 未就绪 |
+| DatabaseMetrics | linux, macos | 6 | 6 | 0 | 可用 |
 | DatabaseService | linux, macos | 2 | 2 | 0 | 可用 |
 | DevToolchain | macos | 1 | 0 | 1 | 未就绪 |
-| DorisMetrics | linux | 0 | 0 | 0 | 已废弃 |
+
 | GatekeeperQuarantine | macos | 1 | 0 | 1 | 未就绪 |
 | HostMetrics | 全平台 | 2 | 2 | 0 | 可用 |
-| KafkaMetrics | linux | 0 | 0 | 0 | 已废弃 |
+
 | KernelSystem | linux | 1 | 1 | 0 | 可用 |
 | LoginSession | 全平台 | 2 | 1 | 1 | 可用 |
 | MessageQueueMetrics | linux | 1 | 1 | 0 | 可用 |
 | MiscSystem | 全平台 | 2 | 0 | 2 | 未就绪 |
-| MysqlMetrics | linux | 0 | 0 | 0 | 已废弃 |
+
 | NetworkFirewall | 全平台 | 2 | 2 | 0 | 可用 |
 | NetworkService | linux | 1 | 0 | 1 | 未就绪 |
-| PostgresMetrics | linux | 0 | 0 | 0 | 已废弃 |
+
 | PrivacyTcc | macos | 1 | 0 | 1 | 未就绪 |
 | PrivilegeExecution | 全平台 | 3 | 2 | 1 | 可用 |
 | RebootPower | 全平台 | 2 | 2 | 0 | 可用 |
@@ -52,9 +57,12 @@
 | `linux-docker-container-stdout` | ContainerWorkload | linux | collect_logs | **active** | 是 | FileGlob |
 | `linux-crash-panic` | CrashPanic | linux | collect_logs | **active** | 是 | FileGlob, FileGlob, Exporter |
 | `mac-crash-panic` | CrashPanic | macos | collect_logs | **draft** | 是 | FileGlob, FileGlob |
-| `linux-doris-metrics` | DatabaseMetrics | linux | collect_metrics | **draft** | 是 | DorisCluster |
-| `linux-mysql-metrics` | DatabaseMetrics | linux | collect_metrics | **draft** | 是 | MysqlInstance |
-| `linux-postgres-metrics` | DatabaseMetrics | linux | collect_metrics | **draft** | 是 | PostgresInstance |
+| `linux-doris-metrics` | DatabaseMetrics | linux | collect_metrics | **active** | 是 | DorisCluster |
+| `linux-mysql-metrics` | DatabaseMetrics | linux | collect_metrics | **active** | 是 | MysqlInstance |
+| `linux-postgres-metrics` | DatabaseMetrics | linux | collect_metrics | **active** | 是 | PostgresInstance |
+| `mac-postgres-metrics` | DatabaseMetrics | macos | collect_metrics | **active** | 是 | PostgresInstance |
+| `mac-mysql-metrics` | DatabaseMetrics | macos | collect_metrics | **active** | 是 | MysqlInstance |
+| `mac-doris-metrics` | DatabaseMetrics | macos | collect_metrics | **active** | 是 | DorisCluster |
 | `linux-db-service` | DatabaseService | linux | collect_logs | **active** | 是 | FileGlob, FileGlob, FileGlob, FileGlob, FileGlob, FileGlob, FileGlob, FileGlob |
 | `mac-db-service` | DatabaseService | macos | collect_logs | **active** | 是 | FileGlob, FileGlob, FileGlob, FileGlob, FileGlob, FileGlob, FileGlob, FileGlob |
 | `mac-dev-toolchain` | DevToolchain | macos | collect_logs | **draft** | 否 | FileGlob, FileGlob |
@@ -214,16 +222,42 @@ probe mysql_metrics  mode=explicit  113ms
 - TiDB 走同一个 `MysqlInstance` 来源（协议兼容），但**本轮未实测**。
 
 
+### 4.5 macOS 自探（结构验证，待真库验收）
+
+macOS 与 Linux 走**同一条链**（进程 → argv → 配置证据 → 监听端口 → 握手），只换事实来源：
+
+| 层 | Linux | macOS |
+| --- | --- | --- |
+| 进程 | `/proc` 扫描 | `ps -axo pid=,comm=`（已有） |
+| 端口归属 | `/proc/<pid>/net/tcp` + fd 反查 | libproc（`PROC_PIDLISTFDS` + `PROC_PIDFDSOCKETINFO`） |
+| argv | `/proc/<pid>/cmdline` | `sysctl(KERN_PROCARGS2)` |
+| 配置证据 | `/proc/<pid>/root/etc/my.cnf` | 真实路径（Homebrew 前缀） |
+| netns | 真实判同/异 | 恒为同一个（没有 netns） |
+| 容器里的库 | 自然覆盖（读的是容器自己的 netns） | Docker API 拿「容器 → 发布端口」→ 对发布端口握手 |
+| 采集 / 上报 | TCP 客户端 + uplink | 同（零改动） |
+
+已用两种测试钉住平台层：
+
+- 纯函数：`KERN_PROCARGS2` 的 argc / exec_path / 对齐填充 / argv 边界（Linux CI 也跑）；
+- 真机冒烟：自己绑的监听口必须被 libproc 看到；自己的 argv 必须被 sysctl 读回。
+
+**边界**：
+
+- **原生 / Homebrew 安装**：走进程自探（libproc + `KERN_PROCARGS2`）。
+- **Docker / OrbStack 里的库**：容器在独立的 Linux VM 里，宿主看不到进程；容器探针改从
+  Docker API（Unix socket）拿**容器名 + 发布端口**，数据库自探再对发布端口做协议握手。
+  凭据口径是容器名（`secrets/<domain>/container-<name>/`），与 Linux 容器侧一致。
+- 看不到的：没把端口发布到宿主的容器（`-p` 没写）、远端库（需要显式端点覆盖，待定）。
+
 ## 五、缺口分析
 
-### 5.1 未就绪的单元（14 个）
+### 5.1 未就绪的单元（11 个）
 
 | 面 | 未就绪单元 | 影响 |
 | --- | --- | --- |
 | BackupJob | `linux-backup-job` | 该面在采集授权页不可派 |
 | ComputeWorkload | `linux-compute-workload` | 该面在采集授权页不可派 |
 | CrashPanic | `mac-crash-panic` | 该面在采集授权页不可派 |
-| DatabaseMetrics | `linux-doris-metrics`, `linux-mysql-metrics`, `linux-postgres-metrics` | 该面在采集授权页不可派 |
 | DevToolchain | `mac-dev-toolchain` | 该面在采集授权页不可派 |
 | GatekeeperQuarantine | `mac-gatekeeper` | 该面在采集授权页不可派 |
 | LoginSession | `mac-login-session` | 该面在采集授权页不可派 |
@@ -243,17 +277,21 @@ probe mysql_metrics  mode=explicit  113ms
 
 ## 六、下一步
 
-1. **数据库三件套逐个真库验收**：
+1. **数据库三件套已全部转 `active`**（知识包 `0.9.5-alpha`，`catalog_version=22`）：
    - ✅ PostgreSQL（已验，11 facts）
-   - ✅ MySQL 8.0（已验，13 facts）；⬜ TiDB（未验）
+   - ✅ MySQL 8.0（已验，13 facts）；⬜ TiDB（未验，走同一个 `MysqlInstance` 来源）
    - ✅ Doris 4.1（已验，修复探针后 4 facts）
-   - 每验通一个，把对应单元改 `active`，`catalog_version` +1；三个可分开发包，不必等齐。
-   - 注意：MySQL / TiDB 需要 `PROCESS` + `REPLICATION CLIENT`；Doris 4.x 实测**不需要特权**。
+   - 剩余风险是**现场前置动作**（凭据 / 只读账号 / 权限）没做完 —— 这类失败会在
+     「Agent 工作」卡片的「采集结果」里以 `degraded` / `failed` 报出来，不再静静没数据。
 2. **现场前置动作**（在真正授权前完成，指南页已有）：
    - 投放凭据到 `/etc/wist-agentd/secrets/{postgres,mysql,doris}/<key>/password`；
    - 数据库侧建 `wist-probe` 只读账号（PG 需要 `pg_read_all_stats`；MySQL 需要 `PROCESS` + `REPLICATION CLIENT`；
      Doris 4.x 默认权限即可）。
-3. **收敛 draft 面**：另有 **11 个**非数据库的 draft 单元（见 5.1），建议按「有无现场需求」排期，长期不用的考虑从词表移除（面只能标废弃，不能删 id）。
+3. **收敛 draft 面**：剩下 **11 个** draft 单元（见 5.1），建议按「有无现场需求」排期；
+   长期不用的可从词表移除（确认无历史数据才可删，否则只能标 `deprecated`）。
+4. **macOS 数据库指标真库验收**：本轮只做到「结构 + 平台层冒烟」，需要在有原生
+   MySQL / PostgreSQL 的 Mac 上跑一次 `wist-agentd probe {mysql,pg}_metrics`，
+   确认 facts / 耗时后再对外声张。Docker Desktop 里的库不属于这条链（见 4.5）。
 
 ## 附录 A：怎么复现本报告
 

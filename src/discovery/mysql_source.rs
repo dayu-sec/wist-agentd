@@ -28,8 +28,8 @@ use serde::Serialize;
 use wist_contracts::discovery::DiscoverySnapshot;
 
 use super::db_source::{
-    DbProc, ObservedProcess, RealProc, candidate_addrs, container_identities, credential_key,
-    processes, rooted, tcp_probe,
+    DbProc, ObservedProcess, RealProc, candidate_addrs, container_identities, container_targets,
+    credential_key, processes, rooted, tcp_probe,
 };
 
 /// MySQL 经典协议的问候包第一字节（`protocol_version`）。
@@ -205,6 +205,33 @@ fn resolve(
         }
     }
 
+    // 容器里的库（目前只有 macOS 的 Docker 探针会产出这条证据）：宿主看不到进程，
+    // 只能靠「镜像名粗筛 + 协议握手」。凭据口径是容器名（`container-<name>`）。
+    for target in container_targets(snapshot, may_be_server, |addr| {
+        handshake.mysql_greeting(addr)
+    }) {
+        let detail = format!(
+            "容器镜像 {} 发布到宿主 {}:{}",
+            target.image, target.host, target.port
+        );
+        let entry = MysqlInstanceEntry {
+            source_ref: target.source_ref,
+            host: target.host,
+            port: target.port,
+            credential_key: target.credential_key,
+            scope: InstanceScope::Container,
+            evidence: "container_image".to_string(),
+            detail,
+            confidence: 70,
+        };
+        match by_target.get(&(entry.host.clone(), entry.port)) {
+            Some(existing) if existing.confidence >= entry.confidence => {}
+            _ => {
+                by_target.insert((entry.host.clone(), entry.port), entry);
+            }
+        }
+    }
+
     let mut out: Vec<MysqlInstanceEntry> = by_target.into_values().collect();
     out.sort_by_key(|entry| (entry.host.clone(), entry.port));
     out
@@ -292,7 +319,24 @@ fn defaults_files(argv: &[String]) -> Vec<String> {
     ]
     .iter()
     .map(|path| path.to_string())
+    .collect::<Vec<String>>()
+    .into_iter()
+    .chain(macos_defaults_files())
     .collect()
+}
+
+/// Homebrew 的 my.cnf 位置（Apple Silicon / Intel 两个前缀）。
+///
+/// 非 macOS 构建下恒为空：Linux 上读 `/opt/homebrew` 只会白白 open 一次。
+fn macos_defaults_files() -> Vec<String> {
+    if cfg!(target_os = "macos") {
+        vec![
+            "/opt/homebrew/etc/my.cnf".to_string(),
+            "/usr/local/etc/my.cnf".to_string(),
+        ]
+    } else {
+        Vec::new()
+    }
 }
 
 fn argv_port(argv: &[String]) -> Option<u16> {
@@ -410,6 +454,16 @@ mod tests {
     use std::collections::BTreeSet;
     use wist_contracts::discovery::DiscoveredResource;
 
+    /// Homebrew 的 my.cnf 位置只在 macOS 上列入候选：Linux 上多发两次 open 没意义。
+    #[test]
+    fn homebrew_defaults_files_are_only_listed_on_macos() {
+        let files = defaults_files(&[]);
+        let has_homebrew = files
+            .iter()
+            .any(|path| path.starts_with("/opt/homebrew/") || path == "/usr/local/etc/my.cnf");
+        assert_eq!(has_homebrew, cfg!(target_os = "macos"));
+    }
+
     #[derive(Default)]
     struct FakeProc {
         cmdlines: BTreeMap<u32, Vec<String>>,
@@ -512,6 +566,27 @@ mod tests {
             DiscoverySnapshot::new("test".to_string(), 1, "2026-11-05T00:00:00Z".to_string());
         snapshot.resources = resources;
         snapshot
+    }
+
+    /// 容器里的 MySQL（macOS / Docker）：宿主看不到进程，靠容器探针给的发布端口。
+    #[test]
+    fn a_container_published_port_becomes_a_container_scoped_instance() {
+        let snapshot = snapshot(vec![crate::discovery::db_source::container_port_fixture(
+            "c1", "mysql", "mysql:8", "0.0.0.0", 33060,
+        )]);
+        let proc = FakeProc::default();
+        let handshake = FakeHandshake {
+            accepting: vec!["127.0.0.1:33060".to_string()],
+        };
+
+        let found = resolve(&snapshot, &proc, &handshake);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].host, "127.0.0.1", "通配绑定要落到回环");
+        assert_eq!(found[0].port, 33060);
+        assert_eq!(found[0].scope, InstanceScope::Container);
+        assert_eq!(found[0].credential_key, "container-mysql");
+        assert_eq!(found[0].evidence, "container_image");
     }
 
     #[test]
@@ -701,7 +776,7 @@ mod tests {
             .insert(42, vec!["/usr/sbin/mysqld".to_string()]);
         proc.same_netns.insert(42);
         proc.files.insert(
-            "/proc/42/root/etc/my.cnf".to_string(),
+            rooted(42, "/etc/my.cnf"),
             "[mysqld]\nport = 3308\nsocket = /run/mysqld.sock\n".to_string(),
         );
         let handshake = FakeHandshake {
@@ -726,7 +801,7 @@ mod tests {
         proc.same_netns.insert(42);
         proc.listen.insert(42, vec![3307]);
         proc.files.insert(
-            "/proc/42/root/etc/my.cnf".to_string(),
+            rooted(42, "/etc/my.cnf"),
             "[mysqld]
 port = 3306
 "

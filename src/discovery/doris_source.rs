@@ -13,8 +13,8 @@ use serde::Serialize;
 use wist_contracts::discovery::DiscoverySnapshot;
 
 use super::db_source::{
-    DbProc, InstanceScope, RealProc, candidate_addrs, container_identities, credential_key,
-    processes, tcp_probe,
+    DbProc, InstanceScope, RealProc, candidate_addrs, container_identities, container_targets,
+    credential_key, processes, tcp_probe,
 };
 
 /// FE 的默认查询端口（MySQL 协议）。
@@ -141,6 +141,30 @@ fn resolve(
         }
     }
 
+    // 容器里的 FE：镜像名粗筛 + MySQL 协议握手。
+    for target in container_targets(snapshot, may_be_fe, |addr| handshake.mysql_greeting(addr)) {
+        let detail = format!(
+            "容器镜像 {} 发布到宿主 {}:{}",
+            target.image, target.host, target.port
+        );
+        let entry = DorisInstanceEntry {
+            source_ref: target.source_ref,
+            host: target.host,
+            port: target.port,
+            credential_key: target.credential_key,
+            scope: InstanceScope::Container,
+            evidence: "container_image".to_string(),
+            detail,
+            confidence: 70,
+        };
+        match by_target.get(&(entry.host.clone(), entry.port)) {
+            Some(existing) if existing.confidence >= entry.confidence => {}
+            _ => {
+                by_target.insert((entry.host.clone(), entry.port), entry);
+            }
+        }
+    }
+
     let mut out: Vec<DorisInstanceEntry> = by_target.into_values().collect();
     out.sort_by_key(|entry| (entry.host.clone(), entry.port));
     out
@@ -256,6 +280,31 @@ mod tests {
             DiscoverySnapshot::new("test".to_string(), 1, "2026-11-05T00:00:00Z".to_string());
         snapshot.resources = resources;
         snapshot
+    }
+
+    /// 容器里的 Doris FE：宿主看不到进程（java 在 VM 里），靠容器发布端口。
+    #[test]
+    fn a_container_published_port_becomes_a_container_scoped_instance() {
+        let snapshot = snapshot(vec![crate::discovery::db_source::container_port_fixture(
+            "c1",
+            "doris-fe",
+            "apache/doris:2.1",
+            "0.0.0.0",
+            19030,
+        )]);
+        let proc = FakeProc::default();
+        let handshake = FakeHandshake {
+            accepting: vec!["127.0.0.1:19030".to_string()],
+        };
+
+        let found = resolve(&snapshot, &proc, &handshake);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].host, "127.0.0.1");
+        assert_eq!(found[0].port, 19030);
+        assert_eq!(found[0].scope, InstanceScope::Container);
+        assert_eq!(found[0].credential_key, "container-doris-fe");
+        assert_eq!(found[0].evidence, "container_image");
     }
 
     #[test]

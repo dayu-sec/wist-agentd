@@ -356,6 +356,15 @@ let outcomes = scheduler::collect_all(view);    // 主机三域 + Kafka（最近
 | PostgreSQL | `postgresql.conf` / `-D` 数据目录 / 端口 → 容器 `PGPORT` → 监听端口 |
 | Doris | `fe.conf` / `be.conf`（`http_port`、`rpc_port`、`query_port`）→ 容器 env → 监听端口 |
 
+**平台事实来源**按平台换，判定链不变：
+
+| 事实 | Linux | macOS |
+|---|---|---|
+| 进程 / argv | `/proc/<pid>/cmdline` | `sysctl(KERN_PROCARGS2)` |
+| 端口归属 | `/proc/<pid>/net/tcp` + fd 反查（能看到容器 netns） | libproc（只看到宿主进程） |
+| 容器里的库 | 上面两条已覆盖（读的是容器自己的 netns） | 容器探针问 Docker API，拿「容器 → 发布端口」，再对发布端口握手 |
+| 容器凭据 | `container-<name>` | 同（`container-<name>`） |
+
 共性：**只读白名单键**（`port`、`listener`、`data_dir`、`http_port` 等），
 `*.password`、`sasl.jaas.config`、`pg_hba.conf` 一律不读不报；结果只在本机使用，
 不上报、不进网关。`doctor` 每域一个检查项（`discovery.<domain>`）。

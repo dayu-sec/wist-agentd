@@ -12,6 +12,9 @@ use wist_shared::time::now_rfc3339;
 
 use super::{DiscoveryError, DiscoveryProbe, DiscoverySourceKind, ProbeOutput};
 
+#[cfg(target_os = "macos")]
+mod docker_macos;
+
 #[derive(::jumo_derive::Jumo)]
 #[jumo(kind = "struct", domain = "Discovery", module = "Discovery.Probe")]
 pub struct ContainerDiscoveryProbe;
@@ -109,6 +112,61 @@ impl DiscoveryProbe for ContainerDiscoveryProbe {
                 execution_hints,
                 state: "active".to_string(),
             });
+        }
+
+        // macOS：容器在独立的 Linux VM 里，宿主扫不到运行时根目录，只能问 Docker。
+        // 与上面同一套资源形状（`container`）+ 每条发布端口一个 `container_port`
+        // （数据库自探靠它找到容器里的库）。
+        #[cfg(target_os = "macos")]
+        if let Some(docker) = docker_macos::list_containers() {
+            for container in docker {
+                let resource_id = container.id.clone();
+                let attributes = BTreeMap::from([
+                    ("container.id".to_string(), container.id.clone()),
+                    ("container.name".to_string(), container.name.clone()),
+                    ("container.runtime".to_string(), "docker".to_string()),
+                    ("container.image".to_string(), container.image.clone()),
+                ]);
+                resources.push(DiscoveredResource {
+                    resource_id: resource_id.clone(),
+                    kind: "container".to_string(),
+                    origin_idx: 0,
+                    attributes,
+                    discovered_at: discovered_at.clone(),
+                    last_seen_at: discovered_at.clone(),
+                    health: "healthy".to_string(),
+                    source: self.name().to_string(),
+                });
+                // **不**发 `container` target：target 会被映射成 `container_metrics` 采集，
+                // 而 macOS 上容器的 cgroup 在 Linux VM 里，宿主采不到 —— 发了只会得到
+                // 一堆假失败。这里只留资源：它进事实摘要（`container_names`），
+                // 供知识库按 `container:postgres` 门控单元，以及数据库自探拿发布端口。
+
+                for port in &container.ports {
+                    let attributes = BTreeMap::from([
+                        ("container.id".to_string(), container.id.clone()),
+                        ("container.name".to_string(), container.name.clone()),
+                        ("container.image".to_string(), container.image.clone()),
+                        ("endpoint.protocol".to_string(), "tcp".to_string()),
+                        ("endpoint.bind.ip".to_string(), port.host_ip.clone()),
+                        ("endpoint.bind.port".to_string(), port.host_port.to_string()),
+                        (
+                            "endpoint.container.port".to_string(),
+                            port.container_port.to_string(),
+                        ),
+                    ]);
+                    resources.push(DiscoveredResource {
+                        resource_id: format!("{}:port:{}", container.id, port.host_port),
+                        kind: "container_port".to_string(),
+                        origin_idx: 0,
+                        attributes,
+                        discovered_at: discovered_at.clone(),
+                        last_seen_at: discovered_at.clone(),
+                        health: "healthy".to_string(),
+                        source: self.name().to_string(),
+                    });
+                }
+            }
         }
 
         Ok(ProbeOutput {

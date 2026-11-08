@@ -3,6 +3,37 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.30.0-alpha] - 2026-11-08
+
+### 新增
+
+- **macOS 数据库指标自探**：数据库指标的发现链（进程 → argv → 配置证据 → 监听端口 → 握手）
+  现在有 macOS 实现，语义与 Linux **完全一致**，只换平台事实来源：
+  - 端口 / 绑定地址：复用端点探针的 libproc 实现（新增 `listening_tcp_for_pid`，按 pid 查，
+    不全文扇出）；
+  - argv：`sysctl(KERN_PROCARGS2)`，不引入外部二进制（与 `endpoint_macos.rs` 同取舍）；
+  - 配置文件：读真实路径（`rooted` 在非 Linux 上是恒等）；
+  - netns：macOS 没有，恒为同一个 ⇒ 凭据口径是 `Host`（`secrets/<domain>/port-<port>/`）。
+- **macOS 容器发现（Docker / OrbStack）**：容器跑在独立的 Linux VM 里，宿主扫不到运行时
+  目录也看不到进程，所以容器探针改走 Docker Engine API（Unix socket，手写一个 HTTP GET，
+  不引入 HTTP 客户端、不依赖 `docker` 命令）。产出两类事实：
+  - `container` 资源（id / 名字 / **镜像**）→ 事实摘要里的 `container_names`，供知识库按
+    `container:postgres` 这类条件门控单元；
+  - `container_port` 资源（容器 → 发布到宿主的 TCP 端口）→ 数据库自探据此对容器里的库
+    做协议握手，凭据口径 `container-<name>`（与 Linux 容器侧一致）。
+- 证据路径补 Homebrew 布局：`/opt/homebrew/etc/my.cnf`、`/usr/local/etc/my.cnf`、
+  `/opt/homebrew/var/postgres[/postgresql@N]`（Intel 前缀同样），且**只在 macOS 上**列入候选。
+
+### 边界
+
+- 没把端口发布到宿主（`-p` 没写）的容器不在这条路上；远端库需要显式端点覆盖（待定）。
+
+### 测试
+
+- `KERN_PROCARGS2` 解析抽成纯函数并有偏移用例（Linux CI 也跑）；
+- 真 libproc / 真 sysctl 冒烟：自己绑的监听口必须被看到、自己的 argv 必须读回来；
+- 既有 MySQL / PG 用例改成跟 `rooted` 走，不再写死 `/proc/42/root/...`。
+
 ## [0.29.0-beta] - 2026-11-08
 
 与 `0.29.0-alpha` **内容相同**（采集面结果上报 + 运行时 P0），推进到 beta 通道。

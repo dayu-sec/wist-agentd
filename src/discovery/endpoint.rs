@@ -200,6 +200,16 @@ fn discover_service_endpoints() -> std::io::Result<Vec<ObservedServiceEndpoint>>
     Ok(Vec::new())
 }
 
+/// 单个 pid 的 TCP 监听端点（地址, 端口）—— 给数据库自探用。
+///
+/// Linux 上**不**走这条：容器的端口在**它自己的 netns** 里，宿主的端点表看不到；
+/// 那边用 `/proc/<pid>/net/tcp`（见 `db_source.rs`）。macOS 没有 netns，
+/// 一个进程在宿主机上听的端口就是 libproc 报的那些。
+#[cfg(target_os = "macos")]
+pub(crate) fn listening_tcp_for_pid(pid: u32) -> Vec<(String, u16)> {
+    endpoint_macos::listening_tcp_for_pid(pid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::ObservedServiceEndpoint;
