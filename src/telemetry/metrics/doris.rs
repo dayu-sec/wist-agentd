@@ -220,13 +220,16 @@ pub(super) async fn collect_with(
 }
 
 fn be_label(row: &Row) -> Option<String> {
-    let ip = row.get("IP")?.trim();
-    if ip.is_empty() {
+    // 列名在 Doris 版本间不一致：2.x 是 `IP`，**4.x 起改成 `Host`**（4.1 实测）。
+    // 只认一个会让**每一行**都被跳过 —— 现象是 probe 报 success 但 `facts` 为 0，
+    // 只附一条「行缺少 IP/HeartbeatPort」的 warning，很容易被当成集群问题。
+    let host = row.get("Host").or_else(|| row.get("IP"))?.trim();
+    if host.is_empty() {
         return None;
     }
     match row.get("HeartbeatPort").map(|port| port.trim()) {
-        Some(port) if !port.is_empty() => Some(format!("{ip}:{port}")),
-        _ => Some(ip.to_string()),
+        Some(port) if !port.is_empty() => Some(format!("{host}:{port}")),
+        _ => Some(host.to_string()),
     }
 }
 
@@ -455,6 +458,53 @@ mod tests {
                 ("TabletNum", "3"),
             ]),
         ]
+    }
+
+    /// Doris 4.x 把 `IP` 列改叫 `Host`（4.1 实测）。只认旧名会**一行都读不出来**：
+    /// probe 仍是 `success`、`facts=0`，只附一条 warning —— 现场很容易误判成「集群没就绪」。
+    #[tokio::test]
+    async fn host_column_from_doris_4_is_accepted() {
+        let mut transport = Fake::with(vec![row(&[
+            ("Host", "10.0.0.9"),
+            ("HeartbeatPort", "9050"),
+            ("Alive", "true"),
+            ("TotalCapacity", "1.000 TB"),
+            ("AvailCapacity", "512.000 GB"),
+            ("TabletNum", "42"),
+        ])]);
+
+        let result = collect_with(&mut transport, &config()).await;
+
+        assert_eq!(result.failed, 0);
+        assert_eq!(labeled(&result, "doris.be.up", "10.0.0.9:9050"), Some("1"));
+        assert_eq!(
+            labeled(&result, "doris.be.tablets", "10.0.0.9:9050"),
+            Some("42")
+        );
+        assert!(
+            result.warnings.is_empty(),
+            "新列名不该再报「缺少 IP/HeartbeatPort」：{:?}",
+            result.warnings
+        );
+    }
+
+    /// 两列同时存在（某些代理/改造版会两列都给）：以 `Host` 为准，不重复出两条。
+    #[tokio::test]
+    async fn host_wins_when_both_columns_exist() {
+        let mut transport = Fake::with(vec![row(&[
+            ("Host", "10.0.0.9"),
+            ("IP", "10.9.9.9"),
+            ("HeartbeatPort", "9050"),
+            ("Alive", "true"),
+            ("TotalCapacity", "1.000 TB"),
+            ("AvailCapacity", "512.000 GB"),
+            ("TabletNum", "7"),
+        ])]);
+
+        let result = collect_with(&mut transport, &config()).await;
+
+        assert_eq!(labeled(&result, "doris.be.up", "10.0.0.9:9050"), Some("1"));
+        assert_eq!(labeled(&result, "doris.be.up", "10.9.9.9:9050"), None);
     }
 
     #[tokio::test]
