@@ -14,6 +14,7 @@
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use globset::{GlobBuilder, GlobMatcher};
 use wist_contracts::work::ContainerFilters;
@@ -60,57 +61,105 @@ pub(super) async fn resolve_family_paths(
     max_paths: usize,
 ) -> io::Result<FamilySelection> {
     let target_text = target.display().to_string();
-    if target_text.contains("**") {
+    reject_recursive_glob(&target_text)?;
+    // 选择层（排除项 + 结构化过滤器）在**收集时**求值：`max_paths` 必须只数“留下的”。
+    //
+    // 否则目录里候选很多时会先被截断、再被过滤 —— 留下的可能远少于上限（甚至为空），
+    // 而“超过上限”又被当成正常状态，没人会发现少采了。
+    let gate = SelectionGate::new(exclude_globs, filters)?;
+    let keep = |path: &Path| gate.keep(path);
+    let selected = if has_glob(&target_text) {
+        resolve_glob(&target_text, max_paths, &keep).await?
+    } else {
+        resolve_explicit_or_dir(target, max_paths, &keep).await?
+    };
+    Ok(gate.finish(selected))
+}
+
+/// `**` 不支持：整棵树递归展开不在方案内（深度与代价都不可控）。
+fn reject_recursive_glob(target: &str) -> io::Result<()> {
+    if target.contains("**") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "recursive glob `**` is not supported",
         ));
     }
-    // 选择层（排除项 + 结构化过滤器）在**收集时**求值：`max_paths` 必须只数“留下的”。
-    //
-    // 否则目录里候选很多时会先被截断、再被过滤 —— 留下的可能远少于上限（甚至为空），
-    // 而“超过上限”又被当成正常状态，没人会发现少采了。
-    let excludes = if exclude_globs.is_empty() {
-        Vec::new()
-    } else {
-        compile_excludes(exclude_globs)?
-    };
-    let rejected = std::sync::Mutex::new(BTreeSet::new());
-    let stats = std::sync::Mutex::new((0usize, 0usize));
-    let keep = |path: &Path| {
-        let excluded = excludes.iter().any(|matcher| matcher.is_match(path));
-        let verdict = if excluded {
-            FilterVerdict::Drop
-        } else {
-            container_filters_verdict(filters, path)
-        };
+    Ok(())
+}
+
+/// 发现阶段的**选择层**：排除 glob + 结构化过滤器，并在收集过程中累计自观测计数。
+///
+/// 为什么是结构体而不是内联闭包：判定要用到「排除项 + 过滤器 + 两个计数器」四份状态，
+/// 而遍历把它当 `&dyn Fn` 传入（同一轮里会被反复调用），所以计数用互斥量做内部可变性 ——
+/// 与旧实现的 `Mutex` + 闭包逐字等价，只是把「判定」和「记账」收进同一处。
+struct SelectionGate<'a> {
+    filters: &'a ContainerFilters,
+    excludes: Vec<GlobMatcher>,
+    deselected: Mutex<BTreeSet<String>>,
+    stats: Mutex<SelectionStats>,
+}
+
+/// 选择层自观测：被结构化过滤器剔掉的候选数，其中「取不到容器身份」的候选数。
+#[derive(Debug, Default, Clone, Copy)]
+struct SelectionStats {
+    filtered: usize,
+    identity_unknown: usize,
+}
+
+impl<'a> SelectionGate<'a> {
+    fn new(exclude_globs: &[String], filters: &'a ContainerFilters) -> io::Result<Self> {
+        Ok(Self {
+            filters,
+            excludes: compile_excludes(exclude_globs)?,
+            deselected: Mutex::new(BTreeSet::new()),
+            stats: Mutex::new(SelectionStats::default()),
+        })
+    }
+
+    /// 这条候选进不进工作集；被剔掉的现存路径记进 `deselected`。
+    fn keep(&self, path: &Path) -> bool {
+        if self.is_excluded(path) {
+            // 排除项**不**计入 `filtered`：那个计数只回答“结构化过滤器剔了多少”。
+            self.reject(path);
+            return false;
+        }
+        let verdict = container_filters_verdict(self.filters, path);
         if verdict.identity_unknown() {
-            stats.lock().expect("selection stats").1 += 1;
+            self.bump(|stats| stats.identity_unknown += 1);
         }
         if verdict.keeps() {
             return true;
         }
-        if !excluded {
-            stats.lock().expect("selection stats").0 += 1;
-        }
-        rejected
+        self.bump(|stats| stats.filtered += 1);
+        self.reject(path);
+        false
+    }
+
+    fn is_excluded(&self, path: &Path) -> bool {
+        self.excludes.iter().any(|matcher| matcher.is_match(path))
+    }
+
+    fn reject(&self, path: &Path) {
+        self.deselected
             .lock()
             .expect("deselected set")
             .insert(path.display().to_string());
-        false
-    };
-    let selected = if !has_glob(&target_text) {
-        resolve_explicit_or_dir(target, max_paths, &keep).await?
-    } else {
-        resolve_glob(&target_text, max_paths, &keep).await?
-    };
-    let (filtered, identity_unknown) = stats.into_inner().expect("selection stats");
-    Ok(FamilySelection {
-        selected,
-        deselected: rejected.into_inner().expect("deselected set"),
-        filtered,
-        identity_unknown,
-    })
+    }
+
+    fn bump(&self, update: impl FnOnce(&mut SelectionStats)) {
+        update(&mut self.stats.lock().expect("selection stats"));
+    }
+
+    /// 收尾：把本轮留下的路径与自观测计数拼成结果。
+    fn finish(self, selected: Vec<PathBuf>) -> FamilySelection {
+        let stats = self.stats.into_inner().expect("selection stats");
+        FamilySelection {
+            selected,
+            deselected: self.deselected.into_inner().expect("deselected set"),
+            filtered: stats.filtered,
+            identity_unknown: stats.identity_unknown,
+        }
+    }
 }
 
 /// 容器日志文件名 `<pod>_<namespace>_<container>-<id>.log` 里选源要用的部分。
@@ -126,12 +175,29 @@ struct ContainerLogName<'a> {
 }
 
 fn parse_container_log_name(path: &Path) -> Option<ContainerLogName<'_>> {
+    let (pod, namespace, container) = split_container_labels(container_log_stem(path)?)?;
+    Some(ContainerLogName {
+        pod,
+        namespace,
+        container,
+    })
+}
+
+/// 去掉 `.log` 与 `-<id>` 之后的 `<pod>_<ns>_<container>`。
+///
+/// `-` 之后必须有东西（空 id 不是容器日志），这样 `a_b_c-.log` 不会被当成候选。
+fn container_log_stem(path: &Path) -> Option<&str> {
     let name = path.file_name()?.to_str()?;
     let stem = name.strip_suffix(".log")?;
     let (head, id) = stem.rsplit_once('-')?;
     if id.is_empty() {
         return None;
     }
+    Some(head)
+}
+
+/// 按 `_` 切三段：第三段吃掉剩余部分，任何一段为空都是坏形状。
+fn split_container_labels(head: &str) -> Option<(&str, &str, &str)> {
     let mut parts = head.splitn(3, '_');
     let pod = parts.next()?;
     let namespace = parts.next()?;
@@ -139,11 +205,7 @@ fn parse_container_log_name(path: &Path) -> Option<ContainerLogName<'_>> {
     if pod.is_empty() || namespace.is_empty() || container.is_empty() {
         return None;
     }
-    Some(ContainerLogName {
-        pod,
-        namespace,
-        container,
-    })
+    Some((pod, namespace, container))
 }
 
 /// 选择层的判定结果。多出两个 `IdentityUnknown` 态，是为了让“身份读不到”可被计数：
@@ -166,6 +228,21 @@ impl FilterVerdict {
     fn identity_unknown(self) -> bool {
         matches!(self, Self::KeepIdentityUnknown | Self::DropIdentityUnknown)
     }
+
+    /// 维度内判定的结果：命中保留、不命中剔除。
+    fn of_match(matched: bool) -> Self {
+        if matched { Self::Keep } else { Self::Drop }
+    }
+
+    /// 取不到容器身份时的降级：包含式（`name_in`）要求“证明确实是它” → 不命中；
+    /// 排除式不能因为读不到配置就把日志全丢了 → 保留。
+    fn unknown_identity(requires_identity: bool) -> Self {
+        if requires_identity {
+            Self::DropIdentityUnknown
+        } else {
+            Self::KeepIdentityUnknown
+        }
+    }
 }
 
 /// 过滤器求值：空过滤器 = 全收。
@@ -176,61 +253,81 @@ impl FilterVerdict {
 /// * `name_in` / `name_not_in` 对两种载体都适用：k8s 取文件名第三段，Docker 取
 ///   `config.v2.json` 里的 `Name`（见 [`crate::telemetry::container_ref`]）。
 ///
-/// 取不到容器身份时的三态是**刻意不对称**的：
-/// * 包含式（`name_in`）要求“证明确实是它” —— 没有身份就不命中；
-/// * 排除式（`name_not_in`）不能因为读不到配置就把日志全丢了 —— 保留。
+/// 取不到容器身份时的三态是**刻意不对称**的，见 [`FilterVerdict::unknown_identity`]。
 fn container_filters_verdict(filters: &ContainerFilters, path: &Path) -> FilterVerdict {
     if filters.is_empty() {
         return FilterVerdict::Keep;
     }
     let k8s = parse_container_log_name(path);
-    if !filters.namespace_in.is_empty() || !filters.pod_not_in.is_empty() {
-        let Some(name) = k8s else {
-            return FilterVerdict::Drop;
-        };
-        if !filters.namespace_in.is_empty()
-            && !filters
-                .namespace_in
-                .iter()
-                .any(|namespace| namespace == name.namespace)
-        {
-            return FilterVerdict::Drop;
-        }
-        if filters.pod_not_in.iter().any(|pod| pod == name.pod) {
-            return FilterVerdict::Drop;
-        }
+    if let Some(verdict) = k8s_dimension_verdict(filters, k8s) {
+        return verdict;
     }
-    let want_name = !filters.name_in.is_empty();
-    let skip_name = !filters.name_not_in.is_empty();
-    if !want_name && !skip_name {
+    if !uses_name_dimension(filters) {
         // 只用 k8s 维度时，非 k8s 命名的候选一律不收（旧行为）。
-        return if k8s.is_some() {
-            FilterVerdict::Keep
-        } else {
-            FilterVerdict::Drop
-        };
+        return FilterVerdict::of_match(k8s.is_some());
     }
-    let container = k8s.map(|name| name.container.to_string()).or_else(|| {
-        crate::telemetry::container_ref::for_source_path(path.to_str()?).map(|found| found.name)
-    });
-    let Some(container) = container else {
-        return if want_name {
-            FilterVerdict::DropIdentityUnknown
-        } else {
-            FilterVerdict::KeepIdentityUnknown
-        };
+    name_dimension_verdict(filters, path, k8s)
+}
+
+/// k8s 维度（`namespace_in` / `pod_not_in`）：只认 `<pod>_<ns>_<container>-<id>.log`。
+///
+/// `Some` = 这一维度已经否决了这条候选；`None` = 它没意见，交给名字维度。
+fn k8s_dimension_verdict(
+    filters: &ContainerFilters,
+    k8s: Option<ContainerLogName<'_>>,
+) -> Option<FilterVerdict> {
+    if filters.namespace_in.is_empty() && filters.pod_not_in.is_empty() {
+        return None;
+    }
+    let Some(name) = k8s else {
+        return Some(FilterVerdict::Drop);
     };
-    if want_name && !filters.name_in.iter().any(|wanted| wanted == &container) {
+    let namespace_ok =
+        filters.namespace_in.is_empty() || list_contains(&filters.namespace_in, name.namespace);
+    let pod_allowed = !list_contains(&filters.pod_not_in, name.pod);
+    if namespace_ok && pod_allowed {
+        None
+    } else {
+        Some(FilterVerdict::Drop)
+    }
+}
+
+/// 名字维度（`name_in` / `name_not_in`）：两种载体都适用。
+///
+/// 黑名单优先于白名单的含义不变：命中任一黑名单即剔，白名单只在“没被剔”之后才要求命中。
+fn name_dimension_verdict(
+    filters: &ContainerFilters,
+    path: &Path,
+    k8s: Option<ContainerLogName<'_>>,
+) -> FilterVerdict {
+    let requires_identity = !filters.name_in.is_empty();
+    let Some(container) = resolve_container_name(path, k8s) else {
+        return FilterVerdict::unknown_identity(requires_identity);
+    };
+    if requires_identity && !list_contains(&filters.name_in, &container) {
         return FilterVerdict::Drop;
     }
-    if filters
-        .name_not_in
-        .iter()
-        .any(|skipped| skipped == &container)
-    {
+    if list_contains(&filters.name_not_in, &container) {
         return FilterVerdict::Drop;
     }
     FilterVerdict::Keep
+}
+
+fn uses_name_dimension(filters: &ContainerFilters) -> bool {
+    !filters.name_in.is_empty() || !filters.name_not_in.is_empty()
+}
+
+/// 容器名：k8s 取文件名第三段；Docker 读 `config.v2.json`（读不到就是“身份未知”）。
+fn resolve_container_name(path: &Path, k8s: Option<ContainerLogName<'_>>) -> Option<String> {
+    if let Some(name) = k8s {
+        return Some(name.container.to_string());
+    }
+    crate::telemetry::container_ref::for_source_path(path.to_str()?).map(|found| found.name)
+}
+
+/// 白名单 / 黑名单都是**整名**匹配（大小写敏感）：k8s 名字永远小写，折叠只会把写错的值当能用。
+fn list_contains(list: &[String], value: &str) -> bool {
+    list.iter().any(|item| item == value)
 }
 
 /// 目标里有没有 glob 元字符。
@@ -244,12 +341,18 @@ async fn resolve_explicit_or_dir(
     max_paths: usize,
     keep: &(dyn Fn(&Path) -> bool + Sync),
 ) -> io::Result<Vec<PathBuf>> {
-    match tokio::fs::metadata(target).await {
-        Ok(metadata) if metadata.is_dir() => list_dir_files(target, max_paths, keep).await,
-        Ok(_) if keep(target) => Ok(vec![target.to_path_buf()]),
-        Ok(_) => Ok(Vec::new()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(err) => Err(err),
+    let metadata = match tokio::fs::metadata(target).await {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    if metadata.is_dir() {
+        return list_dir_files(target, max_paths, keep).await;
+    }
+    if keep(target) {
+        Ok(vec![target.to_path_buf()])
+    } else {
+        Ok(Vec::new())
     }
 }
 
@@ -265,16 +368,25 @@ async fn list_dir_files(
         if out.len() >= max_paths {
             break;
         }
-        let path = entry.path();
-        // 跟随 symlink；断链 / 无权限的单条目跳过，不拖垮整个目录。
-        if let Ok(metadata) = tokio::fs::metadata(&path).await
-            && metadata.is_file()
-            && keep(&path)
-        {
-            out.insert(path);
-        }
+        collect_file(&entry.path(), &mut out, keep).await;
     }
     Ok(out.into_iter().collect())
+}
+
+/// 跟随 symlink 后确实是普通文件、且通过选择层时收进集合。
+///
+/// 断链 / 无权限的单条目直接跳过，不拖垮整个目录。
+async fn collect_file(
+    path: &Path,
+    out: &mut BTreeSet<PathBuf>,
+    keep: &(dyn Fn(&Path) -> bool + Sync),
+) {
+    let Ok(metadata) = tokio::fs::metadata(path).await else {
+        return;
+    };
+    if metadata.is_file() && keep(path) {
+        out.insert(path.to_path_buf());
+    }
 }
 
 /// 按 pattern 的固定前缀逐层展开。
@@ -283,6 +395,20 @@ async fn resolve_glob(
     max_paths: usize,
     keep: &(dyn Fn(&Path) -> bool + Sync),
 ) -> io::Result<Vec<PathBuf>> {
+    let (base, wildcard_components) = split_pattern(pattern);
+    if wildcard_components.is_empty() {
+        // 没有元字符（调用方已判定有 glob，这里只做防御）：按显式路径处理。
+        return resolve_explicit_or_dir(&base, max_paths, keep).await;
+    }
+    let mut out = BTreeSet::new();
+    walk_components(&base, &wildcard_components, max_paths, &mut out, keep).await?;
+    Ok(out.into_iter().collect())
+}
+
+/// 把 pattern 拆成「固定前缀目录 + 从第一个含元字符的组件起的剩余段」。
+///
+/// 固定前缀仍以 `/` 为根拼回去 —— 只扫前缀、不扫整棵树，是这条采集路径的代价边界。
+fn split_pattern(pattern: &str) -> (PathBuf, Vec<&str>) {
     let components: Vec<&str> = pattern.split('/').filter(|part| !part.is_empty()).collect();
     let first_glob = components
         .iter()
@@ -292,15 +418,10 @@ async fn resolve_glob(
     for component in &components[..first_glob] {
         base.push(component);
     }
-    if first_glob == components.len() {
-        // 没有元字符（调用方已判定有 glob，这里只做防御）：按显式路径处理。
-        return resolve_explicit_or_dir(&base, max_paths, keep).await;
-    }
-    let mut out = BTreeSet::new();
-    walk_components(&base, &components[first_glob..], max_paths, &mut out, keep).await?;
-    Ok(out.into_iter().collect())
+    (base, components[first_glob..].to_vec())
 }
 
+/// 逐层展开剩余组件；`out` 到上限即停（上限只数**留下的**）。
 async fn walk_components(
     base: &Path,
     remaining: &[&str],
@@ -308,35 +429,37 @@ async fn walk_components(
     out: &mut BTreeSet<PathBuf>,
     keep: &(dyn Fn(&Path) -> bool + Sync),
 ) -> io::Result<()> {
-    if out.len() >= max_paths || remaining.is_empty() {
+    if remaining.is_empty() || out.len() >= max_paths {
         return Ok(());
     }
-    let matcher = component_matcher(remaining[0])?;
-    let mut entries = match tokio::fs::read_dir(base).await {
-        Ok(entries) => entries,
-        // 固定前缀不存在 = 没匹配；无权限 / 其它 IO 错误要报出来。
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err),
+    let matcher = compile_glob(remaining[0])?;
+    // 固定前缀不存在 = 没匹配；无权限 / 其它 IO 错误要报出来。
+    let Some(mut entries) = open_dir(base).await? else {
+        return Ok(());
     };
     while let Some(entry) = entries.next_entry().await? {
         if out.len() >= max_paths {
             break;
         }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !matcher.is_match(name.as_ref()) {
-            continue;
-        }
-        let path = entry.path();
-        let Ok(metadata) = tokio::fs::metadata(&path).await else {
-            // 断链 symlink / 读取中被删：跳过这个条目。
-            continue;
-        };
-        if remaining.len() == 1 {
-            if metadata.is_file() && keep(&path) {
-                out.insert(path);
-            }
-        } else if metadata.is_dir() {
+        walk_entry(&entry, &matcher, remaining, max_paths, out, keep).await?;
+    }
+    Ok(())
+}
+
+/// 一个目录项的分派：最后一层收文件，否则只在目录上下探。
+async fn walk_entry(
+    entry: &tokio::fs::DirEntry,
+    matcher: &GlobMatcher,
+    remaining: &[&str],
+    max_paths: usize,
+    out: &mut BTreeSet<PathBuf>,
+    keep: &(dyn Fn(&Path) -> bool + Sync),
+) -> io::Result<()> {
+    let Some((path, metadata)) = matched_child(entry, matcher).await else {
+        return Ok(());
+    };
+    if remaining.len() > 1 {
+        if metadata.is_dir() {
             Box::pin(walk_components(
                 &path,
                 &remaining[1..],
@@ -346,28 +469,52 @@ async fn walk_components(
             ))
             .await?;
         }
+        return Ok(());
+    }
+    if metadata.is_file() && keep(&path) {
+        out.insert(path);
     }
     Ok(())
 }
 
-fn component_matcher(component: &str) -> io::Result<GlobMatcher> {
-    GlobBuilder::new(component)
+/// 条目名匹配、且元数据可读（跟随 symlink）时返回路径与元数据。
+///
+/// 断链 symlink / 读取中被删：`None` 单条目跳过，不拖垮整个遍历。
+async fn matched_child(
+    entry: &tokio::fs::DirEntry,
+    matcher: &GlobMatcher,
+) -> Option<(PathBuf, std::fs::Metadata)> {
+    let name = entry.file_name();
+    if !matcher.is_match(name.to_string_lossy().as_ref()) {
+        return None;
+    }
+    let path = entry.path();
+    let metadata = tokio::fs::metadata(&path).await.ok()?;
+    Some((path, metadata))
+}
+
+/// 打开目录：固定前缀不存在当「没匹配」（`Ok(None)`），其它 IO 错误如实上报。
+async fn open_dir(dir: &Path) -> io::Result<Option<tokio::fs::ReadDir>> {
+    match tokio::fs::read_dir(dir).await {
+        Ok(entries) => Ok(Some(entries)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// 编译一段 glob（组件或排除项）。`*` 不跨目录：`literal_separator(true)`。
+fn compile_glob(pattern: &str) -> io::Result<GlobMatcher> {
+    GlobBuilder::new(pattern)
         .literal_separator(true)
         .build()
         .map(|glob| glob.compile_matcher())
-        .map_err(|err| invalid_glob(component, err))
+        .map_err(|err| invalid_glob(pattern, err))
 }
 
 fn compile_excludes(patterns: &[String]) -> io::Result<Vec<GlobMatcher>> {
     patterns
         .iter()
-        .map(|pattern| {
-            GlobBuilder::new(pattern)
-                .literal_separator(true)
-                .build()
-                .map(|glob| glob.compile_matcher())
-                .map_err(|err| invalid_glob(pattern, err))
-        })
+        .map(|pattern| compile_glob(pattern))
         .collect()
 }
 
@@ -867,5 +1014,199 @@ mod tests {
             "排除式保留了它，但仍然要计入“身份读不到”"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // ── 重构后拆出的内聚单元（过滤器判定 / pattern 拆分 / 遍历原子）──────
+
+    const K8S_LOG: &str = "/var/log/containers/web-1_prod_nginx-a1.log";
+
+    /// 既不是 k8s 命名、也没有 `containers` 段：两条身份通道都读不到。
+    const PLAIN_LOG: &str = "/tmp/wist-agentd-fixture/agent.log";
+
+    fn verdict(filters: &ContainerFilters, path: &str) -> FilterVerdict {
+        container_filters_verdict(filters, Path::new(path))
+    }
+
+    /// 判定矩阵：k8s / 非 k8s 命名 × 两道维度 × 空过滤器。
+    #[test]
+    fn verdict_matrix_separates_mismatch_from_unknown_identity() {
+        // 空过滤器 = 全收，连“不是容器日志”的路径也收。
+        assert_eq!(verdict(&no_filters(), K8S_LOG), FilterVerdict::Keep);
+        assert_eq!(verdict(&no_filters(), PLAIN_LOG), FilterVerdict::Keep);
+
+        // k8s 维度：namespace 白名单命中 / 不命中；pod 黑名单整名匹配（不是前缀）。
+        let k8s_cases = [
+            (filters(&["prod"], &[]), FilterVerdict::Keep),
+            (filters(&["batch"], &[]), FilterVerdict::Drop),
+            (filters(&[], &["web-1"]), FilterVerdict::Drop),
+            (filters(&[], &["web"]), FilterVerdict::Keep),
+        ];
+        for (filters, expected) in k8s_cases {
+            assert_eq!(verdict(&filters, K8S_LOG), expected);
+        }
+
+        // 名字维度：k8s 取文件名第三段。
+        let name_cases = [
+            (name_filters(&["nginx"], &[]), FilterVerdict::Keep),
+            (name_filters(&[], &["nginx"]), FilterVerdict::Drop),
+        ];
+        for (filters, expected) in name_cases {
+            assert_eq!(verdict(&filters, K8S_LOG), expected);
+        }
+
+        // 非 k8s 命名：k8s 维度当“不是候选”，名字维度退化成“身份未知”的两种降级。
+        let unknown = [
+            (filters(&["prod"], &[]), FilterVerdict::Drop),
+            (
+                name_filters(&["nginx"], &[]),
+                FilterVerdict::DropIdentityUnknown,
+            ),
+            (
+                name_filters(&[], &["nginx"]),
+                FilterVerdict::KeepIdentityUnknown,
+            ),
+        ];
+        for (filters, expected) in unknown {
+            assert_eq!(verdict(&filters, PLAIN_LOG), expected);
+        }
+    }
+
+    #[test]
+    fn pattern_splitting_stops_at_the_first_wildcard_component() {
+        // 元字符识别：`*` / `?` / `[` 才算 glob。
+        assert!(has_glob("*.log") && has_glob("app?.log") && has_glob("[ab].log"));
+        assert!(!has_glob("/var/log/app.log") && !has_glob("/var/log/app.log.1"));
+
+        let (base, rest) = split_pattern("/var/log/containers/*/*-json.log");
+        assert_eq!(base, PathBuf::from("/var/log/containers"));
+        assert_eq!(rest, vec!["*", "*-json.log"]);
+
+        // 元字符出现在中间段时，前缀仍必须是绝对路径（不能被拼成相对路径）。
+        let (base, rest) = split_pattern("/var/lib/docker/containers/[0-9a-f]*/*-json.log");
+        assert_eq!(base, PathBuf::from("/var/lib/docker/containers"));
+        assert_eq!(rest, vec!["[0-9a-f]*", "*-json.log"]);
+
+        // 没有元字符：整条都是固定前缀，剩余为空（调用方走显式路径分支）。
+        let (base, rest) = split_pattern("/var/log/app.log");
+        assert_eq!(base, PathBuf::from("/var/log/app.log"));
+        assert!(rest.is_empty());
+
+        // 重复 / 结尾的 `/` 不影响拆分。
+        let (base, rest) = split_pattern("//var//log//*.log");
+        assert_eq!(base, PathBuf::from("/var/log"));
+        assert_eq!(rest, vec!["*.log"]);
+    }
+
+    #[test]
+    fn container_log_name_splitting_rejects_bad_shapes() {
+        let path = Path::new("/x").join("a_b_c-d1.log");
+        assert_eq!(container_log_stem(&path), Some("a_b_c"));
+        // 空 id / 缺 id 段 / 轮转件 / 大小写不同的后缀都不是容器日志。
+        for name in ["a_b_c-.log", "a_b_c.log", "a_b_c-d.log.1", "a_b_c-d.LOG"] {
+            let path = Path::new("/x").join(name);
+            assert!(container_log_stem(&path).is_none(), "{name}");
+        }
+
+        assert_eq!(split_container_labels("a_b_c"), Some(("a", "b", "c")));
+        // 第三段吃掉剩余部分：真出现多余 `_` 就是格式变了，不猜。
+        assert_eq!(split_container_labels("a_b_c_d"), Some(("a", "b", "c_d")));
+        for head in ["a_b", "_b_c", "a_b_"] {
+            assert!(split_container_labels(head).is_none(), "{head}");
+        }
+    }
+
+    #[test]
+    fn component_globs_do_not_cross_separators_and_report_bad_patterns() {
+        let matcher = compile_glob("*").expect("compile");
+        assert!(matcher.is_match("a.log"));
+        assert!(!matcher.is_match("nested/a.log"), "`*` 不跨目录");
+
+        let err = compile_glob("[").expect_err("invalid glob");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains('['), "{err}");
+    }
+
+    #[tokio::test]
+    async fn opening_a_missing_directory_is_not_an_error() {
+        let dir = temp_dir("open-dir");
+        assert!(open_dir(&dir.join("missing")).await.expect("io").is_none());
+        assert!(open_dir(&dir).await.expect("io").is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_file_in_an_intermediate_component_is_not_descended_into() {
+        let dir = temp_dir("intermediate-file");
+        // 同名层里既有文件也有目录：文件不该被当成目录下探。
+        fs::write(dir.join("aaa"), "x\n").unwrap();
+        fs::create_dir_all(dir.join("bbb")).unwrap();
+        fs::write(dir.join("bbb").join("b-json.log"), "x\n").unwrap();
+
+        let paths = resolve_selected(&dir.join("*").join("*-json.log"), &[], &no_filters(), 512)
+            .await
+            .unwrap();
+        assert_eq!(names(&paths), vec!["b-json.log"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn broken_symlinks_are_skipped_not_fatal() {
+        let dir = temp_dir("broken-link");
+        fs::write(dir.join("real.log"), "x\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("missing.log"), dir.join("dangling.log")).unwrap();
+
+        let paths = resolve_selected(&dir, &[], &no_filters(), 512)
+            .await
+            .unwrap();
+        assert_eq!(names(&paths), vec!["real.log"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_path_cap_is_global_across_wildcard_levels() {
+        let dir = temp_dir("cap-two-levels");
+        for id in ["aaa", "bbb", "ccc"] {
+            let sub = dir.join(id);
+            fs::create_dir_all(&sub).unwrap();
+            fs::write(sub.join(format!("{id}-json.log")), "x\n").unwrap();
+        }
+
+        let paths = resolve_selected(&dir.join("*").join("*-json.log"), &[], &no_filters(), 2)
+            .await
+            .unwrap();
+        assert_eq!(paths.len(), 2, "上限是整个 pattern 的，不是每层各算一份");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn exclude_drops_are_deselected_but_not_counted_as_filtered() {
+        let dir = temp_dir("exclude-stats");
+        for name in ["keep-1_prod_nginx-a.log", "skip-1_prod_nginx-b.log"] {
+            fs::write(dir.join(name), "x\n").unwrap();
+        }
+        let excludes = vec![format!("{}/*skip-1*", dir.display())];
+
+        let selection = resolve_family_paths(&dir, &excludes, &filters(&["prod"], &[]), 512)
+            .await
+            .expect("selection");
+        assert_eq!(names(&selection.selected), vec!["keep-1_prod_nginx-a.log"]);
+        assert_eq!(
+            selection.filtered, 0,
+            "排除项只进 deselected，不计入结构化过滤器"
+        );
+        assert_eq!(selection.identity_unknown, 0);
+        assert_eq!(
+            selection.deselected.len(),
+            1,
+            "被剔的现存路径要能被“立刻停读”看见"
+        );
+        assert!(
+            selection
+                .deselected
+                .iter()
+                .any(|path| path.contains("skip-1"))
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }
