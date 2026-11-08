@@ -80,7 +80,10 @@ jobs:
             for bin in ${BINS}; do
               desc="$(file -b "${BIN_DIR}/${bin}")"
               case "${desc}" in
-                *"statically linked"*) echo "静态链接 ${bin} ✓（${desc}）" ;;
+                # 两种都算静态：普通静态，**以及静态 PIE**。Rust 在 x86_64-musl 上默认开 PIE，
+                # file 吐的是 `static-pie linked`；aarch64-musl 上则是 `statically linked`。
+                # 判据是「没有绑动态库」，不是「没有 PIE」—— PIE 不影响制品可移植性。
+                *"statically linked"*|*"static-pie linked"*) echo "静态链接 ${bin} ✓（${desc}）" ;;
                 *) echo "拒绝发布：${bin} 不是静态链接 —— ${desc}" >&2; exit 1 ;;
               esac
             done
