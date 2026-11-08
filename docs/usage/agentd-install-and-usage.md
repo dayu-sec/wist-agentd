@@ -108,9 +108,10 @@ WIST_AGENTD_RUN_ONCE=1 ./target/release/wist-agentd --config-dir ./dev-conf     
 2. 运维在目标主机执行网关给出的安装指令（由网关签名的 `install.sh` 引导，脚本内嵌网关信任锚）：
 
    ```bash
-   # 运行 install.sh 的实际形态（macOS 用 curl 的证书指纹固定；Linux 用 Ed25519 脚本签名验证）
-   curl -fsSLk --pinnedpubkey "sha256//<gateway-spki-pin>" \
-     "https://<gateway>/api/v1/agent/install/<arch>/install.sh" -o s && sh s
+   # 运行 install.sh 的实际形态（三个平台同形）：先取脚本，按命令内嵌的 sha256 校验通过才执行
+   curl -fsSLk "https://<gateway>/api/v1/agent/install/<arch>/install.sh" -o s
+   # 与页面命令里内嵌的摘要核对一致后再执行
+   sh s
    ```
 
 3. 安装脚本负责：下载安装包并校验摘要 → 放二进制（tarball 形态连 `wist-exec`、`wist-upgrader` 一起，
@@ -128,7 +129,7 @@ WIST_AGENTD_RUN_ONCE=1 ./target/release/wist-agentd --config-dir ./dev-conf     
 | 系统级常驻 + 自启 + 崩溃拉起 | `service install`（systemd / launchd） | ✅ 已实现 |
 | 配置 / 数据（含采集输出）/ 日志分离 | `[paths]` 与采集输出的默认推导 | ✅ 已实现 |
 | 幂等注册、重复执行安全 | 已注册时直接返回 `already enrolled` | ✅ 已实现 |
-| 安装脚本 / 网关下发 | 网关 `wist-gateway/src/api/install.sh`（签名 + 摘要校验 + `service install`） | ✅ 已实现 |
+| 安装脚本 / 网关下发 | 网关 `wist-gateway/src/api/install.sh`（摘要校验 + `service install`） | ✅ 已实现 |
 | 发布制品打包 | `dev/package-agentd.sh`（三件齐 + 打完演练）；本地升级测试用 `dev/package-local-upgrade.sh`（临时提版 + 表单三值） | ✅ 已实现 |
 | 升级通道（网关下发） | 一次性工作 `action=upgrade` → `wist-upgrader` 取包/校验/换件/重启/回滚 | ✅ 已实现 |
 | 系统包 / 批量编排 | deb/rpm/brew、`--no-activate` + CM | ❌ TODO |

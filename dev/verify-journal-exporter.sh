@@ -160,7 +160,7 @@ fi
 err=$(journalctl -k -o json --no-pager --quiet --after-cursor=garbage 2>&1 >/dev/null)
 rc=$?
 if [ "$rc" -ne 0 ]; then
-  pass "畸形游标退出码非 0（$rc）"
+  pass "畸形游标退出码非 0（${rc}）"
 else
   bad "畸形游标居然退出码 0 —— agentd 会把空输出当成「正常没数据」"
 fi
@@ -182,7 +182,7 @@ stale_lines=$(printf '%s' "$stale_out" | wc -l | tr -d ' ')
 if [ "$stale_rc" -eq 0 ]; then
   info "已不存在的游标：退出码 0，返回 $stale_lines 行（静默重读 → 靠超时自愈，靠不了 --since）"
 else
-  info "已不存在的游标：退出码 $stale_rc（旧版本行为，is_cursor_error 会接住）"
+  info "已不存在的游标：退出码 ${stale_rc}（旧版本行为，is_cursor_error 会接住）"
 fi
 
 # 4c. --since 与 --after-cursor 不能同时给（agentd 用「替换」而不是「追加」的原因）

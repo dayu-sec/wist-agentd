@@ -60,7 +60,7 @@ assert_jq() {
 assert_no() {
   local name=$1 text=$2 needle=$3
   case "$text" in
-  *"$needle"*) bad "$name（出现了 \`$needle\`）" ;;
+  *"$needle"*) bad "${name}（出现了 \`$needle\`）" ;;
   *) pass "$name" ;;
   esac
 }
@@ -70,7 +70,7 @@ assert_has() {
   local name=$1 text=$2 needle=$3
   case "$text" in
   *"$needle"*) pass "$name" ;;
-  *) bad "$name（缺少 \`$needle\`）" ;;
+  *) bad "${name}（缺少 \`$needle\`）" ;;
   esac
 }
 

@@ -142,11 +142,14 @@ curl -sk -H "Authorization: Bearer <token>" https://<网关>/api/v1/admin/agents
 agent 的信任锚（`agentd.toml` 的 `control_plane.trust_bundle`）是**安装那一刻**拿的，网关换证书或换证书
 形态后即失效：网关日志刷 `failed TLS handshake … CertificateUnknown`，agent 侧即 §2.3 的报错。
 
-**重跑安装**（重写 `agentd.toml`、带上新锚；直接粘管理面给的安装命令，含证书指纹）：
+**重跑安装**（重写 `agentd.toml`、带上新锚）：直接粘管理面给的安装命令就行 —— 它钉的是**脚本摘要**，
+与证书无关（旧版那套 `--pinnedpubkey` 钉证书指纹，换证书后反而会挡路）：
 
 ```bash
-curl -fsSLk --pinnedpubkey "sha256//<网关证书指纹>" \
-  "https://<网关>/api/v1/agent/install/<arch>/install.sh" -o s && sh s
+# 管理面那条命令的形态；摘要必须用页面给出的值，别自己拼
+curl -fsSLk "https://<网关>/api/v1/agent/install/<arch>/install.sh" -o s
+shasum -a 256 s     # 与页面命令里的摘要核对一致
+sh s
 ```
 
 ⚠️ `dev/re-enroll.sh` 只重写 `enrollment_token`，**不刷新 `trust_bundle`**，换证书后跑它无效。
