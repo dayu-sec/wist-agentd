@@ -3,7 +3,7 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布]
+## [0.30.1-alpha] - 2026-11-09
 
 ### 修复（上送不再产生截断帧：固定 `len` 分帧）
 
@@ -15,6 +15,11 @@
 - 半帧不再可能被当成记录：`len` 帧凑不齐长度时，接收端可以明确丢弃。
 - 删除「按多行读法升 `len`」的运行时判定：所有帧都已固定 `len`，sink 仍按目标/类型
   跨 tick 复用。
+
+### 升级提示
+
+- 本机 `agentd.toml` 无需修改；旧配置里的 `line` 会自动按 `len` 工作。
+- 数据面 `tcp_src` 保持 `framing = "auto"`（现场默认）；若显式写死 `"line"`，需改成 `"auto"`。
 
 ## [0.30.0-alpha] - 2026-11-08
 
