@@ -53,11 +53,6 @@ impl MultilineMode {
             _ => None,
         }
     }
-
-    /// 这种读法会不会折叠出**含换行**的正文（决定 TCP 分帧要不要升 `len`）。
-    pub fn folds_records(self) -> bool {
-        !matches!(self, Self::None)
-    }
 }
 
 /// 界定器配置：起点状态 + 边界信号。
@@ -146,10 +141,12 @@ mod tests {
     }
 
     #[test]
-    fn every_declared_mode_parses_and_round_trips_through_the_name() {
+    fn every_declared_mode_parses() {
         for name in wist_contracts::work::MULTILINE_MODES {
-            let mode = MultilineMode::parse(name).expect("vocabulary and parser must agree");
-            assert_eq!(mode.folds_records(), *name != "none", "{name}");
+            assert!(
+                MultilineMode::parse(name).is_some(),
+                "vocabulary and parser must agree: {name}"
+            );
         }
         assert!(MultilineMode::parse("guessed").is_none());
     }

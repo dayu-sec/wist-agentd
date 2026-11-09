@@ -522,7 +522,8 @@ fn default_logs_output_tcp_port() -> u16 {
 }
 
 fn default_logs_output_tcp_framing() -> String {
-    "line".to_string()
+    // `len` 是唯一安全的上送分帧：`line` 无法区分「完整记录」与「连接在帧中途断掉留下的残行」。
+    "len".to_string()
 }
 
 fn default_multiline_mode() -> String {
