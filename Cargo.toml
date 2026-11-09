@@ -22,7 +22,7 @@ wist-artifact = { version = "0.1" }
 # agent 本地身份材料（mTLS 客户端证书）：密钥对**本地生成、不出本机**，只把 CSR 交上去。
 rcgen = "0.13"
 # 从本地证书读 `notAfter` 做**本地**过期自检（服务端在握手期就拒过期证书，给不出错误码）。
-x509-parser = "0.16"
+x509-parser = "0.18"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 # diagnose 的证书主机名自检：reqwest 拿不到对端证书，所以单独开一次只读 TLS 握手把叶证书读出来。
 # 与网关共用同一套 rustls；不参与真实请求，真实信任判定仍由 `network.control_plane` 负责。
