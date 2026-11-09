@@ -31,28 +31,17 @@ fn bind_tcp_listener(addr: &str) -> Option<TcpListener> {
     }
 }
 
-/// 从长度前缀帧（`{len} {json} LOGRAW: <raw>`）中提取原始日志正文，供 TCP 输出断言使用。
+/// 从 `{json} LOGRAW: <raw>` 帧中提取原始日志正文，供 TCP 输出断言使用。
 /// 指标帧（` METRICS: `）与日志帧（` LOGRAW: `）共用同一连接、指标优先，这里只取日志正文。
 fn raw_body_sections(payload: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut rest = payload;
-    while let Some(space) = rest.find(' ') {
-        let Ok(len) = rest[..space].parse::<usize>() else {
-            break;
-        };
-        let start = space + 1;
-        let end = start + len;
-        if rest.len() < end {
-            break;
-        }
-        if let Some((_, raw)) = rest[start..end].rsplit_once(" LOGRAW: ") {
-            // `len` 帧把正文原样带上线；文件行自带的结尾换行也在里面。
-            // 断言比的是「逻辑行」，去掉行终止符与旧 `line` 分帧的交付口径一致。
-            out.push(raw.trim_end_matches(['\r', '\n']).to_string());
-        }
-        rest = &rest[end..];
-    }
-    out
+    payload
+        .lines()
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            line.rsplit_once(" LOGRAW: ")
+                .map(|(_, raw)| raw.to_string())
+        })
+        .collect()
 }
 
 /// 在本机配置 + 一份工作授权下跑一轮（`run_once` 本身不拉授权，得直接给）。

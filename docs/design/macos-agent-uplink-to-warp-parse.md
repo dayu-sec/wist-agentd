@@ -22,7 +22,7 @@
 
 ## 2. 结论
 
-- `wist-agentd` 到 `warp-parse` 采用 **统一结构化 record（NDJSON）→ TCP(len framing)** 上送；
+- `wist-agentd` 到 `warp-parse` 采用 **统一结构化 record（NDJSON）→ TCP(line framing)** 上送；
 - 文件型 P0 子集**现有能力即可闭环**（几乎零代码，属配置 + WPL）；
 - 统一日志 / OpenBSM / TCC 属于**采集器能力缺口**，需要 agentd 新增 source 与 root helper；
 - 数据面只承担接入/解析/路由；控制面（注册、租约、任务、升级）仍走控制中心；
@@ -38,7 +38,7 @@
   `input_id / path / startup_position(head|tail) / multiline_mode`；
   带本地缓冲（`state/spool/logs`）与 checkpoint（见 log-file-input-spec）；
 - `[telemetry.logs.output] kind = "file" | "tcp"`；
-  - `tcp`：`addr / port / framing="len"`（长度前缀帧，上送固定使用）；
+  - `tcp`：`addr / port / framing="line"`（行帧 NDJSON 发送已现成）；
   - `file`：未显式声明 `path` 时按“数据”落点改写为 `<数据根>/data/wist-records.ndjson`
     （系统级 `/var/lib/wist-agentd/data/wist-records.ndjson`），本地落盘/回放。
 
@@ -75,7 +75,7 @@
  │                 ▼                                      │
  │      spool 本地缓冲（state/spool/logs，断连排队）        │
  │                 ▼                                      │
- │      output.kind=tcp / framing=len / addr=<data-plane> │
+ │      output.kind=tcp / framing=line / addr=<data-plane>│
  └──────────────────────────┬────────────────────────────┘
                             │ TCP 9000
  ┌──────────────────────────▼────────────────────────────┐
@@ -89,7 +89,7 @@
 - agent 只做：采集、结构化、缓冲、上送。
 - 无论来源类型，统一先转结构化 record，便于数据面一套入口 + 按规则逐类路由。
 
-### 4.1 上送帧格式（帧标记 + 正文；固定 `len` 分帧）
+### 4.1 上送帧格式（帧标记 + 正文；分帧按正文是否可能含换行定）
 
 **JSON 信封 + 行尾 ` LOGRAW: ` 原文**，`raw` 不作为 JSON 字段、不做 JSON 转义：
 
@@ -110,9 +110,16 @@
 
 - JSON 信封只承载通用字段（`schema/agent/ts/seq`），**不含 raw**；
 - `LOGRAW:` 是行尾固定前缀，之后到行尾为原始内容；原始内容**保持原样，不转义**，避免体积膨胀并便于审计核对；
-- 因此**上送固定使用 `len` 分帧**（`{字节长度} {帧内容}`）：连接在帧中途断掉时，半帧凑不齐长度，接收端可以明确丢弃，不会把残行当记录（issue #34、#43）。`line` 仍被协议与配置解析接受（旧配置能启动），但 agentd 不会再把它用于 TCP 上送，首次遇到时打一条 `event=UplinkFramingForced`。
-- **一条连接的最后一条数据必须是完整帧**。即使已经固定 `len`，agentd 仍在写停住时把未写完的字节交给后台收尾再关连接，避免慢但仍在推进的连接被误杀（`telemetry/warp_parse.rs` 的 `write_payload_bytes` / `finish_in_background`）。
-  例外：链路真断（写报错）或进程被 SIGTERM/kill 打断时本端已无法收尾；`len` 分帧下接收端只会丢掉这段不完整的尾巴，不会产出半条记录。
+- 因此 `line` 分帧只适用于**单行**记录。正文可能含换行时（如按缩进归并出的多行记录、`.ips`/panic 文本）必须用 `len` 分帧（`{字节长度} {帧内容}`）—— 否则接收端会按 `\n` 把续行当独立行，那些行没有信封、匹配不上任何规则，**静默掉进 miss**（已实测复现）。协议依据见 `telemetry-uplink-protocol.md` §3。
+- **不靠人去配对配置**：agentd 在本轮有输入声明的读法是 `indented` 时，自动把上送升到 `len` 并打 `event=UplinkFramingEscalated`（配置写 `len` 时不重复报）。
+- **一条连接的最后一条数据必须是完整帧**。接收端（wparse `line` / `auto`）在 EOF 上会把
+  「最后一条没有换行的残行」当成一条完整记录交付，所以写到一半就断连会在数据面留下一条
+  **截断帧**（miss 里的半条 JSON，现象见 issue #34）。agentd 侧的口径：写超时按「**无进展**
+  5s」判（不是整次写 5s），另有 15s 的单次写总上限防「对端滴数据拖住主循环」；停住时把
+  未写完的字节交给后台收尾再关连接，**绝不丢下半帧**（`telemetry/warp_parse.rs` 的
+  `write_payload_bytes` / `finish_in_background`）。
+  例外：链路真断（写报错）或进程被 SIGTERM/kill 打断时本端已无法收尾，数据面仍可能看到一次
+  残行；数据本身由 spool 兜住，重放会补上（下游按 `(agent, seq)` 去重）。
 - 数据面处理：先 `json(...)` 解析信封字段路由；`LOGRAW:` 原文按需由规则抓取，miss/rescue 保留原文供回放核对。
 
 ---
@@ -165,7 +172,7 @@
 ### Phase 1 —— 最小闭环（低代码，先跑通链路）
 
 1. agentd 配置：`file_inputs` 指向 `install.log`、`launchd.log`、`shutdown_monitor.log`、`fsck_apfs.log`；
-2. `output.kind="tcp"`，`addr=<data-plane>`、`port=9000`、`framing="len"`；
+2. `output.kind="tcp"`，`addr=<data-plane>`、`port=9000`、`framing="line"`；
 3. data-plane 已收口（9000 实测可收，miss 落盘）；
 4. 上述类写 `parse.wpl`（对照真机 sample）并 `wpl-check sample` 回放验证；
 5. 验收：一次安装 / 一次 launchd 事件 → 本地 ndjson → TCP → wparse → 规则命中落业务/security sink。
