@@ -410,11 +410,12 @@ impl TcpRecordSink {
 
     /// 写一段已分帧的字节到连接；失败时重置连接并进入指数退避，以便下次重连。
     ///
-    /// 关键不变量：**这条连接上最后一条数据必须是完整帧**。写停住时不能直接关连接，
-    /// 否则线上剩下的半帧会在接收端 EOF 时被当成一条记录（见 [`finish_in_background`]）。
+    /// 关键不变量：**这条连接上不留半个帧**。上送固定 `len`，接收端在 EOF 上会丢弃凑不齐
+    /// 长度的尾巴（不会当记录交付），但这一帧也就丢了；所以写停住且已出去一部分时，仍然把
+    /// 剩余字节写完再关（见 [`finish_in_background`]）。
     ///
     /// 例外只有一种：链路真的断了（`PayloadWrite::Failed`）或进程被直接杀掉 —— 那时本端
-    /// 已经无法再写，残尾只能由接收端看到；数据本身由 spool 兜住。
+    /// 已经无法再写，残尾只能由接收端丢弃；数据本身由 spool 兜住。
     async fn write_payload(&mut self, payload: &[u8]) -> io::Result<()> {
         self.ensure_connected().await?;
         let mut stream = self.stream.take().expect("connected");
@@ -534,8 +535,9 @@ enum PayloadWrite {
     Stalled { written: usize },
     /// 连接出错；出错前可能已有部分字节在线上，而错误后的连接已不可再写。
     ///
-    /// 这种残尾**没法在本端收尾**（socket 已经坏了），接收端仍可能在 EOF 上把它当一条记录。
-    /// 数据本身由 spool 兜住，这里只是如实区分「我们主动不等了」与「链路断了」。
+    /// 这种残尾**没法在本端收尾**（socket 已经坏了）；`len` 分帧下接收端会把它丢掉，
+    /// 不会变成半条记录。数据本身由 spool 兜住，这里只是如实区分「我们主动不等了」与
+    /// 「链路断了」。
     Failed(io::Error),
 }
 

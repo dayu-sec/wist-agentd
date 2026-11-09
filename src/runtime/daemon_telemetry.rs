@@ -1055,6 +1055,15 @@ mod tests {
         assert!(!uplink_framing_forced(&output("file", "line")));
     }
 
+    #[test]
+    fn a_standby_output_never_announces_framing_force() {
+        // `enabled = false` 是「完全静默」：没有日志/指标帧要发，也就没有分帧被强制这回事。
+        // 待命机器每 3s 打一条「你的 line 被改成 len 了」只会让人以为配置没生效。
+        let mut standby = output("tcp", "line");
+        standby.enabled = false;
+        assert!(!uplink_framing_forced(&standby));
+    }
+
     // ------------------------------------------------------------------
     // 跨 tick 复用（P0）：连接与退避状态必须活过一拍
     // ------------------------------------------------------------------
