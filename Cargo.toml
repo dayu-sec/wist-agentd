@@ -47,7 +47,7 @@ wist-shared = { version = "0.2" }
 log = "0.4"
 wist-log = { version = "0.1" }
 #wist-log = { version = "0.1", path = "../wist-log" }
-wist-validate = { version = "0.6" }
+wist-validate = { version = "0.8" }
 #wist-validate = { version = "0.5", path = "../wist-validate" }
 
 [lib]
