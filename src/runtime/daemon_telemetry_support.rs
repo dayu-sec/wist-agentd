@@ -37,7 +37,7 @@ pub(super) const SPOOL_REPLAY_BATCH_SIZE: usize = 128;
 ///   4. 下发 `enabled = true` 但没给目标 → 沿用本机 `kind`（本机 `enabled = false` 则仍静默）。
 ///
 /// 注意 `kind` 与 `enabled` 正交：grant 只改「写到哪」（`kind`/目标），不改「怎么分帧」
-/// （`tcp.framing` 仍是本机的事实，由下游 `build_telemetry_sink` 按本轮输入决定要不要升 `len`）。
+/// （TCP 上送固定 `len`，见 `telemetry/warp_parse.rs`；配置里的 `line` 会被升级并提示一次）。
 pub fn effective_output(
     config: &AgentConfig,
     grant: Option<&AgentUplinkGrant>,

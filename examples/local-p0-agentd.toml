@@ -16,7 +16,7 @@ kind = "tcp"
 [telemetry.logs.output.tcp]
 addr = "127.0.0.1"
 port = 9000
-framing = "line"
+framing = "len"
 
 [paths]
 root_dir = "."

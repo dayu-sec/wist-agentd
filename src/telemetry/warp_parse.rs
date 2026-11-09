@@ -95,25 +95,24 @@ pub(crate) enum SinkIdentity {
 impl SinkIdentity {
     /// 唯一构造点：`SinkIdentity` 与跨 tick 复用键都走这里，避免两处判定漂移。
     ///
-    /// `framing` 给了就**覆盖**配置里的值：调用方已经算出「实际必须用哪种分帧」。
-    /// 为什么要能覆盖：分帧合不合法取决于**记录是否可能含多行**（协议 §3：`line` 只适用于
-    /// 单行记录），而那取决于本轮采什么（授权工作），不是静态配置能表达全的。
-    pub(crate) fn resolve(
-        output: &LogsOutputSection,
-        framing: Option<TcpFraming>,
-    ) -> io::Result<Self> {
+    /// TCP 上送的分帧**不看配置**：固定 `len`。`line` 的帧边界是 `\n`，连接在帧中途断掉时
+    /// （对端 RST、进程被杀、tick future 被取消）线上留下的是一条没有换行的前缀；接收端只要
+    /// 在 EOF 上把残行当记录交付，数据面就会收到半条 JSON（issue #34、#43）。`len` 自带长度
+    /// 前缀，半帧永远凑不齐。配置里的 `line` 仍然接受（升级不破坏旧配置），但会提示一次。
+    pub(crate) fn resolve(output: &LogsOutputSection) -> io::Result<Self> {
         match output.kind.as_str() {
             "file" => Ok(Self::File {
                 path: output.file.path.clone(),
             }),
-            "tcp" => Ok(Self::Tcp {
-                addr: output.tcp.addr.clone(),
-                port: output.tcp.port,
-                framing: match framing {
-                    Some(framing) => framing,
-                    None => TcpFraming::parse(&output.tcp.framing)?,
-                },
-            }),
+            "tcp" => {
+                // 仍然解析一次：非法值要在建 sink 时就是一个显式错误（配置校验之外的第二道）。
+                TcpFraming::parse(&output.tcp.framing)?;
+                Ok(Self::Tcp {
+                    addr: output.tcp.addr.clone(),
+                    port: output.tcp.port,
+                    framing: TcpFraming::Len,
+                })
+            }
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("unsupported telemetry output kind: {other}"),
@@ -260,7 +259,12 @@ impl FileRecordSink {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TcpFraming {
+    /// `{帧}\n`。**只用于测试与协议兼容**：上送链路不再使用它。
+    ///
+    /// 帧边界是 `\n`，而 TCP 是字节流：连接在帧中途断掉时，线上留下的是一条没有
+    /// 换行的前缀，接收端无法把它和「一条完整记录」区分开（见 `SinkIdentity::resolve`）。
     Line,
+    /// `{字节长度} {帧}`。上送固定使用这一种：半帧凑不齐长度，接收端天然可以丢弃。
     Len,
 }
 
@@ -1043,6 +1047,94 @@ mod tests {
         assert_eq!(build_payload_bytes(b"hello", TcpFraming::Len), b"5 hello");
     }
 
+    #[test]
+    fn a_line_configured_tcp_uplink_still_uses_length_framing() {
+        // 配置里的 `line` 只用于兼容旧配置；上送链路一律 `len`。
+        let output = LogsOutputSection {
+            kind: "tcp".to_string(),
+            tcp: crate::config::agent_config::LogsTcpOutputSection {
+                framing: "line".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let identity = SinkIdentity::resolve(&output).expect("line sink");
+        match identity {
+            SinkIdentity::Tcp { framing, .. } => assert_eq!(framing, TcpFraming::Len),
+            other => panic!("tcp output must build a tcp identity, got {other:?}"),
+        }
+    }
+
+    /// 与数据面相同的 `{len} {payload}` 拆帧器：只返回**凑齐了长度**的帧。
+    fn extract_len_frames(payload: &[u8]) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        let mut rest = payload;
+        while let Some(space) = rest.iter().position(|byte| *byte == b' ') {
+            let Ok(len) = std::str::from_utf8(&rest[..space])
+                .expect("ascii length")
+                .parse::<usize>()
+            else {
+                break;
+            };
+            let start = space + 1;
+            let end = start + len;
+            if rest.len() < end {
+                break;
+            }
+            frames.push(rest[start..end].to_vec());
+            rest = &rest[end..];
+        }
+        frames
+    }
+
+    #[test]
+    fn a_torn_length_framed_payload_never_exposes_a_partial_frame() {
+        // issue #43：连接在帧中途断掉时，line 分帧会把残行交给解析器。
+        // len 分帧下同一个断点只是一段「凑不齐长度」的尾巴，拆帧器不会产出任何半帧。
+        let frames = vec![
+            super::build_record_frame(&record("first")).expect("frame"),
+            super::build_record_frame(&record("second")).expect("frame"),
+        ];
+        let mut payload = Vec::new();
+        for frame in &frames {
+            payload.extend_from_slice(&build_payload_bytes(frame, TcpFraming::Len));
+        }
+
+        for cut in 0..=payload.len() {
+            let visible = extract_len_frames(&payload[..cut]);
+            assert!(visible.len() <= frames.len());
+            for (index, frame) in visible.iter().enumerate() {
+                assert_eq!(
+                    frame, &frames[index],
+                    "only complete frames may surface (cut={cut}, frame={index})"
+                );
+            }
+            if cut < payload.len() {
+                assert!(
+                    visible.len() < frames.len(),
+                    "a torn payload must not look complete (cut={cut})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_same_torn_payload_under_line_framing_exposes_a_broken_record() {
+        // 反证：line 分帧没有长度可校验，同一个断点留下的正是 issue 里那种
+        // 「以 `{"schema"` 开头、JSON 未闭合」的残行。
+        let frame = super::build_record_frame(&record("line")).expect("frame");
+        let payload = build_payload_bytes(&frame, TcpFraming::Line);
+        let torn = &payload[..payload.len() / 2];
+
+        assert!(torn.starts_with(b"{\"schema\""));
+        assert!(!torn.ends_with(b"\n"));
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(torn).is_err(),
+            "the tail really is unparseable, not just visually cut"
+        );
+    }
+
     /// 连上之后必须开 kernel keepalive。
     ///
     /// 这条钉子跟的是“连接跨 tick 存活”带来的新风险：一条活了小时的连接被中间设备静默
@@ -1074,12 +1166,12 @@ mod tests {
         server.await.expect("server task");
     }
 
-    /// 分帧是 sink **身份**的一部分。
+    /// 分帧现在恒定是 `len`：`line`/`len` 配置不再造成重建；换目标仍必须重建。
     ///
-    /// 跨 tick 复用按身份判重建：若分帧不进身份，“本轮有输入要求升 `len`”就不会触发重建，
-    /// 旧连接会接着按 `line` 分帧——含换行的正文被切成多行，续行掉进 miss（协议 §3）。
+    /// 报告与调查帧共用同一个 sink 槽位，重建就意味着丢连接；分帧已经不会变，
+    /// 所以只有目标变化（或 kind 变化）才应该触发。
     #[test]
-    fn sink_identity_folds_framing_into_the_reuse_key() {
+    fn sink_identity_reuses_across_line_and_len_configs() {
         let output = LogsOutputSection {
             kind: "tcp".to_string(),
             tcp: crate::config::agent_config::LogsTcpOutputSection {
@@ -1089,16 +1181,33 @@ mod tests {
             },
             ..Default::default()
         };
-        let from_config = SinkIdentity::resolve(&output, None).expect("line sink");
+        let line = SinkIdentity::resolve(&output).expect("line sink");
         assert_eq!(
-            from_config,
-            SinkIdentity::resolve(&output, None).expect("same config, same identity"),
+            line,
+            SinkIdentity::resolve(&output).expect("same config, same identity"),
             "配置没变，身份必须逐字相同（否则每拍都会重建）"
         );
+        match &line {
+            SinkIdentity::Tcp { framing, .. } => {
+                assert_eq!(*framing, TcpFraming::Len, "上送固定 len");
+            }
+            other => panic!("expected a tcp identity, got {other:?}"),
+        }
+
+        let mut len_config = output.clone();
+        len_config.tcp.framing = "len".to_string();
+        assert_eq!(
+            line,
+            SinkIdentity::resolve(&len_config).expect("len sink"),
+            "分帧不再随配置变：line/len 应复用同一身份"
+        );
+
+        let mut moved = output.clone();
+        moved.tcp.port = 9001;
         assert_ne!(
-            from_config,
-            SinkIdentity::resolve(&output, Some(TcpFraming::Len)).expect("len sink"),
-            "分帧升级必须让身份变——否则不会重建，旧连接会接着按 line 切帧"
+            line,
+            SinkIdentity::resolve(&moved).expect("moved sink"),
+            "换目标必须重建（旧连接指向旧目标）"
         );
     }
 

@@ -17,7 +17,7 @@ use crate::telemetry::logs::files::{
 };
 use crate::telemetry::logs::gate::Withheld;
 use crate::telemetry::warp_parse::{
-    RecordSink, SinkIdentity, TcpFraming, TelemetryRecordSink, uplink_write_detail,
+    RecordSink, SinkIdentity, TelemetryRecordSink, uplink_write_detail,
 };
 
 #[path = "daemon_telemetry_support.rs"]
@@ -182,46 +182,42 @@ impl UplinkHealth {
     }
 }
 
-/// 分帧**必须**升到 `len` 时返回是谁要求的（`input_id`）；`None` = 照配置即可。
+/// 配置里的 `line` 是否会被上送固定升级成 `len`（`kind = "tcp"` 时永远如此）。
 ///
-/// 抽成纯函数是为了能直接测这个判定：它错了会让日志静默丢进 miss（续行没有信封、
-/// 匹配不上任何规则），而端到端测试很难稳定复现“恰好掉在 miss 里”。
-///
-/// 只看 `tcp` + `line`：file sink 逐条 JSON 编码，换行天然安全；`len` 对单行同样合法。
-/// 注意这里看的是**生效输出**（grant 合流后），不是原始本机配置 —— grant 可能把本机
-/// `file` 覆盖成 tcp，此时分帧升级的判定必须跟着走。
-pub(super) fn len_framing_required<'a>(
-    output: &LogsOutputSection,
-    mut inputs: impl Iterator<Item = &'a LogFileInputSection>,
-) -> Option<&'a str> {
-    if output.kind != "tcp" || output.tcp.framing == "len" {
-        return None;
-    }
-    inputs
-        .find(|input| {
-            // 读法词表与折叠器同源：新增长读法（`mysql_slow` / `postgres_csv`）自动升级分帧。
-            crate::telemetry::logs::multiline::MultilineMode::parse(&input.multiline_mode)
-                .is_some_and(|mode| mode.folds_records())
-        })
-        .map(|input| input.input_id.as_str())
+/// 抽成纯函数是为了能直接测这个判定：它决定日志/指标/事实是不是走安全分帧。
+pub(super) fn uplink_framing_forced(output: &LogsOutputSection) -> bool {
+    output.kind == "tcp" && output.tcp.framing != "len"
 }
 
 /// 构建共享的遥测上送 sink（日志与指标共用同一连接）。
 ///
-/// 分帧**不照抄配置**：`line` 只适用于不含换行的记录（协议 §3）。一旦有输入声明的读法
-/// 是 `indented`，折叠出来的正文就可能含换行 —— 此时若还用 `line`，接收端会把续行当成
-/// 独立行；那些行没有信封、匹配不上任何规则，**静默掉进 miss**（实测复现过）。
+/// 分帧**不看配置**：`line` 的帧边界是 `\n`，连接在帧中途断掉时（对端 RST、进程被杀、
+/// tick future 被取消），线上留下的是一条没有换行的前缀；接收端只要在 EOF 上把残行
+/// 当记录交付，数据面就会收到半条 JSON（issue #34、#43）。所以 TCP 上送固定 `len`
+/// （见 [`SinkIdentity::resolve`]）；配置写 `line` 仍然能启动，但这里提示一次，
+/// 避免「配了 line、实际跑 len」成为隐式行为。
 ///
-/// 所以这里不靠人去配对配置，而是按本轮真要采什么定：有这种输入就升到 `len` 并说清是谁要求的。
 /// 分帧取的是**生效输出**（`[telemetry.logs.output]` 与 grant 合流后的结论，见
-/// [`effective_output`]），因此 grant 把本机 `file` 覆盖成 tcp 时也照样升级。
+/// [`effective_output`]），因此 grant 把本机 `file` 覆盖成 tcp 时也照样走 `len`。
 pub(super) fn build_telemetry_sink(
     work: &AppliedWorkGrant,
     output: &LogsOutputSection,
 ) -> io::Result<TelemetryRecordSink> {
-    let (identity, escalated) = resolve_sink_identity(work, output)?;
-    log_framing_escalation(escalated.as_deref());
-    Ok(identity.sink())
+    if uplink_framing_forced(output) {
+        warn_uplink_framing_forced_once(work);
+    }
+    Ok(SinkIdentity::resolve(output)?.sink())
+}
+
+/// 只提示一次：`build_telemetry_sink` / `get_or_build` 每 3s 一拍都会跑，按拍打印会把日志刷满。
+fn warn_uplink_framing_forced_once(work: &AppliedWorkGrant) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        let inputs = work.log_inputs().len();
+        log::warn!(
+            "event=UplinkFramingForced from=line to=len inputs={inputs} reason=\"line 分帧无法区分完整记录与断连残行；上送固定使用 len（协议 §3，issue #43）\""
+        );
+    });
 }
 
 /// 跨 tick 复用的 sink 槽位。
@@ -232,8 +228,9 @@ pub(super) fn build_telemetry_sink(
 ///   * 断网时的指数退避（`1s..30s`）**跨不过 tick** —— 每拍都从 0 重来，
 ///     5 秒连接超时把 3 秒的节奏拉成 8 秒。
 ///
-/// 重建条件只有一个：身份变了（本机配置与 grant 合流后的 `kind` / 目标 / 分帧）。
-/// 目标换了还留着旧连接是错的；同一目标上的退避与连接则应该活到下一轮。
+/// 重建条件只有一个：身份变了（本机配置与 grant 合流后的 `kind` / 目标）。
+/// 分帧现在固定 `len`，不再参与身份变化；目标换了还留着旧连接是错的，
+/// 同一目标上的退避与连接则应该活到下一轮。
 #[derive(Default)]
 pub(super) struct TelemetrySinkSlot {
     identity: Option<SinkIdentity>,
@@ -247,20 +244,11 @@ impl TelemetrySinkSlot {
         work: &AppliedWorkGrant,
         output: &LogsOutputSection,
     ) -> io::Result<&mut TelemetryRecordSink> {
-        let (identity, escalated) = resolve_sink_identity(work, output)?;
+        if uplink_framing_forced(output) {
+            warn_uplink_framing_forced_once(work);
+        }
+        let identity = SinkIdentity::resolve(output)?;
         if self.identity.as_ref() != Some(&identity) {
-            // 只在分帧真的刚升上来的那一拍报一次；单纯换目标（例如网关改下发地址）
-            // 不算“升级”，别把同一句话重复说。
-            let already_len = matches!(
-                self.identity.as_ref(),
-                Some(SinkIdentity::Tcp {
-                    framing: TcpFraming::Len,
-                    ..
-                })
-            );
-            if !already_len {
-                log_framing_escalation(escalated.as_deref());
-            }
             // 上一帧已经写完（写失败会交给后台收尾，见 `finish_in_background`），
             // 所以这里直接丢弃旧实例是干净的。
             self.identity = Some(identity);
@@ -271,26 +259,6 @@ impl TelemetrySinkSlot {
         }
         Ok(self.sink.as_mut().expect("just built"))
     }
-}
-
-/// 算出本轮的 sink 身份，以及「是哪个输入把分帧升到 `len`」（仅用于日志）。
-fn resolve_sink_identity(
-    work: &AppliedWorkGrant,
-    output: &LogsOutputSection,
-) -> io::Result<(SinkIdentity, Option<String>)> {
-    let from_work = work.log_inputs();
-    let required = len_framing_required(output, from_work.iter().map(|entry| &entry.input));
-    let identity = SinkIdentity::resolve(output, required.map(|_| TcpFraming::Len))?;
-    Ok((identity, required.map(str::to_string)))
-}
-
-fn log_framing_escalation(input_id: Option<&str>) {
-    let Some(input_id) = input_id else {
-        return;
-    };
-    log::info!(
-        "event=UplinkFramingEscalated from=line to=len input_id={input_id} reason=\"该输入声明多行读法，折叠出的正文可能含换行（协议 §3：line 只用于单行）\""
-    );
 }
 
 /// 当 sink 无法构建（非法输出配置）时，为每个输入生成一条 `InvalidOutput` 失败。
@@ -860,7 +828,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        CatchupBudget, InputTickReports, TelemetrySinkSlot, UplinkHealth, len_framing_required,
+        CatchupBudget, InputTickReports, TelemetrySinkSlot, UplinkHealth, uplink_framing_forced,
     };
     use crate::config::agent_config::LogsSection;
     use crate::control::work::AppliedWorkGrant;
@@ -1066,9 +1034,7 @@ mod tests {
         assert!(health.note_tick(true, true).is_none());
         assert!(health.note_tick(false, true).is_some());
     }
-    use crate::config::agent_config::{
-        LogFileInputSection, LogsOutputSection, LogsTcpOutputSection,
-    };
+    use crate::config::agent_config::{LogsOutputSection, LogsTcpOutputSection};
 
     fn output(kind: &str, framing: &str) -> LogsOutputSection {
         LogsOutputSection {
@@ -1081,56 +1047,18 @@ mod tests {
         }
     }
 
-    fn input(id: &str, multiline: &str) -> LogFileInputSection {
-        LogFileInputSection {
-            input_id: id.to_string(),
-            path: "/var/log/app.log".to_string(),
-            startup_position: "tail".to_string(),
-            multiline_mode: multiline.to_string(),
-            exclude_globs: Vec::new(),
-            filters: Default::default(),
-            drop_if_contains: Vec::new(),
-        }
-    }
-
-    fn required(output: &LogsOutputSection, inputs: &[LogFileInputSection]) -> Option<String> {
-        len_framing_required(output, inputs.iter()).map(str::to_string)
+    #[test]
+    fn a_line_tcp_uplink_is_forced_to_length_framing() {
+        // `line` 分帧靠 `\n` 切帧；连接在帧中途断掉时，残行会被接收端当记录交付。
+        // 所以哪怕采的全是单行日志，只要走 TCP 上送就必须固定 `len`。
+        assert!(uplink_framing_forced(&output("tcp", "line")));
     }
 
     #[test]
-    fn a_folding_input_forces_length_framing_on_a_line_uplink() {
-        // `line` 分帧靠 `\n` 切帧；折叠出的正文自带换行 → 续行会被当成独立行、掉进 miss。
-        // 所以只要有一个输入要归并，就必须升到 `len`，而且要报出是谁要求的。
-        let output = output("tcp", "line");
-        assert_eq!(
-            required(&output, &[input("a", "none"), input("b", "indented")]),
-            Some("b".to_string())
-        );
-        // 新读法同样归并（CRI 容器日志的多行正文）：不升 `len` 就会把续行打散。
-        assert_eq!(
-            required(&output, &[input("a", "none"), input("b", "container_cri")]),
-            Some("b".to_string())
-        );
-    }
-
-    #[test]
-    fn all_single_line_inputs_leave_the_configured_framing_alone() {
-        let output = output("tcp", "line");
-        assert_eq!(required(&output, &[input("a", "none")]), None);
-    }
-
-    #[test]
-    fn an_explicit_length_uplink_needs_no_escalation() {
-        // 配置已经写了 `len`：对单行同样合法，不必（也不该）再报一次升级。
-        let output = output("tcp", "len");
-        assert_eq!(required(&output, &[input("a", "indented")]), None);
-    }
-
-    #[test]
-    fn a_file_uplink_needs_no_escalation() {
-        // file sink 逐条 JSON 编码，换行天然安全 —— 没有“被切开”这回事。
-        let output = output("file", "line");
-        assert_eq!(required(&output, &[input("a", "indented")]), None);
+    fn explicit_len_and_file_uplinks_need_no_force() {
+        // 配置已经是 `len`：不重复提示。file sink 逐条 JSON 编码，换行天然安全。
+        assert!(!uplink_framing_forced(&output("tcp", "len")));
+        assert!(!uplink_framing_forced(&output("file", "line")));
     }
 
     // ------------------------------------------------------------------
