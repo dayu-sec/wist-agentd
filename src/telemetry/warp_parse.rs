@@ -77,27 +77,26 @@ impl RecordSink for TelemetryRecordSink {
 }
 
 impl TelemetryRecordSink {
-    /// 只按输出类型建 sink。TCP 上送的分帧**不看配置**：固定 `len`。
+    /// `framing` 给了就**覆盖**配置里的值：调用方已经算出「实际必须用哪种分帧」。
     ///
-    /// 为什么固定：`line` 的帧边界是 `\n`，连接在帧中途断掉时（对端 RST、进程被杀、
-    /// tick future 被取消），线上留下的是一条没有换行的前缀；接收端只要在 EOF 上把残行
-    /// 当记录交付，数据面就会收到半条 JSON（issue #34、#43）。`len` 自带长度前缀，半帧
-    /// 永远凑不齐，接收端可以明确丢弃。配置里的 `line` 仍然接受（升级不破坏旧配置），
-    /// 但不会再用于 TCP 上送；`build_telemetry_sink` 会在第一次遇到时提示一次。
-    pub(crate) fn from_logs_output(output: &LogsOutputSection) -> io::Result<Self> {
+    /// 为什么要能覆盖：分帧合不合法取决于**记录是否可能含多行**（协议 §3：`line` 只适用于
+    /// 单行记录），而那取决于本轮采什么（授权工作），不是静态配置能表达全的。
+    pub(crate) fn from_logs_output(
+        output: &LogsOutputSection,
+        framing: Option<TcpFraming>,
+    ) -> io::Result<Self> {
         match output.kind.as_str() {
             "file" => Ok(Self::File(FileRecordSink::new(PathBuf::from(
                 &output.file.path,
             )))),
-            "tcp" => {
-                // 仍然解析一次：非法值要在建 sink 时就是一个显式错误（配置校验之外的第二道）。
-                TcpFraming::parse(&output.tcp.framing)?;
-                Ok(Self::Tcp(TcpRecordSink::new(
-                    output.tcp.addr.clone(),
-                    output.tcp.port,
-                    TcpFraming::Len,
-                )))
-            }
+            "tcp" => Ok(Self::Tcp(TcpRecordSink::new(
+                output.tcp.addr.clone(),
+                output.tcp.port,
+                match framing {
+                    Some(framing) => framing,
+                    None => TcpFraming::parse(&output.tcp.framing)?,
+                },
+            ))),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("unsupported telemetry output kind: {other}"),
@@ -229,12 +228,7 @@ impl FileRecordSink {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TcpFraming {
-    /// `{帧}\n`。**只用于测试与协议兼容**：上送链路不再使用它。
-    ///
-    /// 帧边界是 `\n`，而 TCP 是字节流：连接在帧中途断掉时，线上留下的是一条没有
-    /// 换行的前缀，接收端无法把它和「一条完整记录」区分开（见 `from_logs_output`）。
     Line,
-    /// `{字节长度} {帧}`。上送固定使用这一种：半帧凑不齐长度，接收端天然可以丢弃。
     Len,
 }
 
@@ -656,7 +650,6 @@ mod tests {
         TcpRecordSink, build_payload_bytes,
     };
 
-    use crate::config::agent_config::{LogsOutputSection, LogsTcpOutputSection};
     use crate::telemetry::metrics::samples::{VmMetricLabels, VmMetricLine};
     use wist_contracts::telemetry_record::{DataFrame, TelemetryRecord};
 
@@ -952,94 +945,6 @@ mod tests {
     fn payload_builder_matches_line_and_len_contract() {
         assert_eq!(build_payload_bytes(b"abc", TcpFraming::Line), b"abc\n");
         assert_eq!(build_payload_bytes(b"hello", TcpFraming::Len), b"5 hello");
-    }
-
-    #[test]
-    fn a_line_configured_tcp_uplink_still_uses_length_framing() {
-        // 配置里的 `line` 只用于兼容旧配置；上送链路一律 `len`。
-        let output = LogsOutputSection {
-            kind: "tcp".to_string(),
-            tcp: LogsTcpOutputSection {
-                framing: "line".to_string(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let sink = super::TelemetryRecordSink::from_logs_output(&output).expect("build sink");
-        match sink {
-            super::TelemetryRecordSink::Tcp(sink) => assert_eq!(sink.framing, TcpFraming::Len),
-            super::TelemetryRecordSink::File(_) => panic!("tcp output must build a tcp sink"),
-        }
-    }
-
-    /// 与数据面相同的 `{len} {payload}` 拆帧器：只返回**凑齐了长度**的帧。
-    fn extract_len_frames(payload: &[u8]) -> Vec<Vec<u8>> {
-        let mut frames = Vec::new();
-        let mut rest = payload;
-        while let Some(space) = rest.iter().position(|byte| *byte == b' ') {
-            let Ok(len) = std::str::from_utf8(&rest[..space])
-                .expect("ascii length")
-                .parse::<usize>()
-            else {
-                break;
-            };
-            let start = space + 1;
-            let end = start + len;
-            if rest.len() < end {
-                break;
-            }
-            frames.push(rest[start..end].to_vec());
-            rest = &rest[end..];
-        }
-        frames
-    }
-
-    #[test]
-    fn a_torn_length_framed_payload_never_exposes_a_partial_frame() {
-        // issue #43：连接在帧中途断掉时，line 分帧会把残行交给解析器。
-        // len 分帧下同一个断点只是一段「凑不齐长度」的尾巴，拆帧器不会产出任何半帧。
-        let frames = vec![
-            super::build_record_frame(&record("first")).expect("frame"),
-            super::build_record_frame(&record("second")).expect("frame"),
-        ];
-        let mut payload = Vec::new();
-        for frame in &frames {
-            payload.extend_from_slice(&build_payload_bytes(frame, TcpFraming::Len));
-        }
-
-        for cut in 0..=payload.len() {
-            let visible = extract_len_frames(&payload[..cut]);
-            assert!(visible.len() <= frames.len());
-            for (index, frame) in visible.iter().enumerate() {
-                assert_eq!(
-                    frame, &frames[index],
-                    "only complete frames may surface (cut={cut}, frame={index})"
-                );
-            }
-            if cut < payload.len() {
-                assert!(
-                    visible.len() < frames.len(),
-                    "a torn payload must not look complete (cut={cut})"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn the_same_torn_payload_under_line_framing_exposes_a_broken_record() {
-        // 反证：line 分帧没有长度可校验，同一个断点留下的正是 issue 里那种
-        // 「以 `{"schema"` 开头、JSON 未闭合」的残行。
-        let frame = super::build_record_frame(&record("line")).expect("frame");
-        let payload = build_payload_bytes(&frame, TcpFraming::Line);
-        let torn = &payload[..payload.len() / 2];
-
-        assert!(torn.starts_with(b"{\"schema\""));
-        assert!(!torn.ends_with(b"\n"));
-        assert!(
-            serde_json::from_slice::<serde_json::Value>(torn).is_err(),
-            "the tail really is unparseable, not just visually cut"
-        );
     }
 
     #[test]

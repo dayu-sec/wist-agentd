@@ -5726,12 +5726,11 @@ mod tests {
         assert!(detail.contains("完整报告"), "{detail}");
 
         let frame = server.await.expect("server task");
-        // 上送固定 `len` 分帧：先剥掉 `{字节长度} `，再按帧内容断言。
-        let (len, frame) = frame.split_once(' ').expect("length prefix");
-        let len: usize = len.parse().expect("numeric length");
-        let frame = &frame[..len];
         assert_eq!(frame.matches(" IVSREP: ").count(), 1, "{frame}");
-        let (envelope, body) = frame.split_once(" IVSREP: ").expect("IVSREP marker");
+        let (envelope, body) = frame
+            .trim_end_matches('\n')
+            .split_once(" IVSREP: ")
+            .expect("IVSREP marker");
         let envelope: serde_json::Value = serde_json::from_str(envelope).expect("envelope");
         assert_eq!(envelope["agent"], "agent-x");
         let body: serde_json::Value = serde_json::from_str(body).expect("report body");
