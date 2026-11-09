@@ -1,5 +1,7 @@
 //! 进程域采集：CPU 累计时间、RSS、状态；Linux 走 procfs，其它 unix 走 `ps`。
 
+#[cfg(target_os = "linux")]
+use std::fs;
 use std::io;
 #[cfg(all(unix, not(target_os = "linux")))]
 use std::process::Command;
