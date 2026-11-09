@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::Path;
+use std::time::Instant;
 
 use sysinfo::{Disks, System};
 use wist_contracts::discovery::StringKeyValue;
@@ -26,16 +27,25 @@ pub(super) fn collect_host_runtime_facts(
     let mut facts = Vec::new();
     let mut labeled_facts = Vec::new();
 
-    // CPU：逐核逐 mode 的累计秒（不在这里求占用率）。
-    for time in cpu::host_cpu_times() {
+    // CPU：逐核逐 mode 的累计秒（权威源）。
+    let cpu_times = cpu::host_cpu_times();
+    for time in &cpu_times {
         labeled_facts.push(MetricsLabeledFact {
             key: "host.cpu.seconds".to_string(),
             value: format!("{:.3}", time.seconds),
             labels: vec![
-                StringKeyValue::new("cpu", time.cpu),
+                StringKeyValue::new("cpu", time.cpu.clone()),
                 StringKeyValue::new("mode", time.mode),
             ],
         });
+    }
+    // 整机使用率（0–1）：窗口内 idle 增量 / (经过时间 × 核数)，再取 `1 -`。
+    // 首轮 / 计数器回退 / 核数变化时不出值（见 `cpu::CpuUsageWindow`）。
+    if let Some(ratio) = cpu::usage_ratio(Instant::now(), &cpu_times) {
+        push_fact_if_absent(
+            &mut facts,
+            StringKeyValue::new("host.cpu.usage_ratio", ratio.to_string()),
+        );
     }
 
     let loadavg = System::load_average();

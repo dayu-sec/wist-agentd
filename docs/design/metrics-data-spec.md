@@ -301,7 +301,8 @@ process_state{state="running"} 1
 3. **同名同单位**：同一指标名在所有平台、所有采集路径下只有一个单位。跨平台差异（页/字节、不同文件系统类型）必须在采集侧换算完毕。
 4. **单位不进 label**：单位由名字后缀承载；样本**不得**携带 `unit` label——单位进入序列身份会让同名不同单位裂成两条序列，单位修正也会断档。
 5. **单位与后缀双向校验**：注册表 `unit` 与名字后缀必须互相印证（§12 门禁）。
-6. **ratio 必须声明分母**：任何 `*_ratio` 指标必须在注册表备注分母口径（整机容量 / 单核 / cgroup 配额）；**不得**同时落库同一物量的比例与累计量，比例在查询层由累计量派生（窗口选择见 §9.1）。
+6. **ratio 必须声明分母**：任何 `*_ratio` 指标必须在注册表备注分母口径（整机容量 / 单核 / cgroup 配额）；同一物量的比例默认不落库，由查询层从累计量派生（窗口选择见 §9.1）。
+   **唯一例外**：`system_cpu_usage_ratio` —— 采集端按固定 60s 窗口从 `system_cpu_seconds_total{mode="idle"}` 算好的整机使用率（分母 = 经过时间 × 核数，先算 idle 比例再取 `1 -`）。累计量仍是权威源，查询层仍可用 `rate()` 重算；比例只是给不写 PromQL 的调用方的便利值，两者不得互相替代（见 §10.1）。
 
 ```promql
 # 整机 CPU 利用率：累计秒 → 比例，分母由核数隐含（avg 就是除以核数）
@@ -530,6 +531,7 @@ process_state{state="running"} 1
 | `host.loadavg.15m` | `system_load_average_15m` | gauge_f64 | 1 | — | — | `system.cpu.load_average.15m` |
 | `host.uptime.seconds` | `system_uptime_seconds` | gauge_f64 | s | — | — | `system.uptime` |
 | `host.cpu.seconds` | `system_cpu_seconds_total` | counter_f64 | s | — | `cpu`,`mode` | `system.cpu.time` |
+| `host.cpu.usage_ratio` | `system_cpu_usage_ratio` | gauge_f64 | 1 | — | — | `system.cpu.utilization` |
 | `host.memory.total_bytes` | `system_memory_total_bytes` | gauge_i64 | By | — | — | `system.memory.limit` |
 | `host.memory.available_bytes` | `system_memory_available_bytes` | gauge_i64 | By | — | — | `system.memory.usage`（state=free，近似） |
 | `host.memory.usage_ratio` | `system_memory_usage_ratio` | gauge_f64 | 1 | — | — | `system.memory.utilization` |
@@ -554,9 +556,15 @@ process_state{state="running"} 1
 | `host.filesystem.inodes_free` | `system_filesystem_inodes_free` | gauge_i64 | 1 | — | `mountpoint`,`fstype` | — |
 | `host.info` | `system_host_info` | gauge_i64 | 1 | — | `host_name`,`host_ip`,`os`,`arch`,`kernel` | `host.name` / `host.ip` |
 
+- `system_cpu_usage_ratio` 不带 `cpu` / `mode`：核维度已在窗口内取平均，留下任一维度都会让「整机一个值」裂成多条序列。
 - `disk_role=system` 的磁盘序列**必须**存在；`disk_role=data` 仅在存在数据盘时出现。
 - `system_disk_*{disk_role}` 是角色汇总，`system_filesystem_*{mountpoint}` 是逐挂载点明细；两者对同一角色必须一致。
-- **CPU**：核数不上报，由 `count by (agent) (system_cpu_seconds_total{mode="idle"})` 派生；利用率在查询层算（§5.2 规则 6）。
+- **CPU**：核数不上报，由 `count by (agent) (system_cpu_seconds_total{mode="idle"})` 派生。
+  `system_cpu_usage_ratio` 由采集端按 **60s 窗口**从 `mode="idle"` 派生：
+  `usage = 1 - idle 增量 / (经过时间 × 核数)`，取值夹在 0–1。首轮、计数器回退（重启/热插拔）、
+  核数变化时**不出值**（不伪造 0）；窗口内不足以形成两个点时同样不出。累计量仍是权威源，
+  查询层需要更长/更短窗口时仍用 `rate()` 重算（§5.2 规则 6）。
+  业务归属（`tenant_id`）**不由 agentd 写入**：下游按业务单元附加，不改变本指标的口径。
 - **内存**：`system_memory_usage_ratio` 与 `available` 同批采集，保证互不矛盾；swap 只报总量与剩余，使用率在查询层算。
 - **磁盘**：容量（total / available / usage）按挂载点表达，供 `mountpoint` 下钻；`device` 维度只承载 I/O 计数，不重复报容量；`disk_role` 保留为角色汇总的快速视图。
 - **inodes**：使用率在查询层派生 `1 - inodes_free / inodes`；inode 总数命名为 `system_filesystem_inodes`（**不带** `_total`，避免与计数器后缀混淆）。

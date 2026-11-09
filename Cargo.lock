@@ -2926,7 +2926,7 @@ checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 
 [[package]]
 name = "wist-agentd"
-version = "0.30.2"
+version = "0.31.0"
 dependencies = [
  "base64 0.22.1",
  "globset",
@@ -3008,9 +3008,9 @@ dependencies = [
 
 [[package]]
 name = "wist-metrics"
-version = "0.17.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f01aee6511dfce2e17da2789d5c73af32a0dad59fe4e5aba3b9003de35cd738"
+checksum = "f91156188c54d0456db34883a1d2a1a636ad9b13dbd1b54ced4733182ad3c7ff"
 dependencies = [
  "jumo-derive",
  "serde",

@@ -946,6 +946,101 @@ mod tests {
         }
     }
 
+    /// 采两轮真实主机事实，直到 `host.cpu.usage_ratio` 出现。
+    ///
+    /// 不断言「首轮没有」：进程内的窗口是共享的，测试并行时会先被其它用例喂入基线。
+    /// 有界重试只为了抵消「本轮 /proc/stat 恰好没读到」这种与环境有关的瞬态。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn host_facts_with_cpu_usage() -> super::HostRuntimeFacts {
+        let _ = super::collect_host_runtime_facts(&[]);
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let collected = super::collect_host_runtime_facts(&[]);
+            if collected
+                .facts
+                .iter()
+                .any(|fact| fact.key == "host.cpu.usage_ratio")
+            {
+                return collected;
+            }
+        }
+        panic!("host.cpu.usage_ratio never appeared");
+    }
+
+    /// `system_cpu_usage_ratio` 必须作为 0–1 的 gauge 事实出现（不是百分比）。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn cpu_usage_ratio_fact_is_a_bounded_gauge() {
+        let collected = host_facts_with_cpu_usage();
+        let usage = collected
+            .facts
+            .iter()
+            .find(|fact| fact.key == "host.cpu.usage_ratio")
+            .expect("host.cpu.usage_ratio");
+        let usage: f64 = usage.value.parse().expect("usage should parse as f64");
+        assert!(
+            (0.0..=1.0).contains(&usage),
+            "usage 必须是 0–1 的比例，不是百分比：{usage}"
+        );
+    }
+
+    /// 端到端：真实事实 → 样本 → VM 行。整机口径只有一条，身份走 `instance`，
+    /// 且**不得**带 `cpu` / `mode`（否则一台主机会裂成多条序列）。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn cpu_usage_ratio_becomes_one_unlabeled_vm_line() {
+        use crate::telemetry::metrics::samples::{
+            build_samples_snapshot, build_vm_metric_lines_with,
+        };
+
+        let collected = host_facts_with_cpu_usage();
+        let target = MetricsCollectionTargetSample {
+            candidate_id: "host-1:host:host_metrics".to_string(),
+            target_ref: "host-1:host".to_string(),
+            status: "succeeded".to_string(),
+            last_error: None,
+            resource_ref: "host-1".to_string(),
+            execution_hints: Vec::new(),
+            runtime_facts: collected.facts,
+            labeled_facts: collected.labeled_facts,
+        };
+        let runtime = MetricsRuntimeSnapshot {
+            generated_at: "2026-11-09T00:00:00Z".to_string(),
+            total_targets: 1,
+            host_targets: 1,
+            process_targets: 0,
+            container_targets: 0,
+            outcomes: vec![MetricsCollectionOutcome {
+                collection_kind: "host_metrics".to_string(),
+                status: "succeeded".to_string(),
+                attempted_targets: 1,
+                succeeded_targets: 1,
+                failed_targets: 0,
+                dropped_targets: 0,
+                last_error: None,
+                runtime_facts: Vec::new(),
+                labeled_facts: Vec::new(),
+                sample_targets: vec![target],
+            }],
+        };
+
+        let snapshot = build_samples_snapshot(&runtime);
+        let lines = build_vm_metric_lines_with(&snapshot, "agent-1", &Default::default());
+        let ratio: Vec<_> = lines
+            .iter()
+            .filter(|line| line.metric.name == "system_cpu_usage_ratio")
+            .collect();
+        assert_eq!(ratio.len(), 1, "整机口径只能有一条序列");
+        let line = ratio[0];
+        assert_eq!(line.metric.agent, "agent-1");
+        assert_eq!(line.metric.instance, "host-1");
+        assert!(line.metric.cpu.is_none(), "核维度已平均，不得带 cpu");
+        assert!(line.metric.mode.is_none(), "不得带 mode");
+        assert_eq!(line.values.len(), 1, "每步一个点");
+        let value = line.values[0].as_f64().expect("gauge_f64 应是 JSON 数值");
+        assert!((0.0..=1.0).contains(&value), "got {value}");
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn host_filesystem_runtime_facts_carry_mount_labels() {

@@ -3,6 +3,24 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.31.0-alpha] - 2026-11-09
+
+### 新增（主机整机 CPU 使用率）
+
+- 主机采集新增 `system_cpu_usage_ratio`（`host.cpu.usage_ratio`，0–1）：
+  按 60s 窗口对 `mode="idle"` 的累计秒做差分，
+  `usage = 1 - idle 增量 / (经过时间 × 核数)`。
+  与 `system_cpu_seconds_total` 并存：累计量仍是权威源，比例是给不写 PromQL 的调用方的便利值。
+- 窗口边界：首轮、计数器回退（重启/热插拔）、核数变化、窗口内不足两个点时**不出值**；
+  时钟用单调时钟，墙钟回拨不影响窗口。
+- 依赖 `wist-metrics` 0.18（注册表新增该指标）。
+
+### 测试
+
+- `CpuUsageWindow`：首轮不出值、`1 - idle` 口径、两端点、异常增量夹取、
+  计数器回退、核数变化、超窗裁剪；
+- 真实采集两轮后产出 0–1 的 gauge 事实。
+
 ## [0.30.2-alpha] - 2026-11-09
 
 ### 修复（半帧补写不再重复投递）
