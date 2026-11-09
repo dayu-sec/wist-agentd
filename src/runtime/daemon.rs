@@ -1216,7 +1216,6 @@ async fn deliver_investigation(
     command: &AgentCommand,
     report: &crate::investigate::Report,
     path: &Path,
-    work: &AppliedWorkGrant,
     uplink: &AppliedUplink,
     state_dir: &Path,
 ) -> (&'static str, String) {
@@ -1224,7 +1223,7 @@ async fn deliver_investigation(
     let stored = format!("；完整报告：{}", path.display());
 
     let output = effective_output(config, uplink.grant());
-    let delivery = match build_telemetry_sink(work, &output) {
+    let delivery = match build_telemetry_sink(&output) {
         Ok(mut sink) if sink.carries_investigation_frames() => {
             let seq_path = log_seq_state::path_for(state_dir);
             // 与日志/指标/事实共用同一个 seq 空间（`(agent, seq)` 是数据面的去重键）。
@@ -1273,13 +1272,12 @@ async fn run_investigation(
     config: &AgentConfig,
     command: &AgentCommand,
     request: &crate::investigate::InvestigateRequest,
-    work: &AppliedWorkGrant,
     uplink: &AppliedUplink,
     state_dir: &Path,
 ) -> (&'static str, String) {
     match crate::investigate::run_for_command(config, request).await {
         Ok((report, path)) => {
-            deliver_investigation(config, command, &report, &path, work, uplink, state_dir).await
+            deliver_investigation(config, command, &report, &path, uplink, state_dir).await
         }
         Err(detail) => (command_outcome::FAILED, detail),
     }
@@ -1294,7 +1292,6 @@ async fn run_investigation(
 async fn drain_finished_investigations(
     inflight: &mut Vec<InflightInvestigation>,
     config: &AgentConfig,
-    work: &AppliedWorkGrant,
     uplink: &AppliedUplink,
     state_dir: &Path,
     history: &mut commands::CommandHistory,
@@ -1310,16 +1307,8 @@ async fn drain_finished_investigations(
         let done = inflight.remove(index);
         let (outcome, detail) = match done.task.await {
             Ok(Ok((report, path))) => {
-                deliver_investigation(
-                    config,
-                    &done.command,
-                    &report,
-                    &path,
-                    work,
-                    uplink,
-                    state_dir,
-                )
-                .await
+                deliver_investigation(config, &done.command, &report, &path, uplink, state_dir)
+                    .await
             }
             Ok(Err(detail)) => (command_outcome::FAILED, detail),
             // 任务被 abort / panic：如实回一条失败，而不是让网关等到 1h TTL 的
@@ -2142,7 +2131,6 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
         let (investigation_acks, investigation_recorded) = drain_finished_investigations(
             &mut inflight_investigations,
             &runtime_config,
-            &work_runtime,
             &uplink_runtime,
             &command_state_dir,
             &mut command_history,
@@ -2712,7 +2700,7 @@ async fn run_once_with_failure_cache(
     // 本轮导出器失败（工作 id 仍会出现在健康汇总里）——
     // 在 enabled 分支里填空；待命/构建失败时保持空。
     let mut exporter_report = ExporterReport::default();
-    let telemetry_tick = match telemetry_sink.get_or_build(work, &effective) {
+    let telemetry_tick = match telemetry_sink.get_or_build(&effective) {
         Ok(sink) => {
             if !effective.enabled {
                 // 待命（本机 `enabled = false`，或控制面 grant 明确 `enabled = false`）：
@@ -4492,7 +4480,7 @@ mod tests {
         }
     }
 
-    /// 收**一帧**（line framing：一帧一行）后返回文本。
+    /// 收**一帧**后返回文本（正文自带的 `\n` 会原样出现在 `len` 前缀之后）。
     ///
     /// 不读到 EOF：sink 会把连接留着复用，读 EOF 会挂到测试结束。
     fn frame_server(listener: TcpListener) -> tokio::task::JoinHandle<String> {
@@ -6393,7 +6381,6 @@ mod tests {
             &config,
             &command,
             &request,
-            &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             std::path::Path::new(&config.paths.state_dir),
         )
@@ -6454,7 +6441,6 @@ mod tests {
             &config,
             &command,
             &request,
-            &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             std::path::Path::new(&config.paths.state_dir),
         )
@@ -6504,7 +6490,6 @@ mod tests {
             &config,
             &command,
             &request,
-            &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             std::path::Path::new(&config.paths.state_dir),
         )
@@ -6632,7 +6617,6 @@ mod tests {
             drain_finished_investigations(
                 &mut inflight,
                 &config,
-                &AppliedWorkGrant::default(),
                 &AppliedUplink::default(),
                 Path::new(&config.paths.state_dir),
                 &mut history,
@@ -6679,7 +6663,6 @@ mod tests {
         let (again, recorded_again) = drain_finished_investigations(
             &mut inflight,
             &config,
-            &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             Path::new(&config.paths.state_dir),
             &mut history,
@@ -7008,7 +6991,6 @@ mod tests {
         let (acks, recorded) = drain_finished_investigations(
             &mut inflight,
             &config,
-            &AppliedWorkGrant::default(),
             &AppliedUplink::default(),
             &state_dir,
             &mut history,

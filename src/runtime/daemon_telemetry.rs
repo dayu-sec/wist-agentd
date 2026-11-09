@@ -182,11 +182,11 @@ impl UplinkHealth {
     }
 }
 
-/// 配置里的 `line` 是否会被上送固定升级成 `len`（`kind = "tcp"` 时永远如此）。
+/// 配置里的 `line` 是否会被上送固定升级成 `len`（只在真正会发送的 tcp 输出上提示）。
 ///
 /// 抽成纯函数是为了能直接测这个判定：它决定日志/指标/事实是不是走安全分帧。
 pub(super) fn uplink_framing_forced(output: &LogsOutputSection) -> bool {
-    output.kind == "tcp" && output.tcp.framing != "len"
+    output.enabled && output.kind == "tcp" && output.tcp.framing == "line"
 }
 
 /// 构建共享的遥测上送 sink（日志与指标共用同一连接）。
@@ -199,23 +199,19 @@ pub(super) fn uplink_framing_forced(output: &LogsOutputSection) -> bool {
 ///
 /// 分帧取的是**生效输出**（`[telemetry.logs.output]` 与 grant 合流后的结论，见
 /// [`effective_output`]），因此 grant 把本机 `file` 覆盖成 tcp 时也照样走 `len`。
-pub(super) fn build_telemetry_sink(
-    work: &AppliedWorkGrant,
-    output: &LogsOutputSection,
-) -> io::Result<TelemetryRecordSink> {
+pub(super) fn build_telemetry_sink(output: &LogsOutputSection) -> io::Result<TelemetryRecordSink> {
     if uplink_framing_forced(output) {
-        warn_uplink_framing_forced_once(work);
+        warn_uplink_framing_forced_once();
     }
     Ok(SinkIdentity::resolve(output)?.sink())
 }
 
 /// 只提示一次：`build_telemetry_sink` / `get_or_build` 每 3s 一拍都会跑，按拍打印会把日志刷满。
-fn warn_uplink_framing_forced_once(work: &AppliedWorkGrant) {
+fn warn_uplink_framing_forced_once() {
     static WARNED: std::sync::Once = std::sync::Once::new();
     WARNED.call_once(|| {
-        let inputs = work.log_inputs().len();
         log::warn!(
-            "event=UplinkFramingForced from=line to=len inputs={inputs} reason=\"line 分帧无法区分完整记录与断连残行；上送固定使用 len（协议 §3，issue #43）\""
+            "event=UplinkFramingForced from=line to=len reason=\"line 分帧无法区分完整记录与断连残行；上送固定使用 len（协议 §3，issue #43）\""
         );
     });
 }
@@ -241,11 +237,10 @@ impl TelemetrySinkSlot {
     /// 取本轮可用的 sink：身份没变就复用上一轮的实例（连接 + 退避状态都在）。
     pub(super) fn get_or_build(
         &mut self,
-        work: &AppliedWorkGrant,
         output: &LogsOutputSection,
     ) -> io::Result<&mut TelemetryRecordSink> {
         if uplink_framing_forced(output) {
-            warn_uplink_framing_forced_once(work);
+            warn_uplink_framing_forced_once();
         }
         let identity = SinkIdentity::resolve(output)?;
         if self.identity.as_ref() != Some(&identity) {
@@ -831,7 +826,6 @@ mod tests {
         CatchupBudget, InputTickReports, TelemetrySinkSlot, UplinkHealth, uplink_framing_forced,
     };
     use crate::config::agent_config::LogsSection;
-    use crate::control::work::AppliedWorkGrant;
     use crate::telemetry::logs::files::file::{FamilyCapacity, ProcessOutcome, ProcessOutcomeKind};
     use crate::telemetry::logs::gate::Withheld;
     use wist_contracts::telemetry_record::DataFrame;
@@ -1113,10 +1107,9 @@ mod tests {
         });
 
         let output = tcp_output(port);
-        let grant = AppliedWorkGrant::default();
         let mut slot = TelemetrySinkSlot::default();
         for seq in [1u64, 2] {
-            let sink = slot.get_or_build(&grant, &output).expect("sink");
+            let sink = slot.get_or_build(&output).expect("sink");
             sink.write_fact(
                 &DataFrame::new("agent-1", "2026-11-08T00:00:00Z", seq),
                 b"{}",
@@ -1151,12 +1144,11 @@ mod tests {
             listener.local_addr().expect("addr").port()
         };
         let output = tcp_output(port);
-        let grant = AppliedWorkGrant::default();
         let mut slot = TelemetrySinkSlot::default();
 
         // 第一拍：真的去连，被拒 → 进退避。
         let first = slot
-            .get_or_build(&grant, &output)
+            .get_or_build(&output)
             .expect("第一拍要能构造 sink")
             .write_fact(&DataFrame::new("agent-1", "2026-11-08T00:00:00Z", 1), b"{}")
             .await
@@ -1168,7 +1160,7 @@ mod tests {
 
         // 第二拍（同一目标）：**不得再连一次**，直接按退避失败。
         let second = slot
-            .get_or_build(&grant, &output)
+            .get_or_build(&output)
             .expect("第二拍要能取回同一份 sink")
             .write_fact(&DataFrame::new("agent-1", "2026-11-08T00:00:00Z", 2), b"{}")
             .await
@@ -1210,10 +1202,9 @@ mod tests {
         let first_server = reader(first);
         let second_server = reader(second);
 
-        let grant = AppliedWorkGrant::default();
         let mut slot = TelemetrySinkSlot::default();
         for (port, seq) in [(first_port, 1u64), (second_port, 2)] {
-            let sink = slot.get_or_build(&grant, &tcp_output(port)).expect("sink");
+            let sink = slot.get_or_build(&tcp_output(port)).expect("sink");
             sink.write_fact(
                 &DataFrame::new("agent-1", "2026-11-08T00:00:00Z", seq),
                 b"{}",

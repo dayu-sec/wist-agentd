@@ -295,9 +295,9 @@ const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// TCP 写超时窗口：判的是**没有进展**，不是整次写的时长。
 ///
 /// 为什么必须是「无进展」而不是 `timeout(_, write_all)`：后者会把一个**慢但一直在推进**的
-/// 连接当场取消，取消点落在任意字节上，于是线上留下半帧。接收端（wparse 的 `line`/`auto`）
-/// 在 EOF 上会把最后一条**没有换行**的残行当成一条完整记录交付 —— 数据面因此看到一条被截断
-/// 的 JSON 帧（解析失败 + miss 脏数据）。见 [`finish_in_background`]。
+/// 连接当场取消，取消点落在任意字节上，于是线上留下半帧。上送固定 `len` 分帧，接收端在
+/// EOF 上会把凑不齐长度的尾巴丢掉（不会产出半条记录），但那一帧也就丢了，只能等 spool
+/// 重放；所以仍然不能随便取消。见 [`finish_in_background`]。
 const TCP_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// 单次 payload 写（一条连接上的一次写单元）的**总时长**上限。
 ///
@@ -436,7 +436,7 @@ impl TcpRecordSink {
             }
             PayloadWrite::Stalled { written } => {
                 self.schedule_backoff();
-                if written < payload.len() {
+                if should_finish_in_background(written, payload.len()) {
                     // 线上已经有半帧：交给后台把剩余字节写完再关。绝不在这里直接关。
                     finish_in_background(stream, payload[written..].to_vec());
                 }
@@ -539,6 +539,15 @@ enum PayloadWrite {
     Failed(io::Error),
 }
 
+/// 写停住后是否需要把剩余字节交给后台补完。
+///
+/// 只有「已经出去了一部分、但还没写完」才需要；`written == 0` 时线上没有半帧，
+/// 直接关连接是干净的。若 0 字节也交给后台重写，调用方会同时把整批落 spool 重放，
+/// 造成重复投递。
+fn should_finish_in_background(written: usize, total: usize) -> bool {
+    written > 0 && written < total
+}
+
 /// 把 `payload` 写进 `stream`：`stall` 管「多久没进展就算停住」，`total` 管「这次写最多占多久」。
 ///
 /// 两个上限都要：只有 `stall` 时，对端慢慢滴数据可以无限拖住串行的主循环；
@@ -583,10 +592,9 @@ where
 
 /// 把「已经写了半截」的剩余字节写完再关连接。
 ///
-/// 为什么必须有：接收端在 EOF 上会把最后一条**没有换行**的残行交付成一条记录
-/// （wparse `line` / `auto` 的 tail-line 语义）。所以这条连接的最后一条数据必须是完整帧；
-/// 写停住时若直接关闭，数据面就会收到一条**截断的 JSON 帧**，现象就是 miss 里出现半条报文
-/// （`{"schema":"v1","agent":"..."` 这类截在信封中间的脏数据）。
+/// 为什么必须有：上送固定 `len` 分帧，接收端在 EOF 上会把凑不齐长度的尾巴丢掉 —— 不会
+/// 产生半条记录，但这一帧也就真的丢了，只能等 spool 重放。写完剩余字节让这一帧**当场送达**，
+/// 而不是把「这一帧能不能到」完全压在重放上。
 ///
 /// 为什么放后台而不是这里 await：这一轮已经失败（调用方会把整批落 spool，下一轮重放），
 /// 但半帧不能就这么留在线上；进度等不起，收尾可以慢慢来。
@@ -960,10 +968,10 @@ mod tests {
         );
     }
 
-    /// 停住之后必须把剩余字节写完再关：对端最终拿到的是**完整帧**，而不是半条。
+    /// 停住之后必须把剩余字节写完再关：对端最终拿到的是**完整帧**，而不是半截。
     ///
-    /// 这就是 issue #34 的要害：wparse 在 EOF 上会把最后一条无换行的残行当记录交付，
-    /// 半帧会变成 miss 里的一条截断 JSON。
+    /// `len` 分帧下截断不会变成一条脏记录（接收端会丢弃凑不齐长度的尾巴），但这一帧
+    /// 就白白丢了；后台补完才能让它当即送达。
     #[tokio::test(flavor = "current_thread")]
     async fn a_stalled_frame_is_finished_before_the_stream_closes() {
         let (mut writer, mut reader) = tokio::io::duplex(64);
@@ -1120,19 +1128,93 @@ mod tests {
     }
 
     #[test]
-    fn the_same_torn_payload_under_line_framing_exposes_a_broken_record() {
-        // 反证：line 分帧没有长度可校验，同一个断点留下的正是 issue 里那种
-        // 「以 `{"schema"` 开头、JSON 未闭合」的残行。
-        let frame = super::build_record_frame(&record("line")).expect("frame");
-        let payload = build_payload_bytes(&frame, TcpFraming::Line);
-        let torn = &payload[..payload.len() / 2];
+    fn only_a_partial_write_needs_a_background_finish() {
+        // 0 字节：线上没有半帧，直接关；若也交给后台重写，会与 spool 重放重复。
+        assert!(!super::should_finish_in_background(0, 10));
+        assert!(super::should_finish_in_background(1, 10));
+        assert!(!super::should_finish_in_background(10, 10));
+    }
 
-        assert!(torn.starts_with(b"{\"schema\""));
-        assert!(!torn.ends_with(b"\n"));
-        assert!(
-            serde_json::from_slice::<serde_json::Value>(torn).is_err(),
-            "the tail really is unparseable, not just visually cut"
-        );
+    #[test]
+    fn a_len_frame_preserves_the_body_line_terminator() {
+        // len 按字节原样携带正文：文件行自带的 `\n` 不再被行分帧吃掉。
+        // 这是 0.30.1 起数据面能看到的内容变化，必须显式钉住。
+        let body = "install: done\n";
+        let frame = super::build_record_frame(&record(body)).expect("frame");
+        let text = String::from_utf8(frame).expect("utf8 frame");
+        let (_, raw) = text.split_once(" LOGRAW: ").expect("LOGRAW marker");
+        assert_eq!(raw, body, "len framing carries the body verbatim");
+    }
+
+    /// 与修好的数据面 `Auto` 一致：长度前缀未收齐时**不**回退按行。
+    fn len_prefix_in_progress(payload: &[u8]) -> bool {
+        let mut digits = 0;
+        while digits < payload.len() && digits < 10 && payload[digits].is_ascii_digit() {
+            digits += 1;
+        }
+        if digits == 0 || digits >= payload.len() || payload[digits] != b' ' {
+            return false;
+        }
+        let Ok(len) = std::str::from_utf8(&payload[..digits])
+            .expect("ascii length")
+            .parse::<usize>()
+        else {
+            return false;
+        };
+        len > 0 && payload.len() < digits + 1 + len
+    }
+
+    fn take_len_frame(payload: &[u8]) -> Option<(Vec<u8>, &[u8])> {
+        let space = payload.iter().position(|byte| *byte == b' ')?;
+        let len = std::str::from_utf8(&payload[..space])
+            .ok()?
+            .parse::<usize>()
+            .ok()?;
+        if len == 0 || payload.len() < space + 1 + len {
+            return None;
+        }
+        Some((
+            payload[space + 1..space + 1 + len].to_vec(),
+            &payload[space + 1 + len..],
+        ))
+    }
+
+    fn extract_auto_frames(mut payload: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        loop {
+            if let Some((frame, rest)) = take_len_frame(payload) {
+                out.push(frame);
+                payload = rest;
+                continue;
+            }
+            if len_prefix_in_progress(payload) {
+                break;
+            }
+            let Some(newline) = payload.iter().position(|byte| *byte == b'\n') else {
+                break;
+            };
+            out.push(payload[..newline].to_vec());
+            payload = &payload[newline + 1..];
+        }
+        out
+    }
+
+    #[test]
+    fn a_torn_multiline_length_frame_is_not_delivered_as_lines() {
+        // container_cri / indented 的正文会含 `\n`；read 边界可能切在任意位置。
+        // 修好后的 `Auto` 在长度前缀进行中不回退按行，所以任何截断都不会产出半帧。
+        let body = "line-A\nline-B\nline-C\n";
+        let frame = super::build_record_frame(&record(body)).expect("frame");
+        let payload = build_payload_bytes(&frame, TcpFraming::Len);
+
+        for cut in 1..payload.len() {
+            let visible = extract_auto_frames(&payload[..cut]);
+            assert!(
+                visible.is_empty(),
+                "incomplete multi-line len frame must not surface as lines (cut={cut})"
+            );
+        }
+        assert_eq!(extract_auto_frames(&payload), vec![frame]);
     }
 
     /// 连上之后必须开 kernel keepalive。

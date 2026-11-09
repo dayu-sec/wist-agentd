@@ -3,6 +3,44 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.30.2-alpha] - 2026-11-09
+
+### 修复（半帧补写不再重复投递）
+
+- `write_payload` 在「一个字节都没写出去」（`written == 0`）时不再把整批交后台重写。
+  线上本无半帧，直接关连接是干净的；旧实现会让后台把整批补一遍，同时调用方又把整批落
+  spool 重放 —— 同一批数据投递两次（靠数据面 `(agent, seq)` 去重兜底，但白白多发了）。
+  现在只有 `0 < written < total` 才走后台补完。
+
+### 修复（告警语义）
+
+- `event=UplinkFramingForced` 只在**真正会发送**的 `tcp` 输出上打：
+  `enabled = true && kind == "tcp" && framing == "line"`。待命（`enabled = false`）与
+  已显式写 `len` 的配置不再误报。
+- 告警里去掉无意义的 `inputs=<n>` 字段：分帧与采集面数量无关。
+
+### 文档
+
+- 修正 0.30.1 里写错的升级提示：多行采集的数据面 `tcp_src` 必须是 `framing = "len"`。
+  `auto` 在长度前缀读到一半时会回退按行，`container_cri` / 缩进续行仍会被切碎
+  （上游修复见 `wp-core-connectors#24`；合入并升级后可再评估）。
+- 同步清理 `metrics-data-spec.md`、`agentd-investigation.md`、`runtime-structure-review.md`
+  与代码注释里「行分帧下残行会被当记录交付」的旧理由：上送固定 `len` 后，凑不齐长度的
+  尾巴只会被接收端丢弃（不产生脏记录），但那一帧也就丢了。
+
+### 行为说明（承 0.30.1）
+
+- 单行日志的 `raw` 正文现在带尾部 `\n`：`len` 按字节原样携带正文，不再像 `line` 那样
+  吃掉行尾。下游按整行文本比对的地方需要知道这一点。
+
+### 测试
+
+- `only_a_partial_write_needs_a_background_finish`：钉住 `written == 0` 不走后台补写；
+- `a_len_frame_preserves_the_body_line_terminator`：钉住 `len` 原样携带正文换行；
+- `a_torn_multiline_length_frame_is_not_delivered_as_lines`：用含 `\n` 的多行正文，
+  遍历每个字节截断点，模拟修好后的 `Auto`（长度前缀进行中不回退按行），任何截断都不产出
+  可见记录。
+
 ## [0.30.1-alpha] - 2026-11-09
 
 ### 修复（上送不再产生截断帧：固定 `len` 分帧）
@@ -19,7 +57,8 @@
 ### 升级提示
 
 - 本机 `agentd.toml` 无需修改；旧配置里的 `line` 会自动按 `len` 工作。
-- 数据面 `tcp_src` 保持 `framing = "auto"`（现场默认）；若显式写死 `"line"`，需改成 `"auto"`。
+- 数据面 `tcp_src` **必须**用 `framing = "len"`：`auto` 在「长度前缀读到一半」时会回退按行，多行正文
+  （`container_cri` / 缩进续行）仍会被切碎。0.30.2 起栈模板与现场配置都已改 `len`。
 
 ## [0.30.0-alpha] - 2026-11-08
 

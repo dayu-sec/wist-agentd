@@ -99,7 +99,7 @@ pub const REPORT_SCHEMA_PREFIX: &str = "wist.investigation";
 
 /// 数据面回传单帧正文的上限。
 ///
-/// 为什么必须有：一帧就是**一整条记录**（行分帧），塞不下会被截断成半条 —— 那比不发更糟。
+/// 为什么必须有：一帧就是**一整条记录**（`len` 分帧），塞不下会被截断成半条 —— 那比不发更糟。
 /// 典型的 `disk` 报告（10 行文件 + 10 行目录）只有几 KB；64 KiB 足够装下 `--top 50`。
 /// 再大的时侯**逐级退化**（去 `rows` → 去 `hint` + 截 `detail`），见 [`Report::to_uplink_body`]：
 /// 永远不发半条 JSON，也永远不把结论（`title` / `status` / `verdict`）丢掉。
@@ -612,7 +612,8 @@ impl Report {
     /// 与 [`Self::to_json`] 的差别只有两处，都是为了**关联与体积**：
     /// * 带 `command_id` —— 报告走数据面、ack 走控制面，两者靠它 join；
     /// * 超 [`MAX_UPLINK_BODY_BYTES`] 时**逐级退化**（去 `rows` → 去 `hint` + 截 `detail`），
-    ///   宁可只给结论，也不发半条 JSON（行分帧下一个断开的 JSON 会被当成丢失的记录）。
+    ///   宁可只给结论，也不发半条 JSON（`len` 分帧下凑不齐长度的尾巴会被接收端丢弃，
+    ///   这次调查就等于白做）。
     ///   退化分两级是刻意的：第一次只丢证据表（典型大报告），第二次才动“结论文本”——
     ///   而结论才是这张报告存在的理由。
     pub fn to_uplink_body(&self, command_id: &str) -> Vec<u8> {
@@ -1228,7 +1229,8 @@ mod tests {
         assert_eq!(value["command_id"], "cmd_agent_1_refresh_123");
         assert_eq!(value["report_schema"], "wist.investigation.disk/v1");
         assert!(value.get("rows_omitted").is_none(), "小报告不该退化");
-        // 行分帧：正文里不能有换行（否则一帧会被拆成两条记录）。
+        // 正文是 JSON，序列化天然无换行；`len` 分帧不要求正文单行，但保持单行便于在
+        // 日志里肉眼核对（这里钉住的是正文契约，不是分帧约束）。
         assert!(!body.contains(&b'\n'), "body must stay single-line");
     }
 
