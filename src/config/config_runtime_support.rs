@@ -94,7 +94,7 @@ source_resolve = true
 # [telemetry.logs.output.tcp]
 # addr = "127.0.0.1"
 # port = 9000
-# framing = "line"
+# framing = "len"   # 上送固定 len（line 仍可解析，但会被升级并提示）
 #
 # 本进程**运行日志**（与上面 telemetry.logs 的“被采集日志”不同）：级别 / 格式 / 落点 / 轮转。
 # 缺省写 stderr（系统级部署交给 journald；容器里交给容器 runtime 收）。RUST_LOG 环境变量优先于 [log].level。

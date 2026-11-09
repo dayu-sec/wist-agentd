@@ -309,7 +309,7 @@ LogsOutputSection {
 - `tcp.addr` / `tcp.port`
   `kind = "tcp"` 时的目标地址与端口，默认 `127.0.0.1` / `9000`
 - `tcp.framing`
-  TCP 分帧方式：`line`（默认）/ `len`，其他值报 `invalid_logs_output_tcp_framing`
+  TCP 分帧方式：`len`（默认，且上送固定使用）/ `line`（兼容旧配置，会被升级为 `len` 并提示一次），其他值报 `invalid_logs_output_tcp_framing`
 
 ---
 
