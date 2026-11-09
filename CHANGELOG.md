@@ -3,6 +3,19 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 修复（上送不再产生截断帧：固定 `len` 分帧）
+
+- TCP 上送一律使用 `len` 分帧（`{字节长度} {帧内容}`），不再使用 `line`。`line` 的帧边界是
+  `\n`，连接在帧中途断掉时（对端 RST、进程被杀、主循环 tick 被取消），接收端会把没有换行的
+  残行当记录交付，数据面因此收到半条 JSON（issue #34、#43）。
+- `[telemetry.logs.output.tcp] framing` 默认值改为 `len`；旧配置里的 `line` 仍可启动，
+  但会被升级为 `len` 并打一条 `event=UplinkFramingForced`（只提示一次）。
+- 半帧不再可能被当成记录：`len` 帧凑不齐长度时，接收端可以明确丢弃。
+- 删除「按多行读法升 `len`」的运行时判定：所有帧都已固定 `len`，sink 仍按目标/类型
+  跨 tick 复用。
+
 ## [0.30.0-alpha] - 2026-11-08
 
 ### 新增

@@ -212,7 +212,7 @@
 | 用例 | 钉住什么 |
 |---|---|
 | `the_client_cache_key_covers_every_input_that_shapes_the_client` | key 少一项就是“证书轮换后永远拿旧证书握手” |
-| `sink_identity_folds_framing_into_the_reuse_key` | 分帧必须是身份的一部分，否则升级不重建 |
+| `sink_identity_reuses_across_line_and_len_configs` | 分帧固定 `len`，不应因 `line`/`len` 配置触发重建；换目标必须重建 |
 | `the_sink_slot_reuses_one_connection_across_ticks` | 两拍两帧必须落在**一条**连接上 |
 | `the_sink_slot_keeps_the_backoff_window_across_ticks` | 退避状态必须活过一拍（复用只是手段，退避才是目的） |
 | `the_sink_slot_rebuilds_when_the_target_changes` | 换目标必须新建连接 |

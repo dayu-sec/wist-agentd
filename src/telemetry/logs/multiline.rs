@@ -69,7 +69,10 @@ impl MultilineMode {
             .map(|(_, read_mode)| *read_mode)
     }
 
-    /// 这种读法会不会折叠出**含换行**的正文（决定 TCP 分帧要不要升 `len`）。
+    /// 这种读法会不会折叠出**含换行**的正文（读法词表的语义钉子，供测试使用）。
+    ///
+    /// 上送已固定 `len` 分帧，所以生产路径不再需要这个判定。
+    #[cfg(test)]
     pub fn folds_records(self) -> bool {
         !matches!(self, Self::None)
     }
