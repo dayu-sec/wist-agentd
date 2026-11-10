@@ -1,6 +1,6 @@
 [package]
 name = "wist-agentd"
-version = "0.31.1" #@gxl:set(version)
+version = "0.32.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -43,10 +43,10 @@ tokio = { version = "1.48", features = ["full"] }
 # 下限必须是 0.10.4：本仓用 `AgentLocalStandingWork.collection`（采集面采集结果），
 # 0.10.3 没这个字段。写成 `0.10.3` 时一个 `cargo update -Z minimal-versions`
 # 或 CI 的最小版本任务就能解析到编译不过的版本。
-wist-contracts = "0.10.4"
+wist-contracts = "0.11"
 # 跨进程 seam 报文（enrollment / agent_status / gateway / work / agent_uplink）。CI/发布走 registry；本地联调可临时切 path。
-wist-api = "0.10.4"
-wist-metrics = "0.18"
+wist-api = "0.11"
+wist-metrics = "0.19"
 # 本地联调：按 rust-gx 约定切 path 指向本地 registry；发布前切回 registry（见 docs/design/metrics-spec-rollout.md）。
 wist-shared = { version = "0.2" }
 # 运行日志：`log` 门面 + 共享 crate `wist-log`（级别 / 格式 / 落点 / 轮转 统一口径）。
@@ -73,8 +73,8 @@ sqlx = { version = "0.9", default-features = false, features = [
 ] }
 wist-log = { version = "0.1" }
 #wist-log = { version = "0.1", path = "../wist-log" }
-wist-validate = { version = "0.8" }
-#wist-validate = { version = "0.5", path = "../wist-validate" }
+wist-validate = { version = "0.9" }
+#wist-validate = { version = "0.9", path = "../wist-validate" }
 
 [lib]
 path = "src/lib.rs"
@@ -103,7 +103,9 @@ path = "src/bin/wist-upgrader.rs"
 # 已于 2026-11-09 发布，本轮已切回 registry（下面的 patch 全部保持注释）。
 # 2026-11-08：`wist-contracts` 0.10.4（含 `AgentLocalStandingWork.collection`）已上
 # crates.io，contracts patch 保持注释；切回前核对过 registry 源码里确有该字段。
-# [patch.crates-io]
+# 2026-11-10：采集状态改多字段正交模型 → `wist-contracts` 0.11.0 / `wist-api` 0.11.0 /
+# `wist-metrics` 0.19.0 / `wist-validate` 0.9.0 均已上 crates.io，patch 保持注释。
+[patch.crates-io]
 # wist-contracts = { path = "../wist-contracts" }
 # wist-api = { path = "../wist-api" }
 # wist-validate = { path = "../wist-validate" }

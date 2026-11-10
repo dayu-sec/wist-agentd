@@ -319,6 +319,18 @@ pub(super) async fn process_telemetry_inputs(
     tick
 }
 
+/// 导出器失败的**性质**。
+///
+/// 采集状态要把「没装工具」与「跑了但失败」分开：前者是部署前提，装上即自动恢复，
+/// 报成 failed 会让一个只含导出器的工作整面变红；后者才是真的采集错误。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExporterFailureKind {
+    /// 前置条件不满足：工具/依赖缺失，本轮**根本没执行**。
+    Precondition,
+    /// 已执行但失败：参数解析、命令运行、或结果上送失败。
+    Run,
+}
+
 /// 一次导出器运行的失败（本轮没采成 / 没送达）。
 ///
 /// 单独一条而不并进 [`TelemetryFailure`]：导出器按运行而不是按文件句柄计，
@@ -328,6 +340,7 @@ pub(super) struct ExporterFailure {
     pub(super) work_id: String,
     pub(super) input_id: String,
     pub(super) exporter_id: String,
+    pub(super) kind: ExporterFailureKind,
     pub(super) detail: String,
 }
 
@@ -405,6 +418,7 @@ pub(super) async fn process_exporters(
                     work_id: run.work_id,
                     input_id: run.input_id,
                     exporter_id: run.exporter_id,
+                    kind: ExporterFailureKind::Run,
                     detail: err.to_string(),
                 });
                 continue;
@@ -420,6 +434,7 @@ pub(super) async fn process_exporters(
                 work_id: run.work_id.clone(),
                 input_id: run.input_id.clone(),
                 exporter_id: run.exporter_id.clone(),
+                kind: ExporterFailureKind::Precondition,
                 detail: format!("工具缺失：{tool}（装上后自动恢复）"),
             });
             if newly {
@@ -494,6 +509,7 @@ pub(super) async fn process_exporters(
                         work_id: run.work_id.clone(),
                         input_id: run.input_id.clone(),
                         exporter_id: run.exporter_id.clone(),
+                        kind: ExporterFailureKind::Run,
                         detail: format!("上送失败：{err}"),
                     });
                 }

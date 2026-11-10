@@ -15,12 +15,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use wist_contracts::local_work::{AgentLocalCollection, collection_status};
+use wist_contracts::local_work::{
+    AgentLocalCollection, CollectionReason, collection_prerequisites, collection_reason_kind,
+    collection_result, collection_status,
+};
 use wist_metrics::provider::MetricsCollectionOutcome;
 
 use super::metrics_support::MetricsTick;
 use super::telemetry_support::{
-    ExporterFailure, ExporterReport, TelemetryFailure, TelemetryFailureKind, TelemetryTick,
+    ExporterFailure, ExporterFailureKind, ExporterReport, TelemetryFailure, TelemetryFailureKind,
+    TelemetryTick,
 };
 use crate::control::work::{AppliedWorkGrant, UnsupportedUnit, WorkExporterRun};
 use crate::state_store::work::StandingWorkRecord;
@@ -175,18 +179,53 @@ fn assess(
 ) -> AgentLocalCollection {
     // 关闸与暂停都不是失败：本就不该采，报成故障只会制造噪音。
     if !uplink_enabled {
-        return paused("数据面上送已关闸（待命）：本机未采集", now);
+        return build_collection(
+            collection_prerequisites::READY,
+            collection_result::CANCELLED,
+            vec![reason(
+                collection_reason_kind::STANDBY,
+                "",
+                "数据面上送已关闸（待命）：本机未采集",
+            )],
+            now,
+        );
     }
     if standing.status != "active" {
-        return paused("工作已暂停（不是采集失败）", now);
+        return build_collection(
+            collection_prerequisites::READY,
+            collection_result::CANCELLED,
+            vec![reason(
+                collection_reason_kind::PAUSED,
+                "",
+                "工作已暂停（不是采集失败）",
+            )],
+            now,
+        );
     }
     if let Some(detail) = spec_failure {
-        return failed(format!("工作参数无法解析：{detail}"), now);
+        return build_collection(
+            collection_prerequisites::READY,
+            collection_result::FAILURE,
+            vec![reason(
+                collection_reason_kind::INVALID_SPEC,
+                "",
+                format!("工作参数无法解析：{detail}"),
+            )],
+            now,
+        );
     }
     // active 但零单元：网关不会下发这种工作；能走到这里通常是恢复时参数丢了/被改坏。
-    // 它确实“一条也采不到”，报 failed 比 unknown 更能促成处理。
     if standing.units.is_empty() {
-        return failed("工作没有可执行单元（参数为空或解析失败）", now);
+        return build_collection(
+            collection_prerequisites::READY,
+            collection_result::FAILURE,
+            vec![reason(
+                collection_reason_kind::NO_UNITS,
+                "",
+                "工作没有可执行单元（参数为空或解析失败）",
+            )],
+            now,
+        );
     }
 
     let unsupported: Vec<&UnsupportedUnit> = unsupported
@@ -204,45 +243,89 @@ fn assess(
         .map(|task| task.input_id.as_str())
         .collect();
 
-    let mut hard_messages: Vec<String> = Vec::new();
-    let mut warn_messages: Vec<String> = Vec::new();
+    let mut reasons: Vec<CollectionReason> = Vec::new();
     let mut hard_inputs: BTreeSet<&str> = BTreeSet::new();
+    let mut hard = 0usize;
+    let mut soft = 0usize;
+    let mut blocked_tool = 0usize;
+    let mut blocked_input = 0usize;
+
     for failure in telemetry_failures {
         if !task_ids.contains(failure.input_id.as_str()) {
             continue;
         }
-        let text = format!("{}: {}", failure.path, failure.detail);
+        let reason = reason(
+            reason_kind_for_telemetry(&failure.kind),
+            failure.path.clone(),
+            failure.detail.clone(),
+        );
         match severity(&failure.kind) {
             Severity::Ignore => {}
-            Severity::Warn => push_unique(&mut warn_messages, text),
+            Severity::Warn => {
+                soft += 1;
+                push_reason(&mut reasons, reason);
+            }
             Severity::Hard => {
                 hard_inputs.insert(failure.input_id.as_str());
-                push_unique(&mut hard_messages, text);
+                push_reason(&mut reasons, reason);
             }
         }
     }
 
     // 签发时就折算不了的单元：不是本 tick 的偶发，但同样意味着「这个面采不全」。
     for unit in &unsupported {
-        push_unique(
-            &mut hard_messages,
-            format!("{} 未支持：{}", unit.unit_id, unit.detail),
+        hard += 1;
+        push_reason(
+            &mut reasons,
+            reason(
+                collection_reason_kind::UNSUPPORTED,
+                unit.unit_id.clone(),
+                unit.detail.clone(),
+            ),
         );
     }
 
     // 导出器：失败按运行记（同一个导出器可能被多个单元各跑一份）。
+    //
+    // 关键区分：**缺工具是前置条件，不是采集错误**。报成 hard failure 会让一个只含
+    // 导出器的工作整面变 `failed`（页面红）；这里只当警告 —— 有其它健康的采集内容就
+    // `degraded`，没有就 `unknown`（「还采不成」），装上工具后自动回到 `ok`。
     let mut exporter_failed_ids: BTreeSet<&str> = BTreeSet::new();
+    let mut exporter_blocked_ids: BTreeSet<&str> = BTreeSet::new();
     for failure in exporter_failures
         .iter()
         .filter(|failure| failure.work_id == standing.work_id)
     {
-        exporter_failed_ids.insert(failure.input_id.as_str());
-        push_unique(
-            &mut hard_messages,
-            format!("{}: {}", failure.exporter_id, failure.detail),
-        );
+        match failure.kind {
+            ExporterFailureKind::Precondition => {
+                exporter_blocked_ids.insert(failure.input_id.as_str());
+                blocked_tool += 1;
+                push_reason(
+                    &mut reasons,
+                    reason(
+                        collection_reason_kind::MISSING_TOOL,
+                        failure.exporter_id.clone(),
+                        failure.detail.clone(),
+                    ),
+                );
+            }
+            ExporterFailureKind::Run => {
+                exporter_failed_ids.insert(failure.input_id.as_str());
+                hard += 1;
+                push_reason(
+                    &mut reasons,
+                    reason(
+                        collection_reason_kind::RUN_FAILED,
+                        failure.exporter_id.clone(),
+                        failure.detail.clone(),
+                    ),
+                );
+            }
+        }
     }
-    let exporter_healthy = runs.len().saturating_sub(exporter_failed_ids.len());
+    let exporter_healthy = runs
+        .len()
+        .saturating_sub(exporter_failed_ids.len() + exporter_blocked_ids.len());
 
     // 指标：只看这个面真有的域；快照里没有的域 = 没授权（不是「未知」）。
     let has_metrics_units = standing
@@ -250,15 +333,18 @@ fn assess(
         .iter()
         .any(|unit| unit.capability == "collect_metrics");
     let mut metric_healthy = 0usize;
-    let mut metric_hard = 0usize;
-    let mut metric_unknown = 0usize;
     if has_metrics_units {
         // tick 级失败（目标视图读不到 / 快照落盘失败）不是“采集失败”：快照可能还在用缓存，
-        // 指标也可能已经发出去了 —— 只降成 degraded，不把整面判死。
+        // 指标也可能已经发出去了 —— 只算软问题。
         for failure in metrics_failures {
-            push_unique(
-                &mut warn_messages,
-                format!("指标 {}: {}", failure.phase, failure.detail),
+            soft += 1;
+            push_reason(
+                &mut reasons,
+                reason(
+                    collection_reason_kind::RUN_FAILED,
+                    failure.phase.clone(),
+                    failure.detail.clone(),
+                ),
             );
         }
         for domain in metric_domains(&standing.family) {
@@ -271,131 +357,201 @@ fn assess(
             match outcome.status.as_str() {
                 "succeeded" => metric_healthy += 1,
                 "partial" => {
-                    // 部分目标成功：算“有内容在采”，但要带上警告 → degraded。
+                    // 部分目标成功：算“有内容在采”，但带上软问题。
                     metric_healthy += 1;
-                    push_unique(
-                        &mut warn_messages,
-                        format!(
-                            "{domain}: {} 个目标失败（{} 个成功）",
-                            outcome.failed_targets, outcome.succeeded_targets
-                        ),
-                    )
-                }
-                "failed" => {
-                    metric_hard += 1;
-                    push_unique(
-                        &mut hard_messages,
-                        format!(
-                            "{domain}: {}",
-                            outcome
-                                .last_error
-                                .clone()
-                                .unwrap_or_else(|| "全部目标采集失败".to_string())
+                    soft += 1;
+                    push_reason(
+                        &mut reasons,
+                        reason(
+                            collection_reason_kind::METRIC_PARTIAL,
+                            *domain,
+                            format!(
+                                "{} 个目标失败（{} 个成功）",
+                                outcome.failed_targets, outcome.succeeded_targets
+                            ),
                         ),
                     );
                 }
-                // pending / idle：授权了但还没有可判定的一轮。
-                _ => metric_unknown += 1,
+                "failed" => {
+                    hard += 1;
+                    push_reason(
+                        &mut reasons,
+                        reason(
+                            collection_reason_kind::RUN_FAILED,
+                            *domain,
+                            outcome
+                                .last_error
+                                .clone()
+                                .unwrap_or_else(|| "全部目标采集失败".to_string()),
+                        ),
+                    );
+                }
+                // pending / idle：授权了但还没有可判定的一轮 —— 目标/来源未就绪。
+                _ => {
+                    blocked_input += 1;
+                    push_reason(
+                        &mut reasons,
+                        reason(
+                            collection_reason_kind::TARGET_NOT_READY,
+                            *domain,
+                            "已授权，尚未观测到采集结果（首轮未完成 / 目标未就绪）",
+                        ),
+                    );
+                }
             }
         }
     }
-
     let task_hard = hard_inputs.len();
+    hard += task_hard;
     let task_healthy = task_ids.len().saturating_sub(task_hard);
-    let hard_count = task_hard + exporter_failed_ids.len() + unsupported.len() + metric_hard;
-    let healthy_count = task_healthy + exporter_healthy + metric_healthy;
+    let healthy = task_healthy + exporter_healthy + metric_healthy;
     let has_content = !task_ids.is_empty() || !runs.is_empty() || has_metrics_units;
     let has_unsupported = !unsupported.is_empty();
 
     if !has_content && !has_unsupported {
-        return unknown("这份授权里没有可执行的采集内容", now);
-    }
-
-    if hard_count > 0 {
-        return if healthy_count > 0 {
-            degraded(hard_messages, warn_messages, now)
-        } else {
-            failed(join_messages(hard_messages, warn_messages), now)
-        };
-    }
-    if !warn_messages.is_empty() {
-        return if healthy_count > 0 {
-            degraded(Vec::new(), warn_messages, now)
-        } else {
-            // 只有软问题、也没有任何健康信号：不冒充失败，如实说「还没采成」。
-            unknown(join_messages(Vec::new(), warn_messages), now)
-        };
-    }
-    if healthy_count > 0 {
-        return AgentLocalCollection {
-            status: collection_status::OK.to_string(),
-            observed_at: now.to_string(),
-            detail: String::new(),
-        };
-    }
-    if metric_unknown > 0 {
-        return unknown(
-            "已授权，尚未观测到采集结果（首轮未完成 / 指标目标未就绪）",
+        push_reason(
+            &mut reasons,
+            reason(
+                collection_reason_kind::NO_CONTENT,
+                "",
+                "这份授权里没有可执行的采集内容",
+            ),
+        );
+        return build_collection(
+            collection_prerequisites::READY,
+            collection_result::PENDING,
+            reasons,
             now,
         );
     }
-    unknown("还没有可判定的采集结果", now)
+
+    let prerequisites = if blocked_tool + blocked_input > 0 {
+        collection_prerequisites::BLOCKED
+    } else {
+        collection_prerequisites::READY
+    };
+    let result = if hard > 0 {
+        if healthy > 0 {
+            collection_result::PARTIAL
+        } else {
+            collection_result::FAILURE
+        }
+    } else if blocked_tool > 0 {
+        // 缺工具：没执行。没有其它内容就是取消，不是失败。
+        if healthy > 0 {
+            collection_result::PARTIAL
+        } else {
+            collection_result::CANCELLED
+        }
+    } else if blocked_input > 0 {
+        // 目标/来源未就绪：还没有可判定的观测。
+        if healthy > 0 {
+            collection_result::PARTIAL
+        } else {
+            collection_result::PENDING
+        }
+    } else if soft > 0 {
+        if healthy > 0 {
+            collection_result::PARTIAL
+        } else {
+            // 只有软问题、也没有任何健康信号：不冒充失败。
+            collection_result::PENDING
+        }
+    } else if healthy > 0 {
+        collection_result::SUCCESS
+    } else {
+        collection_result::PENDING
+    };
+
+    build_collection(prerequisites, result, reasons, now)
 }
 
-fn push_unique(messages: &mut Vec<String>, message: String) {
-    if !messages.contains(&message) {
-        messages.push(message);
-    }
-}
+/// 结构化原因上限：报告要小，页面扫一眼；完整原因在 agent 日志里。
+const MAX_REASON_ITEMS: usize = 5;
 
-/// 说明最多保留几条：页面要能扫一眼，完整原因仍在 agent 日志里。
+/// 旧 `detail` 的上限（与旧页面一致：最多 3 条 + 省略计数）。
 const MAX_DETAIL_ITEMS: usize = 3;
 
-fn join_messages(hard: Vec<String>, warn: Vec<String>) -> String {
-    let mut all = hard;
-    for message in warn {
-        if !all.contains(&message) {
-            all.push(message);
-        }
-    }
-    if all.len() > MAX_DETAIL_ITEMS {
-        let extra = all.len() - MAX_DETAIL_ITEMS;
-        all.truncate(MAX_DETAIL_ITEMS);
-        all.push(format!("等 {extra} 项"));
-    }
-    all.join("；")
-}
-
-fn failed(detail: impl Into<String>, now: &str) -> AgentLocalCollection {
-    AgentLocalCollection {
-        status: collection_status::FAILED.to_string(),
-        observed_at: now.to_string(),
+fn reason(kind: &str, subject: impl Into<String>, detail: impl Into<String>) -> CollectionReason {
+    CollectionReason {
+        kind: kind.to_string(),
+        subject: subject.into(),
         detail: detail.into(),
     }
 }
 
-fn degraded(hard: Vec<String>, warn: Vec<String>, now: &str) -> AgentLocalCollection {
-    let detail = join_messages(hard, warn);
+fn push_reason(reasons: &mut Vec<CollectionReason>, reason: CollectionReason) {
+    if !reasons.iter().any(|existing| {
+        existing.kind == reason.kind
+            && existing.subject == reason.subject
+            && existing.detail == reason.detail
+    }) {
+        reasons.push(reason);
+    }
+}
+
+fn reason_text(reason: &CollectionReason) -> String {
+    if reason.subject.is_empty() {
+        reason.detail.clone()
+    } else {
+        format!("{}: {}", reason.subject, reason.detail)
+    }
+}
+
+/// 折叠成旧 `status`（滚动升级期给旧消费方）。新消费方只看三字段。
+fn legacy_status(result: &str, prerequisites: &str) -> &'static str {
+    match result {
+        collection_result::SUCCESS => collection_status::OK,
+        collection_result::PARTIAL => collection_status::DEGRADED,
+        collection_result::FAILURE => collection_status::FAILED,
+        // 前置条件缺失不是“人为暂停”：旧页面没有对应值，用 unknown 更中性。
+        collection_result::CANCELLED if prerequisites == collection_prerequisites::BLOCKED => {
+            collection_status::UNKNOWN
+        }
+        collection_result::CANCELLED => collection_status::PAUSED,
+        _ => collection_status::UNKNOWN,
+    }
+}
+
+fn legacy_detail(reasons: &[CollectionReason]) -> String {
+    let mut items: Vec<String> = reasons.iter().map(reason_text).collect();
+    if items.len() > MAX_DETAIL_ITEMS {
+        let extra = items.len() - MAX_DETAIL_ITEMS;
+        items.truncate(MAX_DETAIL_ITEMS);
+        items.push(format!("等 {extra} 项"));
+    }
+    items.join("；")
+}
+
+fn build_collection(
+    prerequisites: &str,
+    result: &str,
+    mut reasons: Vec<CollectionReason>,
+    now: &str,
+) -> AgentLocalCollection {
+    let detail = legacy_detail(&reasons);
+    reasons.truncate(MAX_REASON_ITEMS);
     AgentLocalCollection {
-        status: collection_status::DEGRADED.to_string(),
+        prerequisites: prerequisites.to_string(),
+        result: result.to_string(),
+        reasons,
         observed_at: now.to_string(),
+        status: legacy_status(result, prerequisites).to_string(),
         detail,
     }
 }
 
-fn unknown(detail: impl Into<String>, now: &str) -> AgentLocalCollection {
-    AgentLocalCollection {
-        status: collection_status::UNKNOWN.to_string(),
-        observed_at: now.to_string(),
-        detail: detail.into(),
-    }
-}
-
-fn paused(detail: impl Into<String>, now: &str) -> AgentLocalCollection {
-    AgentLocalCollection {
-        status: collection_status::PAUSED.to_string(),
-        observed_at: now.to_string(),
-        detail: detail.into(),
+fn reason_kind_for_telemetry(kind: &TelemetryFailureKind) -> &'static str {
+    use TelemetryFailureKind::*;
+    match kind {
+        MissingInput => collection_reason_kind::MISSING_INPUT,
+        ProcessingFailed | InvalidOutput | OutputWriteFailed => collection_reason_kind::RUN_FAILED,
+        TruncatedLine => collection_reason_kind::TRUNCATED,
+        RecordWithheld | CapacityExceeded | HeadlessLinesDropped => {
+            collection_reason_kind::INCOMPLETE_DATA
+        }
+        // Ignore 类不会走到这里（调用方先按 severity 过滤）。
+        NoiseDropped | SelectionFiltered => "",
     }
 }
 
@@ -477,8 +633,12 @@ mod tests {
     }
 
     fn exporter_grant() -> AppliedWorkGrant {
+        AppliedWorkGrant::restore(&exporter_record())
+    }
+
+    fn exporter_record() -> crate::state_store::work::WorkRecord {
         use wist_contracts::work::WorkSpecSource;
-        let record = crate::state_store::work::WorkRecord {
+        crate::state_store::work::WorkRecord {
             schema_version: crate::state_store::work::SCHEMA_VERSION_V1.to_string(),
             recorded_at: "2026-11-08T00:00:00Z".to_string(),
             gateway_sequence: 1,
@@ -507,7 +667,27 @@ mod tests {
             }],
             one_shot: Vec::new(),
             metrics_interval_seconds: None,
-        };
+        }
+    }
+
+    /// 同一份授权里既有缺工具的导出器，也有正常的日志采集单元。
+    fn exporter_grant_with_healthy_task() -> AppliedWorkGrant {
+        use wist_contracts::work::WorkSpecSource;
+        let mut record = exporter_record();
+        record.standing[0].units.push(WorkSpecUnit {
+            unit_id: "auth".to_string(),
+            capability: "collect_logs".to_string(),
+            rule_ref: "r".to_string(),
+            requires_privilege: "root".to_string(),
+            sources: vec![WorkSpecSource {
+                kind: "FileGlob".to_string(),
+                target: "/var/log/auth.log".to_string(),
+                multiline: "none".to_string(),
+                exclude_globs: Vec::new(),
+                filters: Default::default(),
+                drop_if_contains: Vec::new(),
+            }],
+        });
         AppliedWorkGrant::restore(&record)
     }
 
@@ -586,6 +766,8 @@ mod tests {
         let result = assess_simple(&standing(vec![task("a", "/var/log/a.log")]), &[]);
         assert_eq!(result.status, collection_status::OK);
         assert!(result.detail.is_empty());
+        assert_eq!(result.prerequisites, collection_prerequisites::READY);
+        assert_eq!(result.result, collection_result::SUCCESS);
     }
 
     #[test]
@@ -603,6 +785,15 @@ mod tests {
             )],
         );
         assert_eq!(result.status, collection_status::DEGRADED);
+        assert_eq!(result.prerequisites, collection_prerequisites::READY);
+        assert_eq!(result.result, collection_result::PARTIAL);
+        assert!(
+            result.reasons.iter().any(|reason| reason.kind
+                == collection_reason_kind::MISSING_INPUT
+                && reason.subject == "/var/log/b.log"),
+            "{:?}",
+            result.reasons
+        );
         assert!(
             result.detail.contains("/var/log/b.log"),
             "{}",
@@ -622,6 +813,8 @@ mod tests {
             )],
         );
         assert_eq!(result.status, collection_status::FAILED);
+        assert_eq!(result.prerequisites, collection_prerequisites::READY);
+        assert_eq!(result.result, collection_result::FAILURE);
     }
 
     #[test]
@@ -658,6 +851,15 @@ mod tests {
             )],
         );
         assert_eq!(result.status, collection_status::DEGRADED);
+        assert_eq!(result.result, collection_result::PARTIAL);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason.kind == collection_reason_kind::TRUNCATED),
+            "{:?}",
+            result.reasons
+        );
         assert!(result.detail.contains("truncated"), "{}", result.detail);
     }
 
@@ -681,6 +883,16 @@ mod tests {
             "2026-11-08T00:00:00Z",
         );
         assert_eq!(result.status, collection_status::PAUSED);
+        assert_eq!(result.prerequisites, collection_prerequisites::READY);
+        assert_eq!(result.result, collection_result::CANCELLED);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason.kind == collection_reason_kind::STANDBY),
+            "{:?}",
+            result.reasons
+        );
     }
 
     #[test]
@@ -689,6 +901,15 @@ mod tests {
         work.status = "paused".to_string();
         let result = assess_simple(&work, &[]);
         assert_eq!(result.status, collection_status::PAUSED);
+        assert_eq!(result.result, collection_result::CANCELLED);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason.kind == collection_reason_kind::PAUSED),
+            "{:?}",
+            result.reasons
+        );
     }
 
     #[test]
@@ -749,6 +970,15 @@ mod tests {
             "2026-11-08T00:00:00Z",
         );
         assert_eq!(result.status, collection_status::UNKNOWN);
+        assert_eq!(result.prerequisites, collection_prerequisites::BLOCKED);
+        assert_eq!(result.result, collection_result::PENDING);
+        assert!(
+            result.reasons.iter().any(|reason| reason.kind
+                == collection_reason_kind::TARGET_NOT_READY
+                && reason.subject == "mysql_metrics"),
+            "{:?}",
+            result.reasons
+        );
     }
 
     #[test]
@@ -997,6 +1227,137 @@ mod tests {
         );
     }
 
+    /// 缺工具是**前置条件**，不是错误：只含导出器的工作不得报 failed。
+    #[test]
+    fn a_missing_exporter_tool_is_unknown_not_failed() {
+        let work = exporter_grant();
+        let run = work
+            .exporter_runs()
+            .into_iter()
+            .next()
+            .expect("exporter run");
+        let mut health = CollectionHealth::default();
+        health.observe(
+            &work,
+            &TelemetryTick::silent(),
+            &quiet_metrics(),
+            &ExporterReport {
+                failures: vec![ExporterFailure {
+                    work_id: run.work_id,
+                    input_id: run.input_id,
+                    exporter_id: run.exporter_id,
+                    kind: ExporterFailureKind::Precondition,
+                    detail: "工具缺失：/usr/sbin/smartctl（装上后自动恢复）".to_string(),
+                }],
+                succeeded: Vec::new(),
+            },
+            true,
+            "2026-11-08T00:00:00Z",
+        );
+        let entry = health.get("work-x").expect("entry");
+        assert_eq!(entry.status, collection_status::UNKNOWN);
+        assert_eq!(entry.prerequisites, collection_prerequisites::BLOCKED);
+        assert_eq!(entry.result, collection_result::CANCELLED);
+        assert!(
+            entry
+                .reasons
+                .iter()
+                .any(|reason| reason.kind == collection_reason_kind::MISSING_TOOL
+                    && reason.subject == "smartctl"),
+            "{:?}",
+            entry.reasons
+        );
+        assert!(
+            entry.detail.contains("工具缺失"),
+            "原因必须留给页面：{}",
+            entry.detail
+        );
+    }
+
+    /// 缺工具但又握有其它健康采集单元：整面是「降级」（部分采到），不是取消。
+    #[test]
+    fn a_missing_exporter_tool_beside_healthy_content_is_partial() {
+        let work = exporter_grant_with_healthy_task();
+        let run = work
+            .exporter_runs()
+            .into_iter()
+            .next()
+            .expect("exporter run");
+        let mut health = CollectionHealth::default();
+        health.observe(
+            &work,
+            &TelemetryTick::silent(),
+            &quiet_metrics(),
+            &ExporterReport {
+                failures: vec![ExporterFailure {
+                    work_id: run.work_id,
+                    input_id: run.input_id,
+                    exporter_id: run.exporter_id,
+                    kind: ExporterFailureKind::Precondition,
+                    detail: "工具缺失：/usr/sbin/smartctl（装上后自动恢复）".to_string(),
+                }],
+                succeeded: Vec::new(),
+            },
+            true,
+            "2026-11-08T00:00:00Z",
+        );
+        let entry = health.get("work-x").expect("entry");
+        // 前置条件不满足（工具缺失），但日志单元仍在采：结果是部分成功。
+        assert_eq!(entry.prerequisites, collection_prerequisites::BLOCKED);
+        assert_eq!(entry.result, collection_result::PARTIAL);
+        assert_eq!(entry.status, collection_status::DEGRADED);
+        assert!(
+            entry
+                .reasons
+                .iter()
+                .any(|reason| reason.kind == collection_reason_kind::MISSING_TOOL
+                    && reason.subject == "smartctl"),
+            "{:?}",
+            entry.reasons
+        );
+    }
+
+    /// 真跑失败（参数/命令/上送）仍然是硬失败：没有其它内容就该报 failed。
+    #[test]
+    fn an_exporter_run_failure_is_failed() {
+        let work = exporter_grant();
+        let run = work
+            .exporter_runs()
+            .into_iter()
+            .next()
+            .expect("exporter run");
+        let mut health = CollectionHealth::default();
+        health.observe(
+            &work,
+            &TelemetryTick::silent(),
+            &quiet_metrics(),
+            &ExporterReport {
+                failures: vec![ExporterFailure {
+                    work_id: run.work_id,
+                    input_id: run.input_id,
+                    exporter_id: run.exporter_id,
+                    kind: ExporterFailureKind::Run,
+                    detail: "参数无法解析：bad arg".to_string(),
+                }],
+                succeeded: Vec::new(),
+            },
+            true,
+            "2026-11-08T00:00:00Z",
+        );
+        let entry = health.get("work-x").expect("entry");
+        assert_eq!(entry.status, collection_status::FAILED);
+        assert_eq!(entry.prerequisites, collection_prerequisites::READY);
+        assert_eq!(entry.result, collection_result::FAILURE);
+        assert!(
+            entry
+                .reasons
+                .iter()
+                .any(|reason| reason.kind == collection_reason_kind::RUN_FAILED),
+            "{:?}",
+            entry.reasons
+        );
+    }
+
     #[test]
     fn an_exporter_failure_persists_until_a_successful_run() {
         let work = exporter_grant();
@@ -1010,6 +1371,7 @@ mod tests {
             work_id: run.work_id.clone(),
             input_id: run.input_id.clone(),
             exporter_id: run.exporter_id.clone(),
+            kind: ExporterFailureKind::Precondition,
             detail: "工具缺失：smartctl".to_string(),
         };
 
@@ -1026,7 +1388,7 @@ mod tests {
         );
         assert_eq!(
             health.get("work-x").expect("entry").status,
-            collection_status::FAILED
+            collection_status::UNKNOWN
         );
 
         // 导出器没到点（本轮没有新证据）：不能因为“这轮没报错”就假装好了。
@@ -1040,7 +1402,7 @@ mod tests {
         );
         assert_eq!(
             health.get("work-x").expect("entry").status,
-            collection_status::FAILED
+            collection_status::UNKNOWN
         );
 
         // 下一次真跑成功才清掉失败记忆。
@@ -1079,6 +1441,7 @@ mod tests {
                     work_id: run.work_id,
                     input_id: run.input_id,
                     exporter_id: run.exporter_id,
+                    kind: ExporterFailureKind::Run,
                     detail: "boom".to_string(),
                 }],
                 succeeded: Vec::new(),

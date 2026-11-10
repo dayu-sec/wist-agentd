@@ -5262,8 +5262,12 @@ mod tests {
         health.insert_for_test(
             "work-l",
             wist_contracts::local_work::AgentLocalCollection {
-                status: wist_contracts::local_work::collection_status::DEGRADED.to_string(),
+                prerequisites: wist_contracts::local_work::collection_prerequisites::READY
+                    .to_string(),
+                result: wist_contracts::local_work::collection_result::PARTIAL.to_string(),
+                reasons: Vec::new(),
                 observed_at: "2026-11-08T00:00:00Z".to_string(),
+                status: wist_contracts::local_work::collection_status::DEGRADED.to_string(),
                 detail: "1/2 个采集任务失败".to_string(),
             },
         );
@@ -5299,10 +5303,15 @@ mod tests {
                 "file_inputs 已废弃，local_inputs 必须恒空：{request}"
             );
             // 采集结果：和任务清单一起上报，页面才能回答「到底采成没采成」。
+            // 新模型三字段 + 兼容字段都要在。
             assert!(
-                request.contains(
-                    "\"collection\":{\"status\":\"failed\",\"observed_at\":\"2026-11-08T00:00:00Z\",\"detail\":\"source path does not exist\"}"
-                ),
+                request.contains("\"collection\":{\"prerequisites\":\"ready\""),
+                "{request}"
+            );
+            assert!(request.contains("\"result\":\"failure\""), "{request}");
+            assert!(request.contains("\"status\":\"failed\""), "{request}");
+            assert!(
+                request.contains("\"detail\":\"source path does not exist\""),
                 "{request}"
             );
             let response =
@@ -5327,8 +5336,17 @@ mod tests {
         collection_health.insert_for_test(
             "work-l",
             wist_contracts::local_work::AgentLocalCollection {
-                status: wist_contracts::local_work::collection_status::FAILED.to_string(),
+                prerequisites: wist_contracts::local_work::collection_prerequisites::READY
+                    .to_string(),
+                result: wist_contracts::local_work::collection_result::FAILURE.to_string(),
+                reasons: vec![wist_contracts::local_work::CollectionReason {
+                    kind: wist_contracts::local_work::collection_reason_kind::MISSING_INPUT
+                        .to_string(),
+                    subject: "/var/log/app.log".to_string(),
+                    detail: "source path does not exist".to_string(),
+                }],
                 observed_at: "2026-11-08T00:00:00Z".to_string(),
+                status: wist_contracts::local_work::collection_status::FAILED.to_string(),
                 detail: "source path does not exist".to_string(),
             },
         );

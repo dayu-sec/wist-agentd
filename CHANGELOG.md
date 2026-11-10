@@ -3,6 +3,37 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.32.0-alpha] - 2026-11-10
+
+### 变更（采集结果改多字段正交模型）
+
+- 本机工作视图里的采集结果不再用单一 `status`，改为三个正交字段：
+  - `prerequisites`：`ready` / `blocked` —— 前置条件（工具 / 依赖 / 来源 / 目标）；
+  - `result`：`success` / `partial` / `failure` / `cancelled` / `pending` —— 执行结果；
+  - `reasons`：`[{kind, subject, detail}]` —— 为什么不是成功，闭集 16 种。
+- 旧 `status` / `detail` 仍输出（由新字段派生），供未升级的网关 / 中心 / 页面使用。
+
+### 修复
+
+- **缺工具不再算采集失败**：`smartctl: 工具缺失（装上后自动恢复）` 改为
+  `prerequisites=blocked` + `result=cancelled` + reason `missing_tool`。
+  此前它被当硬失败，一个只含导出器的工作整面变红；装上工具后自动恢复。
+- 导出器失败按**性质**分两类（`ExporterFailureKind`）：缺工具/依赖 = `Precondition`
+  （不执行），参数解析 / 命令运行 / 结果上送 = `Run`（真失败）。
+- 「导出器缺工具 + 同一份授权里还有健康采集单元」现在是 `partial`（降级），
+  而不是整面取消。
+- 指标目标未就绪（首轮未完成）是 `pending`，不是 `failed`。
+
+### 文档
+
+- 新增 `docs/design/collection-status.md`：字段定义、判定顺序、什么不是错误、
+  页面组合、兼容与升级顺序。
+
+### 兼容性
+
+- **必须先把 gateway / center 升到支持新字段的版本，再升本版**：旧网关
+  （`deny_unknown_fields`）会拒收带新字段的上报。
+
 ## [0.31.1-alpha] - 2026-11-10
 
 ### 修复（agent 自观测指标带上主机身份）

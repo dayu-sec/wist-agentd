@@ -11,6 +11,7 @@ wist-agentd（edge daemon）实现时最重要的设计文档。
 2. [agentd-state-and-boundaries.md](./agentd-state-and-boundaries.md) — 状态与边界
 3. [agentd-state-schema.md](./agentd-state-schema.md) — 本地状态 schema
 4. [agentd-failure-handling.md](./agentd-failure-handling.md) — 故障处理
+   - 采集结果的状态口径见 [collection-status.md](./collection-status.md) — `AgentLocalCollection` 五状态定义、判定顺序与「什么不是错误」
 5. [agentd-exec-protocol.md](./agentd-exec-protocol.md) — 本地执行协议（配合 `src/exec/`）
 6. [agent-config-schema.md](./agent-config-schema.md) — 配置 schema（配合 `src/config/`）
 7. [self-observability.md](./self-observability.md) — 自观测（配合 `src/runtime/self_observability.rs`）
