@@ -515,6 +515,9 @@ process_state{state="running"} 1
 
 > 注册表是 `(采集域, fact_key) → (name, type, unit, labels)` 的唯一映射。`semconv_ref` 仅供理解与未来导出，不影响线名。
 >
+> 面向运维的「当前采了什么、多久采一次、什么条件下不出值」见 [`metrics-inventory.md`](./metrics-inventory.md)；
+> 两处冲突时以本节（及 `wist-metrics::METRIC_SPECS`）为准。
+>
 > 四条登记规则：
 >
 > 1. **fact 值必须已处于注册表声明的单位**：KiB→By、页×页大小、0–100→0–1 的换算在采集侧完成，注册表不做数值变换。

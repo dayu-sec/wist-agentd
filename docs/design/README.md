@@ -24,6 +24,7 @@ wist-agentd（edge daemon）实现时最重要的设计文档。
 
 ## 指标采集（配合 `src/telemetry/metrics/`）
 
+- [metrics-inventory.md](./metrics-inventory.md) — **当前采集清单**：主机 / agent 自观测 / 其它域的指标名、单位、label、周期与条件上报（运行态快照；规范性定义见 `metrics-data-spec.md` §10）
 - [metrics-collection-runtime.md](./metrics-collection-runtime.md) — **采集运行时**：统一调度 + `enum Collector` + async/blocking 双执行器（**P0/P0.5 已落地**：主机三域 + Kafka；**P1 已落地**：MySQL / TiDB）
 - [mysql-metrics.md](./mysql-metrics.md) — MySQL / TiDB 指标采集：P0 指标子集 / `sqlx` 连接与凭据 / 自探证据层与握手 / 失败表现
 - [pg-metrics.md](./pg-metrics.md) — PostgreSQL 指标采集：与 MySQL 共用运行时与凭据规则，只换了 SQL / 握手 / 指标
