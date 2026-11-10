@@ -77,7 +77,7 @@
 
 - 快照记录采集完成时刻，`collected_at` 与 VM `timestamps` 同源；
 - `agent_uplink_metrics_failed_total` 计数；
-- 自观测组（`agent_cpu_ratio` / `agent_cpu_cores` / `agent_memory_bytes` / `agent_admin_latency_seconds` / `agent_discovery_policy_version`）与采集记账共享 `instance` 为空的同一组；
+- 自观测组（`agent_cpu_ratio` / `agent_cpu_cores` / `agent_memory_bytes` / `agent_admin_latency_seconds` / `agent_discovery_policy_version`）与采集记账共享同一个 `instance`（与主机指标一致的 host resource id，用于关联 `system_host_info`）；
 - 验收：断言同一批次所有样本时间戳一致，且等于采集结束时刻；拿不到的读数不发而不是补 0。
 
 ### WP6 网关查询适配

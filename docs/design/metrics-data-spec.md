@@ -132,7 +132,7 @@ snake_case，闭集（§3 给出值域与准入规则）。**不得**出现 `_re
 主机      →  <host_resource_id>                       例: host-1
 进程      →  <host_resource_id>:proc:<identity>       例: host-1:proc:/usr/sbin/nginx@1690000000
 容器      →  <host_resource_id>:ctr:<container_id>    例: host-1:ctr:3f9a2b
-agent 自身 →  不适用（自观测指标没有 instance）
+agent 自身 →  <host_resource_id>（与主机指标同一值，用于关联 `system_host_info`）
 ```
 
 - `identity` 是「可执行文件 + 启动时间」或等价的稳定标识；**不得**含 PID。PID 会被回收，同一个 PID 在不同时刻属于不同进程。
@@ -163,7 +163,7 @@ agent 自身 →  不适用（自观测指标没有 instance）
 2. **白名单**：label 键集合封闭；采集实现**不得**注入未登记的 label。未登记 label 必须被丢弃并记为自观测事件。
 3. **禁止高基数**：时间戳、错误文本、命令行、动态路径、PID 数值**不得**作为 label。PID 只能作为指标值（`process_pid` / `container_pid`）。
 4. **保留名**：`__name__` 为存储保留键，任何 label **不得**与之冲突；`job` 属采集编排层，本规范不使用。
-5. `agent` 自观测指标（`agent_*`）**不带** `instance`：它们描述 agent 进程自身，没有外部对象。
+5. `agent` 自观测指标（`agent_*`）使用**与主机指标相同的 `instance`**（host resource id）：它们描述 agent 进程自身，但挂在「哪台机器」上，才能与 `system_host_info` 关联出 `host_ip` 等身份；没有主机目标时回退到本机 host id。
 6. 目标类指标的 `instance` **必须**是稳定身份：同一对象在连续批次、agent 重启前后取值一致。
 
 ### 3.4 选择类 label
@@ -607,7 +607,9 @@ process_state{state="running"} 1
 1. **拿不到就不发**：字段无值时不写该序列，**不补 0**。只有 `agent_uplink_metrics_failed_total` 是真实计数器，0 也发（0 是有意义的历史值）。
 2. **窗口声明**：`agent_cpu_ratio` 是单核口径，窗口取**相邻两次样本的间隔**；首轮没有基线不发。换算整机占比 = `agent_cpu_ratio / agent_cpu_cores`，换算在查询侧做。
 3. **计数器重置**：`*_total` 在进程重启后从 0 开始，不做持久化；查询用 `rate` / `increase`，不直接对原始值做差。
-4. **不带 `instance`**：自观测属于 agent 自身，不指向任何采集目标；`agent_collect_targets` 与自观测共享同一组（`instance` 为空）。
+4. **`instance` 与主机指标一致**（host resource id）：自观测与 `agent_collect_targets` 共享同一组身份，可直接
+   `* on(instance) group_left(host_ip) system_host_info` 关联主机身份。取值优先用本批主机目标的
+   `resource_ref`，没有主机目标时回退到本机 host id；不写空串。
 
 ### 10.5 ignore 表（登记但不产出指标）
 

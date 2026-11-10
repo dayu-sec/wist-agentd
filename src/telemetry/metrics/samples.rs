@@ -41,6 +41,9 @@ pub struct MetricsSamplesSnapshot {
 #[jumo(kind = "struct", domain = "Discovery", module = "Discovery.Collect")]
 pub struct MetricsSampleGroup {
     /// 稳定身份（主机资源 id / `host:proc:identity` / 容器资源 id）。
+    ///
+    /// 注意：它是**样本上的身份**，不是分组的唯一键 —— agent 自观测组与主机组共用
+    /// 同一个 host id，所以两组的 `instance` 相同。
     pub instance: String,
     #[serde(default)]
     pub samples: Vec<MetricsSampleRecord>,
@@ -241,16 +244,35 @@ pub fn build_samples_snapshot(runtime: &MetricsRuntimeSnapshot) -> MetricsSample
     }
 }
 
-/// agent 自有指标（无 `instance`）：采集记账 + 自观测。
+/// agent 自有指标：采集记账 + 自观测。
 ///
-/// 合成一组而不是两组：它们共享同一个实例为空的身份，分开写只会在 Gateway 上多一次合并。
+/// 合成一组而不是两组：它们共享同一个 `instance`（与主机指标一致的 host resource id），
+/// 分开写只会在 Gateway 上多一次合并。
 fn build_agent_group(runtime: &MetricsRuntimeSnapshot) -> Option<MetricsSampleGroup> {
     let mut samples = build_collect_target_samples(runtime);
     samples.extend(build_self_observation_samples(&self_obs::snapshot()));
     (!samples.is_empty()).then(|| MetricsSampleGroup {
-        instance: String::new(),
+        instance: agent_instance(runtime),
         samples,
     })
+}
+
+/// agent 自观测指标与主机指标共用 `instance`（host resource id）。
+///
+/// 之前这里是空串，导致 `agent_cpu_ratio` 无法与 `system_host_info` 关联出 `host_ip`。
+/// 优先取本批主机目标的 `resource_ref`（与主机序列完全一致）；没有主机目标时回退到
+/// 发现层同一个 [`default_host_id`](crate::discovery::host::default_host_id)，
+/// 保证 agent 重启 / 目标缺失时取值仍稳定。
+fn agent_instance(runtime: &MetricsRuntimeSnapshot) -> String {
+    runtime
+        .outcomes
+        .iter()
+        .filter(|outcome| outcome.collection_kind == "host_metrics")
+        .flat_map(|outcome| outcome.sample_targets.iter())
+        .map(|target| target.resource_ref.as_str())
+        .find(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(crate::discovery::host::default_host_id)
 }
 
 /// 采集记账：每批按 `target_kind × outcome` 报目标数（`dropped` 必须有账）。
@@ -533,6 +555,20 @@ mod tests {
             .unwrap_or_else(|| panic!("missing group {instance}"))
     }
 
+    /// 按样本名定位分组。
+    ///
+    /// `instance` 已不能当组的唯一键：agent 自观测组与主机组现在共用同一个 host id。
+    fn group_with_sample<'a>(
+        snapshot: &'a MetricsSamplesSnapshot,
+        name: &str,
+    ) -> &'a MetricsSampleGroup {
+        snapshot
+            .groups
+            .iter()
+            .find(|group| group.samples.iter().any(|sample| sample.name == name))
+            .unwrap_or_else(|| panic!("missing group with sample {name}"))
+    }
+
     fn snapshot(kind: &str, targets: Vec<MetricsCollectionTargetSample>) -> MetricsRuntimeSnapshot {
         MetricsRuntimeSnapshot {
             generated_at: "2026-04-19T00:00:00Z".to_string(),
@@ -565,7 +601,7 @@ mod tests {
 
         let snapshot = build_samples_snapshot(&snapshot("host_metrics", vec![sample_target]));
 
-        let group = group_of(&snapshot, "host-1");
+        let group = group_with_sample(&snapshot, "system_load_average_1m");
         assert_eq!(group.instance, "host-1");
         let names: Vec<&str> = group
             .samples
@@ -577,16 +613,18 @@ mod tests {
     }
 
     #[test]
-    fn failed_targets_do_not_emit_samples() {
+    fn failed_targets_do_not_emit_host_samples() {
         let mut sample_target = target("failed", "host-1");
         sample_target.runtime_facts = vec![StringKeyValue::new("host.loadavg.1m", "0.5")];
         let snapshot = build_samples_snapshot(&snapshot("host_metrics", vec![sample_target]));
+        // 失败目标不产出主机样本；agent 自观测组仍会在（它描述 agent 自身，不属于该目标）。
         assert!(
             snapshot
                 .groups
                 .iter()
-                .all(|group| group.instance.is_empty()),
-            "failed targets must not produce sample groups"
+                .flat_map(|group| group.samples.iter())
+                .all(|sample| !sample.name.starts_with("system_")),
+            "failed targets must not produce host samples"
         );
     }
 
@@ -598,7 +636,7 @@ mod tests {
             StringKeyValue::new("host.uptime.seconds", "12.5"),
         ];
         let snapshot = build_samples_snapshot(&snapshot("host_metrics", vec![sample_target]));
-        let samples = &snapshot.groups[0].samples;
+        let samples = &group_with_sample(&snapshot, "system_uptime_seconds").samples;
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].name, "system_uptime_seconds");
         assert!(samples[0].value.is_number());
@@ -617,8 +655,12 @@ mod tests {
             ],
         }];
         let snapshot = build_samples_snapshot(&snapshot("host_metrics", vec![sample_target]));
-        let group = group_of(&snapshot, "host-1");
-        let sample = &group.samples[0];
+        let group = group_with_sample(&snapshot, "system_filesystem_available_bytes");
+        let sample = group
+            .samples
+            .iter()
+            .find(|sample| sample.name == "system_filesystem_available_bytes")
+            .expect("filesystem sample");
         assert_eq!(sample.name, "system_filesystem_available_bytes");
         assert_eq!(sample.labels.len(), 2, "unknown label must be dropped");
         assert!(sample.const_labels.is_empty());
@@ -739,7 +781,17 @@ mod tests {
         };
         let snapshot = build_samples_snapshot(&runtime);
 
-        let group = group_of(&snapshot, "");
+        // agent 自观测与记账组不再用空 instance 做标记，按样本名定位。
+        let group = snapshot
+            .groups
+            .iter()
+            .find(|group| {
+                group
+                    .samples
+                    .iter()
+                    .any(|sample| sample.name == "agent_collect_targets")
+            })
+            .expect("agent group");
         let value = |outcome: &str| {
             group
                 .samples
@@ -768,9 +820,17 @@ mod tests {
             .expect("collect-targets line");
         assert_eq!(line.metric.name, "agent_collect_targets");
         assert_eq!(line.metric.target_kind.as_deref(), Some("process"));
-        assert!(line.metric.instance.is_empty());
+        // 没有主机目标时回退到本机 host id（与发现层同值），且绝不能为空。
+        assert_eq!(
+            line.metric.instance,
+            crate::discovery::host::default_host_id(),
+            "agent 指标必须带 instance 才能关联主机身份"
+        );
         let json = serde_json::to_value(line).expect("serialize");
-        assert!(json["metric"].get("instance").is_none());
+        assert_eq!(
+            json["metric"]["instance"].as_str(),
+            Some(line.metric.instance.as_str())
+        );
     }
 
     #[test]
@@ -1059,13 +1119,19 @@ mod tests {
             "host_metrics",
             vec![target("succeeded", "host-1")],
         ));
-        // 记账与自观测共享同一身份（`instance` 为空），合成一组。
+        // 记账与自观测共享同一身份，合成一组；身份就是主机目标的 instance。
         let agent_groups: Vec<_> = snapshot
             .groups
             .iter()
-            .filter(|group| group.instance.is_empty())
+            .filter(|group| {
+                group
+                    .samples
+                    .iter()
+                    .any(|sample| sample.name == "agent_collect_targets")
+            })
             .collect();
         assert_eq!(agent_groups.len(), 1, "agent metrics must not split groups");
+        assert_eq!(agent_groups[0].instance, "host-1");
         let sample_names: Vec<&str> = agent_groups[0]
             .samples
             .iter()
@@ -1073,6 +1139,64 @@ mod tests {
             .collect();
         assert!(sample_names.contains(&"agent_collect_targets"));
         assert!(sample_names.contains(&"agent_uplink_metrics_failed_total"));
+    }
+
+    /// `agent_*` 与主机序列必须落在同一个 `instance` 上，否则关联不出 `host_ip`。
+    #[test]
+    fn agent_metrics_share_the_host_instance() {
+        // 先喂一条自观测 CPU 基线：`agent_cpu_ratio` 是相邻两次读数的差分，
+        // 首读不出值。这样下面的断言能确定地拿到这条样本。
+        let _ = crate::telemetry::metrics::self_obs::snapshot();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let mut host = target("succeeded", "host-1");
+        host.labeled_facts = vec![MetricsLabeledFact {
+            key: "host.info".to_string(),
+            value: "1".to_string(),
+            labels: vec![StringKeyValue::new("host_ip", "10.0.0.5")],
+        }];
+        let snapshot = build_samples_snapshot(&snapshot("host_metrics", vec![host]));
+
+        let host_group = snapshot
+            .groups
+            .iter()
+            .find(|group| {
+                group
+                    .samples
+                    .iter()
+                    .any(|sample| sample.name == "system_host_info")
+            })
+            .expect("host group");
+        let agent_group = snapshot
+            .groups
+            .iter()
+            .find(|group| {
+                group
+                    .samples
+                    .iter()
+                    .any(|sample| sample.name == "agent_collect_targets")
+            })
+            .expect("agent group");
+
+        assert_eq!(host_group.instance, "host-1");
+        assert_eq!(
+            agent_group.instance, host_group.instance,
+            "agent 与主机必须共用 instance"
+        );
+
+        let lines = build_vm_metric_lines_with(&snapshot, "agent-1", &BTreeMap::new());
+        let agent_line = lines
+            .iter()
+            .find(|line| line.metric.name == "agent_uplink_metrics_failed_total")
+            .expect("agent line");
+        assert_eq!(agent_line.metric.instance, "host-1");
+
+        // 用户报的就是这一条：`agent_cpu_ratio` 必须带得上主机身份。
+        let cpu_line = lines
+            .iter()
+            .find(|line| line.metric.name == "agent_cpu_ratio")
+            .expect("agent_cpu_ratio line");
+        assert_eq!(cpu_line.metric.instance, "host-1");
     }
 
     #[test]

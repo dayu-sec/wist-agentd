@@ -285,13 +285,13 @@ fn export_metrics_writes_flattened_samples() {
     let ledger = find_row("agent_collect_targets");
     assert_eq!(ledger["metric"]["target_kind"], "host");
     assert_eq!(ledger["metric"]["outcome"], "succeeded");
-    assert!(ledger["metric"].get("instance").is_none());
+    // agent 指标与主机指标共用 instance，导出文件里也必须带上才能关联主机身份。
+    assert_eq!(ledger["metric"]["instance"], "host-1");
 
-    // 自观测：agent 自己的计数器/内存也同构写入，不带 instance。
-    assert!(
-        find_row("agent_uplink_metrics_failed_total")["metric"]
-            .get("instance")
-            .is_none()
+    // 自观测：agent 自己的计数器/内存也同构写入，与主机同一个 instance。
+    assert_eq!(
+        find_row("agent_uplink_metrics_failed_total")["metric"]["instance"],
+        "host-1"
     );
     assert!(
         rows.iter()

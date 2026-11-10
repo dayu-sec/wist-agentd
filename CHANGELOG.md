@@ -3,6 +3,27 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.31.1-alpha] - 2026-11-10
+
+### 修复（agent 自观测指标带上主机身份）
+
+- `agent_*` 序列（`agent_cpu_ratio` / `agent_memory_bytes` / …）现在带 `instance`，
+  取值与主机指标一致（host resource id）。此前是空串，导致 `agent_cpu_ratio`
+  无法与 `system_host_info` 关联出 `host_ip`。
+- 取值优先用本批主机目标的 `resource_ref`；没有主机目标时回退到本机 host id，
+  **不写空串**。
+
+### 兼容性
+
+- 旧序列（无 `instance`）与新序列（带 `instance`）是两条不同的时间线：切换后
+  `{instance=""}` 的查询会变空；按 `agent` 聚合（`sum by (agent)`）不受影响。
+
+### 测试
+
+- `agent_metrics_share_the_host_instance`：`system_host_info` 与 `agent_*` 必须落在
+  同一个 `instance`；
+- 导出的 `metrics.jsonl` 断言 agent 记账 / 自观测行带 `host-1`。
+
 ## [0.31.0-alpha] - 2026-11-09
 
 ### 新增（主机整机 CPU 使用率）
