@@ -582,43 +582,168 @@ async fn report_status_to_control_plane(
         }
     };
     let url = format!("{}/api/v1/agent/status", endpoint.trim_end_matches('/'));
-    let started = Instant::now();
-    match client.post(&url).json(&report).send().await {
-        Ok(response) if response.status().is_success() => {
-            let latency_ms = Some(started.elapsed().as_millis() as u64);
-            // 回执里可能带一条「重采 + 重报」命令。解析失败不算上报失败（延迟已采到）：
-            // 下一轮还会重新下发同一条（网关只在 agent 确认后才清）。
-            let commands = response
-                .json::<AgentStatusAck>()
-                .await
-                .ok()
-                .map(|ack| ack.commands)
-                .unwrap_or_default();
-            StatusReportOutcome {
-                latency_ms,
-                terminal: None,
-                commands,
+    post_status_report(&client, &url, endpoint, &report, quiet).await
+}
+
+/// 采集状态里**只有新模型才有的字段**。旧网关的 v1 报文是 `deny_unknown_fields`，
+/// 见到任何一个就**整份拒收**（见 [`legacy_status_body`]）。
+const COLLECTION_NEW_FIELDS: [&str; 3] = ["prerequisites", "result", "reasons"];
+
+/// 这份上报正文里**有没有**旧网关认不出的东西（有才值得降级重发）。
+fn has_new_collection_fields(body: &serde_json::Value) -> bool {
+    body.get("local_work")
+        .and_then(|work| work.get("standing"))
+        .and_then(|standing| standing.as_array())
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry
+                    .get("collection")
+                    .and_then(|collection| collection.as_object())
+                    .is_some_and(|collection| {
+                        COLLECTION_NEW_FIELDS
+                            .iter()
+                            .any(|key| collection.contains_key(*key))
+                    })
+            })
+        })
+}
+
+/// 把上报正文降级成**旧网关认得**的形状：只摘掉采集状态的新字段，其余原样。
+///
+/// 为什么需要：滚动升级时 agentd 往往**先于网关**发到机器上（制品先发、网关按站点排期）。
+/// 新字段撞上旧网关会在网关的 `Json` 提取器里直接 422 —— 那里不打业务日志，
+/// `last_seen_at` 也不再前进：机器在管理面上变成「离线」，而两边都查不到原因。
+/// 旧形状里的 `status` / `detail` 本来就还在（由新模型派生），降级后语义不减、只是不够细。
+fn legacy_status_body(body: &serde_json::Value) -> Option<serde_json::Value> {
+    if !has_new_collection_fields(body) {
+        return None;
+    }
+    let mut legacy = body.clone();
+    if let Some(entries) = legacy
+        .get_mut("local_work")
+        .and_then(|work| work.get_mut("standing"))
+        .and_then(|standing| standing.as_array_mut())
+    {
+        for entry in entries {
+            let Some(collection) = entry
+                .get_mut("collection")
+                .and_then(|value| value.as_object_mut())
+            else {
+                continue;
+            };
+            for key in COLLECTION_NEW_FIELDS {
+                collection.remove(key);
             }
         }
-        Ok(response) => {
-            let status = response.status();
-            // 读正文才能把「需要停下的终态」从其它 401 里认出来（§5.4）。
-            let body = response.text().await.unwrap_or_default();
-            if let crate::enrollment::AuthRejection::Terminal(code) =
-                crate::enrollment::classify_auth_rejection(status, &body)
-            {
-                return StatusReportOutcome::terminal(code);
+    }
+    Some(legacy)
+}
+
+/// 「报文形状不被这个网关接受」的状态码：只有这一类降级重发才可能有用。
+///
+/// 401/403 不在内 —— 那是身份问题，换个报文形状也过不去。
+fn is_contract_rejection(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 400 | 413 | 415 | 422)
+}
+
+/// 降级重发只提醒一次：网关旧是**环境状态**，不能每分钟刷一行。
+static DOWNGRADE_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// POST 一次状态上报；被旧网关按「报文形状」拒时，改发**降级副本**再试一次。
+///
+/// 正常路径**直出结构体**（字段顺序与契约一致，抓包与契约测试都按那个顺序读），
+/// 只有真的被拒时才把它转成 JSON、摘掉新字段。
+///
+/// 为什么**每次都先试完整正文**（而不是把“这个网关要降级”缓存下来）：网关一升完，
+/// 下一次上报就自动回到新模型——缓存会让新字段一直到 agentd 重启才出现。
+/// 代价是旧网关存续期间每拍多一次被拒的请求（上报周期是分钟级，可接受），
+/// 换的是“不需要重启就能自愈”。
+async fn post_status_report(
+    client: &reqwest::Client,
+    url: &str,
+    endpoint: &str,
+    report: &AgentStatusReport,
+    quiet: bool,
+) -> StatusReportOutcome {
+    let mut downgraded = false;
+    let mut legacy: Option<serde_json::Value> = None;
+    loop {
+        let request = match legacy.as_ref() {
+            Some(body) if downgraded => client.post(url).json(body),
+            _ => client.post(url).json(report),
+        };
+        let started = Instant::now();
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                let latency_ms = Some(started.elapsed().as_millis() as u64);
+                // 回执里可能带一条「重采 + 重报」命令。解析失败不算上报失败（延迟已采到）：
+                // 下一轮还会重新下发同一条（网关只在 agent 确认后才清）。
+                let commands = response
+                    .json::<AgentStatusAck>()
+                    .await
+                    .ok()
+                    .map(|ack| ack.commands)
+                    .unwrap_or_default();
+                return StatusReportOutcome {
+                    latency_ms,
+                    terminal: None,
+                    commands,
+                };
             }
-            if !quiet {
-                log::warn!("wist-agentd status report failed: HTTP {status} from {endpoint}");
+            Ok(response) => {
+                let status = response.status();
+                // 读正文才能把「需要停下的终态」从其它 401 里认出来（§5.4）。
+                let text = response.text().await.unwrap_or_default();
+                if let crate::enrollment::AuthRejection::Terminal(code) =
+                    crate::enrollment::classify_auth_rejection(status, &text)
+                {
+                    return StatusReportOutcome::terminal(code);
+                }
+                if !downgraded && is_contract_rejection(status) {
+                    let candidate = serde_json::to_value(report)
+                        .ok()
+                        .and_then(|body| legacy_status_body(&body));
+                    if let Some(body) = candidate {
+                        if !quiet
+                            && !DOWNGRADE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+                        {
+                            log::warn!(
+                                "wist-agentd status report body rejected by {endpoint} (HTTP {status}): \
+                                 retried with the legacy body, which this gateway accepts — \
+                                 a gateway older than this agentd is the likely cause; \
+                                 the machine stays online, but collection detail is coarser \
+                                 until the gateway is upgraded"
+                            );
+                        }
+                        legacy = Some(body);
+                        downgraded = true;
+                        continue;
+                    }
+                }
+                if !quiet {
+                    // 契约类拒绝且**没有可降的**（例如以后又往报文里加了新字段）：
+                    // 这里必须把“网关可能比 agentd 旧”说出来，否则又回到
+                    // 「机器看着离线、两边都查不到原因」。
+                    if is_contract_rejection(status) {
+                        log::warn!(
+                            "wist-agentd status report failed: HTTP {status} from {endpoint} \
+                             (request body rejected, and there was nothing to downgrade — \
+                             if this gateway predates this agentd, upgrade the gateway)"
+                        );
+                    } else {
+                        log::warn!(
+                            "wist-agentd status report failed: HTTP {status} from {endpoint}"
+                        );
+                    }
+                }
+                return StatusReportOutcome::failed();
             }
-            StatusReportOutcome::failed()
-        }
-        Err(err) => {
-            if !quiet {
-                log::warn!("wist-agentd status report failed: {err}");
+            Err(err) => {
+                if !quiet {
+                    log::warn!("wist-agentd status report failed: {err}");
+                }
+                return StatusReportOutcome::failed();
             }
-            StatusReportOutcome::failed()
         }
     }
 }
@@ -3744,6 +3869,7 @@ pub fn recover_incomplete_executions(state_dir: &Path, instance_id: &str) -> Run
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -4057,6 +4183,316 @@ mod tests {
         .await;
         server.await.expect("server task");
         assert!(outcome.latency_ms.is_some());
+    }
+
+    /// 一份带**新模型**采集状态的上报正文（旧网关会因此整份拒收）。
+    fn status_body_with_new_collection_fields() -> serde_json::Value {
+        serde_json::json!({
+            "agent_id": "agent-x",
+            "instance_id": "instance-x",
+            "version": "0.0.0",
+            "local_work": {
+                "recorded_at": "2026-11-10T00:00:00Z",
+                "gateway_sequence": 3,
+                "standing": [{
+                    "work_id": "work-1",
+                    "family": "StorageHealth",
+                    "status": "active",
+                    "plan_version": 1,
+                    "acknowledged_version": 1,
+                    "effective_from": "2026-11-10T00:00:00Z",
+                    "tasks": [],
+                    "collection": {
+                        "prerequisites": "blocked",
+                        "result": "cancelled",
+                        "reasons": [{
+                            "kind": "missing_tool",
+                            "subject": "smartctl",
+                            "detail": "工具缺失：/usr/sbin/smartctl（装上后自动恢复）"
+                        }],
+                        "observed_at": "2026-11-10T00:00:00Z",
+                        "status": "unknown",
+                        "detail": "工具缺失：/usr/sbin/smartctl（装上后自动恢复）"
+                    }
+                }],
+                "one_shot": [],
+                "local_inputs": []
+            },
+            // 一次性命令回执：降级只能摘采集字段，**回执必须原样保留**。
+            "command_acks": [{"command_id": "cmd-1", "outcome": "succeeded"}]
+        })
+    }
+
+    /// 降级副本：只摘新字段，旧字段（`status` / `detail`）与其余报文原样保留。
+    #[test]
+    fn the_legacy_body_only_drops_the_new_collection_fields() {
+        let body = status_body_with_new_collection_fields();
+        let legacy = legacy_status_body(&body).expect("must produce a legacy body");
+        let collection = &legacy["local_work"]["standing"][0]["collection"];
+        for key in COLLECTION_NEW_FIELDS {
+            assert!(collection.get(key).is_none(), "{key} must be dropped");
+        }
+        assert_eq!(collection["status"], "unknown");
+        assert!(collection["detail"].as_str().unwrap().contains("工具缺失"));
+        assert_eq!(collection["observed_at"], "2026-11-10T00:00:00Z");
+        // 新字段之外的报文一字不改（身份 / 工作清单都不能被动到）。
+        assert_eq!(legacy["agent_id"], "agent-x");
+        assert_eq!(legacy["local_work"]["gateway_sequence"], 3);
+        assert_eq!(legacy["local_work"]["standing"][0]["work_id"], "work-1");
+        assert_eq!(
+            legacy["local_work"]["standing"][0]["tasks"],
+            serde_json::json!([])
+        );
+    }
+
+    /// 旧形状本来就能过：不降级（避免无意义的第二次请求）。
+    #[test]
+    fn a_legacy_shaped_body_is_not_downgraded() {
+        let mut body = status_body_with_new_collection_fields();
+        let collection = body["local_work"]["standing"][0]["collection"]
+            .as_object_mut()
+            .expect("collection");
+        for key in COLLECTION_NEW_FIELDS {
+            collection.remove(key);
+        }
+        assert!(legacy_status_body(&body).is_none());
+        // 完全没有本机工作视图（旧 agent 的形状）也不降级。
+        assert!(legacy_status_body(&serde_json::json!({"agent_id": "a"})).is_none());
+    }
+
+    /// 假控制面：按顺序回状态码，并把收到的**每一份**正文收下来（用来数请求次数）。
+    async fn spawn_status_server(
+        responses: Vec<&'static str>,
+    ) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let hits: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&hits);
+        let handle = tokio::spawn(async move {
+            let mut index = 0usize;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let request = read_http_request(&mut socket).await;
+                let response = responses
+                    .get(index)
+                    .copied()
+                    .or_else(|| responses.last().copied())
+                    .unwrap_or("HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                index += 1;
+                seen.lock().expect("hits").push(request);
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (endpoint, hits, handle)
+    }
+
+    const STATUS_ACCEPTED: &str =
+        "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+    const STATUS_UNPROCESSABLE: &str =
+        "HTTP/1.1 422 Unprocessable Entity\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+    const STATUS_BAD_REQUEST: &str =
+        "HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+    const STATUS_TOO_LARGE: &str =
+        "HTTP/1.1 413 Payload Too Large\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+    const STATUS_UNAUTHORIZED: &str =
+        "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
+    fn status_report_with_new_fields() -> AgentStatusReport {
+        serde_json::from_value(status_body_with_new_collection_fields()).expect("decode report")
+    }
+
+    async fn post_report_with_server(
+        report: &AgentStatusReport,
+        responses: Vec<&'static str>,
+    ) -> (StatusReportOutcome, Vec<String>) {
+        let (endpoint, hits, server) = spawn_status_server(responses).await;
+        let outcome = post_status_report(
+            &reqwest::Client::new(),
+            &format!("{endpoint}/api/v1/agent/status"),
+            &endpoint,
+            report,
+            false,
+        )
+        .await;
+        server.abort();
+        let hits = hits.lock().expect("hits").clone();
+        (outcome, hits)
+    }
+
+    async fn post_with_server(responses: Vec<&'static str>) -> (StatusReportOutcome, Vec<String>) {
+        post_report_with_server(&status_report_with_new_fields(), responses).await
+    }
+
+    /// 漂移守卫：`AgentLocalCollection` 一旦新增字段，`COLLECTION_NEW_FIELDS` 必须跟着长，
+    /// 否则降级副本里会留着旧网关认不出的字段 —— 等于没降级（机器又“离线”）。
+    #[test]
+    fn the_downgrade_covers_every_field_the_old_contract_lacks() {
+        use std::collections::BTreeSet;
+        use wist_contracts::local_work::{
+            AgentLocalCollection, CollectionReason, collection_prerequisites,
+            collection_reason_kind, collection_result,
+        };
+
+        let full = AgentLocalCollection {
+            prerequisites: collection_prerequisites::BLOCKED.to_string(),
+            result: collection_result::CANCELLED.to_string(),
+            reasons: vec![CollectionReason {
+                kind: collection_reason_kind::MISSING_TOOL.to_string(),
+                subject: "smartctl".to_string(),
+                detail: "工具缺失".to_string(),
+            }],
+            observed_at: "2026-11-10T00:00:00Z".to_string(),
+            status: "unknown".to_string(),
+            detail: "工具缺失".to_string(),
+        };
+        let serialized = serde_json::to_value(&full).expect("serialize");
+        let keys: BTreeSet<&str> = serialized
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+
+        // 旧契约（wist-contracts 0.10.4）只有这三个。
+        let legacy_keys: BTreeSet<&str> = ["status", "observed_at", "detail"].into_iter().collect();
+        let new_keys: BTreeSet<&str> = COLLECTION_NEW_FIELDS.iter().copied().collect();
+        assert!(
+            legacy_keys.is_disjoint(&new_keys),
+            "新旧字段不能重叠：{new_keys:?}"
+        );
+        assert_eq!(
+            keys,
+            legacy_keys
+                .union(&new_keys)
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            "AgentLocalCollection 的字段变了：请把新增字段补进 COLLECTION_NEW_FIELDS"
+        );
+    }
+
+    /// 只有「报文形状」类拒绝才值得降级；身份问题（401/403）与瞬时故障（429/5xx）不重发。
+    #[test]
+    fn contract_rejections_are_only_the_body_shape_codes() {
+        for code in [400, 413, 415, 422] {
+            let status = reqwest::StatusCode::from_u16(code).expect("status");
+            assert!(is_contract_rejection(status), "{code} 应触发降级");
+        }
+        for code in [401, 403, 404, 409, 429, 500, 503] {
+            let status = reqwest::StatusCode::from_u16(code).expect("status");
+            assert!(!is_contract_rejection(status), "{code} 不应触发降级");
+        }
+    }
+
+    /// 降级只重试**一次**：两份都被拒就是真失败，不能循环。
+    #[tokio::test]
+    async fn a_repeated_rejection_is_retried_exactly_once() {
+        let (outcome, hits) = post_with_server(vec![STATUS_UNPROCESSABLE]).await;
+        assert_eq!(hits.len(), 2, "完整正文 + 降级副本，各一次");
+        for key in COLLECTION_NEW_FIELDS {
+            let needle = format!("\"{key}\":");
+            assert!(!hits[1].contains(&needle), "{key} 必须已摘掉：{}", hits[1]);
+        }
+        assert!(
+            outcome.latency_ms.is_none(),
+            "两份都被拒，不能算送达（否则 last_seen 会假前进）"
+        );
+    }
+
+    /// 413（体积）同样属于形状类：降级后体积变小，重发一次。
+    #[tokio::test]
+    async fn a_payload_too_large_is_downgraded_too() {
+        let (outcome, hits) = post_with_server(vec![STATUS_TOO_LARGE, STATUS_ACCEPTED]).await;
+        assert_eq!(hits.len(), 2);
+        assert!(outcome.latency_ms.is_some(), "降级后的上报要算送达");
+    }
+
+    /// 没有可降的内容时不发第二份（旧形状本来就没这些东西）。
+    #[tokio::test]
+    async fn nothing_to_downgrade_means_no_retry() {
+        // 没有本机工作视图（旧 agent 的形状）：400 时`legacy_status_body` 回 `None`，
+        // 不能无意义地再发一次。
+        let mut value = status_body_with_new_collection_fields();
+        value.as_object_mut().expect("object").remove("local_work");
+        let report: AgentStatusReport = serde_json::from_value(value).expect("decode");
+        let (outcome, hits) = post_report_with_server(&report, vec![STATUS_BAD_REQUEST]).await;
+        assert_eq!(hits.len(), 1, "无可降内容时不重发");
+        assert!(outcome.latency_ms.is_none());
+    }
+
+    /// 凭据问题（401）不能靠换报文形状解决：**不许**把降级当成创可贴。
+    #[tokio::test]
+    async fn an_auth_rejection_is_not_downgraded() {
+        let (outcome, hits) = post_with_server(vec![STATUS_UNAUTHORIZED]).await;
+        assert_eq!(hits.len(), 1, "401 只发一次");
+        assert!(outcome.latency_ms.is_none());
+        assert!(outcome.terminal.is_none(), "无终态码的 401 不进门禁");
+    }
+
+    /// 回执不能丢：降级只摘采集字段，`command_acks` 必须原样带给网关。
+    #[tokio::test]
+    async fn command_acks_survive_the_downgrade() {
+        let (_outcome, hits) = post_with_server(vec![STATUS_UNPROCESSABLE, STATUS_ACCEPTED]).await;
+        assert_eq!(hits.len(), 2);
+        assert!(
+            hits[1].contains("\"command_id\":\"cmd-1\""),
+            "降级副本必须保留命令回执：{}",
+            hits[1]
+        );
+    }
+
+    /// 滚动升级的常态是「agentd 先发、网关还旧」：降级重发必须把机器留在线。
+    #[tokio::test]
+    async fn a_rejected_status_report_is_retried_with_the_legacy_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            // 第一份：新形状，旧网关按 `deny_unknown_fields` 拒。
+            let (mut socket, _) = listener.accept().await.expect("accept 1");
+            let first = read_http_request(&mut socket).await;
+            assert!(first.contains("\"prerequisites\""), "{first}");
+            assert!(first.contains("\"reasons\""), "{first}");
+            socket
+                .write_all(
+                    b"HTTP/1.1 422 Unprocessable Entity\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write 1");
+            // 第二份：降级形状，网关接受。
+            let (mut socket, _) = listener.accept().await.expect("accept 2");
+            let second = read_http_request(&mut socket).await;
+            for key in ["prerequisites", "result", "reasons"] {
+                assert!(!second.contains(key), "{key} must be gone: {second}");
+            }
+            assert!(
+                second.contains("\"status\":\"unknown\""),
+                "legacy status must survive the downgrade: {second}"
+            );
+            socket
+                .write_all(
+                    b"HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write 2");
+        });
+
+        let report: AgentStatusReport =
+            serde_json::from_value(status_body_with_new_collection_fields())
+                .expect("decode status report");
+        let outcome = post_status_report(
+            &reqwest::Client::new(),
+            &format!("{endpoint}/api/v1/agent/status"),
+            &endpoint,
+            &report,
+            false,
+        )
+        .await;
+        server.await.expect("server task");
+        assert!(
+            outcome.latency_ms.is_some(),
+            "降级后的上报必须算送达（否则机器会变离线）"
+        );
     }
 
     #[tokio::test]

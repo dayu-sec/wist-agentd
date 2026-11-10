@@ -3,6 +3,46 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.32.1-alpha] - 2026-11-10
+
+### 修复（升级顺序不再是硬约束）
+
+- **新 agentd 撞上旧网关不再让机器“离线”**：网关的 v1 上报报文是 `deny_unknown_fields`，
+  采集状态的新字段会让它整份拒收（HTTP 422）——而那次拒绝发生在 `Json` 提取器里，
+  网关不打业务日志、`last_seen_at` 也不再前进，管理面上就是一台“离线”的机器、两边都查不到原因。
+  现在上报被这类形状拒绝时，agentd 会自动改发一份**摘掉新字段的降级副本**
+  （`status` / `detail` 仍在，只是粒度粗），并打一行 `warn` 提醒升级网关。
+  滚动升级里 agentd 先发是常态，这条必须不断线。
+- `diagnose` 不再把「目标不比当前新」的**拒绝**报成升级失败：`not_newer` /
+  `version_uncomparable` / `version_mismatch` / `spec_invalid` / `digest_invalid`
+  改为 WARN「最近一次升级被拒绝（机器没动）」。此前手工先把机器装到最新、
+  又收到同一次下发时，会永久留一条红色失败让人去查一台没事的机器。
+
+### 测试
+
+降级语义（`runtime::daemon::tests`）：
+
+- `a_rejected_status_report_is_retried_with_the_legacy_body`：422 后必须用降级正文重发并算送达；
+- `a_repeated_rejection_is_retried_exactly_once`：两份都被拒就是真失败，不能循环；
+- `a_payload_too_large_is_downgraded_too`：413 同属形状类；
+- `nothing_to_downgrade_means_no_retry`：无可降内容时不发第二份；
+- `an_auth_rejection_is_not_downgraded`：401 不能拿降级当创可贴；
+- `command_acks_survive_the_downgrade`：回执照送；
+- `contract_rejections_are_only_the_body_shape_codes`：400/413/415/422 才降级，401/403/404/429/5xx 不降；
+- `the_downgrade_covers_every_field_the_old_contract_lacks`：漂移守卫 ——
+  `AgentLocalCollection` 字段一变，`COLLECTION_NEW_FIELDS` 不改就红；
+- `the_legacy_body_only_drops_the_new_collection_fields`：只摘新字段，身份 / 工作清单 / `observed_at` 不动；
+- `a_legacy_shaped_body_is_not_downgraded`：旧形状本就不降级。
+
+升级记录分类：
+
+- `local_upgrade_check_calls_a_refused_upgrade_a_warning`：拒绝类终态报 WARN 而非 FAIL。
+
+### 文档
+
+- `docs/design/collection-status.md` §5 改口径：升级顺序从“必须网关先”改为
+  “agentd 先发安全（自动降级），但新字段要等网关升级才可见”。
+
 ## [0.32.0-alpha] - 2026-11-10
 
 ### 变更（采集结果改多字段正交模型）

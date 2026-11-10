@@ -1811,6 +1811,17 @@ fn local_upgrade_check(config: &AgentConfig) -> Check {
             join_detail(where_at, &record.detail),
         )
         .hint("升级没成、但机器是干净的；看升级器日志定因后再重派"),
+        // 「被拒绝」（目标不比当前新 / 参数不对）与「升级失败」必须分开：前者机器一动没动，
+        // 换台机器派同一件也一样被拒 —— 报成 FAIL 会让人去查一台根本没问题的机器。
+        "failed" if crate::upgrade::refusal_reason(&record.detail).is_some() => Check::warn(
+            "upgrade.local",
+            "最近一次升级被拒绝（机器没动）",
+            join_detail(where_at, &record.detail),
+        )
+        .hint(
+            "这是派发侧与这台机器对不上（目标版本不比当前新、或参数不对），不是机器故障；\
+             确认管理面的目标版本后重派。这条记录会被下一次升级覆盖，可以不管",
+        ),
         "failed" => Check::fail(
             "upgrade.local",
             "最近一次升级失败",
@@ -3441,6 +3452,28 @@ mod tests {
         assert_eq!(rolled.status, Status::Warn, "{rolled:?}");
         assert!(rolled.title.contains("回滚"), "{rolled:?}");
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 被别人先装好的机器会被派一次「同版本重装」，升级器拒得对 —— 但这不是机器故障。
+    /// diagnose 必须报「被拒绝」而不是「升级失败」，否则人会去查一台没事的机器。
+    #[test]
+    fn local_upgrade_check_calls_a_refused_upgrade_a_warning() {
+        let dir = upgrade_state_dir("refused");
+        write_upgrade_record(
+            &dir,
+            &upgrade_record(
+                "failed",
+                "verify_artifact",
+                "not_newer: target 0.1.22 is not newer than running 0.1.22 \
+                 (downgrade and reinstall are refused)",
+            ),
+        );
+        let check = local_upgrade_check(&upgrade_config_in(&dir));
+        assert_eq!(check.status, Status::Warn, "{check:?}");
+        assert!(check.title.contains("被拒绝"), "{check:?}");
+        assert!(check.detail.contains("not_newer"), "{}", check.detail);
+        assert!(check.hint.is_some(), "must say what to do next");
         let _ = std::fs::remove_dir_all(dir);
     }
 

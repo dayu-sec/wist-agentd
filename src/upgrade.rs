@@ -305,6 +305,29 @@ fn provided_target(request: &UpgradeRequest) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+/// 「这次升级**被拒绝**」的原因短码：前提不满足，机器一动没动。
+///
+/// 与真失败（取包 / 解包 / 换件 / 重启）分开看：拒绝是**派发方与这台机器对不上**
+/// （目标不比当前新、参数不对），换一台机器派同一件也一样被拒 —— 不是这台机器坏了。
+///
+/// 记录里 `detail` 由 [`UpgradeError`] 的 `Display` 写就，形如 `not_newer: …`，
+/// 第一个 `:` 之前就是短码。
+const REFUSAL_REASONS: &[&str] = &[
+    "spec_invalid",
+    "digest_invalid",
+    "not_newer",
+    "version_uncomparable",
+    "version_mismatch",
+];
+
+/// 这条失败记录是「被拒绝」（什么都没改），还是真的升级失败。
+///
+/// 只认**开头那个短码**：说明里随手提到 `not_newer` 不算。
+pub fn refusal_reason(detail: &str) -> Option<&str> {
+    let code = detail.split(':').next().unwrap_or_default().trim();
+    REFUSAL_REASONS.contains(&code).then_some(code)
+}
+
 /// 只前进：目标必须比当前运行版本新（降级与重装一律拒），且两者都得是点分数字。
 fn ensure_newer(target: &str, current: &str) -> Result<(), UpgradeError> {
     match version_is_newer(target, current) {
@@ -1294,6 +1317,30 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wist-upgrade-{label}-{suffix}"));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    /// 拒绝（目标不比当前新、参数不对）与真失败必须能分开：前者机器一动没动。
+    #[test]
+    fn refusal_reasons_are_not_failures() {
+        for code in REFUSAL_REASONS {
+            let detail = format!("{code}: something");
+            assert_eq!(refusal_reason(&detail), Some(*code), "{detail}");
+        }
+        // 真失败：取包 / 解包 / 换件 / 重启。
+        for detail in [
+            "package_unavailable: connect refused",
+            "artifact_invalid: staged artifact has no wist-agentd",
+            "staging_failed: write /var/lib/wist-agentd/upgrade/x",
+            "command_failed: run mv: permission denied",
+            "",
+        ] {
+            assert_eq!(refusal_reason(detail), None, "{detail}");
+        }
+        // 只认开头那个短码：说明里提到 not_newer 不算。
+        assert_eq!(
+            refusal_reason("package_unavailable: not_newer mentioned in passing"),
+            None
+        );
     }
 
     fn config_with_state(state_dir: &Path) -> AgentConfig {
