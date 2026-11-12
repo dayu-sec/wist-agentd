@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use wist_contracts::discovery::{DiscoveredResource, DiscoveredTarget, DiscoveryOrigin};
 use wist_shared::time::now_rfc3339;
 
+use super::cloud_meta;
 use super::{DiscoveryError, DiscoveryProbe, DiscoverySourceKind, ProbeOutput};
 
 #[derive(::jumo_derive::Jumo)]
@@ -42,6 +43,13 @@ impl DiscoveryProbe for HostDiscoveryProbe {
             ("host.name".to_string(), host_name.clone()),
         ]);
         attributes.extend(platform_attributes());
+        // 云实例身份：两个来源（agentd / 云 API）的唯一确定性关联键。
+        // 不在云上时 `probe()` 返回 None，这里就**什么都不写**（缺键比空串好）。
+        // 超时预算见 `cloud_meta` 模块头（最多 600ms，15 分钟一次）。
+        if let Some(cloud) = cloud_meta::probe() {
+            attributes.insert("cloud.provider".to_string(), cloud.provider.to_string());
+            attributes.insert("cloud.instance_id".to_string(), cloud.instance_id);
+        }
 
         Ok(ProbeOutput {
             probe: self.name().to_string(),
