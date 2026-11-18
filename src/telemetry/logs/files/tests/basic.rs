@@ -1,12 +1,56 @@
 use std::fs;
 
 use super::{
-    FileInputProcessor, ReadLimits, TestSink, config, log_checkpoints, read_json,
+    FileInputProcessor, ReadLimits, TestSink, block_on, config, log_checkpoints, read_json,
     read_output_records, temp_dir,
 };
+use crate::telemetry::logs::files::LogFileHandles;
 use crate::telemetry::logs::files::file_watcher::StartupPosition;
 use crate::telemetry::logs::multiline::MultilineMode;
 use crate::telemetry::warp_parse::FileRecordSink;
+
+/// 稳态下**第二批不再 open 源文件**：句柄跨批复用。
+///
+/// 订的就是那条真实故障：审计规则盯读 `audit.log` 时，「每读一批就 open 一次」会形成
+/// 「读日志 → 产生审计记录 → 再读」的反馈环（实测一台机 ~50 次 open/秒，
+/// 10 分钟几十万条记录全是采集器自己踩出来的）。
+#[test]
+fn a_second_batch_reuses_the_open_handle_instead_of_reopening_the_file() {
+    let root = temp_dir("handle-reuse");
+    let source_path = root.join("app.log");
+    let output_path = root.join("log").join("records.ndjson");
+    fs::create_dir_all(root.join("state")).expect("create state");
+    fs::create_dir_all(root.join("log")).expect("create log");
+    fs::write(&source_path, "first\n").expect("write log");
+
+    let mut handles = LogFileHandles::new();
+    let mut next_seq = 0;
+    let mut first = FileInputProcessor::new(
+        config(&root, &source_path),
+        FileRecordSink::new(output_path.clone()),
+    );
+    let first_outcome =
+        block_on(first.process_once_with_handles_async(&mut next_seq, &mut handles))
+            .expect("first batch");
+    assert_eq!(first_outcome.records_processed, 1);
+    assert_eq!(handles.open_count(), 1, "首批开一次");
+
+    fs::write(&source_path, "first\nsecond\n").expect("append");
+    let mut second = FileInputProcessor::new(
+        config(&root, &source_path),
+        FileRecordSink::new(output_path.clone()),
+    );
+    let second_outcome =
+        block_on(second.process_once_with_handles_async(&mut next_seq, &mut handles))
+            .expect("second batch");
+
+    assert_eq!(second_outcome.records_processed, 1, "新行照常采到");
+    assert_eq!(
+        handles.open_count(),
+        1,
+        "第二批必须复用第一批的句柄：每批再 open 一次就是审计反馈环的燃料"
+    );
+}
 
 #[test]
 fn lines_without_a_record_header_are_counted_not_emitted() {

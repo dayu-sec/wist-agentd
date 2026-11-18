@@ -2,6 +2,8 @@
 
 pub mod cache;
 pub mod cgroup;
+// 云实例身份（元数据服务的 instance-id）：双来源（agentd / 云 API）归并的确定性键。
+pub mod cloud_meta;
 pub mod container;
 // 数据库自探的公共层（MySQL / PostgreSQL / Doris 共用）：netns 视角的端口/地址、
 // 运行时判据、凭据 key。

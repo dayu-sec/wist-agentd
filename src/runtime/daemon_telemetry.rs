@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -13,7 +14,7 @@ use crate::telemetry::exporters;
 use crate::telemetry::logs::InputOrigin;
 use crate::telemetry::logs::files::file::FamilyCapacity;
 use crate::telemetry::logs::files::{
-    FileFamilyProcessor, FileInputProcessor, ProcessOutcome, is_family_target,
+    FileFamilyProcessor, FileInputProcessor, LogFileHandles, ProcessOutcome, is_family_target,
 };
 use crate::telemetry::logs::gate::Withheld;
 use crate::telemetry::warp_parse::{
@@ -24,10 +25,10 @@ use crate::telemetry::warp_parse::{
 mod support;
 
 use support::{
-    build_file_input_config, capacity_failure, headless_lines_failure, invalid_output_failure,
-    missing_input_failure, noise_dropped_failure, processing_failure, replay_spool_only,
-    selection_filtered_failure, spool_paused_reason, truncated_failure, unsupported_target,
-    uplink_failure, withheld_failure,
+    build_file_input_config, capacity_failure, catchup_stall_failure, headless_lines_failure,
+    invalid_output_failure, missing_input_failure, noise_dropped_failure, processing_failure,
+    replay_spool_only, selection_filtered_failure, spool_paused_reason, truncated_failure,
+    unsupported_target, uplink_failure, withheld_failure,
 };
 
 // 生效输出解析要给主循环用（它在短路前算），所以在同一层再导出一次；
@@ -79,6 +80,13 @@ pub(super) enum TelemetryFailureKind {
     /// —— 后者说明 `config.v2.json` 读不出来（权限 / 非 json-file 驱动 / 容器创建中），
     /// 那时排除式是静默 no-op、包含式会一条不收。
     SelectionFiltered,
+    /// **读得比写得慢**：连续多拍把追平时间片用尽 —— 没报错，但这条面一直落在文件尾后面。
+    ///
+    /// 为什么必须单列一类：现有信号全是“**内容**出了什么问题”（暂停 / 挡下 / 截断 / 丢噪音 /
+    /// 触顶），这个是“**速度**”问题，不属于其中任何一类 —— 于是它在管理面上长得和
+    /// “采集正常”一模一样，直到 spool 涨满才第一次变红（那时已经落后几百拍）。
+    /// 现场案例：审计规则盯读 `audit.log` 形成的自反馈环，就是靠这个症状被发现。
+    CatchupStalled,
     /// **出口写失败**：记录已安全进 spool 等重发，但「写出口」这一步没成功。
     ///
     /// 单列一类是因为它与「读文件失败」的处置完全不同：输入没问题，是出口（数据面目标）
@@ -286,6 +294,7 @@ pub(super) async fn process_telemetry_inputs(
     work: &AppliedWorkGrant,
     sink: &mut TelemetryRecordSink,
     next_seq: &mut u64,
+    runtime: &mut LogInputRuntime,
 ) -> TelemetryTick {
     // 三个收集器装在一个结构里穿过去：它们本来就是「本 tick 的结果」，分散成三个参数
     // 只会让每个调用点重复三遍（也正好越过 clippy 的参数上限）。
@@ -303,7 +312,12 @@ pub(super) async fn process_telemetry_inputs(
     // “采集面 + 平台单元”下发，这 5 个面已经覆盖了原来本机手写的那几条（install.log /
     // launchd.log / wifi.log …），本机再配一遍只会制造“配了、也以为在采、其实没人管”的错觉。
     // 字段保留只为让旧 toml 还能启动（值被忽略）。
-    for entry in work.log_inputs() {
+
+    // 本 tick 用过哪些句柄、哪些没人用了：用完就把没人用的关掉（撤活 / 文件消失之后
+    // 不该继续占 fd）。起点在此、终点在本函数末尾 —— 拍内多条输入共用同一份。
+    let inputs = work.log_inputs();
+    let handle_mark = runtime.handles.begin_tick();
+    for entry in &inputs {
         process_telemetry_input(
             config,
             &entry.input,
@@ -312,9 +326,16 @@ pub(super) async fn process_telemetry_inputs(
             &mut tick,
             next_seq,
             &budget,
+            &mut runtime.handles,
+            &mut runtime.stalls,
         )
         .await;
     }
+    runtime.handles.end_tick(handle_mark);
+    // 撤活后不该留着“连续追不平”的计数（否则重新授权会秒报）。
+    runtime
+        .stalls
+        .retain_inputs(inputs.iter().map(|entry| entry.input.input_id.as_str()));
 
     tick
 }
@@ -597,6 +618,104 @@ fn persist_cursor(state_dir: &Path, run: &WorkExporterRun, output: &str, fell_ba
     }
 }
 
+/// 「连续多少拍追不平」才算落后，而不是一次正常的追赶突发。
+///
+/// 一场轮转 / 停机后的补读本来就要吃满几拍，那不算病；持续 3 拍（约 9s）还追不平才是。
+const CATCHUP_STALL_TICKS: u32 = 3;
+
+/// 跨 tick 的日志输入运行态。
+///
+/// 两件事天然要一起活过 tick，所以放一个结构里：
+///   * `handles`：已打开的文件句柄（稳态下不再 `open()`，见 `files::file_handles`）；
+///   * `stalls`：「连续追不平」的拍数（「读得比写得慢」这个信号需要跨 tick 才能判）。
+pub(super) struct LogInputRuntime {
+    handles: LogFileHandles,
+    stalls: CatchupStalls,
+}
+
+impl LogInputRuntime {
+    pub(super) fn new() -> Self {
+        Self {
+            handles: LogFileHandles::new(),
+            stalls: CatchupStalls::default(),
+        }
+    }
+
+    /// 进入“不采集”的状态（待命 / 终态）：句柄全放、追平计数清零。
+    ///
+    /// 为什么连计数一起清：一段停采之后重新开，文件可能已经攒了很多 —— 那一轮确实会
+    /// 追平几拍，但它与“停采前就在落后”是两件事，不该把旧账带上来（会“秒报”）。
+    pub(super) fn release_for_idle(&mut self) {
+        let mark = self.handles.begin_tick();
+        self.handles.end_tick(mark);
+        self.stalls.clear();
+    }
+}
+
+/// 这一拍该不该算「没追平」。
+///
+/// 两个条件缺一不可：
+///   * `exit_by_timeout`：退出是**时间到**，不是读到文件尾；
+///   * `spent_ms >= slice`：这条输入确实吃掉了自己那份预算。
+///
+/// 为什么需要第二条：全局预算（`catchup_budget_ms`）被别的输入吃光时，排在后面的输入
+/// 往往只跑一两批就被让位（`spent` 远小于 `slice`）—— 那不是它慢，不能记在它头上。
+/// （这是**尽力而为**的归属：一条输入如果自己就吃掉了 ≥`slice` 的墙钟时间又没读完，
+/// 算在它头上是合理的。）
+///
+/// 为什么**不**拿「落后多少字节」当判据：饱和型输入（读得跟得上、但文件永远在写）每批
+/// 都读到文件尾才让位，让位那一刻 `lag ≈ 0`。用它当判据会正好放过要抓的那一类
+/// （现场案例：`audit.log` 自反馈环）。
+///
+/// 追平被关掉（`catchup_slice_ms = 0`）时没有 `slice`，这条信号也就不存在 ——
+/// “一拍一批”是用户明示的节奏，把那当成“落后”只会变成常驻告警。
+fn saturated_without_catching_up(
+    exit_by_timeout: bool,
+    spent_ms: u64,
+    slice_ms: Option<u64>,
+) -> bool {
+    exit_by_timeout && slice_ms.is_some_and(|slice| spent_ms >= slice)
+}
+
+/// 每条输入的「连续追不平」计数。
+///
+/// 为什么需要跨 tick 状态：单看一拍无法区分「一场正常的追赶」与「永远追不上」。
+/// 追平一拍（本批没读到行）就清零，失败也清零 —— 两者都意味着“本拍不在追平”。
+#[derive(Default)]
+pub(super) struct CatchupStalls {
+    consecutive: BTreeMap<String, u32>,
+}
+
+impl CatchupStalls {
+    /// 记一拍的结果，返回**连续**追不平的拍数（追平 / 未追平都调，不可跳）。
+    fn record(&mut self, input_id: &str, stalled: bool) -> u32 {
+        if !stalled {
+            self.consecutive.remove(input_id);
+            return 0;
+        }
+        let count = self.consecutive.entry(input_id.to_string()).or_insert(0);
+        *count += 1;
+        *count
+    }
+
+    /// 丢掉已经不在本次授权里的输入：撤活后不该留着计数（否则重新授权会“秒报”）。
+    fn retain_inputs<'a>(&mut self, keep: impl Iterator<Item = &'a str>) {
+        let keep: BTreeSet<&str> = keep.collect();
+        self.consecutive
+            .retain(|input_id, _| keep.contains(input_id.as_str()));
+    }
+
+    /// 全部清零（进待命 / 终态：那段停采之后再开，不该继承旧账）。
+    fn clear(&mut self) {
+        self.consecutive.clear();
+    }
+
+    #[cfg(test)]
+    fn count(&self, input_id: &str) -> u32 {
+        self.consecutive.get(input_id).copied().unwrap_or(0)
+    }
+}
+
 /// 一轮 tick 里「采集段」还能占多久。
 ///
 /// 为什么需要它：`max_lines_per_tick` / `max_read_bytes_per_tick` 只是**一批**的上限，
@@ -645,6 +764,11 @@ impl CatchupBudget {
 
     fn exhausted(&self) -> bool {
         self.deadline.is_some_and(|end| Instant::now() >= end)
+    }
+
+    /// 单条输入的时间片（毫秒）；`None` = 追平已关闭。
+    fn slice_ms(&self) -> Option<u64> {
+        self.slice.map(|slice| slice.as_millis() as u64)
     }
 }
 
@@ -696,6 +820,8 @@ impl InputTickReports {
     }
 }
 
+// 参数全是不同来源（配置 / 输入 / 出口 / 本 tick 结果 / 句柄表），打包成结构体只会把调用点弄长。
+#[allow(clippy::too_many_arguments)]
 async fn process_telemetry_input<S: RecordSink>(
     config: &AgentConfig,
     input: &LogFileInputSection,
@@ -704,10 +830,14 @@ async fn process_telemetry_input<S: RecordSink>(
     tick: &mut TelemetryTick,
     next_seq: &mut u64,
     budget: &CatchupBudget,
+    handles: &mut LogFileHandles,
+    stalls: &mut CatchupStalls,
 ) {
     // 目标形态先过一道：`**` / `~` / 相对路径采不了，要报成“形态不支持”，
     // 而不是拖到下面报“路径不存在”（那会把运维引去查权限）。
     if let Some(failure) = unsupported_target(input) {
+        // 本拍根本没在读 —— “连续追不平”的计数要清，不能留着上一拍的。
+        stalls.record(&input.input_id, false);
         tick.failures.push(failure);
         return;
     }
@@ -715,6 +845,8 @@ async fn process_telemetry_input<S: RecordSink>(
     let source_path = PathBuf::from(&input.path);
     let family_target = is_family_target(&input.path);
     if !family_target && !source_path.exists() {
+        // 同上：文件不在了 = 没在追平，计数清零（否则文件回来时第一拍就“秒报”）。
+        stalls.record(&input.input_id, false);
         tick.failures.push(missing_input_failure(input));
         match replay_spool_only(config, input, sink).await {
             Ok(Some(outcome)) => tick.outcomes.push(outcome),
@@ -728,6 +860,13 @@ async fn process_telemetry_input<S: RecordSink>(
     }
 
     let mut reports = InputTickReports::default();
+    // 「追不平」的证据：本拍读到的行数、跑了几批、**这条输入吃掉了多少时间**。
+    // 判据是时间（见 `saturated_without_catching_up`），不是“落后多少字节”。
+    let mut read_lines: usize = 0;
+    let mut batches: usize = 0;
+    let mut checkpoint_offset: u64 = 0;
+    let mut exit_by_timeout = false;
+    let started = Instant::now();
     loop {
         let slice_end = budget.slice_deadline();
         let outcome = match process_input_with_sink(
@@ -737,6 +876,7 @@ async fn process_telemetry_input<S: RecordSink>(
             source_path.clone(),
             sink,
             next_seq,
+            handles,
         )
         .await
         {
@@ -753,6 +893,9 @@ async fn process_telemetry_input<S: RecordSink>(
                 break;
             }
         };
+        read_lines += outcome.read_lines;
+        batches += 1;
+        checkpoint_offset = outcome.checkpoint_offset;
         reports.observe(&outcome);
         let again = InputTickReports::made_progress(&outcome) && slice_end.is_some();
         // 每批的 outcome 都留下：`is_active` / “本轮发过东西吗”本来就是“任一批”的语义。
@@ -761,8 +904,41 @@ async fn process_telemetry_input<S: RecordSink>(
             break;
         }
         if slice_end.is_some_and(|end| Instant::now() >= end) || budget.exhausted() {
+            // 上一批**还读到了行**，是时间用完才退出：这一拍没把文件读到头。
+            exit_by_timeout = true;
             break;
         }
+    }
+    let spent_ms = started.elapsed().as_millis() as u64;
+
+    // 「读得比写得慢」：连续几拍都「吃满自己那份预算 + 还没读到文件尾」才报。
+    // 清零在 `CatchupStalls::record` 里，追平一拍就没了 —— 所以“恢复”不需要单独通知。
+    let stalled = saturated_without_catching_up(exit_by_timeout, spent_ms, budget.slice_ms());
+    let consecutive = stalls.record(&input.input_id, stalled);
+    if consecutive >= CATCHUP_STALL_TICKS
+        && let Some(slice_ms) = budget.slice_ms()
+    {
+        // 真落后多少字节：只在**确实 > 0** 时报。饱和型（每批都读到文件尾才让位）这个数
+        // 天生接近 0，写成“落后 0 字节”只会误导人；文件族（glob / 目录）没有
+        // “一个文件尾”，也不编一个假数。
+        let lag_bytes = if family_target {
+            None
+        } else {
+            tokio::fs::metadata(&source_path)
+                .await
+                .ok()
+                .map(|metadata| metadata.len().saturating_sub(checkpoint_offset))
+                .filter(|lag| *lag > 0)
+        };
+        tick.failures.push(catchup_stall_failure(
+            input,
+            consecutive,
+            batches,
+            read_lines,
+            slice_ms,
+            spent_ms,
+            lag_bytes,
+        ));
     }
 
     // 拍末一次性上报（顺序与旧行为一致：先工作状态，再失败）。
@@ -823,28 +999,41 @@ async fn process_input_with_sink<S: RecordSink>(
     source_path: PathBuf,
     sink: &mut S,
     next_seq: &mut u64,
+    handles: &mut LogFileHandles,
 ) -> io::Result<ProcessOutcome> {
     let config = build_file_input_config(config, input, source_path, origin);
     if is_family_target(&input.path) {
         let mut processor = FileFamilyProcessor::new(config, sink);
-        processor.process_once_async(next_seq).await
+        processor
+            .process_once_with_handles_async(next_seq, handles)
+            .await
     } else {
         let mut processor = FileInputProcessor::new(config, sink);
-        processor.process_once_async(next_seq).await
+        processor
+            .process_once_with_handles_async(next_seq, handles)
+            .await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::{
-        CatchupBudget, InputTickReports, TelemetrySinkSlot, UplinkHealth, uplink_framing_forced,
+        CATCHUP_STALL_TICKS, CatchupBudget, CatchupStalls, InputTickReports, LogInputRuntime,
+        TelemetrySinkSlot, UplinkHealth, uplink_framing_forced,
     };
-    use crate::config::agent_config::LogsSection;
+    use crate::config::agent_config::{
+        AgentConfig, AgentSection, ControlPlaneSection, ExecutionSection, LogFileInputSection,
+        LogsSection, PathsSection,
+    };
+    use crate::control::work::AppliedWorkGrant;
     use crate::telemetry::logs::files::file::{FamilyCapacity, ProcessOutcome, ProcessOutcomeKind};
     use crate::telemetry::logs::gate::Withheld;
+    use wist_api::work::WorkGrant;
     use wist_contracts::telemetry_record::DataFrame;
+    use wist_contracts::work::{StandingWork, WorkSpec, WorkSpecSource, WorkSpecUnit};
 
     /// 一个“本批读了 N 行”的来源批次；其余字段默认空，用例按需覆盖。
     fn outcome(read_lines: usize) -> ProcessOutcome {
@@ -869,6 +1058,362 @@ mod tests {
             spool_bytes: 0,
             capacity: None,
         }
+    }
+
+    fn input() -> LogFileInputSection {
+        LogFileInputSection {
+            input_id: "work-audit-log".to_string(),
+            path: "/var/log/audit/audit.log".to_string(),
+            startup_position: "tail".to_string(),
+            multiline_mode: "none".to_string(),
+            exclude_globs: Vec::new(),
+            filters: Default::default(),
+            drop_if_contains: Vec::new(),
+        }
+    }
+
+    /// 一拍的失败里只挑「追不平」那条（其余失败会混进来，本用例不关心）。
+    fn stalled(tick: &super::TelemetryTick) -> Vec<&super::TelemetryFailure> {
+        tick.failures
+            .iter()
+            .filter(|failure| matches!(failure.kind, super::TelemetryFailureKind::CatchupStalled))
+            .collect()
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime")
+            .block_on(future)
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("wist-agentd-lag-{name}-{suffix}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// 一拍只读一行 + 1ms 时间片：5 万行的追加量在任何机器上都读不完 ——
+    /// “吃满预算且没读到尾”因此是确定的，不靠调度运气。
+    fn lag_signal_config(root: &Path) -> AgentConfig {
+        let mut config = AgentConfig::new(
+            AgentSection {
+                agent_id: Some("agent-lag".to_string()),
+                ..Default::default()
+            },
+            ControlPlaneSection::default(),
+            PathsSection {
+                root_dir: root.display().to_string(),
+                run_dir: root.join("run").display().to_string(),
+                state_dir: root.join("state").display().to_string(),
+                log_dir: root.join("log").display().to_string(),
+            },
+            ExecutionSection::default(),
+        );
+        config.telemetry.logs.max_lines_per_tick = 1;
+        config.telemetry.logs.catchup_slice_ms = 1;
+        config.telemetry.logs.catchup_budget_ms = 50;
+        config.telemetry.logs.output.kind = "file".to_string();
+        config.telemetry.logs.output.file.path = root
+            .join("log")
+            .join("records.ndjson")
+            .display()
+            .to_string();
+        config
+    }
+
+    /// 一份只含一条日志采集单元的授权（与生产同一条路径：授权 → `log_inputs`）。
+    fn lag_signal_grant(source: &Path) -> AppliedWorkGrant {
+        let standing = StandingWork {
+            work_id: "work-agent-lag-HostLogs".to_string(),
+            agent_id: "agent-lag".to_string(),
+            family: "HostLogs".to_string(),
+            spec: WorkSpec {
+                units: vec![WorkSpecUnit {
+                    unit_id: "unit-hot".to_string(),
+                    capability: "collect_logs".to_string(),
+                    rule_ref: "agent_uplink".to_string(),
+                    requires_privilege: "none".to_string(),
+                    sources: vec![WorkSpecSource {
+                        kind: "FileGlob".to_string(),
+                        target: source.display().to_string(),
+                        multiline: "none".to_string(),
+                        exclude_globs: Vec::new(),
+                        filters: Default::default(),
+                        drop_if_contains: Vec::new(),
+                    }],
+                }],
+            }
+            .encode()
+            .expect("encode spec"),
+            catalog_version: 1,
+            proposal_id: None,
+            plan_version: 1,
+            effective_from: "2026-11-18T00:00:00Z".to_string(),
+            status: "active".to_string(),
+            updated_by: "test".to_string(),
+            updated_at: "2026-11-18T00:00:00Z".to_string(),
+        };
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&WorkGrant {
+            agent_id: "agent-lag".to_string(),
+            standing: vec![standing],
+            one_shot: Vec::new(),
+            sequence: 1,
+            granted_at: "2026-11-18T00:00:00Z".to_string(),
+        });
+        applied
+    }
+
+    /// 端到端：这条信号是**采集循环自己**报出来的，不是只在构造器单测里成立。
+    ///
+    /// 回归的是现场那个故障：日志被写得比一拍能读完的速度快，循环每拍都吃满预算、
+    /// 却永远读不到文件尾 —— 旧信号对此完全无感（不失败、不暂停、有数据在进）。
+    #[test]
+    fn the_lag_signal_is_raised_by_the_collection_loop_after_three_saturated_ticks() {
+        use std::io::Write as _;
+
+        let root = temp_dir("signal");
+        for dir in ["state", "log", "run"] {
+            std::fs::create_dir_all(root.join(dir)).expect("create dir");
+        }
+        let source = root.join("audit.log");
+        std::fs::write(&source, "seed\n").expect("write seed");
+
+        let config = lag_signal_config(&root);
+        let grant = lag_signal_grant(&source);
+        let mut sink =
+            super::build_telemetry_sink(&config.telemetry.logs.output).expect("build sink");
+        let mut next_seq = 0u64;
+        let mut runtime = LogInputRuntime::new();
+
+        // 首拍只建立位点（授权折算出的 `startup_position` 恒为 `tail`）：安静的一拍不该报落后。
+        let quiet = block_on(super::process_telemetry_inputs(
+            &config,
+            &grant,
+            &mut sink,
+            &mut next_seq,
+            &mut runtime,
+        ));
+        assert!(stalled(&quiet).is_empty(), "安静的文件不是落后");
+
+        // 制造“写比读快”：一次追加远超一拍能读完的量。
+        let mut body = String::new();
+        for index in 0..50_000 {
+            body.push_str(&format!("line-{index:06}\n"));
+        }
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .expect("open for append")
+            .write_all(body.as_bytes())
+            .expect("append");
+
+        // 第二、三拍：还在攒阈值（一场正常追赶不该被当成病）。
+        for tick in 2..=3 {
+            let report = block_on(super::process_telemetry_inputs(
+                &config,
+                &grant,
+                &mut sink,
+                &mut next_seq,
+                &mut runtime,
+            ));
+            assert!(
+                stalled(&report).is_empty(),
+                "第 {tick} 拍还不足 {CATCHUP_STALL_TICKS} 拍"
+            );
+        }
+
+        // 第四拍：连续三拍饱和 → 报一条，且量都在 magnitude 里。
+        let report = block_on(super::process_telemetry_inputs(
+            &config,
+            &grant,
+            &mut sink,
+            &mut next_seq,
+            &mut runtime,
+        ));
+        let failures = stalled(&report);
+        assert_eq!(failures.len(), 1, "连续三拍追不平要报一条");
+        assert_eq!(
+            failures[0].path,
+            source.display().to_string(),
+            "指到哪个文件是运维第一个要看的字段"
+        );
+        let magnitude = failures[0].magnitude.clone().unwrap_or_default();
+        assert!(
+            magnitude.contains("consecutive_ticks=3"),
+            "阈值处的拍数要如实带上：{magnitude}"
+        );
+        assert!(
+            magnitude.contains("slice=1ms"),
+            "报出去的预算要与本条输入实际拿到的配置一致：{magnitude}"
+        );
+        assert!(
+            magnitude.contains("spent_ms=") && magnitude.contains("read_lines="),
+            "吃掉的预算与读到的行数要能对账：{magnitude}"
+        );
+    }
+
+    /// 计数按**输入**分开：“一条面在落后”不能变成“整台机在落后”。
+    #[test]
+    fn stalls_are_counted_per_input() {
+        let mut stalls = CatchupStalls::default();
+
+        stalls.record("work-a", true);
+        stalls.record("work-a", true);
+        stalls.record("work-b", true);
+
+        assert_eq!(stalls.count("work-a"), 2);
+        assert_eq!(stalls.count("work-b"), 1);
+        assert_eq!(stalls.record("work-b", false), 0);
+        assert_eq!(stalls.count("work-a"), 2, "清一条不能顺带清另一条");
+    }
+
+    /// 这条信号要回答“是不是**持续**追不上”，所以单拍不算：连续 N 拍才开始报。
+    #[test]
+    fn catchup_stalls_only_fire_after_consecutive_exhausted_ticks() {
+        assert_eq!(CATCHUP_STALL_TICKS, 3, "默认阈值就是三拍（约 9s）");
+        let mut stalls = CatchupStalls::default();
+
+        assert_eq!(stalls.record("work-audit-log", true), 1);
+        assert_eq!(stalls.record("work-audit-log", true), 2);
+        assert!(
+            stalls.count("work-audit-log") < CATCHUP_STALL_TICKS,
+            "两拍还不到阈值（轮转 / 停机后的补读本来就要吃满几拍）"
+        );
+        assert_eq!(stalls.record("work-audit-log", true), 3);
+        assert!(stalls.count("work-audit-log") >= CATCHUP_STALL_TICKS);
+    }
+
+    /// 追平一拍就清零：这条信号的“恢复”不需要单独通知（下一拍不再报就是不报了）。
+    #[test]
+    fn a_caught_up_tick_clears_the_stall_counter() {
+        let mut stalls = CatchupStalls::default();
+        stalls.record("work-audit-log", true);
+        stalls.record("work-audit-log", true);
+
+        assert_eq!(stalls.record("work-audit-log", false), 0);
+        assert_eq!(stalls.count("work-audit-log"), 0);
+        // 重新落后要重新攒满阈值，不能“继承”上一次的两拍。
+        assert_eq!(stalls.record("work-audit-log", true), 1);
+    }
+
+    /// 撤活后不能留着计数：否则重新授权会在第一拍就“秒报”落后。
+    #[test]
+    fn a_retracted_input_does_not_carry_its_stall_history() {
+        let mut stalls = CatchupStalls::default();
+        stalls.record("work-audit-log", true);
+        stalls.record("work-audit-log", true);
+
+        stalls.retain_inputs(["work-other"].into_iter());
+
+        assert_eq!(stalls.count("work-audit-log"), 0);
+        assert_eq!(stalls.record("work-audit-log", true), 1);
+    }
+
+    /// 进待命 / 终态（不采集）时旧账也要清：那段停采之后重新开，不该“秒报”。
+    #[test]
+    fn idling_clears_the_stall_history() {
+        let mut runtime = LogInputRuntime::new();
+        runtime.stalls.record("work-audit-log", true);
+        runtime.stalls.record("work-audit-log", true);
+
+        runtime.release_for_idle();
+
+        assert_eq!(runtime.stalls.count("work-audit-log"), 0);
+        assert_eq!(runtime.stalls.record("work-audit-log", true), 1);
+    }
+
+    /// 判据是“吃满自己那份预算 + 还没读到文件尾”，两条缺一不可。
+    #[test]
+    fn a_tick_counts_as_stalled_only_when_it_saturated_its_own_slice() {
+        // 典型现场：每条输入 400ms 预算，这条吃了 1800ms（整轮预算）且是时间到退出。
+        assert!(super::saturated_without_catching_up(true, 1_800, Some(400)));
+        // 恰好吃满也算（边界不靠运气）。
+        assert!(super::saturated_without_catching_up(true, 400, Some(400)));
+        // 全局预算被**别人**吃光：只跑了 120ms 就被让位 —— 不是它慢。
+        assert!(!super::saturated_without_catching_up(true, 120, Some(400)));
+        // 读到文件尾才退出（哪怕拍了很长）：那是追平了。
+        assert!(!super::saturated_without_catching_up(
+            false,
+            5_000,
+            Some(400)
+        ));
+        // 追平关掉（`catchup_slice_ms = 0`）：一拍一批是用户明示的节奏，不报落后。
+        assert!(!super::saturated_without_catching_up(true, 5_000, None));
+    }
+
+    /// 饱和型输入让位那一刻 `lag ≈ 0`：拿它当判据会正好放过要抓的那一类。
+    /// 所以落后量只能是**报出去的量**（且 >0 才写），不能是判据。
+    #[test]
+    fn the_byte_lag_is_reported_only_when_positive() {
+        let input = input();
+
+        let saturated = super::catchup_stall_failure(&input, 3, 23, 9_216, 400, 1_800, None);
+        let magnitude = saturated.magnitude.unwrap_or_default();
+
+        assert!(
+            magnitude.contains("spent_ms=1800"),
+            "吃满预算是运维要看的第一个数：{magnitude}"
+        );
+        assert!(
+            !magnitude.contains("lag_bytes"),
+            "lag≈0 时不写（写成“落后 0 字节”只会误导）：{magnitude}"
+        );
+    }
+
+    /// 去重靠 `detail`，会变的量只能进 `magnitude` —— 否则每拍都是新签名，日志刷屏。
+    #[test]
+    fn the_lag_signal_keeps_a_stable_identity_and_moves_the_numbers_to_magnitude() {
+        let input = input();
+
+        let first =
+            super::catchup_stall_failure(&input, 3, 5, 20_480, 400, 1_200, Some(19_600_000));
+        let later =
+            super::catchup_stall_failure(&input, 41, 7, 28_672, 400, 1_800, Some(24_000_000));
+
+        assert_eq!(
+            first.detail, later.detail,
+            "同一个问题必须是同一行字（签名去重按 kind|input_id|path|detail）"
+        );
+        assert!(
+            !first.detail.chars().any(|ch| ch.is_ascii_digit()),
+            "detail 里不能出现会变的数字（它进签名，一变就每拍新报一条）：{}",
+            first.detail
+        );
+        assert_ne!(
+            first.magnitude, later.magnitude,
+            "变化的量要留在 magnitude 里"
+        );
+        assert_eq!(first.kind, super::TelemetryFailureKind::CatchupStalled);
+        assert!(
+            first
+                .magnitude
+                .as_deref()
+                .is_some_and(|magnitude| magnitude.contains("lag_bytes=19600000")),
+            "落后多少字节是运维第一个要看的数"
+        );
+    }
+
+    /// 文件族（glob / 目录）没有“一个文件尾”：不能编一个假的落后量出来。
+    #[test]
+    fn a_family_input_reports_no_byte_lag() {
+        let mut input = input();
+        input.path = "/var/log/containers/*.log".to_string();
+
+        let failure = super::catchup_stall_failure(&input, 3, 9, 36_864, 400, 1_800, None);
+
+        let magnitude = failure.magnitude.unwrap_or_default();
+        assert!(magnitude.contains("consecutive_ticks=3"));
+        assert!(
+            !magnitude.contains("lag_bytes"),
+            "多文件时落后量无意义：{magnitude}"
+        );
     }
 
     /// 追平会把同一条输入的失败/计数拆到多批上；聚合必须“加起来只报一次”。

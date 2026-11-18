@@ -102,7 +102,9 @@
 - 周期性快照：`health …`、`metrics_runtime …`、`discovery_probe …`
 - 状态变化事件：`event=DiscoveryRefreshed`、`event=DiscoveryRefreshFailed`、`event=MetricsRuntimeUpdated`、`event=MetricsRuntimeFailed`
 - 工作状态通知：`telemetry work-state paused …` / `telemetry work-state resumed …`
-- 失败与告警：telemetry 输入失败（`telemetry input missing|failed|output invalid …`）、指标上送失败（`wist-agentd metrics uplink failed: …`）、状态上报失败（`wist-agentd status report failed: …`）、凭证续期失败（`wist-agentd credential renewal failed …`）
+- 失败与告警：telemetry 输入失败（`telemetry input missing|failed|output invalid …`）、
+  「读得比写得慢」（`telemetry input lagging input_id=… magnitude=consecutive_ticks=…`，
+  它是 `warn`：采集没停，只是追不上写入）、指标上送失败（`wist-agentd metrics uplink failed: …`）、状态上报失败（`wist-agentd status report failed: …`）、凭证续期失败（`wist-agentd credential renewal failed …`）
 
 ### 5.2 稳态收敛
 

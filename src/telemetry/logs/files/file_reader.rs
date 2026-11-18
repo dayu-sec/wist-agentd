@@ -84,16 +84,72 @@ pub fn stable_file_id(path: &Path, identity: &ObservedFileIdentity) -> String {
     block_on(stable_file_id_async(path, identity))
 }
 
+/// 一个**已经打开**的日志文件句柄。
+///
+/// 为什么要有这一层：`open()` 是能被审计规则看见的动作（`-w <file> -p r`）。采集器若每次读都
+/// `open()` 一次，在「审计日志自身也被审计」的主机上就会形成
+/// 「读 audit.log → 产生审计记录 → 再读」的反馈环：实测一台机被打到 ~50 次 open/秒，
+/// 十个钟头几十万条记录全是采集器自己踩出来的。持句柄跟尾把这个环断掉 —— 稳态 0 次 open，
+/// 只有首次接入、轮转、文件被重建时才重开。
+///
+/// 句柄自带打开时的 `(device, inode)`：判断「这个句柄还对不对得上路径」不需要再 open。
+pub struct OpenLogFile {
+    file: File,
+    device_id: Option<u64>,
+    inode: Option<u64>,
+}
+
+impl OpenLogFile {
+    pub async fn open(path: &Path) -> io::Result<Self> {
+        let file = File::open(path).await?;
+        let metadata = file.metadata().await?;
+        Ok(Self {
+            file,
+            device_id: device_id(&metadata),
+            inode: inode(&metadata),
+        })
+    }
+
+    /// 句柄指的文件是不是观测到的那个。任一侧拿不到 `(device, inode)` 一律当「不是」——
+    /// 判不了就重开一次，宁可多一次 open，也不要拿错文件的句柄去读。
+    pub fn points_at(&self, device_id: Option<u64>, inode: Option<u64>) -> bool {
+        match (self.device_id, self.inode, device_id, inode) {
+            (Some(held_device), Some(held_inode), Some(wanted_device), Some(wanted_inode)) => {
+                held_device == wanted_device && held_inode == wanted_inode
+            }
+            _ => false,
+        }
+    }
+
+    /// 只给测试用：证明确实复用了同一个 fd（而不是又开了一次）。
+    #[cfg(all(test, unix))]
+    pub(super) fn raw_fd(&self) -> std::os::unix::io::RawFd {
+        use std::os::unix::io::AsRawFd;
+        self.file.as_raw_fd()
+    }
+}
+
 pub async fn inspect_path_async(path: &Path) -> io::Result<ObservedFileIdentity> {
-    let mut file = File::open(path).await?;
-    let metadata = file.metadata().await?;
-    let prefix = read_prefix_async(&mut file).await?;
-    Ok(identity_from_metadata(&metadata, prefix))
+    let mut file = OpenLogFile::open(path).await?;
+    inspect_open_async(&mut file).await
 }
 
 #[cfg(test)]
 pub fn inspect_path(path: &Path) -> io::Result<ObservedFileIdentity> {
     block_on(inspect_path_async(path))
+}
+
+/// 从**已打开**的句柄观测 identity：`fstat` + 头部 32 字节指纹，不 `open`。
+pub async fn inspect_open_async(file: &mut OpenLogFile) -> io::Result<ObservedFileIdentity> {
+    let metadata = file.file.metadata().await?;
+    let prefix = read_prefix_async(&mut file.file).await?;
+    Ok(identity_from_metadata(&metadata, prefix))
+}
+
+/// 路径现在指向的 `(device, inode)`（只 `stat`，不 `open`）。
+pub async fn path_identity_async(path: &Path) -> io::Result<(Option<u64>, Option<u64>)> {
+    let metadata = tokio::fs::metadata(path).await?;
+    Ok((device_id(&metadata), inode(&metadata)))
 }
 
 /// 从 `start_offset` 起读取完整行。
@@ -103,19 +159,29 @@ pub fn inspect_path(path: &Path) -> io::Result<ObservedFileIdentity> {
 ///   跳过该行剩余到行尾后原子提交，并计入 `truncated_lines`；
 /// - 达到 `max_lines` / `max_bytes` 时在行边界停止，保证下次从行首继续；
 ///   行内不因预算中断——单行可能超过 `max_bytes`，但不会被切成两半。
+#[cfg(test)]
 pub async fn read_from_offset_async(
     path: &Path,
     start_offset: u64,
     limits: ReadLimits,
 ) -> io::Result<ReadFromOffset> {
-    let mut file = File::open(path).await?;
-    let metadata = file.metadata().await?;
-    let prefix = read_prefix_async(&mut file).await?;
+    let mut file = OpenLogFile::open(path).await?;
+    read_from_open_async(&mut file, start_offset, limits).await
+}
+
+/// 从**已打开**的句柄读：只 `seek` + `read`，不 `open`。
+pub async fn read_from_open_async(
+    file: &mut OpenLogFile,
+    start_offset: u64,
+    limits: ReadLimits,
+) -> io::Result<ReadFromOffset> {
+    let metadata = file.file.metadata().await?;
+    let prefix = read_prefix_async(&mut file.file).await?;
     let identity = identity_from_metadata(&metadata, prefix);
     let bounded_offset = start_offset.min(identity.file_len);
-    file.seek(SeekFrom::Start(bounded_offset)).await?;
+    file.file.seek(SeekFrom::Start(bounded_offset)).await?;
 
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::new(&mut file.file);
     let mut lines = Vec::new();
     let mut truncated_lines = 0usize;
     let mut committed_end_offset = bounded_offset;
@@ -261,6 +327,7 @@ fn append_bounded(buf: &mut Vec<u8>, chunk: &[u8], max: usize) -> bool {
     }
 }
 
+#[cfg(test)]
 pub async fn checkpoint_probe_async(
     path: &Path,
     checkpoint_offset: u64,
@@ -269,12 +336,24 @@ pub async fn checkpoint_probe_async(
         return Ok(None);
     }
 
-    let mut file = File::open(path).await?;
+    let mut file = OpenLogFile::open(path).await?;
+    checkpoint_probe_on(&mut file, checkpoint_offset).await
+}
+
+/// checkpoint 处的 16 字节探针，从**已打开**的句柄读（不 `open`）。
+pub async fn checkpoint_probe_on(
+    file: &mut OpenLogFile,
+    checkpoint_offset: u64,
+) -> io::Result<Option<String>> {
+    if checkpoint_offset == 0 {
+        return Ok(None);
+    }
+
     let probe_len = (checkpoint_offset as usize).min(CHECKPOINT_PROBE_BYTES);
     let probe_start = checkpoint_offset - probe_len as u64;
-    file.seek(SeekFrom::Start(probe_start)).await?;
+    file.file.seek(SeekFrom::Start(probe_start)).await?;
     let mut buf = vec![0u8; probe_len];
-    file.read_exact(&mut buf).await?;
+    file.file.read_exact(&mut buf).await?;
     Ok(Some(fingerprint(&buf)))
 }
 

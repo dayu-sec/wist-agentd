@@ -13,10 +13,12 @@ use crate::state_store::log_checkpoint_state::{
 use crate::state_store::log_checkpoints;
 use crate::state_store::log_seq_state;
 use crate::telemetry::logs::InputOrigin;
+use crate::telemetry::logs::files::file_handles::LogFileHandles;
 use crate::telemetry::logs::files::file_reader::{
-    ObservedFileIdentity, ReadLimits, inspect_path_async, read_from_offset_async,
+    ObservedFileIdentity, ReadFromOffset, ReadLimits, checkpoint_probe_on, inspect_open_async,
+    read_from_open_async,
 };
-use crate::telemetry::logs::files::file_watcher::{StartupPosition, decide_resume_async};
+use crate::telemetry::logs::files::file_watcher::{StartupPosition, decide_resume_on_async};
 use crate::telemetry::logs::gate::{UplinkGate, Withheld};
 use crate::telemetry::logs::multiline::MultilineMode;
 use crate::telemetry::spool;
@@ -271,7 +273,11 @@ where
         Self { config, sink }
     }
 
-    pub async fn process_once_async(&mut self, next_seq: &mut u64) -> io::Result<ProcessOutcome> {
+    pub async fn process_once_with_handles_async(
+        &mut self,
+        next_seq: &mut u64,
+        handles: &mut LogFileHandles,
+    ) -> io::Result<ProcessOutcome> {
         let mut runtime = self.load_runtime_state_async().await?;
         match replay_spool_if_present(
             &mut self.sink,
@@ -290,7 +296,9 @@ where
                 };
             }
         }
-        let batch = self.collect_read_batch(&mut runtime, next_seq).await?;
+        let batch = self
+            .collect_read_batch(&mut runtime, next_seq, handles)
+            .await?;
         let CollectedReadBatch {
             records,
             pending_multiline,
@@ -333,7 +341,9 @@ where
         let global_seq_path = log_seq_state::path_for(&self.config.state_dir);
         let mut next_seq =
             block_on_io(async { log_seq_state::load_or_default_async(&global_seq_path).await })?;
-        block_on_io(self.process_once_async(&mut next_seq))
+        // 单测里没有跨 tick 的句柄表：本批用完即关（与旧行为一致）。
+        let mut handles = LogFileHandles::new();
+        block_on_io(self.process_once_with_handles_async(&mut next_seq, &mut handles))
     }
 
     async fn load_runtime_state_async(&mut self) -> io::Result<RuntimeState> {
@@ -360,16 +370,30 @@ where
         &self,
         runtime: &mut RuntimeState,
         next_seq: &mut u64,
+        handles: &mut LogFileHandles,
     ) -> io::Result<CollectedReadBatch> {
-        let current = inspect_path_async(&self.config.source_path).await?;
+        // 观测与「从哪续读」的判定都走**持有句柄**：每批再 open 一次的行为去掉了
+        // （理由见 `file_handles` 模块注释：审计规则盯读的主机上那一次 open 就是一条审计记录）。
         let tracked = checkpoint_for_path(&runtime.log_state, &self.config.source_path);
-        let resume = decide_resume_async(
-            &self.config.source_path,
-            &current,
-            tracked.as_ref(),
-            self.config.startup_position,
-        )
-        .await;
+        let resume = {
+            let file = handles.acquire(&self.config.source_path).await?;
+            let current = match inspect_open_async(file).await {
+                Ok(current) => current,
+                Err(err) => {
+                    // `fstat` / 读头部失败也可能是 fd 级的：摘掉句柄，下批重开。
+                    handles.invalidate(&self.config.source_path);
+                    return Err(err);
+                }
+            };
+            decide_resume_on_async(
+                file,
+                &self.config.source_path,
+                &current,
+                tracked.as_ref(),
+                self.config.startup_position,
+            )
+            .await
+        };
         let mut batch = CollectedReadBatch::new(resume);
         batch.pending_multiline = runtime.log_state.pending_multiline.take();
         // 记录出口的闸门：本次采集的所有记录都过它（内容不全的在它那里被挡下）。
@@ -383,7 +407,14 @@ where
             self.config.origin.clone(),
         );
         let mut saw_new_lines = self
-            .collect_rotated_tail(runtime, tracked.as_ref(), &mut batch, &mut gate, next_seq)
+            .collect_rotated_tail(
+                runtime,
+                tracked.as_ref(),
+                &mut batch,
+                &mut gate,
+                next_seq,
+                handles,
+            )
             .await?;
 
         if batch.resume.rotated || batch.resume.truncated {
@@ -409,7 +440,8 @@ where
             batch.dropped_noise += admitted.dropped_noise;
         }
 
-        let active_read = read_from_offset_async(
+        let (active_read, checkpoint_probe) = read_segment(
+            handles,
             &self.config.source_path,
             batch.resume.start_offset,
             self.config.read_limits,
@@ -438,6 +470,7 @@ where
             identity: active_read.identity,
             checkpoint_offset: batch.checkpoint_offset,
             rotated_from_path: batch.resume.rotated_from_path.clone(),
+            checkpoint_probe,
         });
 
         if !saw_new_lines
@@ -469,6 +502,7 @@ where
         batch: &mut CollectedReadBatch,
         gate: &mut UplinkGate<'_>,
         next_seq: &mut u64,
+        handles: &mut LogFileHandles,
     ) -> io::Result<bool> {
         if !batch.resume.rotated {
             return Ok(false);
@@ -488,7 +522,8 @@ where
             &self.config.source_path,
             &rotated_path,
         );
-        let rotated_read = read_from_offset_async(
+        let (rotated_read, checkpoint_probe) = read_segment(
+            handles,
             &rotated_path,
             previous.checkpoint_offset,
             self.config.read_limits,
@@ -516,6 +551,7 @@ where
             identity: rotated_read.identity,
             checkpoint_offset: rotated_read.committed_end_offset,
             rotated_from_path: None,
+            checkpoint_probe,
         });
         Ok(saw_new_lines)
     }
@@ -550,6 +586,7 @@ where
                     real_path: "",
                     pending_multiline: None,
                     rotated_from_path: checkpoint.rotated_from_path,
+                    checkpoint_probe: checkpoint.checkpoint_probe,
                 },
             )
             .await;
@@ -558,6 +595,33 @@ where
         runtime.log_state.updated_at = runtime.observed_at.clone();
         log_checkpoints::store_async(&runtime.checkpoint_path, &runtime.log_state).await
     }
+}
+
+/// 从**持有句柄**读一段，并把提交位置的 checkpoint 探针一并取好。
+///
+/// 为什么要合成一个函数：读、探针两步又得用同一个句柄（探针再按路径读 = 多一次 `open()`），
+/// 而那一次 `open()` 在审计规则盯读的主机上就是一条审计记录（见 `file_handles` 模块注释）。
+async fn read_segment(
+    handles: &mut LogFileHandles,
+    path: &Path,
+    start_offset: u64,
+    limits: ReadLimits,
+) -> io::Result<(ReadFromOffset, Option<String>)> {
+    let file = handles.acquire(path).await?;
+    let read = match read_from_open_async(file, start_offset, limits).await {
+        Ok(read) => read,
+        Err(err) => {
+            // 读不动可能是 **fd 级**的（`EIO` / 磁盘掉线）：旧实现每批重开，这类错误不会
+            // “粘”在这个文件上；持句柄后必须显式摘掉，否则这条输入会永远读不动。
+            handles.invalidate(path);
+            return Err(err);
+        }
+    };
+    let probe = checkpoint_probe_on(file, read.committed_end_offset)
+        .await
+        .ok()
+        .flatten();
+    Ok((read, probe))
 }
 
 /// 读取/加载一个 input 的本地状态（单文件与文件族共用）。
@@ -645,10 +709,16 @@ where
         let global_seq_path = log_seq_state::path_for(&self.config.state_dir);
         let mut next_seq =
             block_on_io(async { log_seq_state::load_or_default_async(&global_seq_path).await })?;
-        block_on_io(self.process_once_async(&mut next_seq))
+        let mut handles = LogFileHandles::new();
+        block_on_io(self.process_once_with_handles_async(&mut next_seq, &mut handles))
     }
 
-    pub async fn process_once_async(&mut self, next_seq: &mut u64) -> io::Result<ProcessOutcome> {
+    /// 一批采集，每个文件的句柄从 `handles` 里拿：**稳态下不再 `open()`**。
+    pub async fn process_once_with_handles_async(
+        &mut self,
+        next_seq: &mut u64,
+        handles: &mut LogFileHandles,
+    ) -> io::Result<ProcessOutcome> {
         let mut runtime = load_runtime_state_async(&self.config).await?;
         // 提交时用来判断「状态真的变了吗」：没变就不重写状态盘。
         // 必须在 `migrate` **之前**拍快照 —— 迁移本身也是状态变更（否则孤儿块会被反复迁、反复发）。
@@ -678,7 +748,7 @@ where
             }
         }
         let batch = self
-            .collect_family_batch(&mut runtime, next_seq, orphan_pending)
+            .collect_family_batch(&mut runtime, next_seq, orphan_pending, handles)
             .await?;
         let FamilyBatch {
             records,
@@ -741,6 +811,7 @@ where
         runtime: &mut RuntimeState,
         next_seq: &mut u64,
         orphan_pending: Option<PendingMultilineState>,
+        handles: &mut LogFileHandles,
     ) -> io::Result<FamilyBatch> {
         let observed_at = runtime.observed_at.clone();
         let mut gate = UplinkGate::new(
@@ -874,6 +945,7 @@ where
                     &mut budget,
                     next_seq,
                     &mut batch,
+                    handles,
                 )
                 .await
             {
@@ -905,14 +977,23 @@ where
         budget: &mut ReadLimits,
         next_seq: &mut u64,
         batch: &mut FamilyBatch,
+        handles: &mut LogFileHandles,
     ) -> io::Result<()> {
         let tracked = checkpoint_for_path(&runtime.log_state, display);
-        let current = match inspect_path_async(display).await {
-            Ok(current) => current,
+        // 观测走持有句柄（只 `stat` 判身份，不 `open`）。
+        let current = match handles.acquire(display).await {
+            Ok(file) => match inspect_open_async(file).await {
+                Ok(current) => current,
+                Err(err) => {
+                    // `fstat` / 读头部失败也可能是 fd 级的：摘掉句柄，下批重开。
+                    handles.invalidate(display);
+                    return Err(err);
+                }
+            },
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 if let Some(previous) = tracked.as_ref() {
                     let drained = self
-                        .drain_rotated(runtime, previous, gate, budget, next_seq, batch)
+                        .drain_rotated(runtime, previous, gate, budget, next_seq, batch, handles)
                         .await?;
                     // 找不到轮转目标（被删 / 被压缩搬走）：手里那条未封口块按到期封口交出去，
                     // 并把 pending 从 checkpoint 里清掉。不清就成了一个既不会封口、也不会被
@@ -952,7 +1033,7 @@ where
         } else {
             self.config.startup_position
         };
-        // `decide_resume_async` 用 `path` 字符串判定“同一个文件”。symlink 输入下显示路径
+        // `decide_resume` 用 `path` 字符串判定“同一个文件”。symlink 输入下显示路径
         // （`/var/log/containers/...`）与真实路径（`/var/log/pods/...`）不同，必须把比较基准
         // 换成真实路径，否则每一轮都会被误判成“轮转了”。
         let resume_base = tracked
@@ -964,13 +1045,18 @@ where
             clone.path = checkpoint_real_path(previous).to_string();
             clone
         });
-        let resume = decide_resume_async(
-            &resume_base,
-            &current,
-            previous_for_resume.as_ref(),
-            startup,
-        )
-        .await;
+        let resume = {
+            // 探针也走持有句柄：每批一次 16 字节的 `read`（不 `open`）。
+            let file = handles.acquire(Path::new(&real_path)).await?;
+            decide_resume_on_async(
+                file,
+                &resume_base,
+                &current,
+                previous_for_resume.as_ref(),
+                startup,
+            )
+            .await
+        };
         let mut pending = tracked
             .as_ref()
             .and_then(|entry| entry.pending_multiline.clone());
@@ -989,7 +1075,7 @@ where
         }
         if resume.rotated {
             let drained = if let Some(previous) = tracked.as_ref() {
-                self.drain_rotated(runtime, previous, gate, budget, next_seq, batch)
+                self.drain_rotated(runtime, previous, gate, budget, next_seq, batch, handles)
                     .await?
             } else {
                 false
@@ -1029,6 +1115,8 @@ where
                     identity: current,
                     checkpoint_offset: 0,
                     pending_multiline: None,
+                    // 起点是 0：没有可比的提交位置，也就没有探针。
+                    checkpoint_probe: None,
                 });
             }
             return Ok(());
@@ -1039,8 +1127,8 @@ where
             max_bytes: budget.max_bytes,
             max_lines: budget.max_lines,
         };
-        let read =
-            read_from_offset_async(Path::new(&real_path), resume.start_offset, limits).await?;
+        let (read, checkpoint_probe) =
+            read_segment(handles, Path::new(&real_path), resume.start_offset, limits).await?;
         let consumed_lines = read.lines.len();
         let consumed_bytes = read
             .committed_end_offset
@@ -1094,6 +1182,7 @@ where
                 identity: read.identity,
                 checkpoint_offset: read.committed_end_offset,
                 pending_multiline: pending,
+                checkpoint_probe,
             });
         }
         budget.max_lines = budget.max_lines.saturating_sub(consumed_lines);
@@ -1105,6 +1194,8 @@ where
     /// 找到被改名的旧文件，把它剩下的尾巴读完，并把旧块跟着改名。
     ///
     /// 返回「是否真的找到了旧文件」：找不到时调用方要处理手里的未封口块。
+    // 与 `read_one_file` 同一取舍：每个参数都是不同来源，拆结构体只会把调用点弄长。
+    #[allow(clippy::too_many_arguments)]
     async fn drain_rotated(
         &self,
         runtime: &mut RuntimeState,
@@ -1113,6 +1204,7 @@ where
         budget: &mut ReadLimits,
         next_seq: &mut u64,
         batch: &mut FamilyBatch,
+        handles: &mut LogFileHandles,
     ) -> io::Result<bool> {
         let base = PathBuf::from(checkpoint_real_path(previous));
         let Some(rotated_path) = find_rotated_path_async(&base, previous).await? else {
@@ -1126,8 +1218,8 @@ where
             max_bytes: budget.max_bytes,
             max_lines: budget.max_lines,
         };
-        let read =
-            read_from_offset_async(&rotated_path, previous.checkpoint_offset, limits).await?;
+        let (read, checkpoint_probe) =
+            read_segment(handles, &rotated_path, previous.checkpoint_offset, limits).await?;
         let consumed_lines = read.lines.len();
         let consumed_bytes = read
             .committed_end_offset
@@ -1176,6 +1268,7 @@ where
             identity: read.identity,
             checkpoint_offset: read.committed_end_offset,
             pending_multiline: pending,
+            checkpoint_probe,
         });
         budget.max_lines = budget.max_lines.saturating_sub(consumed_lines);
         budget.max_bytes = budget.max_bytes.saturating_sub(consumed_bytes as usize);
@@ -1199,6 +1292,7 @@ where
                     real_path: &checkpoint.real_path,
                     pending_multiline: checkpoint.pending_multiline.as_ref(),
                     rotated_from_path: None,
+                    checkpoint_probe: checkpoint.checkpoint_probe,
                 },
             )
             .await;
@@ -1221,6 +1315,8 @@ struct FamilyCheckpoint {
     identity: ObservedFileIdentity,
     checkpoint_offset: u64,
     pending_multiline: Option<PendingMultilineState>,
+    /// 提交位置前的 16 字节探针：读的时候从同一个句柄取好，提交时不再 open。
+    checkpoint_probe: Option<String>,
 }
 
 struct FamilyBatch {
