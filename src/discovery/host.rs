@@ -45,7 +45,8 @@ impl DiscoveryProbe for HostDiscoveryProbe {
         attributes.extend(platform_attributes());
         // 云实例身份：两个来源（agentd / 云 API）的唯一确定性关联键。
         // 不在云上时 `probe()` 返回 None，这里就**什么都不写**（缺键比空串好）。
-        // 超时预算见 `cloud_meta` 模块头（最多 600ms，15 分钟一次）。
+        // 注意这是**同步阻塞**调用（跑在本 tick 线程上）：总预算 ≤ `PROBE_BUDGET`（400ms），
+        // 不要把它加到更频繁的探针里。详见 `cloud_meta` 模块头。
         if let Some(cloud) = cloud_meta::probe() {
             attributes.insert("cloud.provider".to_string(), cloud.provider.to_string());
             attributes.insert("cloud.instance_id".to_string(), cloud.instance_id);
