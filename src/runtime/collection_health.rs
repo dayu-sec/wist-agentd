@@ -146,6 +146,7 @@ fn severity(kind: &TelemetryFailureKind) -> Severity {
         TelemetryFailureKind::RecordWithheld
         | TelemetryFailureKind::TruncatedLine
         | TelemetryFailureKind::CapacityExceeded
+        | TelemetryFailureKind::CatchupStalled
         | TelemetryFailureKind::HeadlessLinesDropped => Severity::Warn,
         TelemetryFailureKind::MissingInput
         | TelemetryFailureKind::ProcessingFailed
@@ -547,7 +548,8 @@ fn reason_kind_for_telemetry(kind: &TelemetryFailureKind) -> &'static str {
         MissingInput => collection_reason_kind::MISSING_INPUT,
         ProcessingFailed | InvalidOutput | OutputWriteFailed => collection_reason_kind::RUN_FAILED,
         TruncatedLine => collection_reason_kind::TRUNCATED,
-        RecordWithheld | CapacityExceeded | HeadlessLinesDropped => {
+        // 持续追不平 = 这一面没读全（落后），与“挡下 / 触顶”同档：软缺陷，不判 failure。
+        RecordWithheld | CapacityExceeded | HeadlessLinesDropped | CatchupStalled => {
             collection_reason_kind::INCOMPLETE_DATA
         }
         // Ignore 类不会走到这里（调用方先按 severity 过滤）。

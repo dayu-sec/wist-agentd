@@ -250,6 +250,38 @@ pub(super) fn capacity_failure(
     }
 }
 
+/// 「读得比写得慢」：连续多拍把追平时间片用尽。
+///
+/// 这是本机唯一能区分「安静」与「追不上」的信号 —— 两者在吞吐上看着都是“有数据在进”。
+///
+/// `detail` 必须**稳定**（去重按 `kind|input_id|path|detail`）：这是同一个问题的反复出现，
+/// 应该是同一行字；会变的量（几拍、几批、多少行、片多长）全放 `magnitude`。
+pub(super) fn catchup_stall_failure(
+    input: &LogFileInputSection,
+    consecutive_ticks: u32,
+    batches: usize,
+    read_lines: usize,
+    slice_ms: u64,
+    spent_ms: u64,
+    lag_bytes: Option<u64>,
+) -> TelemetryFailure {
+    let mut magnitude = format!(
+        "consecutive_ticks={consecutive_ticks} spent_ms={spent_ms} batches={batches} read_lines={read_lines} slice={slice_ms}ms"
+    );
+    // 真正的落后量只在 > 0 时有意义（饱和型输入的让位时刻 lag ≈ 0）；文件族干脆没有。
+    if let Some(lag_bytes) = lag_bytes {
+        magnitude.push_str(&format!(" lag_bytes={lag_bytes}"));
+    }
+    TelemetryFailure {
+        kind: TelemetryFailureKind::CatchupStalled,
+        input_id: input.input_id.clone(),
+        path: input.path.clone(),
+        detail: "catchup slice exhausted on consecutive ticks; this input cannot drain the file within its share              of a tick (the writer outpaces the reader)"
+            .to_string(),
+        magnitude: Some(magnitude),
+    }
+}
+
 pub(super) fn spool_paused_reason(spool_bytes: u64) -> String {
     format!("spool over limit ({spool_bytes} bytes); source read paused")
 }

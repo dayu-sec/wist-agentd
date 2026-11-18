@@ -235,7 +235,7 @@ checkpoint（同一路径换了 inode 时旧条目让位，否则新文件永远
 - buffer/spool 与 `commit point`：`src/telemetry/logs/files/delivery_support.rs`、`src/telemetry/buffer.rs`、`src/telemetry/spool.rs`
 - checkpoint / `seq` 推进：`src/telemetry/logs/files/checkpoint_support.rs`、`src/state_store/log_checkpoints.rs`、`src/state_store/log_seq_state.rs`
 
-驱动方式是**轮询 tick**：每个 tick 对每个 input 调用一次 `process_once_async`；不存在事件驱动 `watcher`、多路径 `discover` 与扫描调度阶段。
+驱动方式是**轮询 tick**：每个 tick 对每个 input 调用一次 `process_once_with_handles_async`（句柄表由调用方跨 tick 持有）；不存在事件驱动 `watcher`、多路径 `discover` 与扫描调度阶段。
 
 ### 5.2 读取模型
 
@@ -252,6 +252,28 @@ checkpoint（同一路径换了 inode 时旧条目让位，否则新文件永远
 - 只读取追加内容
 - 默认按 `\n` 切分
 - 对未完成尾行不提交，留待下次读取补齐（行边界结算见 §6.5）
+
+#### 5.2.1 句柄跨 tick 复用（read offset 之外的状态）
+
+文件句柄本身也是需要跨 tick 维护的状态（`src/telemetry/logs/files/file_handles.rs`）：
+
+- 稳态下每批读完**不关句柄、不重新 `open()`**；续读靠 `seek(offset)`。
+- “这个句柄还对不对得上路径”用路径 `stat` 与句柄打开时的 `(device, inode)` 比，
+  只有轮转 / 文件被重建时才重开一次。
+- checkpoint 探针（提交位置前 16 字节）与头部指纹都从**同一个句柄**读。
+- 一轮 tick 结束时关掉本轮没用到的句柄（撤活 / 文件消失），并有总量上限（默认 512，
+  与 service 的 `LimitNOFILE=65536` 同量级）。
+
+为什么这不是优化题而是正确性题：`open()` 是能被审计规则看见的动作。若每次读都 `open()`
+一次，在「审计日志自身也被审计」的主机上（`-w /var/log/audit/audit.log -p rwa -k auditlog`，
+等保 / CIS 类基线常见）就会形成
+
+```text
+读 audit.log → 审计规则记下这次 open → audit.log 多出 4~6 行 → 下一批又有行可读 → 再 open
+```
+
+这个环会一直跑到追平时间片用尽（实测一台机 ~50 次 open/秒，10 分钟几十万条记录全是采集器自己踩出来的），
+并且会顶高 auditd backlog、压掉真正的安全事件。
 
 ---
 

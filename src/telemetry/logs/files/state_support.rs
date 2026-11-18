@@ -14,6 +14,8 @@ pub(super) struct PendingCheckpoint {
     pub(super) identity: ObservedFileIdentity,
     pub(super) checkpoint_offset: u64,
     pub(super) rotated_from_path: Option<String>,
+    /// 提交位置前的 16 字节探针：读的时候就从**同一个句柄**取好，提交时不再 open 一次。
+    pub(super) checkpoint_probe: Option<String>,
 }
 
 #[derive(::jumo_derive::Jumo)]

@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 use crate::state_store::log_checkpoint_state::{
     LogCheckpointState, PendingMultilineState, TrackedFileCheckpoint,
 };
+#[cfg(test)]
+use crate::telemetry::logs::files::file_reader::checkpoint_probe_async;
 use crate::telemetry::logs::files::file_reader::{
-    ObservedFileIdentity, checkpoint_probe_async, inspect_path_async, stable_file_id_async,
+    ObservedFileIdentity, inspect_path_async, stable_file_id_async,
 };
 
 pub(super) fn checkpoint_for_path(
@@ -113,6 +115,12 @@ pub(super) struct CheckpointUpdate<'a> {
     pub(super) real_path: &'a str,
     pub(super) pending_multiline: Option<&'a PendingMultilineState>,
     pub(super) rotated_from_path: Option<String>,
+    /// 提交位置前 16 字节的探针（copytruncate 探针）：**读的时候从同一个句柄取好**。
+    ///
+    /// 它不能在这里再按路径读一次：那是一次 `open()`，在审计规则盯读的主机上就是一条
+    /// 自己造出来的审计记录（见 `files::file_handles` 模块注释）。
+    /// `None` = 这个位置没有可比的探针（`checkpoint_offset == 0` / 读失败）。
+    pub(super) checkpoint_probe: Option<String>,
 }
 
 pub(super) async fn upsert_checkpoint_async(
@@ -123,11 +131,7 @@ pub(super) async fn upsert_checkpoint_async(
 ) {
     let source_path = source_path.display().to_string();
     let file_id = stable_file_id_async(Path::new(&source_path), identity).await;
-    let checkpoint_probe =
-        checkpoint_probe_async(Path::new(&source_path), update.checkpoint_offset)
-            .await
-            .ok()
-            .flatten();
+    let checkpoint_probe = update.checkpoint_probe.clone();
     // 先找到「要写哪一条」：同一文件（file_id / inode / path+fingerprint）就地更新，
     // 否则新增一条。轮转时旧文件已经用 `relocate_checkpoint_path` 换了 path，所以两边互不抢。
     let existing_index = state.files.iter().position(|entry| {
@@ -197,6 +201,7 @@ fn checkpoint_from_observation(
     }
 }
 
+/// 单测用的同步包装：探针按旧行为（按路径读）取得，保证“按路径读”的行为基线仍被钉住。
 #[cfg(test)]
 pub(super) fn upsert_checkpoint(
     state: &mut LogCheckpointState,
@@ -206,18 +211,26 @@ pub(super) fn upsert_checkpoint(
     observed_at: &str,
     rotated_from_path: Option<String>,
 ) {
-    block_on(upsert_checkpoint_async(
-        state,
-        source_path,
-        identity,
-        CheckpointUpdate {
-            checkpoint_offset,
-            observed_at,
-            real_path: "",
-            pending_multiline: None,
-            rotated_from_path,
-        },
-    ))
+    block_on(async {
+        let checkpoint_probe = checkpoint_probe_async(source_path, checkpoint_offset)
+            .await
+            .ok()
+            .flatten();
+        upsert_checkpoint_async(
+            state,
+            source_path,
+            identity,
+            CheckpointUpdate {
+                checkpoint_offset,
+                observed_at,
+                real_path: "",
+                pending_multiline: None,
+                rotated_from_path,
+                checkpoint_probe,
+            },
+        )
+        .await
+    })
 }
 
 #[cfg(test)]

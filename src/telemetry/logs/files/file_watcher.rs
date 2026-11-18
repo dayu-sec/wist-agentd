@@ -5,7 +5,9 @@ use std::path::Path;
 
 use crate::state_store::log_checkpoint_state::TrackedFileCheckpoint;
 
-use super::file_reader::{ObservedFileIdentity, checkpoint_probe_async};
+#[cfg(test)]
+use super::file_reader::checkpoint_probe_async;
+use super::file_reader::{ObservedFileIdentity, OpenLogFile, checkpoint_probe_on};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupPosition {
@@ -22,11 +24,62 @@ pub struct ResumeDecision {
     pub rotated: bool,
 }
 
+/// 按路径判定的旧入口：生产一律走 [`decide_resume_on_async`]（稳态 0 次 `open`），
+/// 这条只剩测试在用 —— 留着它是因为它是“行为基线”：换句柄不能改变任何续读/轮转判定。
+#[cfg(test)]
 pub async fn decide_resume_async(
     source_path: &Path,
     current: &ObservedFileIdentity,
     previous: Option<&TrackedFileCheckpoint>,
     startup_position: StartupPosition,
+) -> ResumeDecision {
+    decide_resume_with(
+        source_path,
+        current,
+        previous,
+        startup_position,
+        ProbeSource::Path,
+    )
+    .await
+}
+
+/// 与 `decide_resume_async`（只剩测试在用的旧入口）判定逻辑逐字相同，差别只在
+/// “checkpoint 探针”从**已打开的句柄**读。
+///
+/// 为什么重要：稳态下探针每批都要比一次，按路径读 = 每批多一次 `open()`。在审计规则盯读的
+/// 主机上那一次 `open()` 就是一条审计记录（见 `files::file_handles` 的模块注释）。
+pub async fn decide_resume_on_async(
+    file: &mut OpenLogFile,
+    source_path: &Path,
+    current: &ObservedFileIdentity,
+    previous: Option<&TrackedFileCheckpoint>,
+    startup_position: StartupPosition,
+) -> ResumeDecision {
+    decide_resume_with(
+        source_path,
+        current,
+        previous,
+        startup_position,
+        ProbeSource::Handle(file),
+    )
+    .await
+}
+
+/// 探针从哪里读。
+enum ProbeSource<'a> {
+    /// 按路径重开读（只有测试走这条）。
+    #[cfg(test)]
+    Path,
+    /// 从已打开的句柄读（稳态）。
+    Handle(&'a mut OpenLogFile),
+}
+
+async fn decide_resume_with(
+    source_path: &Path,
+    current: &ObservedFileIdentity,
+    previous: Option<&TrackedFileCheckpoint>,
+    startup_position: StartupPosition,
+    probe: ProbeSource<'_>,
 ) -> ResumeDecision {
     let source_path = source_path.display().to_string();
     let Some(previous) = previous else {
@@ -56,11 +109,20 @@ pub async fn decide_resume_async(
     };
 
     if same_identity {
-        if previous.checkpoint_offset > current.file_len
-            || !checkpoint_probe_matches_async(Path::new(&source_path), previous)
-                .await
-                .unwrap_or(false)
-        {
+        // 位置超过文件长度 = 一定被截断过，不必再读探针。
+        let probe_agrees = if previous.checkpoint_offset > current.file_len {
+            false
+        } else {
+            match probe {
+                #[cfg(test)]
+                ProbeSource::Path => {
+                    checkpoint_probe_matches_async(Path::new(&source_path), previous).await
+                }
+                ProbeSource::Handle(file) => checkpoint_probe_matches_on(file, previous).await,
+            }
+            .unwrap_or(false)
+        };
+        if previous.checkpoint_offset > current.file_len || !probe_agrees {
             return ResumeDecision {
                 start_offset: 0,
                 rotated_from_path: None,
@@ -126,6 +188,7 @@ fn short_file_append_keeps_prefix(
         && current_fingerprint.starts_with(previous_fingerprint)
 }
 
+#[cfg(test)]
 async fn checkpoint_probe_matches_async(
     path: &Path,
     previous: &TrackedFileCheckpoint,
@@ -137,6 +200,22 @@ async fn checkpoint_probe_matches_async(
         return Ok(true);
     };
     Ok(checkpoint_probe_async(path, previous.checkpoint_offset)
+        .await?
+        .as_deref()
+        == Some(expected))
+}
+
+async fn checkpoint_probe_matches_on(
+    file: &mut OpenLogFile,
+    previous: &TrackedFileCheckpoint,
+) -> io::Result<bool> {
+    if previous.checkpoint_offset == 0 {
+        return Ok(true);
+    }
+    let Some(expected) = previous.checkpoint_probe.as_deref() else {
+        return Ok(true);
+    };
+    Ok(checkpoint_probe_on(file, previous.checkpoint_offset)
         .await?
         .as_deref()
         == Some(expected))

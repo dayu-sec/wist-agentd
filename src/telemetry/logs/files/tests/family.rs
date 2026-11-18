@@ -9,6 +9,7 @@ use super::{config, log_checkpoints, read_json, read_output_records, temp_dir};
 use crate::state_store::log_checkpoint_state::{
     LogCheckpointState, PendingMultilineState, TrackedFileCheckpoint,
 };
+use crate::telemetry::logs::files::LogFileHandles;
 use crate::telemetry::logs::files::file_reader::ReadLimits;
 use crate::telemetry::logs::files::file_watcher::StartupPosition;
 use crate::telemetry::logs::files::{FileFamilyProcessor, FileInputConfig};
@@ -32,6 +33,43 @@ fn output_path(root: &Path) -> PathBuf {
 
 fn checkpoint_path(root: &Path) -> PathBuf {
     log_checkpoints::path_for(&root.join("state"), "input-app")
+}
+
+/// 文件族也要走同一份跨 tick 句柄表：N 个文件第二批 **一个都不再 open**。
+///
+/// 为什么单拎一条：这条面才是个数会堆起来的地方（容器日志动辄上百个文件），
+/// 每批各 open 一次就是每秒上百次无谓的 `open()`。
+#[test]
+fn a_second_family_batch_reuses_every_open_handle() {
+    let root = temp_dir("family-handle-reuse");
+    fs::create_dir_all(root.join("state")).expect("create state");
+    let a = root.join("a.log");
+    let b = root.join("b.log");
+    fs::write(&a, "a1\n").expect("write a");
+    fs::write(&b, "b1\n").expect("write b");
+    let output = output_path(&root);
+
+    let mut cfg = family_config(&root, &root.join("*.log"));
+    cfg.startup_position = StartupPosition::Head;
+    let mut handles = LogFileHandles::new();
+    let mut next_seq = 0;
+
+    let mut first = FileFamilyProcessor::new(cfg.clone(), FileRecordSink::new(output.clone()));
+    super::block_on(first.process_once_with_handles_async(&mut next_seq, &mut handles))
+        .expect("first batch");
+    let opened = handles.open_count();
+    assert_eq!(opened, 2, "两个文件各开一次");
+
+    fs::write(&a, "a1\na2\n").expect("append a");
+    let mut second = FileFamilyProcessor::new(cfg, FileRecordSink::new(output.clone()));
+    super::block_on(second.process_once_with_handles_async(&mut next_seq, &mut handles))
+        .expect("second batch");
+
+    assert_eq!(
+        handles.open_count(),
+        opened,
+        "第二批必须全部复用句柄（每批重开就是审计反馈环的燃料）"
+    );
 }
 
 fn read_state(root: &Path) -> LogCheckpointState {

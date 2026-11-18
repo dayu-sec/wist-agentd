@@ -99,6 +99,18 @@ pub(super) fn emit_telemetry_failure(failure: &TelemetryFailure) {
                 failure.detail
             );
         }
+        // 读得比写得慢：采集没停、也没报错，但这条面一直落在文件尾后面。
+        // 打 `warn`（不是 `error`）：它不是故障 —— 代价是滞后与 spool 压力，
+        // 但如果一直不处理，最后会以 `pause` 的形式变成故障，所以不能打 `info`。
+        TelemetryFailureKind::CatchupStalled => {
+            let magnitude = failure.magnitude.as_deref().unwrap_or("n/a");
+            log::warn!(
+                "telemetry input lagging input_id={} path={} detail={} magnitude={magnitude}",
+                failure.input_id,
+                failure.path,
+                failure.detail
+            );
+        }
         // 出口写失败：`magnitude` 里带目标地址与底层原因（`TcpRecordSink` 已挂 `host:port`）——
         // 运维看到这一行就该知道是哪个数据面目标连不上。
         TelemetryFailureKind::OutputWriteFailed => {

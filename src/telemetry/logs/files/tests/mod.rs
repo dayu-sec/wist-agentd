@@ -35,6 +35,15 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// 同步跑一段 async：验证「跨 tick 句柄表」的用例必须多批共用一个 `LogFileHandles`。
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime")
+        .block_on(future)
+}
+
 #[derive(Default)]
 struct TestSink {
     records: Vec<wist_contracts::telemetry_record::TelemetryRecord>,

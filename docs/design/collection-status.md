@@ -47,7 +47,9 @@
 5. 汇总本 tick 证据：
    - **硬失败**：文件不存在 / 权限不足 / 未支持单元 / 导出器**运行**失败 / 指标域全部失败；
    - **阻塞**：导出器工具缺失（`blocked`）、指标目标未就绪（`blocked` + `pending`）；
-   - **软问题**：行截断、记录不完整、指标 tick 级失败、指标部分目标失败；
+   - **软问题**：行截断、记录不完整、指标 tick 级失败、指标部分目标失败，以及**持续追不平**
+     （连续 ≥3 拍把这条输入那份预算吃掉、却仍没读到文件尾：写比读快，见
+     `daemon_telemetry.rs::saturated_without_catching_up`）；
    - **健康信号**：成功采集的任务 / 正常跑完的导出器 / 成功的指标域。
 6. 折叠：
    - 有硬失败：还有健康 → `partial`；没有 → `failure`
@@ -66,6 +68,7 @@
 | 日志文件很安静 | `success` | 没有失败 ≠ 没有新数据 |
 | 过滤 / 降噪命中 | `success` | 主动不采 |
 | 行被截断 / 记录不完整 | `partial` + reason `truncated`/`incomplete_data` | 软缺陷，不判 failure |
+| 轮转 / 停机后的补读（连续不足 3 拍） | `success` | 追赶是正常态；连续 ≥3 拍才报 `incomplete_data` |
 | **导出器工具未安装**（如 `smartctl`） | `prerequisites=blocked`、`result=cancelled`、reason `missing_tool` | 装上即自动恢复 |
 | 发现层目标未产出 | `prerequisites=blocked`、`result=pending`、reason `target_not_ready` | 等自动条件 |
 | 首轮还没跑完 | `result=pending` | 还没有可判定的观测 |

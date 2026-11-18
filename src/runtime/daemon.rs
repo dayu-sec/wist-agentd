@@ -1965,9 +1965,9 @@ use runtime_state_support::{
     work_state_changes,
 };
 use telemetry_support::{
-    ExporterReport, TelemetryFailureKind, TelemetrySinkSlot, TelemetryTick, TelemetryWorkState,
-    UplinkHealth, WorkState, build_telemetry_sink, effective_output, invalid_output_tick,
-    process_exporters, process_telemetry_inputs,
+    ExporterReport, LogInputRuntime, TelemetryFailureKind, TelemetrySinkSlot, TelemetryTick,
+    TelemetryWorkState, UplinkHealth, WorkState, build_telemetry_sink, effective_output,
+    invalid_output_tick, process_exporters, process_telemetry_inputs,
 };
 
 fn to_agent_work_state_changes(changes: &[TelemetryWorkState]) -> Vec<AgentWorkStateChange> {
@@ -2121,6 +2121,12 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     let mut collection_health = CollectionHealth::default();
     // 遥测 sink 跨 tick 复用：连接与指数退避都活在里面（每 tick 重建会让退避失效）。
     let mut telemetry_sink = TelemetrySinkSlot::default();
+    // 日志输入的跨 tick 运行态：句柄复用（稳态不再 `open()` 源文件）+ 「连续追不平」计数。
+    //
+    // 句柄部分不仅是省一次系统调用 —— 在「审计日志自身也被审计」的主机上，每批一次
+    // `open()` 就会把 audit.log 打成「读 → 产生审计记录 → 再读」的反馈环
+    // （见 `files::file_handles` 模块注释）。
+    let mut log_runtime = LogInputRuntime::new();
     let mut last_metrics_uplink: Option<Instant> = None;
     let mut last_discovery_uplink: Option<Instant> = None;
     // 只提醒一次：`snapshot_uplink_enabled = true` 搭配非 tcp 输出时，行为是
@@ -2185,6 +2191,9 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
         // —— 这是有意的：重启后读回台账的那台机器应当**一个 tick 内**就知道自己是否已恢复，
         // 而不是白等 5 分钟。之后的节奏才是 `terminal_retry_interval()`。
         if let Some(state) = terminal.as_mut() {
+            // 终态：采集也停（下面两条分支都是 `continue`），那就把源文件句柄全放掉 ——
+            // 一个被轮转走的旧 inode 被句柄钉住时，它的磁盘块也不会归还，而终态可能停很久。
+            log_runtime.release_for_idle();
             if last_terminal_retry.is_none_or(|at| at.elapsed() >= terminal_retry) {
                 last_terminal_retry = Some(Instant::now());
                 let recovered = retry_terminal_probe(
@@ -2615,6 +2624,7 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
             Some(&mut uplink_health),
             Some(&mut collection_health),
             &mut telemetry_sink,
+            Some(&mut log_runtime),
             send_metrics,
             send_discovery_snapshot,
             force_refresh,
@@ -2784,6 +2794,8 @@ async fn run_once_with_failure_cache(
     collection_health: Option<&mut CollectionHealth>,
     // 跨 tick 复用的遥测 sink：连接与退避状态都在里面，每 tick 重建会让二者都失效。
     telemetry_sink: &mut TelemetrySinkSlot,
+    // 跨 tick 复用的日志输入运行态（句柄 + 追平计数）；`None` = 一次性路径。
+    mut log_runtime: Option<&mut LogInputRuntime>,
     // 本轮要不要上送指标（由调用方按授权与周期定；一次性路径按授权定）。
     send_metrics: bool,
     // 本轮要不要上送原文发现快照（由调用方按配置与周期定；一次性路径不发）。
@@ -2833,6 +2845,12 @@ async fn run_once_with_failure_cache(
                 // 关键在**位置**：这一切排在读任何源文件之前，否则待命期会推进 log
                 // checkpoint，重新启用后就从新 offset 续读，把待命期间写入的行永久丢掉。
                 //
+                // 待命期间也把已经持着的源文件句柄放掉：不读源就不该占着 fd ——
+                // 一个被轮转走的旧 inode 被句柄钉住时，它的磁盘块也不会归还。
+                if let Some(runtime) = log_runtime.as_mut() {
+                    runtime.release_for_idle();
+                }
+
                 // 但**事实摘要照发** —— 它不是主机内容，而是让平台能推断“这台机器是什么”的
                 // 最小元数据（进程列表 / 监听端口 / os / arch）。没有它，新装机器在网关侧一片
                 // 空白，连「该派什么活」都定不下来 —— 这正是“新装了什么也干不了”的死锁。
@@ -2911,9 +2929,18 @@ async fn run_once_with_failure_cache(
                     )
                     .await;
                 }
-                let telemetry_tick =
-                    process_telemetry_inputs(loop_ctx.config, work, &mut *sink, &mut next_seq)
-                        .await;
+                let telemetry_tick = {
+                    let mut scratch_runtime = LogInputRuntime::new();
+                    let runtime: &mut LogInputRuntime = log_runtime.unwrap_or(&mut scratch_runtime);
+                    process_telemetry_inputs(
+                        loop_ctx.config,
+                        work,
+                        &mut *sink,
+                        &mut next_seq,
+                        runtime,
+                    )
+                    .await
+                };
                 // 导出器（`Exporter` 来源）与文件输入平行：到点的跑一条固定命令，输出当记录上送。
                 exporter_report = process_exporters(
                     work,
@@ -3847,6 +3874,7 @@ async fn run_once_with_work_async(
         None,
         None,
         &mut telemetry_sink,
+        None,
         send_metrics,
         false,
         false,
@@ -4063,6 +4091,7 @@ mod tests {
             None,
             None,
             &mut TelemetrySinkSlot::default(),
+            None,
             false,
             false,
             false,
@@ -5080,6 +5109,7 @@ mod tests {
             None,
             None,
             &mut TelemetrySinkSlot::default(),
+            None,
             false,
             false,
             false,
@@ -5130,6 +5160,7 @@ mod tests {
             None,
             None,
             &mut TelemetrySinkSlot::default(),
+            None,
             false,
             false,
             false,
@@ -6625,6 +6656,7 @@ mod tests {
             None,
             None,
             &mut TelemetrySinkSlot::default(),
+            None,
             false,
             false,
             true,
