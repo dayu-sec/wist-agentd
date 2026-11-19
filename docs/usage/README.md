@@ -244,6 +244,17 @@ wist-agentd investigate disk --json     # 机器可读
 - 正在写的日志文件**不要手工删**（轮转由 `wist-log` 管，删了进程会继续往已删除的 inode 写，
   空间不会释放）。
 
+### 2.7.1 老内核上直接 `getentropy failed.` / `Aborted`
+
+CentOS 6（kernel 2.6.32）这类**没有 `getrandom(2)`**（Linux 3.17 才有）的机器上，
+**0.34.0 及更早**的静态 musl 制品只要触发一次 TLS（`enroll` / 上报 / `diagnose` 的连通性探测）
+就会打印 `getentropy failed.` 然后 SIGABRT。这不是配置问题，也不是网络问题。
+
+- **0.34.1+ 已修**：静态 musl 制品提供带 `/dev/urandom` 回退的 `getentropy`（新内核仍走
+  `getrandom`）。升级后用 `wist-agentd version` 确认 ≥ 0.34.1，再跑 `wist-agentd diagnose`。
+- 旧版本没有绕法：TLS 必须有熵源，只能升级。
+- 怎么认：`uname -r` 是 2.6.32 / 3.10 这类；`investigate`（只读）不受影响，只有走 TLS 的命令会中。
+
 ### 2.8 采集与落点
 
 **采不到 `/var/log/xxx`**：要系统级安装（root）；macOS 可能还需 Full Disk Access，Linux 看 SELinux / AppArmor

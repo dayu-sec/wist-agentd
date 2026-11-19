@@ -30,6 +30,8 @@ pub mod runtime;
 pub mod service;
 pub(crate) mod single_instance;
 pub mod state_store;
+/// 老内核（< 3.17）上没有 `getrandom(2)` 时的熵源回退（仅 Linux + 静态 musl）。
+pub mod sys_compat;
 pub(crate) mod telemetry;
 /// 升级执行体（`wist-upgrader` 二进制的全部逻辑；见模块注释里的取向说明）。
 pub mod upgrade;
