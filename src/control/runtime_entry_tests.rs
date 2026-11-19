@@ -546,6 +546,23 @@ fn parse_command_accepts_cross_platform_render_target() {
         })
     );
 
+    // upstart（CentOS 6 / RHEL 6）与它的别名 `init` 都必须能渲染。
+    for alias in ["upstart", "init"] {
+        match parse_command(["service", "print", "--for", alias])
+            .expect("parse")
+            .command
+        {
+            super::Command::Service(request) => {
+                assert_eq!(
+                    request.platform,
+                    Some(super::ServicePlatform::Upstart),
+                    "{alias}"
+                );
+            }
+            other => panic!("{alias}: unexpected command {other:?}"),
+        }
+    }
+
     let err = parse_command(["service", "status", "--for", "systemd"]).expect_err("flag misuse");
     assert!(
         err.to_string()
@@ -554,6 +571,8 @@ fn parse_command_accepts_cross_platform_render_target() {
 
     let err = parse_command(["service", "print", "--for", "windows"]).expect_err("bad target");
     assert!(err.to_string().contains("unknown platform for --for"));
+    // 报错里要把新平台列出来，否则运维不知道有 upstart 这个选项。
+    assert!(err.to_string().contains("upstart"), "{err}");
 }
 
 #[test]

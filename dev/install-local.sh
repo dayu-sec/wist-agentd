@@ -106,8 +106,17 @@ wait_until() {
 
 case "$(uname -s)" in
   Darwin) PLATFORM="launchd" ;;
-  Linux) PLATFORM="systemd" ;;
-  *) die "unsupported platform: $(uname -s) (macOS launchd / Linux systemd only)" ;;
+  Linux)
+    # 与 agentd 自己的判定一致：有 systemctl 走 systemd，否则 /etc/init + initctl 走 upstart。
+    if command -v systemctl >/dev/null 2>&1; then
+      PLATFORM="systemd"
+    elif [ -d /etc/init ] && command -v initctl >/dev/null 2>&1; then
+      PLATFORM="upstart"
+    else
+      PLATFORM="systemd"
+    fi
+    ;;
+  *) die "unsupported platform: $(uname -s) (macOS launchd / Linux systemd|upstart)" ;;
 esac
 
 # agentd 只支持系统级托管：二进制落 /usr/local/bin、配置在 /etc/wist-agentd、日志在 /var/log。
@@ -115,6 +124,14 @@ BIN_DST_DIR="${WIST_AGENTD_BIN_DIR:-/usr/local/bin}"
 CONFIG_DIR="${WIST_AGENTD_HOME:-/etc/wist-agentd}"
 LOG_DIR="/var/log/wist-agentd"
 SERVICE_TARGET="system/${LAUNCHD_LABEL}"
+
+# 给人看的服务标识：launchd 要 domain/label，upstart 是 job 名，systemd 是 unit 名。
+service_display() {
+  case "${PLATFORM}" in
+    launchd) printf '%s\n' "${SERVICE_TARGET}" ;;
+    *) printf '%s\n' "${SERVICE_NAME}" ;;
+  esac
+}
 
 # 系统级要 root：脚本自己提权（而不是要求外层 sudo —— 那会把 cargo build 也变成 root）。
 SUDO="sudo"
@@ -137,31 +154,40 @@ sha12() { shasum -a 256 "$1" 2>/dev/null | awk '{print substr($1, 1, 12)}'; }
 # ---------------------------------------------------------------- 运行状态查询
 
 service_is_running() {
-  if [ "${PLATFORM}" = "launchd" ]; then
-    # system 域可免 sudo 查询。
-    launchctl print "${SERVICE_TARGET}" 2>/dev/null | grep -q 'state = running'
-  else
-    systemctl is-active --quiet "${SERVICE_NAME}"
-  fi
+  case "${PLATFORM}" in
+    launchd)
+      # system 域可免 sudo 查询。
+      launchctl print "${SERVICE_TARGET}" 2>/dev/null | grep -q 'state = running'
+      ;;
+    upstart)
+      # respawn 期间是 `start/post-stop`（不在跑）：只认 `start/running`。
+      initctl status "${SERVICE_NAME}" 2>/dev/null | grep -q 'start/running'
+      ;;
+    *) systemctl is-active --quiet "${SERVICE_NAME}" ;;
+  esac
 }
 
 service_program_path() {
-  if [ "${PLATFORM}" = "launchd" ]; then
-    launchctl print "${SERVICE_TARGET}" 2>/dev/null |
-      awk -F'= ' '/^[[:space:]]*program = /{print $2; exit}'
-  else
-    systemctl show -p ExecStart --value "${SERVICE_NAME}" 2>/dev/null
-  fi
+  case "${PLATFORM}" in
+    launchd)
+      launchctl print "${SERVICE_TARGET}" 2>/dev/null |
+        awk -F'= ' '/^[[:space:]]*program = /{print $2; exit}'
+      ;;
+    upstart)
+      awk '/^[[:space:]]*exec /{ $1=""; print; exit }' "/etc/init/${SERVICE_NAME}.conf" 2>/dev/null
+      ;;
+    *) systemctl show -p ExecStart --value "${SERVICE_NAME}" 2>/dev/null ;;
+  esac
 }
 
 # 服务定义文件在不在 —— 这是「首次安装」比配置可读性更可靠的判据：
 # 系统级的 /etc/wist-agentd 对普通用户不可读，拿它判断会得出假结论。
 service_definition_present() {
-  if [ "${PLATFORM}" = "launchd" ]; then
-    [ -f "/Library/LaunchDaemons/${LAUNCHD_LABEL}.plist" ]
-  else
-    [ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]
-  fi
+  case "${PLATFORM}" in
+    launchd) [ -f "/Library/LaunchDaemons/${LAUNCHD_LABEL}.plist" ] ;;
+    upstart) [ -f "/etc/init/${SERVICE_NAME}.conf" ] ;;
+    *) [ -f "/etc/systemd/system/${SERVICE_NAME}.service" ] ;;
+  esac
 }
 
 # ---------------------------------------------------------------- 步骤
@@ -177,7 +203,7 @@ preflight() {
   note "platform=${PLATFORM} uid=$(id -u) dry_run=${DRY_RUN} mode=${MODE}"
   note "产物目录 ${BIN_SRC_DIR}"
   note "目标目录 $(short "${BIN_DST_DIR}")　配置目录 $(short "${CONFIG_DIR}")"
-  note "服务目标 ${SERVICE_TARGET}"
+  note "服务目标 $(service_display)"
 
   if ! service_definition_present; then
     note "没找到服务定义：这是一次**首次安装**（换二进制 + 注册服务，不写初始配置、不注册身份）"
@@ -321,7 +347,7 @@ verify() {
   fi
 
   if wait_until "${READY_WAIT_SECS}" "服务就绪" service_is_running; then
-    pass "服务在跑（${SERVICE_TARGET}）"
+    pass "服务在跑（$(service_display)）"
   else
     bad "等了 ${READY_WAIT_SECS}s 服务仍未 running"
     note "看日志：$(short "${LOG_DIR}")/agentd.err"
@@ -348,7 +374,7 @@ verify() {
     return 1
   fi
 
-  if [ "${PLATFORM}" = "launchd" ]; then
+  if [ "${PLATFORM}" != "systemd" ]; then
     printf '    %s启动行：%s\n' "$DIM" "$RESET"
     ${SUDO} tail -n 3 "${LOG_DIR}/agentd.err" 2>/dev/null | sed 's/^/      /' || true
   fi

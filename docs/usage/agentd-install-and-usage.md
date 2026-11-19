@@ -22,7 +22,8 @@
 
 | 项 | 要求 |
 | --- | --- |
-| 操作系统 | Linux（systemd）、macOS（launchd）；常驻托管仅这两个平台支持 |
+| 操作系统 | Linux（systemd；CentOS/RHEL 6 等无 systemd 的走 upstart）、macOS（launchd） |
+| 制品 | glibc 2.12 / kernel 2.6.32 这类老系统（如 CentOS 6）必须用**静态 musl** 制品（CI 默认产物） |
 | 运行时依赖 | 无外部运行时依赖；`wist-agentd` 与 `wist-exec` 一起发布且**必须同目录** |
 | 源码构建 | Rust 1.85+（edition 2024） |
 | 权限 | 读 `/var/log/**`、执行下发的 `ActionPlan`、写入自己的 state 目录。系统级安装通常以 **root** 运行 |
@@ -63,7 +64,7 @@ install -m 0755 target/release/wist-agentd target/release/wist-exec ~/bin/   # �
 ./dev-conf/
   agentd.toml            # 配置（可 gitignore）
   tasks/*.toml           # 可选：外置采集清单
-  agentd.env             # 可选：长期环境变量（Linux 系统级 systemd 会读）
+  agentd.env             # 可选：长期环境变量（Linux 系统级会读；语义见 §4.6）
   run/ state/            # 数据
   data/                  # 采集输出（默认 data/wist-records.ndjson）
   log/                   # 日志
@@ -126,7 +127,7 @@ WIST_AGENTD_RUN_ONCE=1 ./target/release/wist-agentd --config-dir ./dev-conf     
 | --- | --- | --- |
 | 一次性 token 注册，不落盘 | `wist-agentd enroll --token <token>`（或 `--token-stdin`） | ✅ 已实现 |
 | 装服务时一并注册（失败不留半成品） | `service install --enrollment-token <token>` | ✅ 已实现 |
-| 系统级常驻 + 自启 + 崩溃拉起 | `service install`（systemd / launchd） | ✅ 已实现 |
+| 系统级常驻 + 自启 + 崩溃拉起 | `service install`（systemd / upstart / launchd，自动识别） | ✅ 已实现 |
 | 配置 / 数据（含采集输出）/ 日志分离 | `[paths]` 与采集输出的默认推导 | ✅ 已实现 |
 | 幂等注册、重复执行安全 | 已注册时直接返回 `already enrolled` | ✅ 已实现 |
 | 安装脚本 / 网关下发 | 网关 `wist-gateway/src/api/install.sh`（摘要校验 + `service install`） | ✅ 已实现 |
@@ -139,7 +140,7 @@ WIST_AGENTD_RUN_ONCE=1 ./target/release/wist-agentd --config-dir ./dev-conf     
 - [x] 网关侧：主机授权、一次性 token 生成/回收、安装指令生成；
 - [x] 安装脚本：下载 + 校验（哈希/签名）、放二进制、`init-config`、`service install --enrollment-token`、自检；
 - [~] 发行形态：tarball 已有打包脚本（`dev/package-agentd.sh`，三件齐、打完自己演练一遍）；
-      deb/rpm/brew 与 systemd unit / launchd plist 模板仍未做（`service print --for <platform>` 已能输出）；
+      deb/rpm/brew 仍未做（`service print --for <systemd|upstart|launchd>` 已能输出定义文本）；
 - [x] 升级通道：网关下发新版本（一次性工作 `action=upgrade`）+ 校验 + 重启 + 失败回滚
       （执行体 `wist-upgrader`；链路验收 `dev/verify-upgrade.sh`）；
 - [ ] 批量/无人值守：`--no-activate` + CM 分发定义文件的编排方式。
@@ -159,6 +160,32 @@ wist-agentd service status
 systemctl status wist-agentd && journalctl -u wist-agentd -f
 ```
 
+**Linux（CentOS 6 / RHEL 6：upstart，没有 systemd）**
+
+先取**静态 musl 制品**（CentOS 6 是 glibc 2.12 / kernel 2.6.32，任何动态链接 glibc 的构建都起不来）：
+
+```bash
+# 发布制品即 CI 出的 x86_64-unknown-linux-musl tarball（三件齐）；
+# 本地交叉构建：cargo zigbuild --release --target x86_64-unknown-linux-musl
+sudo install -m 0755 wist-agentd wist-exec wist-upgrader /usr/local/bin/
+sudo wist-agentd init-config --config-dir /etc/wist-agentd
+sudo vi /etc/wist-agentd/agentd.toml
+sudo wist-agentd service install --enrollment-token <token>
+wist-agentd service status                  # platform=upstart
+initctl status wist-agentd && tail -f /var/log/wist-agentd/agentd.err
+```
+
+`service install` 在本机**自动识别**服务管理器（有 `systemctl` 走 systemd，否则有 `/etc/init` + `initctl` 走 upstart），
+写 `/etc/init/wist-agentd.conf` 并 `initctl reload-configuration` + `stop` + `start`。要点：
+
+- **开机自启**：`start on runlevel [2345]`，与系统自带 upstart job 同一机制，不需要 `chkconfig`。
+- **崩溃拉起**：`respawn` + `respawn limit unlimited`，**不会**像 systemd 的 start limit 那样失败 N 次就永久放弃。
+  upstart 没有指数退避，用 `post-stop exec sleep 5` 固定 5s 间隔压住重启风暴；
+  代价是 `initctl stop` / `service uninstall` / `--force` 重装会多等 5 秒。
+- **不要手加 `kill signal` / `kill timeout`**：RHEL 6 的 upstart 0.6.5 不认这两个 stanza，
+  整份 job 会被丢弃（`/var/log/messages` 里是 `Unknown stanza`，`initctl` 报 `Unknown job`）。
+- 日志落 `/var/log/wist-agentd/agentd.{out,err}`（upstart 没有 journald），轮转见 §7.1。
+
 **macOS（launchd LaunchDaemon）**
 
 ```bash
@@ -170,7 +197,9 @@ wist-agentd service status
 launchctl print system/com.dayu-sec.wist-agentd
 ```
 
-装完的服务自身日志：Linux 进 journald，macOS 进 `/var/log/wist-agentd/agentd.{out,err}`（轮转见 §7.1）。
+装完的服务自身日志：systemd 进 journald，upstart / macOS 进 `/var/log/wist-agentd/agentd.{out,err}`（轮转见 §7.1）。
+
+`service print --for <systemd|upstart|launchd>` 可以在别的平台上先看定义文本（落盘前核对）。
 
 这套手工步骤的一键版本（含目录落点、崩溃拉起、单实例断言）见 §8 的 `dev/verify-system-install.sh`。
 
@@ -194,7 +223,7 @@ wist-agentd init-config --stdout                        # 只看默认模板，�
 <config-dir>/                        # 配置类（唯一可能放在 /etc 的东西）
   agentd.toml                        # 主配置（可以由 init-config 生成）
   tasks/*.toml                       # 可选：外置的日志采集清单（file_inputs_file 引用）
-  agentd.env                         # 可选（仅 Linux systemd）：EnvironmentFile，放长期环境变量
+  agentd.env                         # 可选（Linux systemd / upstart）：服务环境变量，只放长期值
 ```
 
 `tasks/` 不是 `[paths]` 项，它和 `agentd.toml` 同级，**跟着配置文件走**（相对配置文件所在目录解析）。
@@ -224,7 +253,7 @@ wist-agentd init-config --stdout                        # 只看默认模板，�
 /etc/wist-agentd/
   agentd.toml                     # 配置（唯一必放的东西）
   tasks/apps.toml                 # 有外置采集清单时：它是配置，跟 agentd.toml 走
-  agentd.env                      # 仅 Linux systemd：EnvironmentFile（长期环境变量）
+  agentd.env                      # Linux systemd / upstart：服务环境变量（长期值；语义见 §4.6）
 
 /var/lib/wist-agentd/            # 数据
   run/                            # wist-exec 工作目录
@@ -291,6 +320,15 @@ echo <token> | sudo wist-agentd enroll --token-stdin
 
 ### 4.6 环境变量
 
+进程级变量见下表；`<配置目录>/agentd.env` 是**服务托管时**的持久注入点（只放长期值，一次性 token 不要写这里）：
+
+- **systemd**：`EnvironmentFile=-<配置目录>/agentd.env`（文件可缺失，不会因此启动失败）。
+- **upstart**（CentOS 6 / RHEL 6）：job 的 `script` 块自己读，**只认 `KEY=VALUE`**（空行、`#` 注释、
+  没有 `=` 的行跳过；值外层的一对引号去掉）。它是**数据语义，不会执行文件内容**——
+  值里写 `$(...)` 只会得到这个字面字符串，与 systemd 的 `EnvironmentFile` 一致。
+  不支持 systemd 的进阶语法（多行续行、`\` 转义），那类场景改用 `agentd.toml` 或由 CM 注入。
+- **macOS**：launchd 无等价物，不读该文件。
+
 | 变量 | 作用 | 默认 |
 | --- | --- | --- |
 | `WARP_INSIGHT_EXEC_BIN` | 覆盖 `wist-exec` 路径 | 同目录 sibling → `PATH` |
@@ -347,7 +385,7 @@ sudo wist-agentd service install --bin /usr/local/bin/wist-agentd --enrollment-t
 wist-agentd service status
 ```
 
-**Linux — 系统级**（systemd）
+**Linux — 系统级**（systemd；CentOS 6 / RHEL 6 自动走 upstart，见 §3.4）
 
 ```bash
 sudo wist-agentd init-config --config-dir /etc/wist-agentd
@@ -358,12 +396,12 @@ journalctl -u wist-agentd -f
 ```
 
 只想写定义文件、自己手动加载（配置管理/发行包场景）：加 `--no-activate`，命令会打印出需要执行的
-`systemctl` / `launchctl` 命令。
+`systemctl` / `initctl` / `launchctl` 命令。
 
 ## 6. `service` 命令参考
 
 ```
-wist-agentd service print     [--bin <path>] [--config-dir <path>] [--for <systemd|launchd>]
+wist-agentd service print     [--bin <path>] [--config-dir <path>] [--for <systemd|upstart|launchd>]
 wist-agentd service install   [--bin <path>] [--config-dir <path>] [--force] [--no-activate] [--enrollment-token <token>]
 wist-agentd service uninstall [--bin <path>] [--config-dir <path>]
 wist-agentd service status    [--bin <path>] [--config-dir <path>]
@@ -372,8 +410,8 @@ wist-agentd enroll            [--token <token> | --token-stdin] [--config-dir <p
 
 | 参数 | 说明 |
 | --- | --- |
-| `print` | 只把服务定义（systemd unit / launchd plist）渲染到 stdout，**不读也不写系统** |
-| `install` | 写定义文件（launchd 还会创建日志目录），默认随后加载并启动服务 |
+| `print` | 只把服务定义（systemd unit / upstart job / launchd plist）渲染到 stdout，**不读也不写系统** |
+| `install` | 写定义文件（upstart / launchd 还会创建日志目录），默认随后加载并启动服务 |
 | `uninstall` | 先停止并取消托管，再删除定义文件（不删配置/状态目录） |
 | `status` | 只读自检：定义、二进制、`wist-exec`、配置、state 目录、**单实例锁**、日志入口 |
 | `enroll` | 用一次性 token 注册（`--token` 或 `--token-stdin`）；不落盘、幂等 |
@@ -438,13 +476,27 @@ sudo wist-agentd investigate exposure       # 谁在听、绑在哪（0.0.0.0 / 
 
 | 平台 | 服务状态 | 日志 |
 | --- | --- | --- |
-| Linux | `systemctl status wist-agentd` | 服务自身：`journalctl -u wist-agentd -f`；采集输出：`tail -f /var/lib/wist-agentd/data/wist-records.ndjson` |
+| Linux（systemd） | `systemctl status wist-agentd` | 服务自身：`journalctl -u wist-agentd -f`；采集输出：`tail -f /var/lib/wist-agentd/data/wist-records.ndjson` |
+| Linux（CentOS 6 / RHEL 6，upstart） | `initctl status wist-agentd` | 服务自身：`tail -f /var/log/wist-agentd/agentd.err`；采集输出：`tail -f /var/lib/wist-agentd/data/wist-records.ndjson` |
 | macOS | `launchctl print system/com.dayu-sec.wist-agentd` | 服务自身：`tail -f /var/log/wist-agentd/agentd.err`；采集输出：`tail -f /var/lib/wist-agentd/data/wist-records.ndjson` |
 
 日志量说明：常驻循环每 3s 产出的健康/指标快照被收敛为“变化才打印 + 默认 5 分钟一条心跳”。
 系统侧轮转兜底：
 
-- Linux：服务自身走 journald（按 `SystemMaxUse` 回收）；采集输出由 logrotate 或上游消费端自行管理。
+- Linux（systemd）：服务自身走 journald（按 `SystemMaxUse` 回收）；采集输出由 logrotate 或上游消费端自行管理。
+- Linux（upstart）：upstart **不会**轮转文件，加 `/etc/logrotate.d/wist-agentd`：
+
+  ```
+  /var/log/wist-agentd/agentd.out /var/log/wist-agentd/agentd.err {
+      weekly
+      rotate 4
+      compress
+      missingok
+      notifempty
+      copytruncate
+  }
+  ```
+
 - macOS：launchd **不会**轮转文件，加 `/etc/newsyslog.d/wist-agentd.conf`：
 
   ```
@@ -456,12 +508,12 @@ sudo wist-agentd investigate exposure       # 谁在听、绑在哪（0.0.0.0 / 
 
 ### 7.2 启动 / 停止 / 重启
 
-| 动作 | Linux | macOS |
-| --- | --- | --- |
-| 启动 | `systemctl start wist-agentd` | `launchctl kickstart -k system/com.dayu-sec.wist-agentd` |
-| 停止 | `systemctl stop wist-agentd` | `launchctl bootout system/com.dayu-sec.wist-agentd` |
-| 重启 | `systemctl restart wist-agentd` | `launchctl kickstart -k system/com.dayu-sec.wist-agentd` |
-| 是否自启 | `systemctl is-enabled wist-agentd` | plist 在 `LaunchDaemons` 即自启（`RunAtLoad`） |
+| 动作 | Linux（systemd） | Linux（upstart） | macOS |
+| --- | --- | --- | --- |
+| 启动 | `systemctl start wist-agentd` | `initctl start wist-agentd` | `launchctl kickstart -k system/com.dayu-sec.wist-agentd` |
+| 停止 | `systemctl stop wist-agentd` | `initctl stop wist-agentd`（等 5s 的 post-stop） | `launchctl bootout system/com.dayu-sec.wist-agentd` |
+| 重启 | `systemctl restart wist-agentd` | `initctl stop wist-agentd && initctl start wist-agentd` | `launchctl kickstart -k system/com.dayu-sec.wist-agentd` |
+| 是否自启 | `systemctl is-enabled wist-agentd` | job 在 `/etc/init` 即自启（`start on runlevel [2345]`） | plist 在 `LaunchDaemons` 即自启（`RunAtLoad`） |
 
 ### 7.3 升级与回滚
 
@@ -473,6 +525,10 @@ sudo install -m 0755 wist-exec.new   /usr/local/bin/wist-exec
 sudo wist-agentd service install --force   # Linux: enable + restart；macOS: bootout + bootstrap
 wist-agentd version                                  # 核对版本
 ```
+
+**从 0.33 及更早升上来（Linux）**：升级只换二进制，unit 定义不会自动重写——那台机器的
+`StartLimitBurst` 仍然在，一次磁盘写满就可能被永久标成 `failed`。存量机器需按使用手册 §2.2 跑一次
+一次性迁移（`reset-failed` → `install --force`）。这是运维动作，不在升级逻辑里。
 
 手工等价动作（想自己控制时机时）：
 

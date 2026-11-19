@@ -1733,6 +1733,26 @@ async fn local_work_check(config: &AgentConfig) -> Check {
     }
 }
 
+/// 升级器失联时的排查提示（按这台机器**实际在用的服务管理器**选）。
+///
+/// 写死 systemd 的话：macOS 上指向不存在的 `journalctl`，CentOS 6 上指向不存在的
+/// `systemctl`/瞬态 unit（upstart 下升级器是分离进程，根本没有 unit）。
+fn upgrade_dead_hint(platform: Option<crate::service::ServicePlatform>) -> &'static str {
+    use crate::service::ServicePlatform;
+    match platform {
+        // 这两者都没有 systemd 的瞬态 unit，升级器是分离进程，只能看落盘日志。
+        Some(ServicePlatform::Upstart) | Some(ServicePlatform::Launchd) => {
+            "看升级器日志：日志目录下的 `wist-upgrader.log` 与 `agentd.err`；\
+             确认当前版本后到管理面重派升级"
+        }
+        _ => {
+            "看升级器日志与那个瞬态 unit：`journalctl -u wist-agentd`、日志目录下的 \
+             `wist-upgrader.log`、`systemctl status wist-upgrader-<work_id>`；\
+             确认当前版本后到管理面重派升级"
+        }
+    }
+}
+
 /// 升级（`state/upgrade.json` + `state/upgrade.heartbeat`）。
 ///
 /// 为什么 diagnose 必须报这一项：升级器是**分离进程**，它死没死不在 agentd 的记忆里。agentd 判死后
@@ -1798,11 +1818,7 @@ fn local_upgrade_check(config: &AgentConfig) -> Check {
                         record.step
                     ),
                 )
-                .hint(
-                    "看升级器日志与那个瞬态 unit：`journalctl -u wist-agentd`、日志目录下的 \
-                     `wist-upgrader.log`、`systemctl status wist-upgrader-<work_id>`；\
-                     确认当前版本后到管理面重派升级",
-                )
+                .hint(upgrade_dead_hint(crate::service::ServicePlatform::current()))
             }
         }
         "rolled_back" => Check::warn(
@@ -3390,6 +3406,26 @@ mod tests {
         assert!(check.detail.contains("restart"), "{}", check.detail);
         assert!(check.hint.is_some(), "must say what to do next");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 升级器失联的提示必须指向这台机器**真实存在**的服务管理器：CentOS 6 / macOS 上
+    /// 没有 systemd 瞬态 unit，给 `systemctl status` 只会把人带到不存在的命令上。
+    #[test]
+    fn upgrade_dead_hint_matches_the_actual_service_manager() {
+        use crate::service::ServicePlatform;
+
+        for platform in [ServicePlatform::Upstart, ServicePlatform::Launchd] {
+            let hint = upgrade_dead_hint(Some(platform));
+            assert!(!hint.contains("systemctl"), "{platform:?}: {hint}");
+            assert!(!hint.contains("journalctl"), "{platform:?}: {hint}");
+            assert!(hint.contains("wist-upgrader.log"), "{platform:?}: {hint}");
+        }
+
+        for platform in [Some(ServicePlatform::Systemd), None] {
+            let hint = upgrade_dead_hint(platform);
+            assert!(hint.contains("systemctl"), "{platform:?}: {hint}");
+            assert!(hint.contains("wist-upgrader.log"), "{platform:?}: {hint}");
+        }
     }
 
     /// 心跳文件存在但时间戳已越过死亡阈值 —— 走的是真实的「老化」路径，不是「文件不存在」。

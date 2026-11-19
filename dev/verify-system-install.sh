@@ -2,7 +2,7 @@
 # wist-agentd 系统级安装真机验收（需要 root，显式触发）。
 #
 # 覆盖自动测试覆盖不到的两类内容：
-#   1) systemd / launchd 的**真实加载**：enabled、running、崩溃拉起、单实例
+#   1) systemd / upstart / launchd 的**真实加载**：enabled、running、崩溃拉起、单实例
 #   2) 系统级**目录落点成功路径**：/etc/wist-agentd 配置、/var/lib/wist-agentd 数据（含采集输出）、
 #      /var/log/wist-agentd 日志
 #
@@ -96,9 +96,18 @@ wait_until() {
 }
 
 case "$(uname -s)" in
-  Linux) PLATFORM="systemd" ;;
+  Linux)
+    # 与 agentd 自己的判定一致：有 systemctl 走 systemd，否则 /etc/init + initctl 走 upstart。
+    if command -v systemctl >/dev/null 2>&1; then
+      PLATFORM="systemd"
+    elif [ -d /etc/init ] && command -v initctl >/dev/null 2>&1; then
+      PLATFORM="upstart"
+    else
+      PLATFORM="systemd"
+    fi
+    ;;
   Darwin) PLATFORM="launchd" ;;
-  *) echo "unsupported platform: $(uname -s) (Linux systemd / macOS launchd only)" >&2; exit 2 ;;
+  *) echo "unsupported platform: $(uname -s) (Linux systemd / upstart, macOS launchd only)" >&2; exit 2 ;;
 esac
 
 # ---------------------------------------------------------------- preflight
@@ -131,6 +140,7 @@ preflight() {
   if [ -e "${MARKER_FILE}" ]; then
     info "检测到本脚本上次的安装标记：${MARKER_FILE}"
   elif [ -f "/etc/systemd/system/${SERVICE_NAME}.service" ] ||
+    [ -f "/etc/init/${SERVICE_NAME}.conf" ] ||
     [ -f "/Library/LaunchDaemons/${LAUNCHD_LABEL}.plist" ]; then
     echo "本机已有 wist-agentd 系统级安装痕迹；请先 --cleanup 或换一台干净机器验收" >&2
     exit 2
@@ -143,6 +153,7 @@ preflight() {
 definition_path() {
   case "${PLATFORM}" in
     systemd) printf '%s\n' "/etc/systemd/system/${SERVICE_NAME}.service" ;;
+    upstart) printf '%s\n' "/etc/init/${SERVICE_NAME}.conf" ;;
     launchd) printf '%s\n' "/Library/LaunchDaemons/${LAUNCHD_LABEL}.plist" ;;
   esac
 }
@@ -150,6 +161,7 @@ definition_path() {
 service_main_pid() {
   case "${PLATFORM}" in
     systemd) systemctl show -p MainPID --value "${SERVICE_NAME}" 2>/dev/null || true ;;
+    upstart) initctl status "${SERVICE_NAME}" 2>/dev/null | awk '/start\/running/{print $NF}' || true ;;
     launchd) launchctl print "system/${LAUNCHD_LABEL}" 2>/dev/null | awk '/pid = /{print $3; exit}' || true ;;
   esac
 }
@@ -157,6 +169,8 @@ service_main_pid() {
 service_is_running() {
   case "${PLATFORM}" in
     systemd) [ "$(systemctl is-active "${SERVICE_NAME}" 2>/dev/null || true)" = "active" ] ;;
+    # respawn 期间是 `start/post-stop`（不在跑）：只认 `start/running`。
+    upstart) initctl status "${SERVICE_NAME}" 2>/dev/null | grep -q 'start/running' ;;
     launchd) launchctl print "system/${LAUNCHD_LABEL}" 2>/dev/null | grep -q 'state = running' ;;
   esac
 }
@@ -164,6 +178,8 @@ service_is_running() {
 service_is_enabled() {
   case "${PLATFORM}" in
     systemd) [ "$(systemctl is-enabled "${SERVICE_NAME}" 2>/dev/null || true)" = "enabled" ] ;;
+    # upstart 没有 enable 概念：job 文件在 /etc/init 就随 runlevel 起。
+    upstart) [ -f "/etc/init/${SERVICE_NAME}.conf" ] ;;
     launchd) launchctl print "system/${LAUNCHD_LABEL}" >/dev/null 2>&1 ;;
   esac
 }
@@ -179,6 +195,7 @@ status_reports_running() {
 read_startup_line() {
   case "${PLATFORM}" in
     systemd) journalctl -u "${SERVICE_NAME}" -n 200 --no-pager 2>/dev/null | grep -F 'starting: config=' | tail -1 || true ;;
+    upstart) grep -F 'starting: config=' "${LOG_DIR}/agentd.err" 2>/dev/null | tail -1 || true ;;
     launchd) grep -F 'starting: config=' "${LOG_DIR}/agentd.err" 2>/dev/null | tail -1 || true ;;
   esac
 }
@@ -392,6 +409,11 @@ phase_report_log_volume() {
       size="$(wc -c <"${LOG_DIR}/agentd.err" 2>/dev/null | tr -d ' ' || echo 0)"
       info "${LOG_DIR}/agentd.err ${size} bytes（需配合 newsyslog 轮转）"
       ;;
+    upstart)
+      local size
+      size="$(wc -c <"${LOG_DIR}/agentd.err" 2>/dev/null | tr -d ' ' || echo 0)"
+      info "${LOG_DIR}/agentd.err ${size} bytes（需配合 logrotate 轮转）"
+      ;;
   esac
 }
 
@@ -416,10 +438,15 @@ dump_diagnostics() {
       systemctl cat "${SERVICE_NAME}" --no-pager 2>&1 | sed 's/^/  | /' || true
       ;;
     launchd) launchctl print "system/${LAUNCHD_LABEL}" 2>&1 | head -40 | sed 's/^/  | /' || true ;;
+    upstart)
+      initctl status "${SERVICE_NAME}" 2>&1 | sed 's/^/  | /' || true
+      cat "/etc/init/${SERVICE_NAME}.conf" 2>&1 | sed 's/^/  | /' || true
+      ;;
   esac
   info "日志尾部："
   case "${PLATFORM}" in
     systemd) journalctl -u "${SERVICE_NAME}" -n 40 --no-pager 2>&1 | sed 's/^/  | /' || true ;;
+    upstart) tail -n 40 "${LOG_DIR}/agentd.err" 2>&1 | sed 's/^/  | /' || true ;;
     launchd) tail -n 40 "${LOG_DIR}/agentd.err" 2>&1 | sed 's/^/  | /' || true ;;
   esac
   info "目录："

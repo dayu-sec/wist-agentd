@@ -46,7 +46,7 @@ host/process metrics, and reports status, health, and execution results back ups
 [后台长期运行方案](docs/design/agentd-service-deployment.md)。
 
 ```bash
-# 长期后台运行（Linux systemd / macOS launchd；需 sudo）
+# 长期后台运行（Linux systemd / upstart、macOS launchd；需 sudo）
 # 注册 token 一次性传入、不落盘（先注册再装服务，注册失败不会留下半成品服务）
 sudo wist-agentd service install --enrollment-token <token>
 
@@ -273,7 +273,7 @@ Usage:
   wist-agentd version
   wist-agentd init-config [--stdout] [--config-dir <path>]
   wist-agentd service <print|install|uninstall|status> [--bin <path>] [--force] [--no-activate] [--config-dir <path>]
-  wist-agentd service print --for <systemd|launchd>   (render for another platform)
+  wist-agentd service print --for <systemd|upstart|launchd>   (render for another platform)
   wist-agentd enroll [--token <token> | --token-stdin] [--config-dir <path>]
   wist-agentd diagnose [--json] [--offline] [--config-dir <path>]
   wist-agentd investigate [disk|load|accounts|persistence|exposure] [--path <dir>] [--top <n>] [--min-size <size>] [--depth <n>] [--max-seconds <n>] [--json] [--config-dir <path>]
@@ -283,7 +283,7 @@ Commands:
   version              Print the daemon version.
   init-config          Initialize config directory wist-agentd/ and write agentd.toml.
   init-config --stdout Print the default config template to stdout.
-  service print        Print the systemd unit / launchd plist without touching the system.
+  service print        Print the systemd unit / upstart job / launchd plist without touching the system.
   service install      Write the service definition and (unless --no-activate) load and start it.
   service uninstall    Stop the service and remove its definition.
   service status       Show definition / binary / config / lock / log status.
@@ -295,9 +295,9 @@ Commands:
                        (the last three are Linux-only for now).
                        Prints evidence (paths + sizes), not just a verdict; exits nonzero on FAIL.
 
-Service options (Linux uses systemd, macOS uses launchd):
+Service options (Linux uses systemd, or upstart on RHEL/CentOS 6; macOS uses launchd):
   --bin <path>         Installed path of the wist-agentd binary (default: current executable).
-  --for <platform>     Only with `service print`: render systemd or launchd output.
+  --for <platform>     Only with `service print`: render systemd, upstart or launchd output.
   --force              Overwrite an existing service definition.
   --no-activate        Only write the definition; print the commands to load it yourself.
   --enrollment-token <token>  Only with `service install`: enroll first (token not persisted).
@@ -325,8 +325,11 @@ Options:
 `wist-agentd` runs in the foreground by design; keeping it alive across logouts, crashes,
 and reboots is delegated to the OS service manager:
 
-- **Linux** — systemd unit at `/etc/systemd/system/wist-agentd.service`,
+- **Linux + systemd** — unit at `/etc/systemd/system/wist-agentd.service`,
   `Restart=always`, logs to journald.
+- **Linux + upstart** (CentOS 6 / RHEL 6, no systemd) — job at `/etc/init/wist-agentd.conf`,
+  `respawn limit unlimited`, logs to `/var/log/wist-agentd/`. Requires the **static musl** build
+  (those hosts are glibc 2.12 / kernel 2.6.32).
 - **macOS** — launchd plist at `/Library/LaunchDaemons/com.dayu-sec.wist-agentd.plist`,
   `KeepAlive`, logs to `/var/log/wist-agentd/`.
 
@@ -379,7 +382,7 @@ src/
   investigate*      # one-shot investigation (model + `disk` / `load` / `accounts` / `persistence` / `exposure` topics)
   reporting/        # result aggregation and upstream reporting
   runtime/          # daemon loop, scheduler, self-observability
-  service/          # systemd / launchd definitions, install & status
+  service/          # systemd / upstart / launchd definitions, install & status
   state_store/      # on-disk state (queue, running, reporting, history, checkpoints)
   telemetry/        # log file tailing and metrics sampling
 examples/           # example agentd.toml configs
@@ -394,7 +397,7 @@ docs/usage/         # install & operations manual + usage/troubleshooting help
 - [`docs/usage/agentd-install-and-usage.md`](docs/usage/agentd-install-and-usage.md) — install & operations
   manual (how to install, configure, run, upgrade, troubleshoot).
 - [`docs/design/agentd-service-deployment.md`](docs/design/agentd-service-deployment.md) — long-running
-  service design rationale (systemd / launchd).
+  service design rationale (systemd / upstart / launchd).
 - [`docs/design/agentd-investigation.md`](docs/design/agentd-investigation.md) — one-shot
   investigation (`investigate`) design: topics, evidence model, scan bounds, wire contract.
 - [`docs/design/agentd-architecture.md`](docs/design/agentd-architecture.md) — module boundaries and state model.

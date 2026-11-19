@@ -23,6 +23,8 @@ pub(crate) mod investigate_probe;
 pub mod investigate_safety;
 /// 遥测健康（我们瞎了多久）：源还在产出吗、积压送得出去吗。
 pub(crate) mod investigate_telemetry;
+/// 死亡遗言兜底：致命错误同时写内核环形缓冲（磁盘写满时 journald 也写不了盘）。
+pub mod kmsg;
 pub mod reporting;
 pub mod runtime;
 pub mod service;

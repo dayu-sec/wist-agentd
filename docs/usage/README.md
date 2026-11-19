@@ -50,10 +50,14 @@ systemctl status wist-agentd                      # Linux 平台侧
 
 ### 1.1 只支持系统级托管
 
-agentd 只装**系统级**：Linux 系统 unit（`/etc/systemd/system/wist-agentd.service`）、macOS LaunchDaemon
+agentd 只装**系统级**：Linux 系统 unit（`/etc/systemd/system/wist-agentd.service`）或 upstart job
+（`/etc/init/wist-agentd.conf`，CentOS 6 / RHEL 6）、macOS LaunchDaemon
 （`/Library/LaunchDaemons/`，launchd 域 `system`），以 root 运行、开机即起。
 
 > 用户级（`systemctl --user` / launchd `gui/<uid>`）已移除，不再支持。
+
+服务管理器**按运行态自动选**：有 `systemctl` 走 systemd；没有但 `/etc/init` + `initctl` 在就走 upstart；
+两者都没有时退回写 systemd unit（供 `--no-activate` + CM 分发）。`service status` 第一行 `platform=` 即是实际选择。
 
 `sudo` 下 uid=0，install.sh 因此一律落到 `system` 域。
 
@@ -68,25 +72,31 @@ systemctl status wist-agentd
 systemctl restart wist-agentd
 systemctl stop wist-agentd
 systemctl disable --now wist-agentd     # 持久停用（重启也不回来）
-systemctl reset-failed wist-agentd      # 清 failed（§2.2）
+systemctl reset-failed wist-agentd      # 仅旧版模板需要（§2.2）
 journalctl -u wist-agentd -f
+
+initctl status wist-agentd              # CentOS 6 / RHEL 6（upstart）：状态
+initctl restart wist-agentd             #  重启（stop + start，stop 要等 5s）
+initctl stop wist-agentd                #  停止（定义还在，重启会回来）
+tail -f /var/log/wist-agentd/agentd.err
 ```
 
 `launchctl load/unload` 已废弃 → `bootstrap`/`bootout`；Linux 不必手工 `daemon-reload`，
-`service install --force` 会做。
+`service install --force` 会做。upstart 也不需要 `chkconfig`：job 在 `/etc/init` 就随 runlevel 起。
 
 ## 2. 常见问题
 
 ### 2.1 kill 完又自己回来
 
-托管必然拉起：launchd `KeepAlive`（`ThrottleInterval=10`）、systemd `Restart=always`（`RestartSec=5`）。
+托管必然拉起：launchd `KeepAlive`（`ThrottleInterval=10`）、systemd `Restart=always`（`RestartSec=5`）、
+upstart `respawn limit unlimited`（固定 `post-stop` 5s 间隔）。
 
-| 目标 | macOS | Linux |
-| --- | --- | --- |
-| 停一会儿 | `launchctl bootout system/…` | `systemctl stop wist-agentd` |
-| 停且不再自启 | 加 `launchctl disable system/…`（恢复 `enable`） | `systemctl disable --now wist-agentd`（恢复 `enable --now`） |
-| 彻底卸载 | `service uninstall` | 同左 |
-| 只重启 | `launchctl kickstart -k …` | `systemctl restart wist-agentd` |
+| 目标 | macOS | Linux（systemd） | Linux（upstart） |
+| --- | --- | --- | --- |
+| 停一会儿 | `launchctl bootout system/…` | `systemctl stop wist-agentd` | `initctl stop wist-agentd`（等 5s） |
+| 停且不再自启 | 加 `launchctl disable system/…`（恢复 `enable`） | `systemctl disable --now wist-agentd`（恢复 `enable --now`） | `service uninstall`（job 文件在就自启） |
+| 彻底卸载 | `service uninstall` | 同左 | 同左 |
+| 只重启 | `launchctl kickstart -k …` | `systemctl restart wist-agentd` | `initctl restart wist-agentd` |
 
 - 只停不 disable：macOS 的 plist 还在 → 下次图形登录重新加载；Linux 的 unit 仍 enabled → **重启机器**会再起。
 - 停止是优雅的：`ExitTimeOut=30` / `TimeoutStopSec=30`（先 SIGTERM，30s 后 SIGKILL）。Linux
@@ -108,9 +118,25 @@ dev/stop.sh                 # 停掉手工那份
 wist-agentd service status | grep running=
 ```
 
-**Linux 专有**：`StartLimitIntervalSec=60` / `StartLimitBurst=10` → 60 秒内失败 10 次即标记 `failed` 并
-**放弃自动拉起**（`start request repeated too quickly`）；launchd 只会按 `ThrottleInterval` 一直重试。
-修掉根因后：`sudo systemctl reset-failed wist-agentd && sudo systemctl start wist-agentd`
+**Linux 专有（0.33 及更早的模板）**：`StartLimitIntervalSec=60` + `StartLimitBurst=10` 配 `Restart=always`，语义是
+60 秒内失败 10 次 → unit 标 `failed` 并**永久放弃拉起**（`start request repeated too quickly`），必须人工
+`reset-failed`；launchd 用 `ThrottleInterval` 一直重试，没有这个问题。
+
+新模板改为 `StartLimitIntervalSec=0` + 指数退避（`RestartSteps=5` / `RestartMaxDelaySec=60`）：5s→60s 封顶后
+一直重试，磁盘满、网络未就绪这类可恢复故障解除后最迟 60s 自己起来。
+
+**旧模板是一次性迁移，不在产品逻辑里。** 升级只换二进制，`/etc/systemd/system/wist-agentd.service` 不会
+自动重写，所以存量机器需要手工（或安装脚本）跑一次：
+
+```bash
+sudo systemctl cat wist-agentd | grep -n 'StartLimitBurst'   # 还有输出 = 旧模板
+sudo systemctl reset-failed wist-agentd                      # 幂等；清掉 start limit 留下的 failed 态
+sudo wist-agentd service install --force                     # 按当前二进制重写定义 + 重建进程
+systemctl show wist-agentd -p StartLimitIntervalUSec -p RestartUSec -p RestartSteps -p RestartMaxDelayUSec
+```
+
+顺序不能反：`service install --force` 的 `restart` **会被 start limit 拒掉**，所以先 `reset-failed` 再
+`install --force`。核对点是 `StartLimitIntervalUSec=0` 且 `RestartSteps=5`（systemd < 254 没有后两项，属正常）。
 
 ⚠️ 别删 `.agentd.lock`：文件在但无人持锁是正常的（内核在进程退出时释放），删了会让两个实例都以为自己是唯一实例。
 
@@ -208,8 +234,10 @@ wist-agentd investigate disk --json     # 机器可读
 
 已经确认是 agentd 的日志：
 
-- macOS：launchd 不轮转文件，配 `/etc/newsyslog.d/wist-agentd.conf`；Linux：journald，额度看
-  `/etc/systemd/journald.conf` 的 `SystemMaxUse`，或 `sudo journalctl --vacuum-size=500M`。
+- macOS：launchd 不轮转文件，配 `/etc/newsyslog.d/wist-agentd.conf`；Linux（systemd）：journald，额度看
+  `/etc/systemd/journald.conf` 的 `SystemMaxUse`，或 `sudo journalctl --vacuum-size=500M`；
+  Linux（upstart）：`/var/log/wist-agentd/agentd.{out,err}` 自己涨，配 `/etc/logrotate.d/wist-agentd`
+  （`copytruncate`，见安装手册 §7.1）。
 - 稳态输出已收敛（变化才打印 + 默认 5 分钟心跳）；调大 `WIST_AGENTD_LOG_HEARTBEAT_SECS`
   （默认 `300`，`0` = 逐轮打印，仅联调）。
 - 采集输出 `wist-records.ndjson` 是数据，不受收敛影响，由下游或 logrotate 管。
@@ -346,7 +374,9 @@ wist-agentd service uninstall      # 停止 + 删定义
 1. `wist-agentd service status` 全文；
 2. `launchctl print …` / `systemctl cat wist-agentd` + `systemctl status`；
 3. 服务日志尾部 200 行（`tail -200 …/agentd.err` 或 `journalctl -u wist-agentd -n 200`）；
-4. `wist-agentd version` 与启动行；网关侧同时段日志（`failed TLS handshake` / `CertificateUnknown`）。
+4. `wist-agentd version` 与启动行；网关侧同时段日志（`failed TLS handshake` / `CertificateUnknown`）；
+5. **启动即退出的磁盘满事故**：`sudo dmesg -T | grep 'wist-agentd\['`（致命错误链会镜像到内核环形缓冲；
+   那时 journald 自己就写不了盘，journal 里什么都没有是正常的）。
 
 ⚠️ 先脱敏：`agentd.toml` 的 `enrollment_token`、`state/agent_runtime.json` 的 `bearer_token` 不外发
 （给 `agent_id` / `credential_id` / `credential_expires_at` 够定位）。
@@ -363,4 +393,4 @@ wist-agentd service uninstall      # 停止 + 删定义
 | 改完 plist/unit 直接重启 | 定义没重写：用 `service install --force` |
 | 把一次性 token 写进 `agentd.toml` | 注册后本会清掉，手工留着等于长期落盘 |
 | `/etc` 下装却不用 sudo | 配置/数据/日志三处都要 root |
-| Linux 崩溃循环后只 `restart` | 已被 start-limit 拒掉：先 `systemctl reset-failed`（§2.2） |
+| Linux 崩溃循环后 `restart` 报 `start request repeated too quickly` | 该机还是旧版模板（`StartLimitBurst`）：先 `systemctl reset-failed`，再 `service install --force`（§2.2） |

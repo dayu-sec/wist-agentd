@@ -1,16 +1,21 @@
 //! 常驻服务集成：把 `wist-agentd` 交给 OS 服务管理器长期托管。
 //!
-//! 两种落地形态：
-//! - Linux：systemd unit（`Restart=always`，日志进 journald）。
+//! 三种落地形态：
+//! - Linux + systemd：unit（`Restart=always`，日志进 journald）。
+//! - Linux + upstart（RHEL / CentOS 6 等无 systemd 的发行版）：`/etc/init` job
+//!   （`respawn`，日志落 `/var/log/wist-agentd`）。
 //! - macOS：launchd plist（`KeepAlive`，日志进 `/var/log/wist-agentd`）。
+//!
+//! 平台**按运行态判定**（[`ServicePlatform::current`]），不按编译目标：同一个静态 musl
+//! 制品既要能在 systemd 机器上装成 unit，也要能在 CentOS 6 上装成 upstart job。
 //!
 //! 设计前提：agentd 自身**只前台运行**（不 fork / 不 double-fork daemonize），
 //! 开机自启、崩溃拉起、退出后重启全部由服务管理器负责；重复实例由 state 目录下的
 //! flock（[`crate::single_instance`]）兜底——服务管理器重启期间若前任未退出，新进程
-//! 会以 `AlreadyRunning` 快速失败，再由 `Restart` / `KeepAlive` 重试。
+//! 会以 `AlreadyRunning` 快速失败，再由 `Restart` / `KeepAlive` / `respawn` 重试。
 //!
 //! 本模块只做三件事：渲染服务定义、落盘/删除定义文件、给出服务管理器的操作命令。
-//! 真正的 `systemctl` / `launchctl` 调用由 CLI 层执行，便于单测只覆盖可确定的部分。
+//! 真正的 `systemctl` / `initctl` / `launchctl` 调用由 CLI 层执行，便于单测只覆盖可确定的部分。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,8 +27,9 @@ use crate::error::{AgentdReason, AgentdResult};
 
 pub mod launchd;
 pub mod systemd;
+pub mod upstart;
 
-/// 服务实例名（systemd unit 名 / 进程显示名）。
+/// 服务实例名（systemd unit 名 / upstart job 名 / 进程显示名）。
 pub const SERVICE_NAME: &str = "wist-agentd";
 /// macOS launchd label（反向域名，全机唯一）。
 pub const LAUNCHD_LABEL: &str = "com.dayu-sec.wist-agentd";
@@ -33,18 +39,23 @@ pub const ENV_FILE_NAME: &str = "agentd.env";
 /// 与 `wist-agentd` 同目录发布、由守护进程拉起的执行器。
 pub const EXEC_BIN_NAME: &str = "wist-exec";
 
-/// 服务管理器形态（由编译目标决定；渲染函数显式接收，便于测试两个平台）。
+/// 服务管理器形态（Linux 上由运行态判定；渲染函数显式接收，便于逐个平台测试）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServicePlatform {
     Systemd,
+    /// RHEL / CentOS 6 等「有 upstart、没有 systemd」的 Linux。
+    Upstart,
     Launchd,
 }
 
 impl ServicePlatform {
-    /// 当前目标平台使用的服务管理器；非 Linux / macOS 返回 `None`。
+    /// 当前主机使用的服务管理器；非 Linux / macOS 返回 `None`。
+    ///
+    /// Linux 上按**运行态**判定，而不是编译目标：同一份静态制品会落到 systemd 机器、
+    /// CentOS 6（upstart）以及两者都没有的精简镜像上。
     pub fn current() -> Option<ServicePlatform> {
         if cfg!(target_os = "linux") {
-            Some(ServicePlatform::Systemd)
+            Some(linux_platform())
         } else if cfg!(target_os = "macos") {
             Some(ServicePlatform::Launchd)
         } else {
@@ -55,18 +66,66 @@ impl ServicePlatform {
     pub fn as_str(self) -> &'static str {
         match self {
             ServicePlatform::Systemd => "systemd",
+            ServicePlatform::Upstart => "upstart",
             ServicePlatform::Launchd => "launchd",
         }
     }
+}
+
+/// Linux 主机的服务管理器：systemd 优先，其次 upstart（RHEL / CentOS 6）。
+fn linux_platform() -> ServicePlatform {
+    if systemd_available() {
+        ServicePlatform::Systemd
+    } else if upstart_available() {
+        ServicePlatform::Upstart
+    } else {
+        // 两者都没有（Alpine / 精简容器）：保持旧行为 —— 写 systemd unit，
+        // 由运维决定怎么拉起（`service install --no-activate`）。
+        ServicePlatform::Systemd
+    }
+}
+
+/// systemd 是 PID 1（`/run/systemd/system` 存在），或至少装了 `systemctl`
+/// （容器里 systemd 没在跑，但 `--no-activate` 仍要能写出 unit）。
+///
+/// 不能只看 `PATH`：`install.sh` / CM 可能用受限环境变量拉起本命令，
+/// 登进 `root` 的 `PATH` 与本进程拿到的 `PATH` 不是一回事。
+fn systemd_available() -> bool {
+    Path::new("/run/systemd/system").is_dir()
+        || program_in_path("systemctl")
+        || has_any_binary(&["/usr/bin/systemctl", "/bin/systemctl"])
+}
+
+/// upstart：job 目录 `/etc/init` 在，且 `initctl` 可用（绝对路径优先，理由同上）。
+fn upstart_available() -> bool {
+    Path::new("/etc/init").is_dir()
+        && (has_any_binary(&["/sbin/initctl", "/usr/sbin/initctl"]) || program_in_path("initctl"))
+}
+
+fn has_any_binary(paths: &[&str]) -> bool {
+    paths.iter().any(|path| Path::new(path).is_file())
+}
+
+fn program_in_path(name: &str) -> bool {
+    program_in_paths(std::env::var_os("PATH").as_deref(), name)
+}
+
+/// PATH 变量里能否找到 `name`。
+///
+/// 拆成纯函数（不读进程环境）是为了可单测：测试里改 `PATH` 会影响并行跑的其他用例。
+fn program_in_paths(path_var: Option<&std::ffi::OsStr>, name: &str) -> bool {
+    path_var
+        .map(|paths| std::env::split_paths(paths).any(|dir| dir.join(name).is_file()))
+        .unwrap_or(false)
 }
 
 /// 服务定义与日志的落盘位置（系统级）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceLayout {
     pub platform: ServicePlatform,
-    /// service 定义文件（`*.service` / `*.plist`）。
+    /// service 定义文件（`*.service` / `/etc/init/*.conf` / `*.plist`）。
     pub definition_path: PathBuf,
-    /// launchd 标准输出/错误目录；systemd 走 journald，故为 `None`。
+    /// 标准输出/错误目录（upstart / launchd）；systemd 走 journald，故为 `None`。
     pub log_dir: Option<PathBuf>,
 }
 
@@ -75,6 +134,7 @@ impl ServiceLayout {
     pub fn resolve(platform: ServicePlatform) -> AgentdResult<Self> {
         let (definition_path, log_dir) = match platform {
             ServicePlatform::Systemd => (systemd::unit_path()?, None),
+            ServicePlatform::Upstart => (upstart::job_path()?, Some(upstart::log_dir()?)),
             ServicePlatform::Launchd => (launchd::plist_path()?, Some(launchd::log_dir()?)),
         };
         Ok(Self {
@@ -137,6 +197,7 @@ impl ServiceSpec {
 pub fn render(layout: &ServiceLayout, spec: &ServiceSpec) -> String {
     match layout.platform {
         ServicePlatform::Systemd => systemd::unit_text(spec),
+        ServicePlatform::Upstart => upstart::job_text(spec, layout.log_dir.as_deref()),
         ServicePlatform::Launchd => launchd::plist_text(spec, layout.log_dir.as_deref()),
     }
 }
@@ -319,6 +380,26 @@ pub fn activate_commands(
                 .retryable(ACTIVATE_RETRIES),
             ])
         }
+        ServicePlatform::Upstart => Ok(vec![
+            // 新写的 `/etc/init/<job>.conf` 必须 reload 才被 init 认识：RHEL 6 的
+            // `initctl start` 对未知 job 直接报 `Unknown job`，不会自己重读目录。
+            ServiceCommand::new("initctl", vec!["reload-configuration".to_string()], false),
+            // `service install --force`（换二进制 / 改定义）必须真的重建进程，
+            // 所以是 stop + start 而不是只 start（只 start 在已跑时是 no-op）。
+            // 没跑过时 stop 返回非零，忽略；`post-stop` 的 5s 在 stop 返回前跑完，
+            // 要紧随的 start 不会撞上它。
+            ServiceCommand::new(
+                "initctl",
+                vec!["stop".to_string(), SERVICE_NAME.to_string()],
+                true,
+            ),
+            ServiceCommand::new(
+                "initctl",
+                vec!["start".to_string(), SERVICE_NAME.to_string()],
+                false,
+            )
+            .retryable(ACTIVATE_RETRIES),
+        ]),
         ServicePlatform::Launchd => {
             let domain = spec.launchd_domain();
             Ok(vec![
@@ -365,6 +446,11 @@ pub fn deactivate_commands(platform: ServicePlatform, spec: &ServiceSpec) -> Vec
             ),
             ServiceCommand::new("systemctl", vec!["daemon-reload".to_string()], false),
         ],
+        ServicePlatform::Upstart => vec![ServiceCommand::new(
+            "initctl",
+            vec!["stop".to_string(), SERVICE_NAME.to_string()],
+            true,
+        )],
         ServicePlatform::Launchd => vec![ServiceCommand::new(
             "launchctl",
             vec!["bootout".to_string(), spec.launchd_target()],
@@ -374,7 +460,11 @@ pub fn deactivate_commands(platform: ServicePlatform, spec: &ServiceSpec) -> Vec
 }
 
 /// 运维检查命令（只打印，不执行）。
-pub fn inspect_commands(platform: ServicePlatform, spec: &ServiceSpec) -> Vec<ServiceCommand> {
+///
+/// 取 `layout` 而不是只取 `platform`：upstart 的 `tail` 目标必须与**实际渲染出来的**
+/// 日志目录一致（`log_hint` 用的是同一个 `layout.log_dir`），不能另写一份常量。
+pub fn inspect_commands(layout: &ServiceLayout, spec: &ServiceSpec) -> Vec<ServiceCommand> {
+    let platform = layout.platform;
     match platform {
         ServicePlatform::Systemd => vec![
             ServiceCommand::new(
@@ -385,6 +475,27 @@ pub fn inspect_commands(platform: ServicePlatform, spec: &ServiceSpec) -> Vec<Se
             ServiceCommand::new(
                 "journalctl",
                 vec!["-u".to_string(), SERVICE_NAME.to_string(), "-f".to_string()],
+                false,
+            ),
+        ],
+        ServicePlatform::Upstart => vec![
+            ServiceCommand::new(
+                "initctl",
+                vec!["status".to_string(), SERVICE_NAME.to_string()],
+                false,
+            ),
+            ServiceCommand::new(
+                "tail",
+                vec![
+                    "-f".to_string(),
+                    layout
+                        .log_dir
+                        .as_ref()
+                        .map(|dir| dir.join(upstart::STDERR_FILE))
+                        .unwrap_or_else(upstart::stderr_path)
+                        .display()
+                        .to_string(),
+                ],
                 false,
             ),
         ],
@@ -478,6 +589,16 @@ pub fn status(layout: &ServiceLayout, spec: &ServiceSpec) -> AgentdResult<Servic
 pub fn log_hint(layout: &ServiceLayout) -> AgentdResult<String> {
     match layout.platform {
         ServicePlatform::Systemd => Ok(format!("journalctl -u {SERVICE_NAME} -f")),
+        ServicePlatform::Upstart => {
+            let log_dir = layout
+                .log_dir
+                .clone()
+                .ok_or_else(|| AgentdReason::ServicePathUnresolved.to_err())?;
+            Ok(format!(
+                "tail -f {}",
+                log_dir.join(upstart::STDERR_FILE).display()
+            ))
+        }
         ServicePlatform::Launchd => {
             let log_dir = layout
                 .log_dir
@@ -542,7 +663,7 @@ fn one_line(text: &str) -> String {
         .join(" / ")
 }
 
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     if !value.is_empty()
         && value.chars().all(|ch| {
             ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '-' | '_' | '=' | ':' | '@')

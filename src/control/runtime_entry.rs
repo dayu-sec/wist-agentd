@@ -954,12 +954,13 @@ fn parse_service_request(
             let value = option_value(args, index + 1, "--for")?;
             request.platform = Some(match value.to_str() {
                 Some("systemd") | Some("linux") => ServicePlatform::Systemd,
+                Some("upstart") | Some("init") => ServicePlatform::Upstart,
                 Some("launchd") | Some("macos") => ServicePlatform::Launchd,
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!(
-                            "unknown platform for --for: {} (supported: systemd | launchd)",
+                            "unknown platform for --for: {} (supported: systemd | upstart | launchd)",
                             PathBuf::from(value).display()
                         ),
                     ));
@@ -1660,7 +1661,7 @@ async fn run_service(
         Some(platform) => platform,
         None => ServicePlatform::current().ok_or_else(|| {
             AgentdReason::ServicePathUnresolved.to_err().with_detail(
-                "service management is supported on Linux (systemd) and macOS (launchd) only",
+                "service management is supported on Linux (systemd / upstart) and macOS (launchd) only",
             )
         })?,
     };
@@ -1718,7 +1719,7 @@ async fn run_service_install(
         );
     }
     if let Some(log_dir) = report.log_dir.as_ref() {
-        println!("launchd logs: {}", log_dir.display());
+        println!("{} logs: {}", report.platform.as_str(), log_dir.display());
     }
     if !spec.config_dir.is_dir() {
         eprintln!(
@@ -1739,7 +1740,7 @@ async fn run_service_install(
         }
     }
     println!("logs: {}", service::log_hint(layout)?);
-    for command in service::inspect_commands(layout.platform, spec) {
+    for command in service::inspect_commands(layout, spec) {
         println!("check: {}", command.display_line());
     }
     Ok(())
@@ -1789,7 +1790,7 @@ fn run_service_status(layout: &ServiceLayout, spec: &ServiceSpec) -> AgentdResul
         None => println!("running=unknown (no readable config)"),
     }
     println!("logs={}", status.log_hint);
-    for command in service::inspect_commands(status.platform, spec) {
+    for command in service::inspect_commands(layout, spec) {
         println!("check={}", command.display_line());
     }
     Ok(())
@@ -1866,7 +1867,7 @@ fn usage_message() -> &'static str {
         "  wist-agentd version\n",
         "  wist-agentd init-config [--stdout] [--config-dir <path>]\n",
         "  wist-agentd service <print|install|uninstall|status> [--bin <path>] [--force] [--no-activate] [--config-dir <path>]\n",
-        "  wist-agentd service print --for <systemd|launchd>   (render for another platform)\n",
+        "  wist-agentd service print --for <systemd|upstart|launchd>   (render for another platform)\n",
         "  wist-agentd enroll [--token <token> | --token-stdin] [--config-dir <path>]\n",
         "  wist-agentd diagnose [--json] [--offline] [--config-dir <path>]\n",
         "  wist-agentd refresh-facts [--wait <secs> | --no-wait] [--config-dir <path>]\n",
@@ -1885,7 +1886,7 @@ fn usage_message() -> &'static str {
         "  version              Print the daemon version.\n",
         "  init-config          Initialize config directory wist-agentd/ and write agentd.toml.\n",
         "  init-config --stdout Print the default config template to stdout.\n",
-        "  service print        Print the systemd unit / launchd plist without touching the system.\n",
+        "  service print        Print the systemd unit / upstart job / launchd plist without touching the system.\n",
         "  service install      Write the service definition and (unless --no-activate) load and start it.\n",
         "  service uninstall    Stop the service and remove its definition.\n",
         "  service status       Show definition / binary / config / lock / log status.\n",
@@ -1943,9 +1944,9 @@ fn usage_message() -> &'static str {
         "  --max-groups <n>     Kafka only: cap how many groups are queried per round (default 200).\n",
         "  --lag-threshold <n>  Kafka only: with no --group, only report groups above this lag (default 1000).\n",
         "\n",
-        "Service options (Linux uses systemd, macOS uses launchd):\n",
+        "Service options (Linux uses systemd, or upstart on RHEL/CentOS 6; macOS uses launchd):\n",
         "  --bin <path>         Installed path of the wist-agentd binary (default: current executable).\n",
-        "  --for <platform>     Only with `service print`: render systemd or launchd output.\n",
+        "  --for <platform>     Only with `service print`: render systemd, upstart or launchd output.\n",
         "  --force              Overwrite an existing service definition.\n",
         "  --no-activate        Only write the definition; print the commands to load it yourself.\n",
         "  --enrollment-token <token>  Only with `service install`: enroll first (token not persisted).\n",

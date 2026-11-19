@@ -36,10 +36,7 @@ use wist_shared::fs::{read_json, write_json_atomic};
 use wist_shared::time::now_rfc3339;
 
 use crate::control::enrollment::enrollment_http_client;
-#[cfg(target_os = "macos")]
-use crate::service::LAUNCHD_LABEL;
-#[cfg(not(target_os = "macos"))]
-use crate::service::SERVICE_NAME;
+use crate::service::{LAUNCHD_LABEL, SERVICE_NAME};
 
 /// 与 `wist-agentd` 同级发布的二进制：制品里必须都带上，换的时候**一起换**。
 pub const AGENTD_BIN_NAME: &str = "wist-agentd";
@@ -884,23 +881,42 @@ fn spawn_heartbeat(state_dir: PathBuf) {
 ///
 /// 只做**重启**（定义不动）：换的是二进制，不是服务定义。
 pub fn default_restart_plan() -> RestartPlan {
-    #[cfg(target_os = "macos")]
-    {
-        RestartPlan::Command {
-            program: "launchctl".to_string(),
-            args: vec![
+    // 重启的必须是**这台机器上真正在管 agentd 的那个服务管理器**：CentOS 6 / RHEL 6
+    // 没有 systemctl，写死 `systemctl restart` 会让「换完二进制重启」必失败，
+    // 于是整个升级被误判失败并白白回滚。判定与 `service` 子命令共用一套。
+    match crate::service::ServicePlatform::current() {
+        Some(platform) => restart_plan_for(platform),
+        // 非 Linux / macOS（目前不支持服务托管）：保持旧的 systemd 缺省，由调用方报错。
+        None => restart_plan_for(crate::service::ServicePlatform::Systemd),
+    }
+}
+
+/// 某个服务管理器重启 agentd 的命令（纯映射，便于单测逐个平台覆盖）。
+///
+/// upstart 0.6.5（RHEL 6）的 `initctl restart` 是有的，语义是先停后起；
+/// 它会把 `post-stop exec sleep 5` 等完再返回（升级慢 5 秒，但重启确实发生了）。
+fn restart_plan_for(platform: crate::service::ServicePlatform) -> RestartPlan {
+    let (program, args) = match platform {
+        crate::service::ServicePlatform::Systemd => (
+            "systemctl",
+            vec!["restart".to_string(), SERVICE_NAME.to_string()],
+        ),
+        crate::service::ServicePlatform::Upstart => (
+            "initctl",
+            vec!["restart".to_string(), SERVICE_NAME.to_string()],
+        ),
+        crate::service::ServicePlatform::Launchd => (
+            "launchctl",
+            vec![
                 "kickstart".to_string(),
                 "-k".to_string(),
                 format!("system/{LAUNCHD_LABEL}"),
             ],
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        RestartPlan::Command {
-            program: "systemctl".to_string(),
-            args: vec!["restart".to_string(), SERVICE_NAME.to_string()],
-        }
+        ),
+    };
+    RestartPlan::Command {
+        program: program.to_string(),
+        args,
     }
 }
 
@@ -1945,7 +1961,12 @@ mod tests {
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
-                    assert_eq!(program, "systemctl");
+                    // 具体是哪个由 `ServicePlatform::current()` 决定（systemd / upstart），
+                    // 这里只断言「它确实是 restart <service>」。
+                    assert!(
+                        program == "systemctl" || program == "initctl",
+                        "unexpected program: {program}"
+                    );
                     assert_eq!(
                         args,
                         vec![
@@ -1956,6 +1977,44 @@ mod tests {
                 }
             }
             RestartPlan::None => panic!("default plan must be a command"),
+        }
+    }
+
+    /// 每个平台的升级重启命令都必须落到那个平台的真实命令上：CentOS 6 上写死
+    /// `systemctl` 会让「换完二进制重启」必失败，升级被误判失败并无谓回滚。
+    #[test]
+    fn restart_plan_maps_each_platform_to_its_real_command() {
+        use crate::service::ServicePlatform;
+
+        for (platform, program, expected) in [
+            (
+                ServicePlatform::Systemd,
+                "systemctl",
+                vec!["restart", crate::service::SERVICE_NAME],
+            ),
+            (
+                ServicePlatform::Upstart,
+                "initctl",
+                vec!["restart", crate::service::SERVICE_NAME],
+            ),
+        ] {
+            match restart_plan_for(platform) {
+                RestartPlan::Command { program: got, args } => {
+                    assert_eq!(got, program, "{platform:?}");
+                    assert_eq!(args, expected, "{platform:?}");
+                }
+                RestartPlan::None => panic!("{platform:?} must be a command"),
+            }
+        }
+
+        match restart_plan_for(ServicePlatform::Launchd) {
+            RestartPlan::Command { program, args } => {
+                assert_eq!(program, "launchctl");
+                assert!(args.iter().any(|arg| arg == "kickstart"));
+                assert!(args.iter().any(|arg| arg == "-k"));
+                assert!(args.iter().any(|arg| arg.starts_with("system/")));
+            }
+            RestartPlan::None => panic!("launchd must be a command"),
         }
     }
 

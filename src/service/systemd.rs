@@ -3,6 +3,11 @@
 //! 关键取舍：
 //! - `Type=simple` + 前台进程：agentd 不做 double-fork，PID 1 直接跟踪主进程。
 //! - `Restart=always`：常驻进程正常/异常退出都拉起；`systemctl stop` 不会触发重启。
+//! - 重启风暴靠**指数退避**压，不靠 start limit：`StartLimitIntervalSec=0` 关掉
+//!   “限流窗口内失败 N 次即标记 failed 并放弃拉起”，再用 `RestartSteps` /
+//!   `RestartMaxDelaySec` 把重启间隔从 `RestartSec` 指数拉到上限。外部故障（磁盘满、
+//!   网络未就绪）解除后必须能自己回来，不能等人工 `reset-failed`。
+//!   单实例锁冲突虽然也可恢复（前任退出后新进程就能起），同样按退避重试。
 //! - `EnvironmentFile=-...`（前导 `-` 表示文件可缺失）：只放长期环境变量；
 //!   一次性注册 token 走命令行（`service install --enrollment-token` / `enroll --token`），不落盘。
 //! - `KillMode=control-group`（systemd 默认）：stop 时连 `wist-exec` 子进程一起收走，
@@ -34,9 +39,12 @@ pub fn unit_text(spec: &ServiceSpec) -> String {
     text.push_str("Documentation=https://github.com/dayu-sec/wist-agentd\n");
     text.push_str("After=network-online.target\n");
     text.push_str("Wants=network-online.target\n");
-    // 单实例锁冲突（前任未退出）会快速失败，这里限流避免重启风暴刷满 journal。
-    text.push_str("StartLimitIntervalSec=60\n");
-    text.push_str("StartLimitBurst=10\n");
+    // 关掉 start limit：`StartLimitIntervalSec=60` + `StartLimitBurst=10` 配 `Restart=always`
+    // 的语义是「限流窗口内失败 N 次 → 标记 failed → **永久放弃拉起**」。它假定失败都是
+    // 「单实例锁冲突」这种配置性错误，但真正的高频场景是磁盘满 / 网络未就绪这类**可恢复的
+    // 外部故障**——故障解除后服务必须自己回来，否则就变成静默躺死（现场：盘满 8 天没人发现）。
+    // 退避由 [Service] 的 `RestartSteps` / `RestartMaxDelaySec` 负责。
+    text.push_str("StartLimitIntervalSec=0\n");
     text.push('\n');
     text.push_str("[Service]\n");
     text.push_str("Type=simple\n");
@@ -51,6 +59,13 @@ pub fn unit_text(spec: &ServiceSpec) -> String {
     ));
     text.push_str("Restart=always\n");
     text.push_str("RestartSec=5\n");
+    // 退避序列 5s → 10s → 20s → 40s → 60s，之后封顶：既压住重启风暴（失败期间不会每 5s
+    // 刷一轮 journal），又不会永久放弃（故障解除后最迟 60s 自动拉起）。
+    // 这两项需要 systemd >= 254；更老的版本（如 Ubuntu 22.04 / 249）忽略它们、退化成固定
+    // 5s 重试，仍然能自愈，只是失败期间日志更吵。选择无条件渲染而不是探测版本，是因为
+    // `unit_text` 是纯函数（`service print --for systemd` 可能在没有 systemd 的机器上跑）。
+    text.push_str("RestartSteps=5\n");
+    text.push_str("RestartMaxDelaySec=60\n");
     text.push_str("KillSignal=SIGTERM\n");
     text.push_str("KillMode=control-group\n");
     text.push_str("TimeoutStopSec=30\n");
