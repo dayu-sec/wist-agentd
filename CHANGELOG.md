@@ -3,6 +3,29 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.34.0-alpha] - 2026-11-19
+
+### 新增（CentOS 6 / RHEL 6 可以用 `service install` 托管了）
+
+- 服务管理器改为按**机器实际状态**选：有 systemd 走 systemd，只有 upstart（EL6 的 PID 1）就走
+  upstart；`service print --for upstart` 可以先看渲染结果。已在 CentOS 6.10（glibc 2.12 /
+kernel 2.6.32）实测：安装、开机自启、崩溃拉起、单实例、卸载都正常。
+- upstart 侧与 systemd 语义对齐：崩溃无限重拉（不像 `StartLimitBurst` 那样失败几次就永久
+  放弃）、`agentd.env` 按 `KEY=VALUE` 读取（**数据语义，不执行文件内容**）、
+  升级后由 `initctl restart` 重建进程；日志落 `/var/log/wist-agentd/agentd.{out,err}`。
+- 已知代价：upstart 没有指数退避，用固定 5 秒间隔压重启风暴，所以 `stop` / `uninstall` /
+  `--force` 重装会多等 5 秒。
+- 这类老系统请用 CI 产出的 **静态 musl** 制品（glibc 2.12 上动态链接的构建起不来）。
+
+### 修复（服务不会因反复失败而永久躺死）
+
+- systemd 模板不再用 `StartLimitIntervalSec` / `StartLimitBurst`：它会在失败 N 次后把服务
+  标成 failed 并**放弃拉起**，而真正高频的是磁盘满 / 网络未就绪这类**可恢复**故障——故障
+  解除后也不会自己回来（现场：盘满 8 天无人发现）。改用指数退避（`RestartSteps` /
+  `RestartMaxDelaySec`），老 systemd 忽略这两项、退化为固定间隔重试。
+- 致命错误的因果链现在**同时**写进内核环形缓冲（`/dev/kmsg`）：stderr 走 journald，
+  而磁盘写满时 journald 自身就写不了盘 —— 那种时刻这次启动失败不再是完全无痕（issue #47）。
+
 ## [0.33.0-alpha] - 2026-11-18
 
 ### 新增（云实例身份：接云 API 来源的归并键）
