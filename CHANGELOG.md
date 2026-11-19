@@ -3,6 +3,23 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.34.1-alpha] - 2026-11-19
+
+### 修复（老内核上任何 TLS 握手都会 `Aborted`：`getentropy failed.`）
+
+- 现场（CentOS 6 / kernel 2.6.32）：`wist-agentd diagnose` 直接 `getentropy failed.` + SIGABRT。
+  三个事实叠在一起：`getrandom(2)` 是 Linux 3.17 才有的系统调用；musl 的 `getentropy()`
+  **只调它、没有 `/dev/urandom` 回退**；aws-lc（rustls 的加密后端）在构建时看不到
+  `<linux/random.h>` 就编入 `getentropy` 路径，失败即 `abort()`——而我们的 musl 交叉构
+  建正好走这条。结果是这类机器上 enroll / 上报 / 连通性探测全不可用。
+- 修法：静态 musl 制品里提供一个带 `/dev/urandom` 回退的 `getentropy`（覆盖 libc 那份）：
+  新内核仍走 `getrandom`，老内核 / 受限沙箱（`ENOSYS` / `EPERM`）回退读 `/dev/urandom`。
+  只对 Linux + musl 编译，其它平台不参与。真机验证：2.6.32 上取出非零熵。
+- **发布门禁**：`release.yml` 在打包前用 seccomp 把 `getrandom(2)` 变成 `ENOSYS`（模拟
+  kernel < 3.17），再让**制品本身**跑一次 TLS 握手（`enroll` → 本地 `openssl s_server`）。
+  断言：不 SIGABRT、不出现 `getentropy failed.`、不卡死，且**确实走到了证书校验**（否则
+  门禁会因为没跑到那段代码而假绿）。CI runner 内核是新的，不用这个手法永远复现不出来。
+
 ## [0.34.0-alpha] - 2026-11-19
 
 ### 新增（CentOS 6 / RHEL 6 可以用 `service install` 托管了）
