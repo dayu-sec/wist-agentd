@@ -27,6 +27,8 @@ pub mod doris_source;
 pub mod policy;
 pub mod process;
 pub mod runtime;
+// 触发规则（倒计时 / 重启归零 / 策略表覆盖周期）：纯决策，不做 I/O，便于单测。
+pub(crate) mod schedule;
 
 use std::time::SystemTime;
 

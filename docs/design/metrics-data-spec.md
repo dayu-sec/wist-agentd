@@ -618,7 +618,7 @@ process_state{state="running"} 1
 
 | fact_key | 理由 |
 |---|---|
-| `process.executable.name` | 身份信息，属发现域 |
+| `process.executable.name` | 身份信息，属发现域。**两端都发**（macOS `ps comm`、Linux `/proc/<pid>/exe`，读不到时回退 `/proc/<pid>/comm`），保证 fact 集合一致；不进指标 |
 | `process.identity` | 身份信息，用于 `instance` 取值 |
 | `container.runtime` / `cgroup.path` / `k8s.*` | 身份信息，属发现域；k8s 身份经 `namespace` / `pod` / `container` label 表达 |
 | `host.name` | 身份信息，由 `agent` / `instance` / `system_host_info` 承载 |

@@ -3583,7 +3583,14 @@ async fn refresh_discovery_snapshot(
     runtime: &mut DiscoveryRuntime,
     force: bool,
 ) -> (DiscoveryHealth, fact_summary::FactSummaryDraft) {
-    let (cached, cache_load_failure) = runtime.load_from_state_dir_async(state_dir).await;
+    // 已经在内存里有快照就不必再读一遍磁盘（那是 1 MB JSON + 解析）：只有首拍（含重启）才恢复。
+    // 这里只要一个“有没有”，不要 clone 快照 —— 那叉会变成每拍 1 MB 的内存抖动。
+    let mut cache_load_failure = None;
+    if runtime.snapshot().is_none() {
+        let (_, failure) = runtime.load_from_state_dir_async(state_dir).await;
+        cache_load_failure = failure;
+    }
+    let cached_snapshot_loaded = runtime.snapshot().is_some();
     let (cached_meta, meta_load_failure) = runtime.load_meta_from_state_dir_async(state_dir).await;
     // 按各探针的 `refresh_interval()` 调度：只刷到期的，未到期的沿用上次输出。
     // 这是“基础观测频率”真的生效的地方 —— 在此之前各探针声明的周期是死代码，
@@ -3595,62 +3602,78 @@ async fn refresh_discovery_snapshot(
             .refresh_due_and_store_async(state_dir, Instant::now())
             .await
     };
-    let candidates = planner_bridge::build_collection_candidates(&result.persisted_snapshot);
-    let host_candidates: Vec<_> = candidates
-        .iter()
-        .filter(|candidate| candidate.collection_kind == "host_metrics")
-        .cloned()
-        .collect();
-    let process_candidates: Vec<_> = candidates
-        .iter()
-        .filter(|candidate| candidate.collection_kind == "process_metrics")
-        .cloned()
-        .collect();
-    let container_candidates: Vec<_> = candidates
-        .iter()
-        .filter(|candidate| candidate.collection_kind == "container_metrics")
-        .cloned()
-        .collect();
-    let planner_store_result: io::Result<()> = async {
-        planner_candidates::store_async(
-            &planner_candidates::host_metrics_path_for(state_dir),
-            &host_candidates,
-        )
-        .await?;
-        planner_candidates::store_async(
-            &planner_candidates::process_metrics_path_for(state_dir),
-            &process_candidates,
-        )
-        .await?;
-        planner_candidates::store_async(
-            &planner_candidates::container_metrics_path_for(state_dir),
-            &container_candidates,
-        )
-        .await
-    }
-    .await;
-    if let Err(err) = planner_store_result {
-        result.last_error = Some(format!("planner candidate store failed: {err}"));
-        result.store_failure = Some(crate::discovery::runtime::DiscoveryStoreFailure {
-            phase: "planner_store",
-            detail: format!("planner candidate store failed: {err}"),
-        });
-    } else {
-        let target_view_result: io::Result<()> = async {
-            let view = target_view::build_metrics_target_view_async(
-                state_dir,
-                &result.persisted_snapshot.generated_at,
+    // 没有探针跑过的那一拍：planner 候选与指标目标视图都是快照的纯函数，不可能变 ——
+    // 不再重算、不再重写（之前这里是 1.5 MB/3s）。
+    if result.changed {
+        let candidates = planner_bridge::build_collection_candidates(&result.persisted_snapshot);
+        let host_candidates: Vec<_> = candidates
+            .iter()
+            .filter(|candidate| candidate.collection_kind == "host_metrics")
+            .cloned()
+            .collect();
+        // 逐进程指标默认停采：连候选都不生成（开不开见 `PROCESS_METRICS_COLLECTION_ENABLED`）。
+        let process_candidates: Vec<_> = if target_view::PROCESS_METRICS_COLLECTION_ENABLED {
+            candidates
+                .iter()
+                .filter(|candidate| candidate.collection_kind == "process_metrics")
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let container_candidates: Vec<_> = candidates
+            .iter()
+            .filter(|candidate| candidate.collection_kind == "container_metrics")
+            .cloned()
+            .collect();
+        let planner_store_result: io::Result<()> = async {
+            planner_candidates::store_async(
+                &planner_candidates::host_metrics_path_for(state_dir),
+                &host_candidates,
             )
             .await?;
-            target_view::store_async(&target_view::path_for(state_dir), &view).await
+            if target_view::PROCESS_METRICS_COLLECTION_ENABLED {
+                planner_candidates::store_async(
+                    &planner_candidates::process_metrics_path_for(state_dir),
+                    &process_candidates,
+                )
+                .await?;
+            } else {
+                // 停采：把上一版留下的候选文件清掉，不让磁盘上留一份「看起来还在采」的旧数据。
+                let _ =
+                    tokio::fs::remove_file(planner_candidates::process_metrics_path_for(state_dir))
+                        .await;
+            }
+            planner_candidates::store_async(
+                &planner_candidates::container_metrics_path_for(state_dir),
+                &container_candidates,
+            )
+            .await
         }
         .await;
-        if let Err(err) = target_view_result {
-            result.last_error = Some(format!("metrics target view store failed: {err}"));
+        if let Err(err) = planner_store_result {
+            result.last_error = Some(format!("planner candidate store failed: {err}"));
             result.store_failure = Some(crate::discovery::runtime::DiscoveryStoreFailure {
-                phase: "metrics_target_view_store",
-                detail: format!("metrics target view store failed: {err}"),
+                phase: "planner_store",
+                detail: format!("planner candidate store failed: {err}"),
             });
+        } else {
+            let target_view_result: io::Result<()> = async {
+                let view = target_view::build_metrics_target_view_async(
+                    state_dir,
+                    &result.persisted_snapshot.generated_at,
+                )
+                .await?;
+                target_view::store_async(&target_view::path_for(state_dir), &view).await
+            }
+            .await;
+            if let Err(err) = target_view_result {
+                result.last_error = Some(format!("metrics target view store failed: {err}"));
+                result.store_failure = Some(crate::discovery::runtime::DiscoveryStoreFailure {
+                    phase: "metrics_target_view_store",
+                    detail: format!("metrics target view store failed: {err}"),
+                });
+            }
         }
     }
     let probes = build_probe_health(
@@ -3670,7 +3693,7 @@ async fn refresh_discovery_snapshot(
         DiscoveryReadiness::ReadyWithStaleSnapshot
     } else if result.had_successful_refresh {
         DiscoveryReadiness::Ready
-    } else if cached.is_some() {
+    } else if cached_snapshot_loaded {
         DiscoveryReadiness::ReadyWithStaleSnapshot
     } else {
         DiscoveryReadiness::NotReady
@@ -3679,7 +3702,7 @@ async fn refresh_discovery_snapshot(
     let health = DiscoveryHealth {
         snapshot: DiscoveryHealthSnapshot {
             readiness,
-            cached_snapshot_loaded: cached.is_some(),
+            cached_snapshot_loaded,
             used_cached_snapshot: result.used_cached_snapshot,
             resource_count: result.persisted_snapshot.resources.len(),
             target_count: result.persisted_snapshot.targets.len(),
@@ -3807,16 +3830,19 @@ fn build_probe_health(
 }
 
 fn emit_discovery_refresh(result: &DiscoveryRefreshResult, probes: &[DiscoveryProbeHealth]) {
-    log::info!(
-        "event=DiscoveryRefreshed revision={} persisted_revision={} resources={} targets={} failures={} used_cached_snapshot={} last_success_at={}",
-        result.refreshed_snapshot.revision,
-        result.persisted_snapshot.revision,
-        result.persisted_snapshot.resources.len(),
-        result.persisted_snapshot.targets.len(),
-        result.errors.len(),
-        result.used_cached_snapshot,
-        result.last_success_at.as_deref().unwrap_or("-"),
-    );
+    // 只在真的跑过探针时打这一行：没有采集的拍打一条一模一样的 revision 只是噪声。
+    if result.changed {
+        log::info!(
+            "event=DiscoveryRefreshed revision={} persisted_revision={} resources={} targets={} failures={} used_cached_snapshot={} last_success_at={}",
+            result.refreshed_snapshot.revision,
+            result.persisted_snapshot.revision,
+            result.persisted_snapshot.resources.len(),
+            result.persisted_snapshot.targets.len(),
+            result.errors.len(),
+            result.used_cached_snapshot,
+            result.last_success_at.as_deref().unwrap_or("-"),
+        );
+    }
 
     for probe in probes {
         if probe.status == "failed" {

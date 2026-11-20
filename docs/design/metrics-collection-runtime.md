@@ -313,7 +313,7 @@ let outcomes = scheduler::collect_all(view);    // 主机三域 + Kafka（最近
 
 | 域 | 执行器 | 关键点 |
 |---|---|---|
-| 主机 / 进程 / 容器 | blocking（现有同步实现） | **目标来源是 `target_view`（发现策略），不是工作授权**；调度器只接管执行，不新造 `*_grant()`；`attempted` 仍按目标数。**已定：P0 一并搬进 collector 线程** |
+| 主机 / 进程 / 容器 | blocking（现有同步实现） | **目标来源是 `target_view`（发现策略），不是工作授权**；调度器只接管执行，不新造 `*_grant()`；`attempted` 仍按目标数。**已定：P0 一并搬进 collector 线程**。取数约束：**一轮一张进程表**（`sys_proc::snapshot()`：macOS 一次 `ps -axo`、Linux 一次 `/proc` 遍历），进程域与容器域都查它 —— 不得按目标 fork（macOS 上 900 进程 = 900 次 fork/轮，实测 ~20% 一个核）。**逐进程指标默认停采**：无授权来源、无消费方，见 `target_view::PROCESS_METRICS_COLLECTION_ENABLED` |
 | Kafka | blocking（现有 `probe_once`，作业里走 `spawn_blocking`） | 协议与语义不变；周期 / 容量预算 / 消费组预算都是该域自己的旋钮 |
 | MySQL / TiDB | async | `sqlx` + `mysql` + `tls-rustls-aws-lc-rs`（musl 探针已过，见 §12.3）；只读账号 + `SET SESSION MAX_EXECUTION_TIME` / `statement_timeout`；查 `information_schema` + `SHOW GLOBAL STATUS` |
 | Doris | async（**复用 MySQL transport**） | 与 MySQL **不是同一个 collector**：Doris 的读数是 `SHOW BACKENDS` / `SHOW PROC '/backends'` / `information_schema` 里的 tablet·副本视图。transport 复用、SQL 与指标映射各自实现 |

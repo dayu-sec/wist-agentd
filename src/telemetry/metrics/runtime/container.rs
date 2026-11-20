@@ -2,12 +2,14 @@
 
 use wist_contracts::discovery::StringKeyValue;
 
-use super::process::collect_process_runtime_facts;
+use super::process::{facts_from_row, missing_row_error};
 use super::push_fact_if_absent;
 use super::{MetricsCollectionTargetSample, MetricsTargetViewEntry};
+use crate::sys_proc::ProcSnapshot;
 
 pub(super) fn probe_container_target(
     target: &MetricsTargetViewEntry,
+    table: &ProcSnapshot,
 ) -> MetricsCollectionTargetSample {
     let mut sample = MetricsCollectionTargetSample {
         candidate_id: target.candidate_id.clone(),
@@ -43,13 +45,13 @@ pub(super) fn probe_container_target(
         .find(|hint| hint.key == "pid")
         .and_then(|hint| hint.value.parse::<u32>().ok())
     {
-        match collect_process_runtime_facts(pid, &[]) {
-            Ok(process_facts) => {
+        match table.get(pid) {
+            Some(row) => {
                 push_fact_if_absent(
                     &mut facts,
                     StringKeyValue::new("container.pid", pid.to_string()),
                 );
-                for fact in process_facts {
+                for fact in facts_from_row(row, &[]) {
                     // pid 在容器域由 `container.pid` 表达；`process.pid` 在此域没有登记，直接丢弃。
                     if fact.key == "process.pid" {
                         continue;
@@ -57,9 +59,8 @@ pub(super) fn probe_container_target(
                     push_fact_if_absent(&mut facts, fact);
                 }
             }
-            Err(err) => {
-                process_probe_error = Some(err.to_string());
-            }
+            // 进程已退出 / 整表取数失败：两种情况都要说出来，别混成「采到了空的」。
+            None => process_probe_error = Some(missing_row_error(pid, table)),
         }
     }
 

@@ -3,14 +3,14 @@
 #[cfg(target_os = "linux")]
 use std::fs;
 use std::io;
-#[cfg(all(unix, not(target_os = "linux")))]
-use std::process::Command;
 
 use std::collections::BTreeMap;
 
 use wist_contracts::discovery::{DiscoveredResource, DiscoveredTarget, DiscoveryOrigin};
 use wist_shared::time::now_rfc3339;
 
+// 身份令牌：Linux 走 `/proc/<pid>/stat`；macOS 由 `sys_proc` 的进程表提供。
+#[cfg(target_os = "linux")]
 use crate::process_control::process_identity;
 
 use super::host::default_host_id;
@@ -259,60 +259,32 @@ fn read_process_comm(pid: u32) -> Option<String> {
 
 #[cfg(all(unix, not(target_os = "linux")))]
 fn list_processes() -> io::Result<Vec<ObservedProcess>> {
-    let output = Command::new("ps").args(["-axo", "pid=,comm="]).output()?;
-    if !output.status.success() {
-        return Err(io::Error::other("ps did not exit successfully"));
+    // 一次 `ps -axo` 拿到全表：进程名与身份令牌（`lstart`）来自同一行。
+    // 以前是「1 次 `ps -axo pid=,comm=` + 每个 pid 一次 `ps -o lstart=`」，
+    // 900 个进程的机器上一次刷新≈ 900 次 fork。
+    let table = crate::sys_proc::snapshot();
+    if table.is_empty() {
+        return Err(io::Error::other(match table.error() {
+            Some(err) => format!("process table unavailable: {err}"),
+            None => "process table returned no rows".to_string(),
+        }));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut processes = Vec::new();
-    for line in stdout.lines() {
-        let Some((pid, name)) = parse_unix_ps_process_line(line) else {
-            continue;
-        };
-        let (identity, identity_unavailable) = match process_identity(pid) {
-            Ok(identity) => (identity, false),
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
-                ) =>
-            {
-                (None, true)
-            }
-            Err(err) => return Err(err),
-        };
-        processes.push(ObservedProcess {
-            pid,
-            identity,
-            name,
-            identity_unavailable,
+    Ok(table
+        .iter()
+        .map(|row| ObservedProcess {
+            pid: row.pid,
+            identity: row.start_token.clone(),
+            name: row.comm.clone(),
+            // 令牌缺失（内核线程等）≠ 读不到：`ps` 已经给了全表。
+            identity_unavailable: row.start_token.is_none(),
             // macOS 的容器跑在虚拟机里，宿主 `ps` 看不到它们的归属。
             container_id: None,
             // macOS 没有 systemd；launchd 的 label 需要 `launchctl` 子进程，
             // 本阶段不采（`app` 在 macOS 上留空，符合规范 §3.4「判不出就留空」）。
             service_unit: None,
-        });
-    }
-    Ok(processes)
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn parse_unix_ps_process_line(line: &str) -> Option<(u32, Option<String>)> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let first_non_pid = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
-    let pid_text = &trimmed[..first_non_pid];
-    let pid = pid_text.parse::<u32>().ok()?;
-    let name = trimmed[first_non_pid..].trim();
-    let name = if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
-    };
-    Some((pid, name))
+        })
+        .collect())
 }
 
 #[cfg(not(unix))]
@@ -324,8 +296,6 @@ fn list_processes() -> io::Result<Vec<ObservedProcess>> {
 mod tests {
     #[cfg(any(target_os = "linux", test))]
     use super::first_cmdline_arg;
-    #[cfg(all(unix, not(target_os = "linux")))]
-    use super::parse_unix_ps_process_line;
     use super::{ObservedProcess, process_attributes};
 
     #[test]
@@ -436,24 +406,5 @@ mod tests {
 
         assert_eq!(observed.resource_id("host-1"), "host-1:pid:42");
         assert_eq!(observed.target_id("host-1"), "host-1:pid:42:process");
-    }
-
-    #[cfg(all(unix, not(target_os = "linux")))]
-    #[test]
-    fn parse_unix_ps_process_line_keeps_command_with_spaces() {
-        let parsed = parse_unix_ps_process_line(
-            "123 /Applications/Microsoft Outlook.app/Contents/MacOS/Microsoft Outlook",
-        );
-
-        assert_eq!(
-            parsed,
-            Some((
-                123,
-                Some(
-                    "/Applications/Microsoft Outlook.app/Contents/MacOS/Microsoft Outlook"
-                        .to_string(),
-                ),
-            ))
-        );
     }
 }

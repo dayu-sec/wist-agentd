@@ -217,8 +217,12 @@ fn build_process_outcome(targets: Vec<&MetricsTargetViewEntry>) -> MetricsCollec
     let mut sample_targets = Vec::new();
     let mut last_error = None;
 
+    // 一轮一张表：macOS 一次 `ps -axo`，Linux 一次 `/proc` 遍历。
+    // 以前是每个目标一次 `ps -p <pid>`，900 个进程的机器上一轮 900 次 fork。
+    let table = crate::sys_proc::snapshot();
+
     for target in &targets {
-        let probed = process::probe_process_target(target);
+        let probed = process::probe_from_table(target, &table);
         if probed.status == "succeeded" {
             succeeded_targets += 1;
         } else {
@@ -282,8 +286,11 @@ fn build_container_outcome(targets: Vec<&MetricsTargetViewEntry>) -> MetricsColl
     let mut sample_targets = Vec::new();
     let mut last_error = None;
 
+    // 容器域读的是同一个 pid 的进程事实，所以同样一轮取一次表。
+    let table = crate::sys_proc::snapshot();
+
     for target in &targets {
-        let probed = container::probe_container_target(target);
+        let probed = container::probe_container_target(target, &table);
         if probed.status == "failed" {
             failed_targets += 1;
             if last_error.is_none() {
@@ -1405,14 +1412,6 @@ mod tests {
             super::filesystem_dedupe_key("", "/data"),
             "mount:/data".to_string()
         );
-    }
-
-    #[test]
-    fn ps_cputime_parses_seconds_minutes_and_hours() {
-        assert_eq!(super::parse_ps_cputime("0:00.42"), Some(0.42));
-        assert_eq!(super::parse_ps_cputime("1:02.00"), Some(62.0));
-        assert_eq!(super::parse_ps_cputime("2:03:04.50"), Some(7384.5));
-        assert_eq!(super::parse_ps_cputime("n/a"), None);
     }
 
     #[test]

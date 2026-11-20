@@ -353,12 +353,15 @@ fn daemon_run_once_processes_granted_log_work() {
             .join("host_metrics_candidates.json"),
     )
     .expect("read host planner candidates");
-    let process_planner_candidates: Vec<CollectionCandidate> = read_json(
-        &state_dir
-            .join("planner")
-            .join("process_metrics_candidates.json"),
-    )
-    .expect("read process planner candidates");
+    // 逐进程指标默认停采：候选文件**不应存在**（也不会产生进程采集目标）。
+    let process_candidates_path = state_dir
+        .join("planner")
+        .join("process_metrics_candidates.json");
+    assert!(
+        !process_candidates_path.exists(),
+        "逐进程指标停采时不得再写候选文件"
+    );
+    let process_planner_candidates: Vec<CollectionCandidate> = Vec::new();
     let container_planner_candidates: Vec<CollectionCandidate> = read_json(
         &state_dir
             .join("planner")
