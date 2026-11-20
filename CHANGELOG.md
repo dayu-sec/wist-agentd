@@ -3,6 +3,47 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.35.0-alpha] - 2026-11-21
+
+### 变更（进程域开销归零：一轮一张表；空闲拍不再落盘）
+
+- **进程取数改「一轮一张表」**：macOS 没有 `/proc`，原来每个采集目标各 fork 一次 `ps`
+  （900 进程的机器上一轮 ≈ 900 次 fork，实测 470–660 forks/s、约 20% 一个核，launchd 还会
+  把进程判成 `immediate reason = inefficient`）。现在每轮只取一次全表（macOS 一次 `ps -axo`，
+  Linux 一次 `/proc` 遍历），指标域与容器域都查同一张表。实测：fork 归零；CPU 21% → 0.2–4.9%
+  （含 debug 构建）。
+- **发现快照只在真的采集过之后才前进/落盘**：没有探针到期的一拍，`generated_at` / `revision`
+  不前进，也不重写 discovery / planner / target view（原来每 3s 全量重写：Ubuntu 实测
+  227 KB/3s ≈ 6.5 GB/天，CentOS 6 约 115 KB/3s ≈ 3.3 GB/天）。实测稳态下这些文件的 mtime
+  只在探针刷新（host/network 900s，process/endpoint/container 300s）时变化。
+- **进程可执行名两端都发**（`process.executable.name`）：Linux 补 `/proc/<pid>/exe`（读不到时
+  回退 `/proc/<pid>/comm` 的 basename），与 macOS 的 `ps comm` 同口径。该 fact 在指标映射里
+  是 ignored，不增加上送序列，只为两端 fact 集合一致。
+- 发现侧 **全量进程清单不变**（用途推断的 `process` / `process_path` 规则依赖它），身份令牌
+  格式也不变（`ps_lstart:` / `linux_proc_start:`，与旧实现逐字节一致，`state/running/*` 无需迁移）。
+- 已知未处理：`metrics_runtime_snapshot.json` 仍随 host 指标每拍变化而重写（约 24 KB/3s，
+  ≈ 0.7 GB/天），留待下一版按上送周期节流。
+
+### 移除（逐进程指标默认停采）
+
+- 逐进程指标（`process_*` 序列与 `agent_collect_targets{target_kind="process"}` 记账）
+  **默认不再采集**。理由：`CollectionSourceKind` 里没有进程类来源，没有任何工作能授权它；
+  网关与前端也没有消费它的查询（资产平台 wist-atlas 的进程维度只认旧指标名
+  `process.memory.rss` / `process.state`，而 agentd 自 0.21.0 起已停止上送旧名）。
+  在此之前它实际只上送 **3 条随机**进程样本（950 个目标里 `dropped_targets=947`）。
+- 恢复条件：给进程域加上「按授权选目标」（`process_path` / label 选择 + 上限 + 确定性选样）
+  后，再打开 `target_view::PROCESS_METRICS_COLLECTION_ENABLED`。**不要**只开开关：选样仍是
+  「遍历顺序前 3 个」，会回到本次修掉的问题。
+- 影响面：发现侧进程清单、用途推断、资产清单不受影响；指标侧只少了 process 域。
+
+### 修复（身份令牌保真 / 缓存补写）
+
+- `lstart` 的空格保真：`ps` 的 `lstart` 用 `%e` 填充，单位数日期是**两个空格**
+  （`Fri Nov  5 …`）。按空白切词再拼接会把它归一化，身份令牌随之变化，升级后会把在飞的
+  execution 判成「进程换了」。改为取原始切片（`comm` 同理，路径里的连续空格也保真）。
+- 缓存缺文件时仍补写：发现缓存三件套（`resources` / `targets` / `meta`）任一缺失都要重写，
+  否则下次读取会把它当成「从未采集过」。
+
 ## [0.34.1-alpha] - 2026-11-19
 
 ### 修复（老内核上任何 TLS 握手都会 `Aborted`：`getentropy failed.`）
