@@ -144,8 +144,8 @@
 | `Client::builder()...build()` + TLS 握手 | `enrollment.rs:630-689` | 复用 `OnceLock<Client>` |
 | 读证书 PEM + 解私钥 + X.509 解析（×2） | `enrollment.rs:674-676, 698-732` + `daemon.rs:342-362` | 60s TTL 或按 mtime 失效 |
 | `getifaddrs` 枚举网卡 + `/etc/machine-id` | `daemon.rs:510` → `enrollment.rs:343-368` | 5min TTL |
-| 写 `state/export/*.jsonl`（十几个 fsync） | `daemon.rs:2856` → `reporting/exporter.rs:253-298` | 内容未变跳过 |
-| 写 metrics runtime snapshot（fsync） | `daemon_metrics.rs:158` | 内容未变跳过 |
+| 写 `state/export/*.jsonl`（十几个 fsync） | `daemon.rs` → `reporting/exporter.rs` `export_disc_snap_async` | ✅ 已做（0.35.1）：按 discovery revision 跳过 |
+| 写 metrics runtime snapshot（fsync） | `daemon_metrics.rs` `store_unless_unchanged` | ✅ 已做（0.35.1）：结构变化立即写，数值抖动 60s 节流 |
 
 ### 4.2 内存 churn（不是泄漏）
 
@@ -291,7 +291,7 @@
 | B8 | 日志每文件 3~5 次 `open` | `file.rs:910/945/962/1043` + `checkpoint_support.rs:126`：512 文件 × 每秒 = 数千 syscall/tick |
 | B9 | 追平循环每批重读 + fsync | `file.rs:652/706-711/1214`：每批 4 次 fsync，吞吐被 fsync 钉住 |
 | B10 | spool 断点续传 | 现在「全量读 + 成功才删」，断网恢复时每拍整份重发 |
-| B11 | 导出器按内容变化写 | `state/export/*.jsonl` 十几个 fsync / 拍 |
+| B11 | 导出器按内容变化写 | ✅ 已做（0.35.1）：发现导出按 revision 跳过，`metrics.jsonl` 直接用内存快照；`agent_runtime.json` 只在缺失时补 |
 | B12 | 无界增长三处 | `inflight_investigations` 无上限；`pending_command_acks` 只在成功时清（对端长期不可达就堆）；`pending_work_state_changes` 失败**静默丢弃**（与 acks 口径不一致） |
 | B13 | tick 的 `Err` 降级 | 主循环 `?` 会把一次 `ENOSPC` 变成进程退出 + 丢内存里的 grant |
 | B14 | 自观测补三个量 | 每 tick 主循环耗时 / fsync 次数 / TLS 握手次数（详见第七节）；没这三个数，“优化有没有效”只能拍脑袋 |

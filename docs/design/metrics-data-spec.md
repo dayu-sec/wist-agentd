@@ -18,6 +18,9 @@
 
 指标名与 label 的切换**必须**在同一个版本完成：两者同属查询面，分两次改会让消费方付两次迁移成本。
 
+改 `instance` 的**编码**（§3.1）也属破坏性变更：它是时间序列的连接键，同时是**跨仓 join 键**
+（§3.1.1）。改一次等于历史断代一次，且所有存了旧编码的外部实体表都要跟着迁移。
+
 ### 0.2 加性变更
 
 新增 `app` / `disk_role` / `state` / `outcome` 等枚举值、放宽数值范围，为加性变更，不升版本。
@@ -150,6 +153,25 @@ agent 自身 →  <host_resource_id>（与主机指标同一值，用于关联 `
 （不写空串、不补 `127.0.0.1`），多网卡机器也不会裂出多条 info 序列。
 **全量网卡地址列表**仍由控制面注册表 `ip_addresses` 承载（形如 `en0 192.168.1.5/24`）；
 采集时机、失败语义与样例帧见 §7.7。
+
+### 3.1.1 跨仓契约：外部实体表如何对齐这条串
+
+`instance` 不只是序列内部的分组键 —— **它是与外部实体表 join 的唯一键**。任何要「拿实体 + 查最新读数」
+的消费方（当前是 `wist-atlas`）**必须**存下这条串本身，不能存自己的第二套编码。
+
+| 项 | 值 |
+|---|---|
+| join 键 | `instance` 的 `process` 形态：`<host_resource_id>:proc:<identity>` |
+| 生产侧 | agentd `stable_instance`（`src/telemetry/metrics/samples.rs`） |
+| 消费侧 | atlas 需新增一列 `metric_instance`，值由 `{machine_id}:proc:{identity}` 拼出 |
+| 为什么不能自己拼另一套 | 两套编码之间的差（例如多一个 `pid:42`）不会报错，只会让 join **永久为空** |
+
+**现状差异（2026-11-21）**：atlas 的 `ProcessRuntimeState.external_ref` 是
+`{machine}:pid:{pid}:{identity}`，与本节不一致。用它对 join 会一条也对不上，且不报错。
+该差异由 `key-process-metrics.md` §12.3.1 跟踪，不在本仓修。
+
+**纪律**：这条串一旦发布就是历史数据的分界线。要改就按 §0.1 当破坏性变更处理
+（同一个版本窗口内切干净，不做双写），并**同步改所有存了它的实体表**。
 
 ### 3.2 label 准入规则
 
@@ -597,7 +619,7 @@ process_state{state="running"} 1
 
 | 指标名 | 类型 | 单位 | 动态 label | 语义 |
 |---|---|---|---|---|
-| `agent_memory_bytes` | gauge_i64 | By | — | agent 进程常驻内存 |
+| `agent_memory_bytes` | gauge_i64 | By | — | agent 进程自身内存占用；口径跟随平台工具：macOS = `phys_footprint`（`top` 的 `MEM` 列 / 活动监视器），Linux = `VmRSS`（`top` 的 `RES`） |
 | `agent_cpu_ratio` | gauge_f64 | 1 | — | 单核口径（1.0 = 占满一个核；分母声明）；窗口 = 相邻两批的间隔 |
 | `agent_cpu_cores` | gauge_i64 | 1 | — | 逻辑核数，用于把单核口径换算成整机占比 |
 | `agent_admin_latency_seconds` | gauge_f64 | s | — | 最近一次成功的管理面交互耗时 |

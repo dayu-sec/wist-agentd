@@ -41,6 +41,14 @@ fn write_cache(state_dir: &Path, resources: serde_json::Value, targets: serde_js
     fs::write(&paths.meta, serde_json::to_vec_pretty(&meta).unwrap()).expect("write meta");
 }
 
+/// 模拟一次探针刷新：只把发现缓存的 revision 推前（内容是同一份）。
+fn bump_revision(state_dir: &Path, revision: u64) {
+    let paths = discovery_cache::DiscoveryCachePaths::under_state_dir(state_dir);
+    let mut meta: serde_json::Value = read_json(&paths.meta).expect("read meta");
+    meta["revision"] = serde_json::json!(revision);
+    fs::write(&paths.meta, serde_json::to_vec_pretty(&meta).unwrap()).expect("write meta");
+}
+
 fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
     std::io::BufReader::new(fs::File::open(path).expect("open jsonl"))
         .lines()
@@ -317,7 +325,7 @@ fn export_skips_when_no_cache() {
 }
 
 #[test]
-fn seq_increases_per_export_call() {
+fn seq_increases_per_actual_write() {
     const BASE: u64 = 10000;
     EXPORT_SEQ.store(BASE, Ordering::Relaxed);
     let state_dir = temp_dir("seq");
@@ -334,14 +342,45 @@ fn seq_increases_per_export_call() {
 
     export_disc_snap(&state_dir, &source).expect("first");
     let first = read_jsonl(&state_dir.join("export").join("host.jsonl"));
-    export_disc_snap(&state_dir, &source).expect("second");
-    let second = read_jsonl(&state_dir.join("export").join("host.jsonl"));
+    assert!(first[0]["seq"].as_u64().unwrap() >= BASE);
 
+    // 同一 revision 再导一次：整组跳过，文件一个字都不动（不是“重写一份一样的”）。
+    export_disc_snap(&state_dir, &source).expect("second");
+    let unchanged = read_jsonl(&state_dir.join("export").join("host.jsonl"));
+    assert_eq!(
+        unchanged, first,
+        "unchanged discovery revision must not rewrite the export"
+    );
+
+    // revision 前进 → 真的重写， seq 必须更大。
+    bump_revision(&state_dir, 2);
+    export_disc_snap(&state_dir, &source).expect("third");
+    let second = read_jsonl(&state_dir.join("export").join("host.jsonl"));
     assert!(
         second[0]["seq"].as_u64().unwrap() > first[0]["seq"].as_u64().unwrap(),
-        "seq must increase"
+        "seq must increase per actual write"
     );
-    assert!(first[0]["seq"].as_u64().unwrap() >= BASE);
+    assert_eq!(second[0]["snapshot_revision"].as_u64(), Some(2));
+}
+
+#[test]
+fn discovery_export_is_rewritten_when_the_files_were_deleted() {
+    let state_dir = temp_dir("export-deleted");
+    write_cache(
+        &state_dir,
+        serde_json::json!([
+            {"resource_id":"h1","kind":"host","attributes":{},"discovered_at":"","last_seen_at":"","health":"healthy","source":"host"}
+        ]),
+        serde_json::json!([]),
+    );
+    let source = ExporterSource::new("a", "i");
+    let host_jsonl = state_dir.join("export").join("host.jsonl");
+    export_disc_snap(&state_dir, &source).expect("first");
+    fs::remove_file(&host_jsonl).expect("remove export");
+
+    // 文件被外部删掉就不能再信内存里的「已写出」标记，否则这份导出永远不会回来。
+    export_disc_snap(&state_dir, &source).expect("second");
+    assert!(host_jsonl.exists(), "missing export must be rewritten");
 }
 
 #[test]

@@ -27,6 +27,7 @@ wist-agentd（edge daemon）实现时最重要的设计文档。
 
 - [metrics-inventory.md](./metrics-inventory.md) — **当前采集清单**：主机 / 进程 / 容器 / agent 自观测 / Kafka / MySQL / PostgreSQL / Doris 的指标名、单位、label、周期与条件上报（运行态快照；规范性定义见 `metrics-data-spec.md` §10 与 `wist-metrics::METRIC_SPECS`）
 - [metrics-collection-runtime.md](./metrics-collection-runtime.md) — **采集运行时**：统一调度 + `enum Collector` + async/blocking 双执行器（**P0/P0.5 已落地**：主机三域 + Kafka；**P1 已落地**：MySQL / TiDB）
+- [key-process-metrics.md](./key-process-metrics.md) — **关键进程指标**（0.36.0 已落地）：采集面 + 单元授权、`unit:`/`exe:`/`port:`/`cmdline:` 签名语法、代表进程与上限、跨平台差异；含 0.35.0 那个编译期开关的归宿
 - [mysql-metrics.md](./mysql-metrics.md) — MySQL / TiDB 指标采集：P0 指标子集 / `sqlx` 连接与凭据 / 自探证据层与握手 / 失败表现
 - [pg-metrics.md](./pg-metrics.md) — PostgreSQL 指标采集：与 MySQL 共用运行时与凭据规则，只换了 SQL / 握手 / 指标
 - [doris-metrics.md](./doris-metrics.md) — Doris 指标采集（P0：BE 存活/容量/tablet）：只从本机 FE 读 `SHOW BACKENDS`，能力边界与凭据

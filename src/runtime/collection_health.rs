@@ -28,6 +28,7 @@ use super::telemetry_support::{
 };
 use crate::control::work::{AppliedWorkGrant, UnsupportedUnit, WorkExporterRun};
 use crate::state_store::work::StandingWorkRecord;
+use wist_contracts::work::CollectionSourceKind;
 
 /// 每个常驻工作（采集面）最近一轮的采集结果。
 #[derive(Debug, Clone, Default)]
@@ -158,7 +159,11 @@ fn severity(kind: &TelemetryFailureKind) -> Severity {
 /// 面 → 指标采集域。命名空间跟着源系统，不跟着面：一个面可能覆盖多个域。
 fn metric_domains(family: &str) -> &'static [&'static str] {
     match family {
-        "HostMetrics" => &["host_metrics", "process_metrics", "container_metrics"],
+        // `process_metrics` **不在这里**：关键进程指标从 0.36 起是独立的面
+        // （`ProcessMetrics`，按签名授权），把它们挂在 HostMetrics 下会让
+        // “只授权了主机指标”的机器误报一个“进程目标未就绪”。
+        "HostMetrics" => &["host_metrics", "container_metrics"],
+        "ProcessMetrics" => &["process_metrics"],
         "DatabaseMetrics" => &["pg_metrics", "mysql_metrics", "doris_metrics"],
         "MessageQueueMetrics" => &["kafka_broker_metrics"],
         _ => &[],
@@ -333,6 +338,18 @@ fn assess(
         .units
         .iter()
         .any(|unit| unit.capability == "collect_metrics");
+    // 面名是**策展约定**：万一有人把 `KeyProcessMetrics` 单元挂在别的面下（如 HostMetrics），
+    // 按面名查表会让进程域的信号**静默消失**（不报也不提示）。这里按来源再兜一次。
+    let mut domains: Vec<&'static str> = metric_domains(&standing.family).to_vec();
+    if !domains.contains(&"process_metrics")
+        && standing
+            .units
+            .iter()
+            .flat_map(|unit| unit.sources.iter())
+            .any(|source| source.kind == CollectionSourceKind::KeyProcessMetrics.as_str())
+    {
+        domains.push("process_metrics");
+    }
     let mut metric_healthy = 0usize;
     if has_metrics_units {
         // tick 级失败（目标视图读不到 / 快照落盘失败）不是“采集失败”：快照可能还在用缓存，
@@ -348,7 +365,7 @@ fn assess(
                 ),
             );
         }
-        for domain in metric_domains(&standing.family) {
+        for domain in &domains {
             let Some(outcome) = metric_outcomes
                 .iter()
                 .find(|outcome| outcome.collection_kind == *domain)
@@ -388,6 +405,8 @@ fn assess(
                     );
                 }
                 // pending / idle：授权了但还没有可判定的一轮 —— 目标/来源未就绪。
+                // `last_error` 带上了“为什么没目标”（如关键进程签名一条都没命中），
+                // 这比一句笼统的“首轮未完成”能让现场直接定位。
                 _ => {
                     blocked_input += 1;
                     push_reason(
@@ -395,7 +414,9 @@ fn assess(
                         reason(
                             collection_reason_kind::TARGET_NOT_READY,
                             *domain,
-                            "已授权，尚未观测到采集结果（首轮未完成 / 目标未就绪）",
+                            outcome.last_error.clone().unwrap_or_else(|| {
+                                "已授权，尚未观测到采集结果（首轮未完成 / 目标未就绪）".to_string()
+                            }),
                         ),
                     );
                 }
@@ -562,7 +583,7 @@ mod tests {
     use super::*;
     use crate::control::work::UnsupportedUnit;
     use crate::state_store::work::{StandingWorkRecord, WorkTaskRecord};
-    use wist_contracts::work::WorkSpecUnit;
+    use wist_contracts::work::{WorkSpecSource, WorkSpecUnit};
 
     fn task(input_id: &str, path: &str) -> WorkTaskRecord {
         WorkTaskRecord {
@@ -628,6 +649,7 @@ mod tests {
     fn quiet_metrics() -> MetricsTick {
         MetricsTick {
             snapshot: None,
+            snapshot_persisted: false,
             failures: Vec::new(),
             target_view_loaded: false,
             used_cached_snapshot: false,
@@ -980,6 +1002,114 @@ mod tests {
                 && reason.subject == "mysql_metrics"),
             "{:?}",
             result.reasons
+        );
+    }
+
+    /// 关键进程指标：授权了但本机没匹配到进程 → 面的采集结果带**具体原因**，
+    /// 而不是笼统的“首轮未完成”。
+    ///
+    /// 原因链路：发现拍写进 `MetricsTargetView.process_selection_error` →
+    /// `build_snapshot` 填到 idle 的 process outcome → 这里进 `target_not_ready` 的明细。
+    #[test]
+    fn a_process_metrics_face_reports_the_selection_reason() {
+        let mut work = standing(Vec::new());
+        work.family = "ProcessMetrics".to_string();
+        work.units = vec![WorkSpecUnit {
+            unit_id: "keyproc".to_string(),
+            capability: "collect_metrics".to_string(),
+            rule_ref: String::new(),
+            requires_privilege: "root".to_string(),
+            sources: Vec::new(),
+        }];
+        let outcome = outcome(
+            "process_metrics",
+            "idle",
+            0,
+            0,
+            0,
+            Some("no process matched unit:kafka|port:9092"),
+        );
+        let result = assess(
+            &work,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[outcome],
+            true,
+            "2026-11-08T00:00:00Z",
+        );
+        assert_eq!(result.prerequisites, collection_prerequisites::BLOCKED);
+        assert!(
+            result.reasons.iter().any(|reason| reason.kind
+                == collection_reason_kind::TARGET_NOT_READY
+                && reason.subject == "process_metrics"
+                && reason.detail.contains("unit:kafka")),
+            "{:?}",
+            result.reasons
+        );
+    }
+
+    /// 面名是策展约定：把 `KeyProcessMetrics` 单元挂在别的面下时，按面名查表会让
+    /// 进程域的信号**静默消失**。这条用例钉住“按来源兜底”。
+    #[test]
+    fn a_key_process_unit_under_another_family_still_observes_process_metrics() {
+        let mut work = standing(Vec::new());
+        // 故意的错误策展：面写成 HostMetrics，来源却是 KeyProcessMetrics。
+        work.family = "HostMetrics".to_string();
+        work.units = vec![WorkSpecUnit {
+            unit_id: "misplaced".to_string(),
+            capability: "collect_metrics".to_string(),
+            rule_ref: String::new(),
+            requires_privilege: "root".to_string(),
+            sources: vec![WorkSpecSource {
+                kind: "KeyProcessMetrics".to_string(),
+                target: "unit:kafka".to_string(),
+                multiline: "none".to_string(),
+                exclude_globs: Vec::new(),
+                filters: Default::default(),
+                drop_if_contains: Vec::new(),
+            }],
+        }];
+        let process = outcome(
+            "process_metrics",
+            "idle",
+            0,
+            0,
+            0,
+            Some("no process matched unit:kafka"),
+        );
+        let result = assess(
+            &work,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[process],
+            true,
+            "2026-11-08T00:00:00Z",
+        );
+        assert!(
+            result.reasons.iter().any(|reason| reason.kind
+                == collection_reason_kind::TARGET_NOT_READY
+                && reason.subject == "process_metrics"),
+            "进程域不能因为面名写错就静默消失：{:?}",
+            result.reasons
+        );
+    }
+
+    /// `process_metrics` 只属于 `ProcessMetrics` 面：归还给 `HostMetrics` 会让
+    /// “只授权了主机指标”的机器误报一个“进程目标未就绪”。
+    #[test]
+    fn process_metrics_belongs_to_its_own_family() {
+        assert_eq!(metric_domains("ProcessMetrics"), &["process_metrics"]);
+        assert!(
+            !metric_domains("HostMetrics").contains(&"process_metrics"),
+            "HostMetrics 不得再声称拥有 process_metrics"
         );
     }
 

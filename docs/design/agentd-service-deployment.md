@@ -110,10 +110,10 @@ supervisor。后者让“谁在管、怎么重启、日志去哪”都有唯一�
 单独一步、可 `--no-activate` 跳过。这样：单测只覆盖“可确定的部分”（文本与文件），发行包/配置管理
 工具可以只取 `service print --for` 的产物自己分发，不需要在安装机上执行二进制。
 
-**为什么主循环是 3s（`TICK_INTERVAL`）。** 每轮都要重算并落盘派生状态（指标快照、`state/export/*.jsonl`、
-`agent_runtime`）并扫描 `state/`，所以 tick 周期**直接等于稳态磁盘动作频率**：3s 一轮即 ≈3 次写盘 ×
-2.88 万轮/天 ≈ 8.6 万次/天。它换来的是“采样延迟”而不是“吞吐”——`drain` 每轮只处理一个队列项且等它
-跑完，该值不是执行吞吐上限。
+**为什么主循环是 3s（`TICK_INTERVAL`）。** 每轮都要重算派生状态并扫描 `state/`，tick 周期直接决定
+采集与上报的时效。**它不等于稳态磁盘动作频率**：派生文件的落盘都按「内容/结构变了才写」收敛
+（0.35.1，见第 7 节第 1 条），空闲拍一次都不写。换来的是“采样延迟”而不是“吞吐”——`drain` 每轮只
+处理一个队列项且等它跑完，该值不是执行吞吐上限。
 
 边界：更快的 tick 只增加写盘次数，换不到可感知的收益（file 输入本就是秒级时效）；慢于 5s 才开始拖
 采集延迟。判断依据是“负载是否真有亚秒级时效要求”——采集（file tail）没有，将来的近实时场景单独议。
@@ -210,13 +210,15 @@ supervisor。后者让“谁在管、怎么重启、日志去哪”都有唯一�
 
 ## 7. 已知限制与后续优化
 
-1. **稳态仍有逐轮磁盘写（每 3s）**：`run_once_with_failure_cache` 每轮都会
-   - 重建并写回指标运行时快照（`telemetry::metrics::runtime::store`）、
-   - 写 `state/export/*.jsonl`（`exporter::export_all_async`，无 revision 判断）、
-   - 更新 `agent_runtime` 状态的 `updated_at`。
+1. **稳态每 3s 已经没有写盘**（0.35.1）。四处都按「没变就不碰磁盘」收敛：
 
-   即与 tick 绑定的**无条件写**：内容没变也写、空闲主机上也写（≈8.6 万次/天）。建议后续按“变化才写”
-   或按探针 refresh interval 节流（例如 export 仅在 discovery revision 前进时重写）。
+   - `state/export/*.jsonl` 的**发现**导出 → 按 discovery revision 跳过（文件被删会重写）；
+   - `metrics_runtime_snapshot.json` → 结构性变化（目标集合 / 状态 / 错误）立即写，只有数值抖动
+     才按 60s 节流；
+   - `export/metrics.jsonl` → 跟着快照落盘的那一拍导，也降到 ≤1/60s；
+   - `agent_runtime.json` → 只在文件缺失时补一份（`updated_at` 没有读者）。
+
+   上送与本地导出都用内存快照，不依赖这些文件的新鲜度。
 2. **环境变量只在 Linux systemd 下可注入**：launchd 没有 `EnvironmentFile` 等价物（plist 只显式补
    `PATH`），macOS 需要长期环境变量时只能手工维护 plist；`agentd.env` 仅用于 Linux systemd。
 3. **root 采集能力**：audit / TCC / 统一日志仍需 root helper，见第 1 节“非目标”。

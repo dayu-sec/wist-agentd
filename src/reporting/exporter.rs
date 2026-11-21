@@ -14,9 +14,11 @@
 //! (PID < 100) are filtered before classification. The filter is exporter-only
 //! and does not affect the internal discovery cache.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::RuntimeResult;
@@ -25,7 +27,9 @@ use wist_contracts::exporter::ExporterSource;
 use wist_shared::time::now_rfc3339;
 
 use crate::discovery::cache as discovery_cache;
-use crate::telemetry::metrics::runtime::{self as metrics_runtime, MetricsRuntimeSnapshot};
+#[cfg(test)]
+use crate::telemetry::metrics::runtime as metrics_runtime;
+use crate::telemetry::metrics::runtime::MetricsRuntimeSnapshot;
 use crate::telemetry::metrics::samples;
 
 static EXPORT_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -73,9 +77,46 @@ fn is_kernel_thread(r: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
-enum ExportResult {
-    Written,
-    Skipped,
+/// 上一次真正写出的发现导出：按 `export/` 目录记「发现缓存 revision + 写过的文件」。
+///
+/// 为什么要它：导出行里的 `generated_at` / `seq` / `output_id` **每拍都变**，而它们描述的
+/// 发现内容只在探针真的刷新时才变（host/network 900s，process/endpoint/container 300s）。
+/// 不比对就是每 3s 把一整组 JSONL 重写一遍：几百个进程的机器上 200 KB+/拍、十几个 fsync。
+///
+/// 进程内记状态即可：重启后先整组重写一次，正是想要的（磁盘上的文件可能已经落后或缺失）。
+/// 按目录分桶而不是单槽：测试会并行跑多个 state 目录，共用一个槽会互相顶掉。
+static LAST_DISCOVERY_EXPORT: LazyLock<Mutex<HashMap<PathBuf, DiscoveryExportMemo>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+struct DiscoveryExportMemo {
+    revision: u64,
+    files: Vec<PathBuf>,
+}
+
+/// 发现缓存 revision 没前进、且上次写出的文件都还在时才允许跳过。
+///
+/// 文件被外部删掉（或整个 `export/` 被清）后不能再信缓存，否则这一组导出会**永远不再重写**；
+/// 与 `metrics_runtime_snapshot` 的「已落盘签名 + 一次 stat」同一套兜底。
+fn discovery_export_is_current(export_dir: &Path, revision: u64) -> bool {
+    let guard = match LAST_DISCOVERY_EXPORT.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let Some(memo) = guard.get(export_dir) else {
+        return false;
+    };
+    memo.revision == revision && memo.files.iter().all(|file| file.exists())
+}
+
+fn remember_discovery_export(export_dir: &Path, revision: u64, files: Vec<PathBuf>) {
+    let mut guard = match LAST_DISCOVERY_EXPORT.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.insert(
+        export_dir.to_path_buf(),
+        DiscoveryExportMemo { revision, files },
+    );
 }
 
 fn filter_by_kind(arr: &serde_json::Value, kind: &str) -> Vec<serde_json::Value> {
@@ -199,6 +240,8 @@ fn build_disc_row(
 
 /// Writes one per-probe discovery snapshot file (JSONL format).
 /// Used for host and container.
+///
+/// 返回 `Some(路径)` 表示确实写了；该 probe 没有资源时返回 `None`（不碰磁盘）。
 async fn export_probe_async(
     state_dir: &Path,
     source: &ExporterSource,
@@ -206,10 +249,10 @@ async fn export_probe_async(
     resources: &serde_json::Value,
     targets: &serde_json::Value,
     meta: Option<&serde_json::Value>,
-) -> RuntimeResult<ExportResult> {
+) -> RuntimeResult<Option<PathBuf>> {
     let probe_resources = filter_by_kind(resources, probe);
     if probe_resources.is_empty() {
-        return Ok(ExportResult::Skipped);
+        return Ok(None);
     }
     let probe_targets = filter_by_kind(targets, probe);
     let (snapshot_id, snapshot_revision, snapshot_generated_at) = snapshot_fields(meta);
@@ -246,15 +289,33 @@ async fn export_probe_async(
 
     let out_path = state_dir.join("export").join(format!("{probe}.jsonl"));
     write_jsonl_async(&out_path, &rows).await?;
-    Ok(ExportResult::Written)
+    Ok(Some(out_path))
 }
 
 /// Reads discovery cache and writes one file per probe kind.
+///
+/// **发现缓存 revision 没前进时整组跳过**：内容一个字也没变，而写入信封里的
+/// `generated_at` / `seq` 每拍都换（见 [`LAST_DISCOVERY_EXPORT`]）。任一 probe 写失败就不记
+/// 这次 revision，下一拍重试。
 pub async fn export_disc_snap_async(
     state_dir: &Path,
     source: &ExporterSource,
 ) -> RuntimeResult<()> {
     let paths = discovery_cache::DiscoveryCachePaths::under_state_dir(state_dir);
+
+    // 先读 meta 再判跳过：发现缓存的 resources 可能有几百 KB，未变时连解析都不做。
+    let meta = read_json_async::<serde_json::Value>(&paths.meta).await.ok();
+    let export_dir = state_dir.join("export");
+    // 读不到 revision 就不做跳过判断：那说明缓存状态不明，宁可重写。
+    let revision = meta
+        .as_ref()
+        .and_then(|m| m.get("revision"))
+        .and_then(|v| v.as_u64());
+    if let Some(revision) = revision
+        && discovery_export_is_current(&export_dir, revision)
+    {
+        return Ok(());
+    }
 
     let mut resources = match read_json_async::<serde_json::Value>(&paths.resources).await {
         Ok(v) => v,
@@ -268,11 +329,12 @@ pub async fn export_disc_snap_async(
         .unwrap_or_default();
     strip_internal_fields(&mut resources);
     strip_internal_fields(&mut targets);
-    let meta = read_json_async(&paths.meta).await.ok();
 
+    let mut written = Vec::new();
+    let mut all_ok = true;
     for probe in DISCOVERY_PROBES {
         if *probe == "process" {
-            if let Err(err) = export_process_classified_async(
+            match export_process_classified_async(
                 state_dir,
                 source,
                 &resources,
@@ -281,20 +343,34 @@ pub async fn export_disc_snap_async(
             )
             .await
             {
-                log::error!("exporter: process_classified error: {err}");
+                Ok(paths) => written.extend(paths),
+                Err(err) => {
+                    all_ok = false;
+                    log::error!("exporter: process_classified error: {err}");
+                }
             }
-        } else if let Err(err) = export_probe_async(
-            state_dir,
-            source,
-            probe,
-            &resources,
-            &targets,
-            meta.as_ref(),
-        )
-        .await
-        {
-            log::error!("exporter: {probe} export error: {err}");
+        } else {
+            match export_probe_async(
+                state_dir,
+                source,
+                probe,
+                &resources,
+                &targets,
+                meta.as_ref(),
+            )
+            .await
+            {
+                Ok(Some(path)) => written.push(path),
+                Ok(None) => {}
+                Err(err) => {
+                    all_ok = false;
+                    log::error!("exporter: {probe} export error: {err}");
+                }
+            }
         }
+    }
+    if all_ok && let Some(revision) = revision {
+        remember_discovery_export(&export_dir, revision, written);
     }
     Ok(())
 }
@@ -311,7 +387,7 @@ async fn export_process_classified_async(
     resources: &serde_json::Value,
     targets: &serde_json::Value,
     meta: Option<&serde_json::Value>,
-) -> RuntimeResult<()> {
+) -> RuntimeResult<Vec<PathBuf>> {
     let mut identified = Vec::new();
     let mut named = Vec::new();
     let mut unidentified = Vec::new();
@@ -340,6 +416,7 @@ async fn export_process_classified_async(
     ];
     let (snapshot_id, snapshot_revision, snapshot_generated_at) = snapshot_fields(meta);
 
+    let mut written = Vec::new();
     for (set_name, proc_resources) in sets {
         if proc_resources.is_empty() {
             continue;
@@ -378,39 +455,33 @@ async fn export_process_classified_async(
             .join("export")
             .join(format!("process-{set_name}.jsonl"));
         write_jsonl_async(&out_path, &rows).await?;
+        written.push(out_path);
     }
-    Ok(())
+    Ok(written)
 }
 
 /// Reads current metrics runtime snapshot and writes one VM JSON line per sample.
 ///
 /// 本地落盘与线格式同构（`metric` / `values` / `timestamps`）：字段、label 集合与
 /// 上送线逐字一致，因此选择类 label（`app` / `env` / `cluster` …）也一并写入。
+///
+/// 快照由调用方从**内存**递进来：磁盘上的 `metrics_runtime_snapshot.json` 是节流写过的
+/// 缓存（见 `daemon_metrics`），拿它导会让本地导出跟着变旧。
 pub async fn export_metrics_async(
     state_dir: &Path,
     source: &ExporterSource,
     selection: &BTreeMap<String, String>,
+    snapshot: &MetricsRuntimeSnapshot,
 ) -> RuntimeResult<()> {
-    let runtime_path = metrics_runtime::path_for(state_dir);
+    let samples_snapshot = samples::build_samples_snapshot(snapshot);
+    let lines = samples::build_vm_metric_lines_with(&samples_snapshot, &source.agent_id, selection);
+    let rows: Vec<serde_json::Value> = lines
+        .into_iter()
+        .filter_map(|line| serde_json::to_value(line).ok())
+        .collect();
 
-    match read_json_async::<MetricsRuntimeSnapshot>(&runtime_path).await {
-        Ok(snapshot) => {
-            let samples_snapshot = samples::build_samples_snapshot(&snapshot);
-            let lines =
-                samples::build_vm_metric_lines_with(&samples_snapshot, &source.agent_id, selection);
-            let rows: Vec<serde_json::Value> = lines
-                .into_iter()
-                .filter_map(|line| serde_json::to_value(line).ok())
-                .collect();
-
-            let out_path = state_dir.join("export").join("metrics.jsonl");
-            write_jsonl_async(&out_path, &rows).await
-        }
-        Err(err) => {
-            log::warn!("exporter: metrics skipped (no runtime snapshot): {err}");
-            Ok(())
-        }
-    }
+    let out_path = state_dir.join("export").join("metrics.jsonl");
+    write_jsonl_async(&out_path, &rows).await
 }
 
 #[cfg(test)]
@@ -419,19 +490,34 @@ pub fn export_metrics(
     source: &ExporterSource,
     selection: &BTreeMap<String, String>,
 ) -> RuntimeResult<()> {
-    block_on(export_metrics_async(state_dir, source, selection))
+    // 测试与离线工具从磁盘读；守护进程走内存快照（`export_all_async`）。
+    block_on(async {
+        let path = metrics_runtime::path_for(state_dir);
+        match read_json_async::<MetricsRuntimeSnapshot>(&path).await {
+            Ok(snapshot) => export_metrics_async(state_dir, source, selection, &snapshot).await,
+            Err(err) => {
+                log::warn!("exporter: metrics skipped (no runtime snapshot): {err}");
+                Ok(())
+            }
+        }
+    })
 }
 
 /// Export all probe discovery snapshots and metrics. Errors are logged, not propagated.
+///
+/// `runtime` = 本拍的内存快照；`None` 表示**这一拍不导出**（没有新的可导出内容）。
 pub async fn export_all_async(
     state_dir: &Path,
     source: &ExporterSource,
     selection: &BTreeMap<String, String>,
+    runtime: Option<&MetricsRuntimeSnapshot>,
 ) {
     if let Err(err) = export_disc_snap_async(state_dir, source).await {
         log::error!("exporter: disc_snap error: {err}");
     }
-    if let Err(err) = export_metrics_async(state_dir, source, selection).await {
+    if let Some(snapshot) = runtime
+        && let Err(err) = export_metrics_async(state_dir, source, selection, snapshot).await
+    {
         log::error!("exporter: metrics error: {err}");
     }
 }

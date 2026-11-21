@@ -3,6 +3,96 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.36.0-alpha] - 2026-11-21
+
+### 新增（关键进程指标：按授权选目标）
+
+- 新增采集来源 `KeyProcessMetrics`：`target` 是**匹配签名列表**
+  （`unit:kafka|port:9092|exe:kafka|cmdline:app.jar`，或语义），实体定义在 `wist-contracts 0.12.0`。
+- `AppliedWorkGrant::key_process_grant()`：从 `collect_metrics` 单元的 `KeyProcessMetrics` 来源里
+  取签名（多份工作取**并集**）；周期仍由 `metrics_interval()` 统一算。
+- `telemetry::metrics::key_process`：从发现快照里选代表进程——
+  按归属分组（`service.unit` → `container.id` → 命中的签名）、组内取 **PID 最小**
+  （worker 在 master 之后 fork，PID 必然更大）、按组截断到上限（默认 50）。
+- 四种签名：`unit`（systemd 单元名，子串）、`exe`（basename 相等）、`port`（端点探针反查）、
+  `cmdline`（argv token 完全相等）。
+- **进程域不再按 `SAMPLE_LIMIT = 3` 截样本**：授权面选出来的每个代表进程都要有序列。
+  以前这个上限对进程域也生效 —— 950 个目标只上送 3 条样本、其余记 `dropped`，
+  正是 0.35 停采逐进程指标的直接原因；改按授权选目标后目标数降到了服务个数，
+  再截一刀就是“授权了 4 个服务、只看到 3 个”。截断只发生在**选目标**那一层（按组，上限 50）。
+- `cmdline` **只在发现拍读一次、读完就丢**：它常带 `--password=…`，不进入任何持久化结构、
+  不上送、不进诊断包。
+- `PROCESS_METRICS_COLLECTION_ENABLED` 编译期开关删除：**授权决定采不采**——
+  没授权时连候选文件都不生成（保持 0.35.0 的行为）。
+- 「授权了但一条签名都没命中」记 `event=KeyProcessNoMatch`（带尝试过的签名），
+  并作为 `target_not_ready` 进面的采集结果（明细就是具体签名）。
+- 单元**只带签名、没写 `MetricInterval`** 时仍然按内建默认 15s 上送（不静默无数据）；
+  `event=WorkGrantApplied … metrics=on(15s default)` 里的 `default` 就是这条兜底在生效的记号 ——
+  没有它就没法区分“策展写的 15s”和“缺周期走了默认值”。
+  - 另修一个 0.35.0 带来的旧账：`process_metrics` 从 `HostMetrics` 的面映射里拿出，
+  否则“只授权了主机指标”的机器会误报一个“进程目标未就绪”。
+  同时按**来源**兜底：若 `KeyProcessMetrics` 单元被挂在别的面下，进程域的信号也不会静默消失。
+
+### 知识库
+
+- 新增 `ProcessMetrics` 面 + 4 个单元（`linux-keyproc-{kafka,nginx,redis,postgres}`），
+  每个单元两条来源：`MetricInterval/15s` + `KeyProcessMetrics/<签名列表>`。
+- 新增包 `linux-process-metrics`，挂到 `linux-compute` 与 `linux-data` 模板；
+  `catalog_version` 抬到 **24**（包/模板的 `catalog_version` 必须与它相等）。
+- 单元 `match` 只用**有探针的**条件（`path_exists:` / `port:`）；`installed:` 目前恒为
+  “无法判定”，写它等于永不展开。
+
+### 依赖
+
+- `wist-contracts` 0.11 → **0.12**（新增枚举变体）；连带 `wist-api` 0.11 → 0.12。
+  contracts 0.12 要求整条链（metrics / api / validate）一起升版，否则同一棵树里会出现
+  两份 contracts、跨边界类型对不上。
+
+### 已知未处理
+
+- 端到端未验收：真机授权 → 指标落 VictoriaMetrics → atlas 查询时 join。
+- atlas 侧仍持有`process_state` / `memory_rss_kib` 两个“最新值”列（待按
+  `docs/design/key-process-metrics.md` §12.2 删除）。
+
+### 变更（`agent_memory_bytes` 改用用户视角口径）
+
+- macOS 的自观测内存从 RSS（`PROC_PIDTASKINFO.pti_resident_size`）改为 `phys_footprint`
+  （`proc_pid_rusage(RUSAGE_INFO_V4)`）。只有 `phys_footprint` 才是 `top` 的 `MEM` 列、
+  活动监视器和 `footprint` 给出的那个数；RSS 会把二进制 `__TEXT` 和系统框架的干净文件页
+  算进来（实测同一进程 53.8 MB vs 9.4 MB，差近 6 倍），上报 RSS 会让面板上的数字和用户
+  自己查工具看到的对不上。取不到 `phys_footprint` 时退回 resident，两者都拿不到才不发该序列。
+- Linux 不变：`VmRSS` 与 `top` 的 `RES`、`ps` 的 `rss` 本来就是同一个数。
+- **看趋势时注意台阶**：`agent_memory_bytes` 在 macOS 上会从 ~54 MB 掉到 ~9 MB 并稳定在
+  后者。这是口径变更而不是内存占用下降，跨 v0.35.0 / v0.36.0 对比时按此解读。
+
+### 变更（稳态写盘：内容没变就不碰磁盘）
+
+承接 0.35.0 的「空闲拍不落盘」，把剩下三处与 tick 绑定的无条件写也收掉。
+
+- **发现导出按 revision 跳过**（`state/export/*.jsonl`）：导出行里的 `generated_at` / `seq` /
+  `output_id` 每拍都变，而它们描述的发现内容只在探针真的刷新时才变（host/network 900s，
+  process/endpoint/container 300s）。原来每 3s 重写 6~9 个 JSONL（几百个进程的机器上
+  200 KB+/拍、十几个 fsync）；现在发现缓存 `revision` 没前进且上次写出的文件都还在时整组跳过。
+  文件被外部删掉会重写；任一 probe 写失败不记 revision，下一拍重试。重启后先整组重写一次。
+- **`agent_runtime.json` 只在缺失时补一份**：原来每拍把 `updated_at` 刷成当前时间再整份重写
+  （tmp + fsync + rename）。但 `updated_at` 没有读者——控制面拿的是 `AgentStatusReport`，
+  `diagnose` 用的是 `agent_id` / 凭据 / `mode`，而 `mode` 只在 enroll / upgrade 时由那两处自己写盘。
+  该字段因此按「内容最后真变化的时间」解释（与 `metrics_runtime_snapshot.generated_at` 同约定）。
+- **`metrics_runtime_snapshot.json` 对数值抖动节流**：主机事实里的 CPU / 内存 / uptime 每拍
+  都在变，所以「内容变了才写」对这类抖动不起作用。现在**结构性**变化（目标集合、状态、错误、
+  计数）仍然立即落盘，只有数值抖动才走 60s 下限。
+- **`export/metrics.jsonl` 跟着缓存同频**：它本来也是每拍重写一份（内容每拍都在变）。现在
+  只在快照真正落盘的那一拍导出（`None` = 本拍不导），于是也降到 ≤1/60s。内容来自**本拍
+  内存快照**，不是磁盘上那份节流过的缓存；代价是这个本地导出最多滞后 60s（它是调试/离线
+  产物，上送不受影响）。
+- 代价：`metrics_runtime_snapshot.json` 里的数值最多滞后 60s。**上送不受影响**（用的是内存快照）；
+  `export/metrics.jsonl` 也直接用内存快照（`exporter::export_metrics_async` 现在收 `&snapshot`），
+  不再读磁盘那份节流过的缓存。
+- 依据：`state/export/` 在仓库与整个 workspace 里**没有消费方**——`atlas-wist-adapter` 读的是
+  `state/discovery/*.json`（内部发现缓存），warp-parse 数据面只有 tcp / syslog 输入（`file_json_sink`
+  写的是它自己的 `out_dat/*.jsonl`），`state/exporters*.json` 是日志源导出器的另一个特性。
+  `doc/data-format/warp-insight-output-format.md` 是 `warp-insightd` 的 Target 态文档，非现行契约。
+
 ## [0.35.0-alpha] - 2026-11-21
 
 ### 变更（进程域开销归零：一轮一张表；空闲拍不再落盘）

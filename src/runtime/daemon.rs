@@ -62,6 +62,7 @@ use crate::state_store::{
     agent_runtime, auth_terminal, commands, execution_queue, fact_report, log_seq_state,
     planner_candidates, work,
 };
+use crate::telemetry::metrics::key_process;
 use crate::telemetry::metrics::target_view;
 
 #[path = "collection_health.rs"]
@@ -228,8 +229,8 @@ const WORK_FETCH_MIN_INTERVAL_MS: i64 = 30_000;
 
 /// A sampled CPU-time reading used to compute a percentage across the report interval.
 use crate::telemetry::metrics::self_obs::{
-    self as self_obs, CpuSample, cpu_percent_since, cpu_ticks, current_rss_bytes, local_cpu_cores,
-    ticks_per_sec,
+    self as self_obs, CpuSample, cpu_percent_since, cpu_ticks, current_memory_bytes,
+    local_cpu_cores, ticks_per_sec,
 };
 
 /// 构造上报用的**本机工作内容视图**：`state/work.json` 的同形子集 + 本机配置里手工加的日志输入。
@@ -551,7 +552,7 @@ async fn report_status_to_control_plane(
         agent_id: agent_id.to_string(),
         instance_id: instance_id.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        memory_bytes: current_rss_bytes(),
+        memory_bytes: current_memory_bytes(),
         cpu_percent,
         cpu_cores: local_cpu_cores(),
         admin_latency_ms: last_latency_ms,
@@ -2814,8 +2815,14 @@ async fn run_once_with_failure_cache(
         .agent_id
         .as_deref()
         .unwrap_or("unknown");
-    let (discovery, fact_summary) =
-        refresh_discovery_snapshot(state_dir, discovery_runtime, force_refresh).await;
+    let key_process_grant = work.key_process_grant();
+    let (discovery, fact_summary) = refresh_discovery_snapshot(
+        state_dir,
+        discovery_runtime,
+        force_refresh,
+        key_process_grant.as_ref(),
+    )
+    .await;
     let metrics_tick = process_metrics_tick(state_dir).await;
     emit_metrics_tick(&metrics_tick);
     if let Some(previous) = previous_metrics_failures {
@@ -3054,7 +3061,23 @@ async fn run_once_with_failure_cache(
 
     // Step 0: export unified-envelope output alongside existing cache files
     let export_source = ExporterSource::new(agent_id, &instance_id);
-    exporter::export_all_async(state_dir, &export_source, &loop_ctx.config.metrics.labels).await;
+    // 指标导出用**内存里这份快照**，不用磁盘上那份：磁盘快照是节流写过的缓存，
+    // 拿它导会让 `export/metrics.jsonl` 跟着变旧。
+    //
+    // 节流那一拍（`snapshot_persisted = false`）干脆不导：导出是**本地调试/离线产物**，
+    // 它跟着缓存同频就够（最多滞后 60s，见 `daemon_metrics::RUNTIME_SNAPSHOT_MIN_INTERVAL`），
+    // 上送用的是内存快照、不受影响。不这么卡的话，值抖动会把 `metrics.jsonl` 拉回每 3s 一次写盘。
+    let metrics_export = metrics_tick
+        .snapshot
+        .as_ref()
+        .filter(|_| metrics_tick.snapshot_persisted);
+    exporter::export_all_async(
+        state_dir,
+        &export_source,
+        &loop_ctx.config.metrics.labels,
+        metrics_export,
+    )
+    .await;
 
     let drained = scheduler::drain_next_async(&scheduler::DrainRequest {
         run_dir: run_dir.to_path_buf(),
@@ -3093,10 +3116,15 @@ async fn run_once_with_failure_cache(
         updated_at: now_rfc3339(),
     };
 
-    let runtime_path = agent_runtime::path_for(state_dir);
-    let mut runtime_state = agent_runtime::load_or_default_async(&runtime_path).await?;
-    runtime_state.updated_at = health.updated_at.clone();
-    agent_runtime::store_async(&runtime_path, &runtime_state).await?;
+    // `agent_runtime.json` 只在缺失时补一份（见 [`agent_runtime::ensure_exists_async`]）。
+    //
+    // 原来每拍都把 `updated_at` 刷成当前时间再整份重写（tmp + fsync + rename，每 3s 一次），
+    // 但 `updated_at` 没有任何读者：控制面拿的是 `AgentStatusReport`，`diagnose` 用的是
+    // `agent_id` / 凭据 / `mode`，而 `mode` 只在 enroll / upgrade 时由那两处自己写盘。
+    // 于是这个字段按「内容最后真变化的时间」解释，与 `metrics_runtime_snapshot.generated_at`
+    // 同一约定：内容不变就不碰文件。
+    agent_runtime::ensure_exists_async(&agent_runtime::path_for(state_dir), &health.updated_at)
+        .await?;
 
     Ok((health, tick_changes))
 }
@@ -3575,6 +3603,42 @@ fn work_result_of(record: &crate::upgrade::UpgradeRecord) -> Option<(&'static st
     }
 }
 
+/// 进程候选文件本拍该做什么。
+///
+/// 纯函数（不碰磁盘），因为这是**最容易悄悄错的一层**：候选文件是指标 tick 的唯一依据，
+/// 只在发现拍清理会让“撤授权”最长 300s 不生效，只在文件缺失时重建又会让重启后最长 300s 没指标。
+/// 两个方向都必须有钉子。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessCandidatesAction {
+    /// 不动：没授权且本来就没文件，或授权了且文件与发现快照都还有效。
+    Keep,
+    /// 删掉：撤授权后必须**立即**停采（不能等到下一次探测）。
+    Remove,
+    /// 重建：授权了但文件不在（重启 / 上次被清），或发现快照则刚刷新过。
+    Rebuild,
+}
+
+fn process_candidates_action(
+    authorized: bool,
+    discovery_changed: bool,
+    file_exists: bool,
+) -> ProcessCandidatesAction {
+    // 没授权：留着就是继续采。删一次（文件不在时 `remove_file` 只剩 NotFound）。
+    if !authorized {
+        return if file_exists {
+            ProcessCandidatesAction::Remove
+        } else {
+            ProcessCandidatesAction::Keep
+        };
+    }
+    // 授权了：快照变了重建；文件不在也重建（否则重启后一段空窗）。
+    if discovery_changed || !file_exists {
+        ProcessCandidatesAction::Rebuild
+    } else {
+        ProcessCandidatesAction::Keep
+    }
+}
+
 /// `force = true`（手动「重采」）时走**全量刷新**并落盘：各探针的周期在这里不参与调度。
 /// 全量刷新会保留失败项的上次成功输出（见 `DiscoveryRuntime::refresh_inner`），
 /// 所以紧接着的重报不会把「没采到」写成「采到了空的」。
@@ -3582,6 +3646,9 @@ async fn refresh_discovery_snapshot(
     state_dir: &Path,
     runtime: &mut DiscoveryRuntime,
     force: bool,
+    // 关键进程指标的授权（`None` = 没授权）：要采哪些进程只在**发现拍**才算，
+    // 因为 `cmdline` 要读 `/proc`，不能放到 3s 的指标 tick 上。
+    key_process: Option<&crate::control::work::KeyProcessGrant>,
 ) -> (DiscoveryHealth, fact_summary::FactSummaryDraft) {
     // 已经在内存里有快照就不必再读一遍磁盘（那是 1 MB JSON + 解析）：只有首拍（含重启）才恢复。
     // 这里只要一个“有没有”，不要 clone 快照 —— 那叉会变成每拍 1 MB 的内存抖动。
@@ -3602,24 +3669,66 @@ async fn refresh_discovery_snapshot(
             .refresh_due_and_store_async(state_dir, Instant::now())
             .await
     };
-    // 没有探针跑过的那一拍：planner 候选与指标目标视图都是快照的纯函数，不可能变 ——
-    // 不再重算、不再重写（之前这里是 1.5 MB/3s）。
-    if result.changed {
+    // 进程候选的生命周期**独立于发现刷新**（否则撤授权不生效）：
+    //   * 没授权 → **每拍**清掉。候选文件是指标 tick 的唯一依据，若只在发现拍清理，
+    //     撤授权后还会继续采到下一次探测（最长 300s）—— 违反「撤授权 / 暂停 = 立即停采」；
+    //   * 有授权但文件不在（重启、上次停采被清）→ 立刻重建，否则最坏 300s 没有进程指标。
+    //
+    // 注意：只删文件还不够 —— `metrics_target_view.json` 里还列着那批进程目标，指标 tick
+    // 读的是视图。所以“候选变了”必须同一拍把视图也重建掉。
+    let process_candidates_path = planner_candidates::process_metrics_path_for(state_dir);
+    let process_candidates_changed = match process_candidates_action(
+        key_process.is_some(),
+        result.changed,
+        process_candidates_path.exists(),
+    ) {
+        ProcessCandidatesAction::Keep => false,
+        ProcessCandidatesAction::Remove => {
+            let _ = tokio::fs::remove_file(&process_candidates_path).await;
+            // 视图里还列着那批进程目标，必须同拍重建（否则删了文件也照旧采）。
+            true
+        }
+        ProcessCandidatesAction::Rebuild => true,
+    };
+
+    // 没有探针跑过、且进程候选没变的那一拍：planner 候选与指标目标视图都是快照的纯函数，
+    // 不可能变 —— 不再重算、不再重写（之前这里是 1.5 MB/3s）。
+    // 关键进程的“为什么没目标”要随视图传给指标 tick（采集记账在那里）。
+    let mut process_selection_error: Option<String> = None;
+    if result.changed || process_candidates_changed {
         let candidates = planner_bridge::build_collection_candidates(&result.persisted_snapshot);
         let host_candidates: Vec<_> = candidates
             .iter()
             .filter(|candidate| candidate.collection_kind == "host_metrics")
             .cloned()
             .collect();
-        // 逐进程指标默认停采：连候选都不生成（开不开见 `PROCESS_METRICS_COLLECTION_ENABLED`）。
-        let process_candidates: Vec<_> = if target_view::PROCESS_METRICS_COLLECTION_ENABLED {
-            candidates
-                .iter()
-                .filter(|candidate| candidate.collection_kind == "process_metrics")
-                .cloned()
-                .collect()
-        } else {
-            Vec::new()
+        // 关键进程指标：**只看授权**。按签名从发现快照里选代表进程。
+        let process_candidates: Vec<_> = match key_process {
+            Some(grant) => {
+                let selection = key_process::select_key_process_candidates(
+                    &result.persisted_snapshot,
+                    &grant.signatures,
+                    &key_process::cmdline_text,
+                    key_process::KEY_PROCESS_TARGET_LIMIT,
+                );
+                match selection.reason.as_deref() {
+                    // 「授权了但一个都没命中」必须看得见：现场最常见的困惑就是
+                    // “授权了、没数据”，日志要能区分没装 / 签名配错。
+                    Some(reason) => {
+                        log::warn!("event=KeyProcessNoMatch detail={reason}");
+                        process_selection_error = Some(reason.to_string());
+                    }
+                    None if selection.dropped > 0 => log::warn!(
+                        "event=KeyProcessDropped groups={} dropped={} limit={}",
+                        selection.groups,
+                        selection.dropped,
+                        key_process::KEY_PROCESS_TARGET_LIMIT
+                    ),
+                    None => {}
+                }
+                selection.candidates
+            }
+            None => Vec::new(),
         };
         let container_candidates: Vec<_> = candidates
             .iter()
@@ -3632,17 +3741,9 @@ async fn refresh_discovery_snapshot(
                 &host_candidates,
             )
             .await?;
-            if target_view::PROCESS_METRICS_COLLECTION_ENABLED {
-                planner_candidates::store_async(
-                    &planner_candidates::process_metrics_path_for(state_dir),
-                    &process_candidates,
-                )
-                .await?;
-            } else {
-                // 停采：把上一版留下的候选文件清掉，不让磁盘上留一份「看起来还在采」的旧数据。
-                let _ =
-                    tokio::fs::remove_file(planner_candidates::process_metrics_path_for(state_dir))
-                        .await;
+            if key_process.is_some() {
+                planner_candidates::store_async(&process_candidates_path, &process_candidates)
+                    .await?;
             }
             planner_candidates::store_async(
                 &planner_candidates::container_metrics_path_for(state_dir),
@@ -3659,11 +3760,14 @@ async fn refresh_discovery_snapshot(
             });
         } else {
             let target_view_result: io::Result<()> = async {
-                let view = target_view::build_metrics_target_view_async(
+                let mut view = target_view::build_metrics_target_view_async(
                     state_dir,
                     &result.persisted_snapshot.generated_at,
                 )
                 .await?;
+                // 把“为什么没有进程目标”带下去（授权了但一条签名都没命中）。
+                // 采集记账在指标 tick，它只看这个文件能拿到结论。
+                view.process_selection_error = process_selection_error.clone();
                 target_view::store_async(&target_view::path_for(state_dir), &view).await
             }
             .await;
@@ -3936,6 +4040,22 @@ mod tests {
     use crate::control::uplink::UplinkFetch;
     use crate::telemetry::warp_parse::{FileRecordSink, TcpFraming, TcpRecordSink};
     use wist_api::uplink::AgentUplinkGrant;
+
+    /// 进程候选文件的生命周期：四个组合都要钉住（这是“撤授权 / 重启”两个方向的正确性）。
+    #[test]
+    fn process_candidates_lifecycle_covers_revoke_and_restart() {
+        use ProcessCandidatesAction::{Keep, Rebuild, Remove};
+        // 没授权：文件在就必须删 —— 候选是指标 tick 的唯一依据，不删就是撤授权后继续采。
+        assert_eq!(process_candidates_action(false, false, true), Remove);
+        // 没授权且本来就没文件：不动（免得每拍一次无谓的 remove）。
+        assert_eq!(process_candidates_action(false, false, false), Keep);
+        // 授权了 + 发现快照刚刷新：重建。
+        assert_eq!(process_candidates_action(true, true, true), Rebuild);
+        // 授权了但文件不在（重启 / 上次停采被清）：立刻重建，不等下一次探测。
+        assert_eq!(process_candidates_action(true, false, false), Rebuild);
+        // 授权了、快照没变、文件还在：不动。
+        assert_eq!(process_candidates_action(true, false, true), Keep);
+    }
 
     #[test]
     fn declared_logs_capabilities_cover_the_whole_contract_vocabulary() {
@@ -5966,8 +6086,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_resource_measurements_return_values() {
-        let rss = current_rss_bytes().expect("current_rss_bytes on macos");
-        assert!(rss > 0, "resident memory should be positive, got {rss}");
+        let memory = current_memory_bytes().expect("current_memory_bytes on macos");
+        assert!(
+            memory > 0,
+            "memory footprint should be positive, got {memory}"
+        );
         let first = cpu_ticks().expect("cpu_ticks on macos");
         let second = cpu_ticks().expect("cpu_ticks on macos");
         assert!(second >= first, "cpu time should not decrease");

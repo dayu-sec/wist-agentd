@@ -1,8 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use wist_contracts::telemetry_record::DataFrame;
 use wist_shared::fs::read_json;
@@ -21,6 +22,10 @@ use crate::telemetry::warp_parse::TelemetryRecordSink;
 #[jumo(kind = "struct", domain = "Reporting", module = "Reporting.Health")]
 pub(super) struct MetricsTick {
     pub(super) snapshot: Option<MetricsRuntimeSnapshot>,
+    /// 本拍的快照是否**真的落了盘**。本地导出（`export/metrics.jsonl`）跟这个标志走：
+    /// 导出是本地调试 / 离线产物，跟着缓存同频就够（最多滞后
+    /// [`RUNTIME_SNAPSHOT_MIN_INTERVAL`]）；不卡就是每 3s 一次写。
+    pub(super) snapshot_persisted: bool,
     pub(super) failures: Vec<MetricsFailure>,
     pub(super) target_view_loaded: bool,
     pub(super) used_cached_snapshot: bool,
@@ -164,6 +169,7 @@ pub(super) async fn process_metrics_tick(state_dir: &Path) -> MetricsTick {
         // blocking 侧 panic：不把整条链路拖死，报成一次快照构建失败（下一拍还会重试）。
         Err(err) => MetricsTick {
             snapshot: None,
+            snapshot_persisted: false,
             failures: vec![metrics_failure(
                 MetricsFailureKind::RuntimeSnapshotLoad,
                 "runtime_snapshot_build",
@@ -185,16 +191,23 @@ fn process_metrics_tick_blocking(state_dir: &Path) -> MetricsTick {
         Ok(view) => {
             let snapshot = runtime::build_runtime_snapshot_live(&view);
             let mut failures = Vec::new();
-            if let Err(err) = store_unless_unchanged(&runtime_snapshot_path, &snapshot) {
-                failures.push(metrics_failure(
-                    MetricsFailureKind::RuntimeSnapshotStore,
-                    "runtime_snapshot_store",
-                    &runtime_snapshot_path,
-                    err,
-                ));
-            }
+            let stored = match store_unless_unchanged(&runtime_snapshot_path, &snapshot) {
+                Ok(stored) => stored,
+                Err(err) => {
+                    failures.push(metrics_failure(
+                        MetricsFailureKind::RuntimeSnapshotStore,
+                        "runtime_snapshot_store",
+                        &runtime_snapshot_path,
+                        err,
+                    ));
+                    // 写失败时仍导一次：导出的是另一份文件（`export/metrics.jsonl`），
+                    // 失败原因已经单独报到 `failures` 里了。
+                    true
+                }
+            };
             MetricsTick {
                 snapshot: Some(snapshot),
+                snapshot_persisted: stored,
                 failures,
                 target_view_loaded: true,
                 used_cached_snapshot: false,
@@ -212,6 +225,7 @@ fn process_metrics_tick_blocking(state_dir: &Path) -> MetricsTick {
 
             MetricsTick {
                 snapshot: cached_snapshot.clone(),
+                snapshot_persisted: false,
                 failures,
                 target_view_loaded: false,
                 used_cached_snapshot: cached_snapshot.is_some(),
@@ -220,41 +234,74 @@ fn process_metrics_tick_blocking(state_dir: &Path) -> MetricsTick {
     }
 }
 
-/// 上一次真正落盘的快照（路径 + 内容签名）。
+/// 上一次真正落盘的快照（路径 + 内容签名 + 结构签名 + 写入时刻）。
 ///
 /// 快照每 3 秒重建一次，而它的 `generated_at` **每拍都变**。不比对就是无条件重写：
 /// pretty JSON + tmp + fsync + rename + 目录 fsync。
-/// 真正省下来的那一类机器是「有授权但内容稳定」的（无目标的待命机器、主机指标不变的闲置机）；
-/// 采着几百个进程的机器每次内容都会变，一拍也不会少写 —— 那是应该写的。
-static LAST_STORED_SNAPSHOT: LazyLock<Mutex<Option<(PathBuf, u64)>>> =
-    LazyLock::new(|| Mutex::new(None));
+static LAST_STORED_SNAPSHOT: LazyLock<Mutex<HashMap<PathBuf, StoredSnapshotMemo>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// 只在内容真的变了时才落盘。
-fn store_unless_unchanged(path: &Path, snapshot: &MetricsRuntimeSnapshot) -> io::Result<()> {
-    let Some(signature) = content_signature(snapshot) else {
+/// 数值抖动（`runtime_facts`）必须落盘的最大间隔。
+///
+/// 主机事实里的 CPU / 内存 / uptime **每拍都在变**，所以「内容变了才写」对它不起作用。
+/// 但这份文件只是本地缓存 + 调试产物：上送用的是内存快照，`export/metrics.jsonl` 也改成
+/// 直接用内存快照（见 `exporter::export_metrics_async`），没有任何链路靠它的逐拍新鲜度。
+/// 目标集合 / 状态 / 错误的**结构性**变化仍然立即落盘，只有数值抖动才走这个下限。
+const RUNTIME_SNAPSHOT_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+struct StoredSnapshotMemo {
+    /// 全量内容签名（排除 `generated_at`）。
+    content: u64,
+    /// 只保留结构（目标集合 / 状态 / 错误 / 计数），排除 `runtime_facts` 这类数值。
+    structure: u64,
+    written_at: Instant,
+}
+
+/// 只在真的需要时才落盘，返回**是否写了**。
+/// - 内容（除数值事实外）变了 → 立即写；
+/// - 只有数值变了 → 距上次写满 [`RUNTIME_SNAPSHOT_MIN_INTERVAL`] 才写；
+/// - 文件被外部删了 → 重写（还要当 `target_view` 失败时的 cache）。
+fn store_unless_unchanged(path: &Path, snapshot: &MetricsRuntimeSnapshot) -> io::Result<bool> {
+    let (Some(content), Some(structure)) =
+        (content_signature(snapshot), structure_signature(snapshot))
+    else {
         // 算不出签名（序列化失败）就宁可多写一次 —— 与“为了省一次写而漏写”相反。
-        return runtime::store(path, snapshot);
+        runtime::store(path, snapshot)?;
+        return Ok(true);
     };
+    let now = Instant::now();
     {
         let guard = match LAST_STORED_SNAPSHOT.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some((stored_path, stored_signature)) = guard.as_ref()
-            && stored_path == path
-            && *stored_signature == signature
+        if let Some(memo) = guard.get(path) {
             // 文件被外部删了就不能再信缓存：否则这一份快照会**永远不再落盘**，
             // 而 target_view 失败时正是靠它当 cache。一次 stat 换掉这个死局。
-            && path.exists()
-        {
-            return Ok(());
+            if memo.content == content && path.exists() {
+                return Ok(false);
+            }
+            // 只有数值变了：结构没变就走下限，不跟着每拍的 CPU / 内存抖动写盘。
+            if memo.structure == structure
+                && path.exists()
+                && now.duration_since(memo.written_at) < RUNTIME_SNAPSHOT_MIN_INTERVAL
+            {
+                return Ok(false);
+            }
         }
     }
     runtime::store(path, snapshot)?;
     if let Ok(mut guard) = LAST_STORED_SNAPSHOT.lock() {
-        *guard = Some((path.to_path_buf(), signature));
+        guard.insert(
+            path.to_path_buf(),
+            StoredSnapshotMemo {
+                content,
+                structure,
+                written_at: now,
+            },
+        );
     }
-    Ok(())
+    Ok(true)
 }
 
 /// 内容签名：**排除 `generated_at`**。
@@ -266,6 +313,31 @@ fn store_unless_unchanged(path: &Path, snapshot: &MetricsRuntimeSnapshot) -> io:
 fn content_signature(snapshot: &MetricsRuntimeSnapshot) -> Option<u64> {
     let mut probe = snapshot.clone();
     probe.generated_at.clear();
+    let bytes = serde_json::to_vec(&probe).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+/// 结构签名：在内容签名的基础上去掉逐拍抖动的数值事实。
+///
+/// 留下来的东西才是“该不该立即落盘”的依据：目标集合、每个结果的状态与错误、
+/// 采集计数。`runtime_facts` / `labeled_facts` 里是本拍的 CPU、内存、更新时间这类值。
+///
+/// **目标级样本里的事实也要清**：主机事实挂在 `outcome.runtime_facts` 上，同时也挂在
+/// `sample_targets[0].runtime_facts` 上（上送只能挂一次，否则按目标复制成重复序列）。
+/// 只清前者的话，签名里仍会含每拍都在变的 CPU / 内存 → 下限永远不生效，真机上依然每 3s 写盘。
+fn structure_signature(snapshot: &MetricsRuntimeSnapshot) -> Option<u64> {
+    let mut probe = snapshot.clone();
+    probe.generated_at.clear();
+    for outcome in &mut probe.outcomes {
+        outcome.runtime_facts.clear();
+        outcome.labeled_facts.clear();
+        for sample in &mut outcome.sample_targets {
+            sample.runtime_facts.clear();
+            sample.labeled_facts.clear();
+        }
+    }
     let bytes = serde_json::to_vec(&probe).ok()?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut hasher);
@@ -721,6 +793,7 @@ mod tests {
                     execution_hints: vec![StringKeyValue::new("process.pid", "42")],
                 },
             ],
+            process_selection_error: None,
         };
         store(&target_view_path_for(&state_dir), &view).expect("store target view");
 
@@ -877,6 +950,76 @@ mod tests {
         assert!(
             path.exists(),
             "文件被删了就必须重写，否则「未变不写」会把缓存永久钉死"
+        );
+    }
+
+    /// 数值抖动（host facts 每拍都在变）不该跟着每 3s 写盘：结构没变就走 60s 下限。
+    ///
+    /// 这份文件只是本地缓存 + 调试产物：上送用的是内存快照，`export/metrics.jsonl`
+    /// 也直接用内存快照（`exporter::export_metrics_async`），没有链路靠它逐拍新鲜。
+    #[test]
+    fn volatile_fact_values_are_throttled() {
+        let state_dir = temp_dir("snapshot-throttle");
+        let path = runtime_path_for(&state_dir);
+
+        let mut first = snapshot_at("2026-11-08T00:00:00Z", 1);
+        let mut only = outcome("host_metrics", "succeeded", 1, 0, None, Vec::new());
+        only.runtime_facts
+            .push(StringKeyValue::new("host.cpu.percent", "10"));
+        first.outcomes.push(only);
+        assert!(
+            store_unless_unchanged(&path, &first).expect("first store"),
+            "首次必须落盘"
+        );
+
+        let mut second = snapshot_at("2026-11-08T00:00:03Z", 1);
+        let mut only = outcome("host_metrics", "succeeded", 1, 0, None, Vec::new());
+        only.runtime_facts
+            .push(StringKeyValue::new("host.cpu.percent", "42"));
+        second.outcomes.push(only);
+        assert!(
+            !store_unless_unchanged(&path, &second).expect("second store"),
+            "只有数值变了，60s 内不该写"
+        );
+
+        let stored: MetricsRuntimeSnapshot = read_json(&path).expect("load");
+        assert_eq!(
+            stored.generated_at, "2026-11-08T00:00:00Z",
+            "只有数值变了，60s 内不该重写快照"
+        );
+    }
+
+    /// **生产形状**：主机事实同时挂在 `sample_targets[0].runtime_facts` 上（上送只能挂一次）。
+    ///
+    /// 只清 outcome 级 facts 时，签名里仍带着每拍的 CPU / 内存 —— 下限形同虚设，
+    /// 真机（毎台都有主机目标）依然每 3s 一次 fsync。这条用例用真实形状钉住它。
+    #[test]
+    fn volatile_values_on_target_samples_are_throttled_too() {
+        let state_dir = temp_dir("snapshot-throttle-samples");
+        let path = runtime_path_for(&state_dir);
+
+        let build = |generated_at: &str, cpu: &str| {
+            let mut target = sample("host-1", "succeeded", None);
+            target
+                .runtime_facts
+                .push(StringKeyValue::new("host.cpu.percent", cpu));
+            let mut only = outcome("host_metrics", "succeeded", 1, 0, None, vec![target]);
+            only.runtime_facts
+                .push(StringKeyValue::new("host.cpu.percent", cpu));
+            let mut snapshot = snapshot_at(generated_at, 1);
+            snapshot.outcomes.push(only);
+            snapshot
+        };
+
+        assert!(
+            store_unless_unchanged(&path, &build("2026-11-08T00:00:00Z", "10"))
+                .expect("first store"),
+            "首次必须落盘"
+        );
+        assert!(
+            !store_unless_unchanged(&path, &build("2026-11-08T00:00:03Z", "42"))
+                .expect("second store"),
+            "目标样本里的数值抖动也不该触发写盘"
         );
     }
 

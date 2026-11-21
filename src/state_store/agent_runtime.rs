@@ -49,6 +49,25 @@ pub async fn store_async(path: &Path, state: &AgentRuntimeState) -> io::Result<(
     write_json_private_atomic_async(path, state).await
 }
 
+/// 文件不存在时按给定时间补一份默认状态；已存在则**一个字节都不碰**。
+///
+/// 存在的文件已有内容这个前提由写入方保证（enroll / upgrade 改字段时自己写盘），
+/// 所以这里不需要「读—合并—写」，也就没有稳态下每拍一次的无谓 fsync。
+/// `updated_at` 因此表示「内容最后真变化的时间」，而不是「最后一次写盘」，
+/// 与 `metrics_runtime_snapshot.generated_at` 同一约定。
+pub async fn ensure_exists_async(path: &Path, updated_at: &str) -> io::Result<()> {
+    match tokio::fs::metadata(path).await {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            let mut state = load_default();
+            state.updated_at = updated_at.to_string();
+            store_async(path, &state).await
+        }
+        // 其它错误（权限、IO）照旧上抛：这是「无法持久化」的真信号。
+        Err(err) => Err(err),
+    }
+}
+
 fn default_instance_id() -> String {
     // 机器名优先级只有一份实现：`discovery::host`；这里只决定「都拿不到」时的占位名。
     crate::discovery::host::resolve_host_name().unwrap_or_else(|| "local-instance".to_string())
@@ -56,7 +75,10 @@ fn default_instance_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_instance_id, load_or_default_async, path_for, store, store_async};
+    use super::{
+        default_instance_id, ensure_exists_async, load_or_default_async, path_for, store,
+        store_async,
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
     use wist_contracts::agent_state::{AgentRuntimeState, RuntimeMode};
 
@@ -122,6 +144,56 @@ mod tests {
         let loaded = load_or_default_async(&path).await.expect("load");
 
         assert_eq!(loaded, state);
+        let _ = tokio::fs::remove_dir_all(&state_dir).await;
+    }
+
+    /// 文件已存在时 **不能**碰它：稳态每拍调用一次，写下去就是每秒一次的 fsync。
+    #[tokio::test]
+    async fn ensure_exists_leaves_an_existing_file_untouched() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "wist-agentd-agent-runtime-ensure-{}",
+            unique_suffix()
+        ));
+        let path = path_for(&state_dir);
+        let mut stored = AgentRuntimeState::new(
+            "agent-a".to_string(),
+            "instance-a".to_string(),
+            "v0.1.0".to_string(),
+            RuntimeMode::Normal,
+            "2026-07-29T00:00:00Z".to_string(),
+        );
+        stored.credential_id = Some("cred-secret".to_string());
+        store_async(&path, &stored).await.expect("store");
+        let before = std::fs::read(&path).expect("read before");
+
+        ensure_exists_async(&path, "2026-11-21T00:00:00Z")
+            .await
+            .expect("ensure exists");
+
+        let after = std::fs::read(&path).expect("read after");
+        assert_eq!(
+            before, after,
+            "existing runtime state must not be rewritten"
+        );
+        let _ = tokio::fs::remove_dir_all(&state_dir).await;
+    }
+
+    /// 文件缺失时仍要补一份：否则「state 里没有身份」会被 `service status` 当成未注册。
+    #[tokio::test]
+    async fn ensure_exists_creates_a_missing_file() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "wist-agentd-agent-runtime-create-{}",
+            unique_suffix()
+        ));
+        let path = path_for(&state_dir);
+        assert!(!path.exists());
+
+        ensure_exists_async(&path, "2026-11-21T00:00:00Z")
+            .await
+            .expect("ensure exists");
+
+        let created = load_or_default_async(&path).await.expect("load");
+        assert_eq!(created.updated_at, "2026-11-21T00:00:00Z");
         let _ = tokio::fs::remove_dir_all(&state_dir).await;
     }
 

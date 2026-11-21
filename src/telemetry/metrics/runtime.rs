@@ -96,7 +96,7 @@ pub fn build_runtime_snapshot_live(view: &MetricsTargetView) -> MetricsRuntimeSn
 
 fn build_snapshot(
     view: &MetricsTargetView,
-    outcomes: Vec<MetricsCollectionOutcome>,
+    mut outcomes: Vec<MetricsCollectionOutcome>,
 ) -> MetricsRuntimeSnapshot {
     let mut host_targets = 0;
     let mut process_targets = 0;
@@ -109,6 +109,18 @@ fn build_snapshot(
             "container_metrics" => container_targets += 1,
             _ => {}
         }
+    }
+
+    // 关键进程指标：授权了但本机一个都没匹配到 → 把原因写进 outcome。
+    // 采集记账（`collection_health`）把 `idle + last_error` 报成 `target_not_ready`
+    // 并把这句话带到管理面，于是“授权了为什么没数据”能直接看到。
+    if let Some(reason) = view.process_selection_error.as_deref()
+        && let Some(outcome) = outcomes
+            .iter_mut()
+            .find(|outcome| outcome.collection_kind == "process_metrics")
+        && outcome.attempted_targets == 0
+    {
+        outcome.last_error = Some(reason.to_string());
     }
 
     MetricsRuntimeSnapshot {
@@ -213,7 +225,6 @@ fn build_process_outcome(targets: Vec<&MetricsTargetViewEntry>) -> MetricsCollec
 
     let mut succeeded_targets = 0usize;
     let mut failed_targets = 0usize;
-    let mut dropped_targets = 0usize;
     let mut sample_targets = Vec::new();
     let mut last_error = None;
 
@@ -231,11 +242,11 @@ fn build_process_outcome(targets: Vec<&MetricsTargetViewEntry>) -> MetricsCollec
                 last_error = probed.last_error.clone();
             }
         }
-        if sample_targets.len() < SAMPLE_LIMIT {
-            sample_targets.push(probed);
-        } else {
-            dropped_targets += 1;
-        }
+        // **进程域不按 [`SAMPLE_LIMIT`] 截断**：这里的每个目标都是授权面按签名选出来的
+        // 代表进程（上限 `KEY_PROCESS_TARGET_LIMIT` = 50 已在选目标那一层卡过），
+        // 少报一个就是“授权了某个服务却没有它的序列”。以前这里是 `SAMPLE_LIMIT = 3`，
+        // 结果是 950 个目标只上送 3 条随机样本、其余记 `dropped` —— 那正是 0.35 停采的原因。
+        sample_targets.push(probed);
     }
 
     let status = if failed_targets == 0 {
@@ -252,7 +263,9 @@ fn build_process_outcome(targets: Vec<&MetricsTargetViewEntry>) -> MetricsCollec
         attempted_targets: targets.len(),
         succeeded_targets,
         failed_targets,
-        dropped_targets,
+        // 没被丢的目标：截断发生在**选目标**那一层（按组算，见 `key_process::select_key_process_candidates`），
+        // 这里再记一遍只会和 `attempted = succeeded + failed` 打架。
+        dropped_targets: 0,
         last_error,
         runtime_facts: vec![
             StringKeyValue::new("process.probe.mode", process::process_probe_mode()),
@@ -389,7 +402,10 @@ pub(super) fn push_fact_if_absent(facts: &mut Vec<StringKeyValue>, candidate: St
     facts.push(candidate);
 }
 
-/// 每类采集每个批次最多保留的目标样本数；超出部分计入 `dropped_targets`。
+/// 主机 / 容器域每批最多保留的目标样本数；超出部分计入 `dropped_targets`。
+///
+/// **进程域不适用**：它的目标集合已由授权面按签名卡到 [`KEY_PROCESS_TARGET_LIMIT`]
+/// （每个目标就是一个**服务**的代表进程），少报一个就是“授权了却没有序列”。
 const SAMPLE_LIMIT: usize = 3;
 
 fn maybe_push_sample(
@@ -420,7 +436,7 @@ mod tests {
 
     use super::{
         MetricsCollectionOutcome, MetricsCollectionTargetSample, MetricsRuntimeSnapshot,
-        build_runtime_snapshot, path_for, store,
+        build_process_outcome, build_runtime_snapshot, build_snapshot, path_for, store,
     };
     use crate::telemetry::metrics::target_view::{MetricsTargetView, MetricsTargetViewEntry};
     use wist_contracts::discovery::StringKeyValue;
@@ -434,6 +450,42 @@ mod tests {
             std::env::temp_dir().join(format!("warp-insight-metrics-runtime-{name}-{suffix}"));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    /// 关键进程指标：授权了但一个都没匹配到 → 原因进 idle 的 process outcome。
+    ///
+    /// 采集记账（`collection_health`）把 `idle + last_error` 报成 `target_not_ready`，
+    /// 所以这里带上了，管理面的「采集结果」才能回答“授权了为什么没数据”。
+    #[test]
+    fn an_idle_process_outcome_carries_the_selection_reason() {
+        let reason = "no process matched unit:kafka|port:9092";
+        let view = MetricsTargetView {
+            generated_at: "2026-11-21T00:00:00Z".to_string(),
+            targets: Vec::new(),
+            process_selection_error: Some(reason.to_string()),
+        };
+        let snapshot = build_snapshot(&view, vec![build_process_outcome(Vec::new())]);
+        let process = snapshot
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.collection_kind == "process_metrics")
+            .expect("process outcome");
+        assert_eq!(process.status, "idle");
+        assert_eq!(process.last_error.as_deref(), Some(reason));
+
+        // 没有选目标错误时不得凭空编一个。
+        let clean = MetricsTargetView {
+            generated_at: "2026-11-21T00:00:00Z".to_string(),
+            targets: Vec::new(),
+            process_selection_error: None,
+        };
+        let snapshot = build_snapshot(&clean, vec![build_process_outcome(Vec::new())]);
+        let process = snapshot
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.collection_kind == "process_metrics")
+            .expect("process outcome");
+        assert!(process.last_error.is_none());
     }
 
     #[test]
@@ -467,6 +519,7 @@ mod tests {
                     ],
                 },
             ],
+            process_selection_error: None,
         };
         crate::telemetry::metrics::target_view::store(
             &crate::telemetry::metrics::target_view::path_for(&state_dir),
@@ -598,8 +651,13 @@ mod tests {
         assert_eq!(loaded, snapshot);
     }
 
+    /// 进程域**不**按 `SAMPLE_LIMIT` 截断：授权面选出来的每个代表进程都要有序列。
+    ///
+    /// 以前这里是 3 —— 950 个目标只上送 3 条随机样本、其余记 `dropped`，
+    /// 正是 0.35 停采逐进程指标的原因。选目标那一层已经把组数卡到 50，这里再截一次
+    /// 只会让“授权了 nginx 却没有 nginx 的序列”变成静默少报。
     #[test]
-    fn build_runtime_snapshot_limits_samples_per_collection_kind() {
+    fn build_runtime_snapshot_reports_every_process_target() {
         let state_dir = temp_dir("sample-limit");
         let target_view = MetricsTargetView {
             generated_at: "2026-04-19T00:00:00Z".to_string(),
@@ -612,6 +670,7 @@ mod tests {
                     execution_hints: vec![StringKeyValue::new("process.pid", idx.to_string())],
                 })
                 .collect(),
+            process_selection_error: None,
         };
         crate::telemetry::metrics::target_view::store(
             &crate::telemetry::metrics::target_view::path_for(&state_dir),
@@ -635,14 +694,14 @@ mod tests {
             process_outcome.status.as_str(),
             "succeeded" | "partial" | "failed"
         ));
-        assert_eq!(process_outcome.sample_targets.len(), 3);
         assert_eq!(
-            process_outcome.dropped_targets, 2,
-            "targets beyond the sample cap must be accounted, not silently dropped"
+            process_outcome.sample_targets.len(),
+            5,
+            "每个代表进程都要上送，不能只给前 3 个"
         );
         assert_eq!(
-            process_outcome.sample_targets.len() + process_outcome.dropped_targets,
-            process_outcome.attempted_targets
+            process_outcome.dropped_targets, 0,
+            "截断在选目标那一层（按组），不在采样层"
         );
     }
 
@@ -658,6 +717,7 @@ mod tests {
                 resource_ref: "proc-1".to_string(),
                 execution_hints: vec![StringKeyValue::new("process.identity", "demo")],
             }],
+            process_selection_error: None,
         };
         crate::telemetry::metrics::target_view::store(
             &crate::telemetry::metrics::target_view::path_for(&state_dir),
@@ -698,6 +758,7 @@ mod tests {
                 resource_ref: "container-1".to_string(),
                 execution_hints: Vec::new(),
             }],
+            process_selection_error: None,
         };
         crate::telemetry::metrics::target_view::store(
             &crate::telemetry::metrics::target_view::path_for(&state_dir),

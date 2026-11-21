@@ -11,28 +11,22 @@ use crate::state_store::planner_candidates;
 
 pub use wist_metrics::target::MetricsTargetViewEntry;
 
-/// 逐进程指标是否采集。
+/// 逐进程指标的候选要不要采，由**授权**决定（`KeyProcessMetrics` 来源 + 签名），
+/// 不再是编译期开关：
 ///
-/// **`false` = 默认停采**，理由：
-///   * `CollectionSourceKind` 里没有进程类来源 —— 没有任何工作能授权它；
-///   * 网关与本仓前端都还没有消费 `process_*` 序列的查询/看板；
-///   * 它以前能采，纯粹是 `planner_bridge` 把发现快照里的 process targets 顺带转成了
-///     采集候选（950 个目标/轮，`SAMPLE_LIMIT=3` 只报 3 条随机样本，其余记 dropped）。
+/// * 没授权 → 守护进程连候选文件都不生成（磁盘上不会留一份“看起来还在采”的旧数据）；
+/// * 授权了 → `key_process::select_key_process_candidates` 按签名从发现快照里选代表进程。
 ///
-/// 重新打开的时机：P2-c 给进程域加上「按授权选目标」后，把它打开并把上限
-/// （`CapabilityLimits.max_metrics_targets`）按授权数下发。
-/// 进程发现本身不受影响：它是用途推断与资产清单的输入，由发现策略管（`[discovery] process_enabled`）。
-pub(crate) const PROCESS_METRICS_COLLECTION_ENABLED: bool = false;
-
-/// 这一版要读的候选文件。顺序固定（host → process → container），
-/// 进程那一格按开关取舍。
-fn candidate_paths(state_dir: &Path, include_process: bool) -> Vec<std::path::PathBuf> {
-    let mut paths = vec![planner_candidates::host_metrics_path_for(state_dir)];
-    if include_process {
-        paths.push(planner_candidates::process_metrics_path_for(state_dir));
-    }
-    paths.push(planner_candidates::container_metrics_path_for(state_dir));
-    paths
+/// 进程发现本身不受影响：它是用途推断与资产清单的输入，由发现策略管。
+///
+/// 这一版读的候选文件。顺序固定（host → process → container）。
+/// 文件不存在时 `load_or_default` 返回空 —— 所以“没授权”自然是零个目标。
+fn candidate_paths(state_dir: &Path) -> Vec<std::path::PathBuf> {
+    vec![
+        planner_candidates::host_metrics_path_for(state_dir),
+        planner_candidates::process_metrics_path_for(state_dir),
+        planner_candidates::container_metrics_path_for(state_dir),
+    ]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +35,13 @@ pub struct MetricsTargetView {
     pub generated_at: String,
     #[serde(default)]
     pub targets: Vec<MetricsTargetViewEntry>,
+    /// 关键进程指标的**选目标结论**：授权了但一条签名都没命中时写原因（`None` = 正常或未授权）。
+    ///
+    /// 为什么要跨文件传：选目标发生在**发现拍**（要读 `/proc/<pid>/cmdline`），而采集记账在
+    /// **指标 tick** —— 两者之间只有这个视图文件。不带下来就只剩一行日志，
+    /// 管理面的「采集结果」看不到“授权了为什么没数据”。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_selection_error: Option<String>,
 }
 
 #[cfg(test)]
@@ -48,18 +49,9 @@ pub fn build_metrics_target_view(
     state_dir: &Path,
     generated_at: &str,
 ) -> io::Result<MetricsTargetView> {
-    build_metrics_target_view_with(state_dir, generated_at, PROCESS_METRICS_COLLECTION_ENABLED)
-}
-
-#[cfg(test)]
-pub fn build_metrics_target_view_with(
-    state_dir: &Path,
-    generated_at: &str,
-    include_process: bool,
-) -> io::Result<MetricsTargetView> {
     let mut targets = Vec::new();
 
-    for path in candidate_paths(state_dir, include_process) {
+    for path in candidate_paths(state_dir) {
         let candidates = planner_candidates::load_or_default(&path)?;
         targets.extend(candidates.into_iter().map(map_candidate));
     }
@@ -67,6 +59,8 @@ pub fn build_metrics_target_view_with(
     Ok(MetricsTargetView {
         generated_at: generated_at.to_string(),
         targets,
+        // 纯构建器不知道选择结论；由发现拍在落盘前填。
+        process_selection_error: None,
     })
 }
 
@@ -85,7 +79,7 @@ pub async fn build_metrics_target_view_async(
 ) -> io::Result<MetricsTargetView> {
     let mut targets = Vec::new();
 
-    for path in candidate_paths(state_dir, PROCESS_METRICS_COLLECTION_ENABLED) {
+    for path in candidate_paths(state_dir) {
         let candidates = planner_candidates::load_or_default_async(&path).await?;
         targets.extend(candidates.into_iter().map(map_candidate));
     }
@@ -93,6 +87,8 @@ pub async fn build_metrics_target_view_async(
     Ok(MetricsTargetView {
         generated_at: generated_at.to_string(),
         targets,
+        // 纯构建器不知道选择结论；由发现拍在落盘前填。
+        process_selection_error: None,
     })
 }
 
@@ -119,7 +115,7 @@ mod tests {
     use wist_contracts::discovery::{CollectionCandidate, StringKeyValue};
     use wist_shared::fs::read_json;
 
-    use super::{build_metrics_target_view, build_metrics_target_view_with, path_for, store};
+    use super::{build_metrics_target_view, path_for, store};
     use crate::state_store::planner_candidates;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -161,7 +157,7 @@ mod tests {
         )
         .expect("store process candidates");
 
-        let view = build_metrics_target_view_with(&state_dir, "2026-04-19T00:00:00Z", true)
+        let view = build_metrics_target_view(&state_dir, "2026-04-19T00:00:00Z")
             .expect("build metrics target view");
 
         assert_eq!(view.targets.len(), 2);
@@ -184,10 +180,25 @@ mod tests {
         }));
     }
 
-    /// 逐进程指标默认停采：进程候选文件存在也不读（否则旧文件会继续被采）。
+    /// 进程候选文件**就是授权的落地结果**：没授权时它不存在 → 零个目标；
+    /// 授权了才由 `key_process::select_key_process_candidates` 写进来。
+    ///
+    /// 这条钉住“不要在读取侧再偷偷关一次”—— 关的职责在写入侧（没授权就不生成文件），
+    /// 两边都关会让“文件在、却不采”变成没人能解释的态。
     #[test]
-    fn process_candidates_are_ignored_while_collection_is_disabled() {
-        let state_dir = temp_dir("process-disabled");
+    fn process_targets_come_only_from_the_candidate_file() {
+        let state_dir = temp_dir("process-candidates-are-the-source");
+
+        let empty = build_metrics_target_view(&state_dir, "2026-04-19T00:00:00Z")
+            .expect("build empty view");
+        assert!(
+            empty
+                .targets
+                .iter()
+                .all(|target| target.collection_kind != "process_metrics"),
+            "没有候选文件就不该有进程目标"
+        );
+
         planner_candidates::store(
             &planner_candidates::process_metrics_path_for(&state_dir),
             &[CollectionCandidate {
@@ -203,12 +214,12 @@ mod tests {
 
         let view = build_metrics_target_view(&state_dir, "2026-04-19T00:00:00Z")
             .expect("build metrics target view");
-
-        assert!(
+        assert_eq!(
             view.targets
                 .iter()
-                .all(|target| target.collection_kind != "process_metrics"),
-            "停采期间不得把进程目标交给采集器"
+                .filter(|target| target.collection_kind == "process_metrics")
+                .count(),
+            1
         );
     }
 

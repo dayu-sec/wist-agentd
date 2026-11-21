@@ -98,7 +98,7 @@
 
 | 指标 | 类型 | 单位 | label | 说明 |
 |---|---|---|---|---|
-| `agent_memory_bytes` | gauge_i64 | By | — | agent 进程常驻内存 |
+| `agent_memory_bytes` | gauge_i64 | By | — | agent 进程自身内存占用，各平台取其用户可见口径：macOS = `phys_footprint`（= `top` 的 `MEM` 列 / 活动监视器），Linux = `VmRSS`（= `top` 的 `RES`） |
 | `agent_cpu_ratio` | gauge_f64 | 1 | — | **agent 进程自身** CPU，单核口径（`1.0` = 占满一个核，可 > 1） |
 | `agent_cpu_cores` | gauge_i64 | 1 | — | 逻辑核数（把单核口径换算成整机占比的分母） |
 | `agent_admin_latency_seconds` | gauge_f64 | s | — | 最近一次成功的管理面交互耗时 |

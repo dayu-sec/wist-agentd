@@ -20,17 +20,36 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crate::config::agent_config::{AgentConfig, LogFileInputSection};
+use crate::telemetry::metrics::key_process::OwnedSignature;
 use wist_api::work::{
     ACK_WORK_KIND, AckWork, POLL_WORK_KIND, PollWork, REPORT_WORK_RESULT_KIND, ReportWorkResult,
     WorkAccepted, WorkGrant, WorkResultAccepted,
 };
 use wist_contracts::work::{
     CollectionSourceKind, OneShotWork, StandingWork, WorkSpec, WorkSpecSource, is_known_exporter,
-    parse_exporter_target,
+    parse_exporter_target, parse_key_process_target,
 };
 use wist_shared::time::now_rfc3339;
 
 use crate::control::enrollment::enrollment_http_client;
+
+/// 「这条来源是不是允许在本机采关键进程指标」。
+///
+/// 与四个自探域**不是同一条判定**：它们的 `target` 只认 `auto`，
+/// 而这里的 `target` 是**签名列表**（`unit:` / `exe:` / `port:` / `cmdline:`）。
+pub(crate) fn is_key_process_source(kind: &str, target: &str) -> bool {
+    kind == CollectionSourceKind::KeyProcessMetrics.as_str()
+        && CollectionSourceKind::KeyProcessMetrics.accepts_target(target)
+}
+
+/// 关键进程指标的授权：按哪些签名认。
+///
+/// 不携带周期：采多密由 [`AppliedWorkGrant::metrics_interval`] 统一算（这个来源也是一个
+/// `collect_metrics` 单元），再存一份只会成为两份真相。
+#[derive(Debug, Clone)]
+pub(crate) struct KeyProcessGrant {
+    pub(crate) signatures: Vec<OwnedSignature>,
+}
 
 /// 单次拉取/确认请求的超时。
 ///
@@ -678,8 +697,18 @@ impl AppliedWorkGrant {
     /// 指标上送的周期；`None` = 现在不该上送（没有授权的指标工作）。
     ///
     /// 取所有在干活的指标工作里**最密**的那个周期：要得最急的需求是上送频率的下界。
+    ///
+    /// 单元没写 `MetricInterval` 时用 [`DEFAULT_METRICS_UPLINK_SECONDS`]（不是“不上送”）：
+    /// 一份缺了周期的授权不该让指标彻底看不见。到底用了没那个默认值，由
+    /// [`Self::metrics_interval_detail`] 说出来 —— 两者必须能分清，否则“周期 15s”
+    /// 到底来自策展还是来自兜底，现场无法判断。
     pub fn metrics_interval(&self) -> Option<Duration> {
-        let mut seconds: Option<i64> = None;
+        self.metrics_interval_detail().map(|(interval, _)| interval)
+    }
+
+    /// 指标周期 + 是否用了内建默认值（日志 / 诊断用）。
+    fn metrics_interval_detail(&self) -> Option<(Duration, bool)> {
+        let mut chosen: Option<(i64, bool)> = None;
         for work in self.works.values() {
             if !work.is_working() {
                 continue;
@@ -694,15 +723,16 @@ impl AppliedWorkGrant {
             {
                 continue;
             }
-            let interval = spec
-                .metric_interval_seconds()
-                .unwrap_or(DEFAULT_METRICS_UPLINK_SECONDS as i64);
-            seconds = Some(match seconds {
-                Some(current) => current.min(interval),
-                None => interval,
+            let declared = spec.metric_interval_seconds();
+            let interval = declared.unwrap_or(DEFAULT_METRICS_UPLINK_SECONDS as i64);
+            chosen = Some(match chosen {
+                // 取最密的那个：默认值也参与比较，否则一份 15s 的显式授权
+                // 会盖过另一份缺周期的授权（两者实际都按 15s 跑）。
+                Some((current, defaulted)) if current <= interval => (current, defaulted),
+                _ => (interval, declared.is_none()),
             });
         }
-        seconds.map(|seconds| Duration::from_secs(seconds.max(1) as u64))
+        chosen.map(|(seconds, defaulted)| (Duration::from_secs(seconds.max(1) as u64), defaulted))
     }
 
     /// Kafka 采集授权（采集面）。
@@ -831,6 +861,47 @@ impl AppliedWorkGrant {
         granted.then_some(DorisGrant { interval })
     }
 
+    /// 关键进程指标的授权（采集面）。
+    ///
+    /// 判据：有一份在干活的工作，它的 `collect_metrics` 单元带了一条
+    /// `KeyProcessMetrics/<签名列表>` 来源。**采哪些进程仍由本机判定**
+    /// （见 `telemetry::metrics::key_process`）—— 授权只说“要不要采、按哪些签名认”。
+    ///
+    /// 多份工作叠加时签名取**并集**、间隔取**最密**：与 `metric_interval()` 的口径一致。
+    pub(crate) fn key_process_grant(&self) -> Option<KeyProcessGrant> {
+        let mut signatures: Vec<OwnedSignature> = Vec::new();
+        for work in self.works.values() {
+            if !work.is_working() {
+                continue;
+            }
+            let Some(spec) = work.spec.as_ref() else {
+                continue;
+            };
+            for unit in &spec.units {
+                if unit.capability != "collect_metrics" {
+                    continue;
+                }
+                for source in &unit.sources {
+                    if !is_key_process_source(&source.kind, &source.target) {
+                        continue;
+                    }
+                    // 能走到这里说明 `accepts_target` 已经通过，解析不会失败；
+                    // 真失败也不报错采全部，只是这条来源不贡献签名。
+                    if let Ok(parsed) = parse_key_process_target(&source.target) {
+                        for signature in parsed {
+                            let owned = OwnedSignature::from_borrowed(signature);
+                            if !signatures.contains(&owned) {
+                                signatures.push(owned);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 授权了但一条签名都没有（target 被改坏）不能退化成“采全部”。
+        (!signatures.is_empty()).then_some(KeyProcessGrant { signatures })
+    }
+
     /// 折算不了的单元（`Exporter` / `UnifiedLogPredicate` …）。
     pub fn unsupported_units(&self) -> Vec<UnsupportedUnit> {
         let mut unsupported = Vec::new();
@@ -851,6 +922,7 @@ impl AppliedWorkGrant {
                         || is_mysql_instance_source(&source.kind, &source.target)
                         || is_pg_instance_source(&source.kind, &source.target)
                         || is_doris_cluster_source(&source.kind, &source.target)
+                        || is_key_process_source(&source.kind, &source.target)
                     {
                         continue;
                     }
@@ -886,8 +958,11 @@ impl AppliedWorkGrant {
         let working = self.works.values().filter(|work| work.is_working()).count();
         let log_inputs = self.log_inputs().len();
         let exporters = self.exporter_runs().len();
-        let metrics = match self.metrics_interval() {
-            Some(interval) => format!("on({}s)", interval.as_secs()),
+        let metrics = match self.metrics_interval_detail() {
+            // 兜底值要能看出来：`on(15s)` 说明策展写了，`on(15s default)` 说明单元缺
+            // `MetricInterval` 来源、走了内建默认值。两者处置不同（后者该补知识库）。
+            Some((interval, true)) => format!("on({}s default)", interval.as_secs()),
+            Some((interval, false)) => format!("on({}s)", interval.as_secs()),
             None => "off".to_string(),
         };
         let kafka = match self.kafka_grant() {
@@ -1293,6 +1368,151 @@ mod tests {
             "能接的 SQL 来源不该报 unsupported：{:?}",
             applied.unsupported_units()
         );
+    }
+
+    /// 关键进程指标：授权只带**签名**，周期仍由 `metrics_interval()` 统一算。
+    #[test]
+    fn key_process_grant_collects_signatures_from_the_authorised_units() {
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![standing(
+                "w-proc",
+                "ProcessMetrics",
+                1,
+                "active",
+                &spec(&[
+                    (
+                        "proc",
+                        "collect_metrics",
+                        "KeyProcessMetrics:unit:kafka|port:9092",
+                    ),
+                    ("interval", "collect_metrics", "MetricInterval:30s"),
+                ]),
+            )],
+        ));
+
+        let granted = applied.key_process_grant().expect("grant");
+        assert_eq!(granted.signatures.len(), 2);
+        assert_eq!(granted.signatures[0].label(), "unit:kafka");
+        assert_eq!(granted.signatures[1].label(), "port:9092");
+        // 认得这个来源，不该报 unsupported（否则会被当成“采集端接不了”）。
+        assert!(
+            applied.unsupported_units().is_empty(),
+            "{:?}",
+            applied.unsupported_units()
+        );
+        // 采多密只有一个真相：`metrics_interval()`。
+        assert_eq!(applied.metrics_interval(), Some(Duration::from_secs(30)));
+    }
+
+    /// **单元只带签名、没有 `MetricInterval`** 时仍然上送（走内建默认 15s），
+    /// 但“用了兜底值”必须能看出来（`summary` 里的 `default` 字样）。
+    ///
+    /// 这是设计 §2 第 5 条的边界：授权了就不能静默无数据；缺周期是**策展缺口**，
+    /// 不是“不上送”的理由。
+    #[test]
+    fn a_key_process_unit_without_an_interval_still_uploads_at_the_default() {
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![standing(
+                "w-proc",
+                "ProcessMetrics",
+                1,
+                "active",
+                &spec(&[("proc", "collect_metrics", "KeyProcessMetrics:unit:kafka")]),
+            )],
+        ));
+
+        // 选目标不受影响。
+        assert_eq!(
+            applied.key_process_grant().expect("grant").signatures.len(),
+            1
+        );
+        // 也不会因为缺周期就不上送。
+        assert_eq!(
+            applied.metrics_interval(),
+            Some(Duration::from_secs(DEFAULT_METRICS_UPLINK_SECONDS))
+        );
+        assert_eq!(
+            applied.metrics_interval_detail(),
+            Some((Duration::from_secs(DEFAULT_METRICS_UPLINK_SECONDS), true)),
+            "必须能区分“策展写的 15s”和“兜底的 15s”"
+        );
+        let summary = applied.summary();
+        assert!(summary.contains("metrics=on(15s default)"), "{summary}");
+        // 来源本身是合法的（它只是缺了个周期），不能报 unsupported。
+        assert!(applied.unsupported_units().is_empty());
+    }
+
+    /// 两份指标工作：一份显式周期、一份缺周期 —— 取**最密**，并如实标注不是兜底。
+    #[test]
+    fn the_tightest_interval_wins_across_works() {
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![
+                standing(
+                    "w-a",
+                    "ProcessMetrics",
+                    1,
+                    "active",
+                    &spec(&[("p", "collect_metrics", "KeyProcessMetrics:unit:kafka")]),
+                ),
+                standing(
+                    "w-b",
+                    "HostMetrics",
+                    1,
+                    "active",
+                    &spec(&[("h", "collect_metrics", "MetricInterval:5s")]),
+                ),
+            ],
+        ));
+
+        assert_eq!(
+            applied.metrics_interval_detail(),
+            Some((Duration::from_secs(5), false)),
+            "显式 5s 比兜底 15s 密，且结论不来自兜底"
+        );
+    }
+
+    /// `auto` 不是签名列表：拿不到授权，而且必须**报 unsupported** ——
+    /// 静默当成“没这个来源”会让现场以为是没授权。
+    #[test]
+    fn key_process_metrics_with_auto_is_unsupported_not_silently_ignored() {
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![standing(
+                "w-proc",
+                "ProcessMetrics",
+                1,
+                "active",
+                &spec(&[("proc", "collect_metrics", "KeyProcessMetrics:auto")]),
+            )],
+        ));
+
+        assert!(applied.key_process_grant().is_none());
+        assert_eq!(applied.unsupported_units().len(), 1);
+    }
+
+    /// 日志单元里出现 `KeyProcessMetrics` 不能变成指标授权。
+    #[test]
+    fn key_process_metrics_under_collect_logs_is_not_a_metrics_grant() {
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![standing(
+                "w-proc",
+                "ProcessMetrics",
+                1,
+                "active",
+                &spec(&[("proc", "collect_logs", "KeyProcessMetrics:unit:kafka")]),
+            )],
+        ));
+
+        assert!(applied.key_process_grant().is_none());
     }
 
     #[test]

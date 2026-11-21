@@ -10,6 +10,8 @@ pub mod kafka_groups;
 /// 真 broker 验收（`dev/kafka-sasl`）：全部 `#[ignore]`，只在起了 broker 时才跑。
 #[cfg(test)]
 mod kafka_live;
+/// 关键进程指标的选目标（`KeyProcessMetrics` 授权 → 采集候选）。
+pub mod key_process;
 /// MySQL / TiDB 指标采集（SQL 直采，只读）。
 pub mod mysql;
 /// PostgreSQL 指标采集（SQL 直采，只读；与 mysql 共用查询通道）。

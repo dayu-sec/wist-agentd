@@ -4,7 +4,8 @@
 //! 上限约束。它们与主机指标共用同一个 `instance`（host resource id），用于和
 //! `system_host_info` 关联出 `host_ip` 等主机身份。值分两类来源：
 //!
-//! - **直接可读**：常驻内存、逻辑核数；
+//! - **直接可读**：内存占用（各平台取用户可见的那个口径，见 `current_memory_bytes`）、
+//!   逻辑核数；
 //! - **跨批次状态**：单核 CPU 占用率（3 秒窗口）、管理面延迟、已生效策略版本、
 //!   指标上送失败累计。这些由运行时在各事件点写入，指标批次只负责读出。
 //!
@@ -77,7 +78,7 @@ pub(crate) fn snapshot() -> SelfObservation {
     SelfObservation {
         cpu_ratio: take_cpu_ratio(),
         cpu_cores: local_cpu_cores().map(u64::from),
-        memory_bytes: current_rss_bytes(),
+        memory_bytes: current_memory_bytes(),
         admin_latency_seconds: admin_latency_seconds(),
         discovery_policy_version: discovery_policy_version(),
         uplink_metrics_failed_total: UPLINK_FAILURES.load(Ordering::Relaxed),
@@ -185,8 +186,16 @@ pub(crate) fn local_cpu_cores() -> Option<u32> {
         .map(|count| count.get() as u32)
 }
 
-/// 当前常驻内存（字节），平台不提供时返回 `None`。
-pub(crate) fn current_rss_bytes() -> Option<u64> {
+/// 当前内存占用（字节），平台不提供时返回 `None`。
+///
+/// 取的是**用户在各自平台上看惯的那个数**，而不是统一的 RSS——两个平台的口径本来就不一样：
+///
+/// - **macOS**：`phys_footprint`（脏页 + 压缩页 + IOKit），等于 `top` 的 `MEM` 列、
+///   活动监视器和 `footprint` 的输出。不用 RSS 是因为它会把二进制 `__TEXT` 和系统框架
+///   的干净文件页算进来——这些页内核随时可回收，不构成内存压力，实测同一个进程
+///   RSS 53.8 MB vs footprint 9.4 MB，差近 6 倍，上报 RSS 会让面板和用户看到的工具对不上。
+/// - **Linux**：`VmRSS`，与 `top` 的 `RES`、`ps` 的 `rss` 是同一个数，无需换算。
+pub(crate) fn current_memory_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let content = std::fs::read_to_string("/proc/self/statm").ok()?;
@@ -196,27 +205,44 @@ pub(crate) fn current_rss_bytes() -> Option<u64> {
     }
     #[cfg(target_os = "macos")]
     {
-        // proc_pidinfo(PROC_PIDTASKINFO) 的 resident_size 就是字节。
-        let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
-        let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
-        let written = unsafe {
-            libc::proc_pidinfo(
-                std::process::id() as libc::c_int,
-                libc::PROC_PIDTASKINFO,
-                0,
-                &mut info as *mut libc::proc_taskinfo as *mut libc::c_void,
-                size,
-            )
-        };
-        if written != size {
-            return None;
-        }
-        Some(info.pti_resident_size)
+        // 老系统上 `proc_pid_rusage` 可能不可用，退回到 resident；两者都拿不到才不发序列。
+        phys_footprint().or_else(resident_size)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         None
     }
+}
+
+/// macOS 的 `phys_footprint`：与 `top` 的 `MEM` 列、活动监视器同口径。
+#[cfg(target_os = "macos")]
+fn phys_footprint() -> Option<u64> {
+    let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            std::process::id() as libc::c_int,
+            libc::RUSAGE_INFO_V4,
+            &mut info as *mut libc::rusage_info_v4 as *mut libc::rusage_info_t,
+        )
+    };
+    (rc == 0).then_some(info.ri_phys_footprint)
+}
+
+/// `PROC_PIDTASKINFO` 的 resident_size（RSS，字节）；`phys_footprint` 不可用时的退路。
+#[cfg(target_os = "macos")]
+fn resident_size() -> Option<u64> {
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            std::process::id() as libc::c_int,
+            libc::PROC_PIDTASKINFO,
+            0,
+            &mut info as *mut libc::proc_taskinfo as *mut libc::c_void,
+            size,
+        )
+    };
+    (written == size).then_some(info.pti_resident_size)
 }
 
 /// 本进程累计 CPU 时间（user + system），单位是 `ticks_per_sec()` 的 tick。
@@ -316,6 +342,27 @@ mod tests {
     fn counter_ticks_never_go_backwards() {
         // 重启后计数归零，差分必须夹到 0，不能出现负占用。
         assert_eq!(cpu_ratio_between(1_000, 10, 1.0, 100), Some(0.0));
+    }
+
+    /// macOS 上报的必须是 `phys_footprint`（`top` 的 `MEM` 列口径），不是 RSS。
+    ///
+    /// 这里不同 `resident_size()` 比大小——两者差多少取决于此刻有多少干净文件页驻留，
+    /// 在 CI 上不稳定；真正确认口径的是「上报值跟 `phys_footprint()` 一致」。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_memory_uses_phys_footprint() {
+        let footprint = phys_footprint().expect("proc_pid_rusage(RUSAGE_INFO_V4) on macos");
+        assert!(
+            footprint > 0,
+            "footprint should be positive, got {footprint}"
+        );
+
+        let reported = current_memory_bytes().expect("current_memory_bytes on macos");
+        let drift = reported.abs_diff(footprint);
+        assert!(
+            drift * 10 < footprint,
+            "reported {reported} should track footprint {footprint}"
+        );
     }
 
     #[test]
