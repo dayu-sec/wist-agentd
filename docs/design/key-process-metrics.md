@@ -345,7 +345,7 @@ JDBC URL 里的口令。一旦让它进入任何持久化结构，就等于：
 | 3 | 前端：`isExecutableSource` 同步（否则页面把可采面标成“未接”） | ✅ 已实现 |
 | 4 | agentd：`key_process_grant()` + 四种签名匹配 + 分组/代表/上限 | ✅ 已实现 |
 | 5 | agentd：`no match` 进面的采集结果（`target_not_ready` + 具体签名） | ✅ 已实现 |
-| 6 | 知识库：`ProcessMetrics` 面 + 4 个单元（kafka / nginx / redis / postgres） | ✅ 已加单元、包与模板（`catalog_version = 24`） |
+| 6 | 知识库：`ProcessMetrics` 面 + 4 个单元（kafka / nginx / redis / postgres） | ✅ `catalog_version = 25`（knowledge 0.12.0-alpha）—— 包同时挂到 **`linux-host`**（关键进程属主机普遍能力，与容器 stdout 同理），`linux-compute` / `linux-data` 不变 |
 | 7 | 端到端验收（真机授权 → 指标落 VM → atlas 查询时 join） | ⬜ 未做（atlas 侧 §12.2 并行） |
 
 > 依赖关系已变：contracts 0.12 要求**整条链**（metrics / api / validate）一起升版发布，
