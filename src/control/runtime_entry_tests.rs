@@ -1625,3 +1625,68 @@ fn probe_accepts_kafka_group_policy_flags() {
     assert_eq!(request.max_groups, Some(50));
     assert_eq!(request.lag_threshold, Some(0));
 }
+
+#[test]
+fn run_plan_needs_a_plan_file() {
+    let err = parse_command(["run-plan"]).expect_err("missing --plan");
+    assert!(err.to_string().contains("--plan"), "{err}");
+}
+
+/// 配置**存在但坏了**时必须失败退出，而不是 `.ok()` 吞掉后跳过本地终审。
+/// 否则「改坏配置」就成了绕过验签的捷径。
+#[test]
+fn a_broken_config_is_fatal_instead_of_skipping_local_review() {
+    let root = temp_dir("broken-config");
+    let conf = root.join("conf");
+    fs::create_dir_all(&conf).expect("mkdir");
+    // `schema_version` 不合法 ⇒ `validate_config` 失败。
+    fs::write(conf.join("agentd.toml"), "schema_version = \"v9\"\n").expect("write config");
+
+    let err = block_on(super::run_local_plan(
+        &root,
+        Some(&conf),
+        root.join("plan.json"),
+        Some(root.join("run")),
+        Some(root.join("state")),
+        Some(root.join("wist-exec")),
+        true,
+    ))
+    .expect_err("broken config must not be ignored");
+
+    let text = format!("{err:?}");
+    assert!(text.contains("加载失败"), "{text}");
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn run_plan_parses_its_flags() {
+    let parsed = parse_command([
+        "run-plan",
+        "--plan",
+        "/tmp/p.json",
+        "--run-dir",
+        "/tmp/run",
+        "--state-dir",
+        "/tmp/state",
+        "--exec-bin",
+        "/tmp/wist-exec",
+        "--json",
+    ])
+    .expect("parse run-plan");
+
+    let Command::RunPlan {
+        plan_path,
+        run_dir,
+        state_dir,
+        exec_bin,
+        json,
+    } = parsed.command
+    else {
+        panic!("expected run-plan");
+    };
+    assert_eq!(plan_path.as_deref(), Some(Path::new("/tmp/p.json")));
+    assert_eq!(run_dir.as_deref(), Some(Path::new("/tmp/run")));
+    assert_eq!(state_dir.as_deref(), Some(Path::new("/tmp/state")));
+    assert_eq!(exec_bin.as_deref(), Some(Path::new("/tmp/wist-exec")));
+    assert!(json);
+}

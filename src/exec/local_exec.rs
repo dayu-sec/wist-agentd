@@ -20,6 +20,11 @@ use crate::execution_support::final_state_name;
 use crate::process_control::process_identity;
 use crate::state_store::running;
 
+/// `config.backup` / `apply` / `rollback` 的备份根（在 `state_dir` 下）。
+///
+/// 放 `state/` 而不是 `run/`：run 目录按保留策略轮转清理，而回滚可能要过很久才发生。
+const ACTION_BACKUPS_DIR: &str = "action_backups";
+
 #[path = "local_exec_support.rs"]
 mod support;
 
@@ -79,6 +84,10 @@ pub async fn execute_async(request: &LocalExecRequest) -> io::Result<LocalExecOu
         .arg("run")
         .arg("--workdir")
         .arg(&workdir)
+        // `config.*` 的备份落点：放在 agent 的 state 目录下，**不随 run 目录轮转清掉**
+        // —— 回滚可能要过很久才发生。
+        .arg("--backup-dir")
+        .arg(request.state_dir.join(ACTION_BACKUPS_DIR))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;

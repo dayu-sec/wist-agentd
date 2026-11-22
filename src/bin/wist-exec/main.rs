@@ -12,17 +12,24 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let workdir_path = parse_cli_args(std::env::args().skip(1))?;
+    let (workdir_path, backup_dir) = parse_cli_args(std::env::args().skip(1))?;
     let workdir = workdir::ExecutionWorkdir::open(&workdir_path)
         .map_err(|err| format!("open workdir failed: {err}"))?;
-    let result = runtime::execute(&workdir).map_err(|err| format!("execute failed: {err}"))?;
+    let result = runtime::execute(&workdir, backup_dir.as_deref())
+        .map_err(|err| format!("execute failed: {err}"))?;
     result_writer::write(&workdir, &result)
         .map_err(|err| format!("persist result failed: {err}"))?;
     eprintln!("wist-exec finished in {}", workdir.root.display());
     Ok(())
 }
 
-fn parse_cli_args<I>(mut args: I) -> Result<std::path::PathBuf, String>
+/// 解析 `run --workdir <path> [--backup-dir <path>]`。
+///
+/// `--backup-dir` 是 `config.backup` / `apply` / `rollback` 的落点：**没给就不允许
+/// 做不可回滚的变更**（handler 会报 `backup_unavailable`），而不是默认写到某个临时目录。
+fn parse_cli_args<I>(
+    mut args: I,
+) -> Result<(std::path::PathBuf, Option<std::path::PathBuf>), String>
 where
     I: Iterator<Item = String>,
 {
@@ -32,11 +39,27 @@ where
         None => return Err("missing subcommand: expected run --workdir <path>".to_string()),
     }
 
-    match (args.next().as_deref(), args.next()) {
-        (Some("--workdir"), Some(path)) => Ok(std::path::PathBuf::from(path)),
-        (Some(flag), _) => Err(format!("unsupported flag: {flag}")),
-        (None, _) => Err("missing --workdir <path>".to_string()),
+    let mut workdir: Option<std::path::PathBuf> = None;
+    let mut backup_dir: Option<std::path::PathBuf> = None;
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--workdir" => {
+                workdir = Some(std::path::PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| "missing value for --workdir".to_string())?,
+                ));
+            }
+            "--backup-dir" => {
+                backup_dir =
+                    Some(std::path::PathBuf::from(args.next().ok_or_else(|| {
+                        "missing value for --backup-dir".to_string()
+                    })?));
+            }
+            other => return Err(format!("unsupported flag: {other}")),
+        }
     }
+    let workdir = workdir.ok_or_else(|| "missing --workdir <path>".to_string())?;
+    Ok((workdir, backup_dir))
 }
 
 #[cfg(test)]
@@ -99,14 +122,16 @@ mod tests {
                 max_total_duration_ms: 30_000,
                 step_timeout_default_ms: 10_000,
                 execution_profile: "agent_exec_v1".to_string(),
-                required_capabilities: vec!["process.list".to_string()],
+                required_capabilities: vec!["disk.cleanup.preview".to_string()],
+                allow: None,
             },
             ActionPlanProgram {
                 entry: "step_collect".to_string(),
                 steps: vec![ActionPlanStep {
                     id: "step_collect".to_string(),
                     kind: "invoke".to_string(),
-                    op: Some("process.list".to_string()),
+                    op: Some("disk.cleanup.preview".to_string()),
+                    args: Some(serde_json::json!({ "target": "tmp" })),
                 }],
             },
         );
@@ -129,7 +154,7 @@ mod tests {
         write_fixture_workdir(&dir);
 
         let workdir = ExecutionWorkdir::open(&dir).expect("open workdir");
-        let result = runtime::execute(&workdir).expect("execute");
+        let result = runtime::execute(&workdir, None).expect("execute");
         result_writer::write(&workdir, &result).expect("write result");
 
         let stored_result: wist_contracts::action_result::ActionResult =

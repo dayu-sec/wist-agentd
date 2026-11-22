@@ -1,8 +1,14 @@
 [package]
 name = "wist-agentd"
-version = "0.36.0" #@gxl:set(version)
+version = "0.40.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
+
+[features]
+default = []
+# 仅测试：允许 `WIST_CLEANUP_ROOT` 覆盖清理根目录（见 `exec/opcode/cleanup`）。
+# 发布构建不启用，因此二进制里不存在这个口子。
+test-cleanup-roots = []
 
 [dependencies]
 globset = "0.4"
@@ -43,7 +49,7 @@ tokio = { version = "1.48", features = ["full"] }
 # 下限必须是 0.10.4：本仓用 `AgentLocalStandingWork.collection`（采集面采集结果），
 # 0.10.3 没这个字段。写成 `0.10.3` 时一个 `cargo update -Z minimal-versions`
 # 或 CI 的最小版本任务就能解析到编译不过的版本。
-wist-contracts = { version = "0.12" }
+wist-contracts = { version = "0.14" }
 # 本地联调：切 path（整条链一起切）
 #wist-contracts = { version = "0.12", path = "../wist-contracts" }
 # 跨进程 seam 报文（enrollment / agent_status / gateway / work / agent_uplink）。
@@ -66,6 +72,9 @@ rustls-pemfile = "2"
 sha2 = "0.10"
 # SCRAM 的 salt / nonce / proof 都是 base64；`/dev/urandom` 只提供随机字节。
 base64 = "0.22"
+# 计划签发证明的**验签**（Ed25519）。只验不签 —— 私钥在签发方（网关，后续是 center），
+# agentd 永远只持有公钥。`ring` 本来就在依赖树里（rustls 的传递依赖），这里只是直依赖它。
+ring = "0.17"
 # 没配 `tls_ca_file` 时用系统根做校验（reqwest 的 rustls 通道用的也是它）。
 rustls-platform-verifier = "0.7"
 # MySQL / TiDB 指标采集（只读）。musl 静态发布下已探针验证：不引入新的 C 依赖
@@ -79,7 +88,7 @@ sqlx = { version = "0.9", default-features = false, features = [
 ] }
 wist-log = { version = "0.1" }
 #wist-log = { version = "0.1", path = "../wist-log" }
-wist-validate = { version = "0.10" }
+wist-validate = { version = "0.12" }
 # 本地联调：切 path（整条链一起切）
 #wist-validate = { version = "0.10", path = "../wist-validate" }
 
@@ -113,6 +122,11 @@ path = "src/bin/wist-upgrader.rs"
 # 2026-11-10：采集状态改多字段正交模型 → `wist-contracts` 0.11.0 / `wist-api` 0.11.0 /
 # `wist-metrics` 0.19.0 / `wist-validate` 0.9.0 均已上 crates.io，patch 保持注释。
 [patch.crates-io]
+# E0（`ActionPlanStep.args`）: contracts 0.13 / validate 0.11 / api 0.13.1 / metrics 0.20.1
+# 尚未全部发布，本地联调先走 path。发布完成后逐行注释回来。
+# 2026-11-22：四个 crate 已全部上 crates.io（contracts 0.14.0 / api 0.13.2 / metrics 0.20.2 /
+# validate 0.12.0），patch 保持注释；留着会让 CI 报
+# `patch location ... does not contain packages`（wist-gateway v0.52.0-alpha 首次发布就这样红过）。
 # wist-contracts = { path = "../wist-contracts" }
 # wist-api = { path = "../wist-api" }
 # wist-validate = { path = "../wist-validate" }

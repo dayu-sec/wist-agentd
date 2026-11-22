@@ -69,6 +69,14 @@ enum Command {
     },
     /// 单次采集 + 落文件：不启服务、不进授权链路（见 [`crate::telemetry::metrics::probe_cli`]）。
     Probe(ProbeRequest),
+    /// 本地执行一条 ActionPlan（E0：不经网关；用于联调与排障）。
+    RunPlan {
+        plan_path: Option<PathBuf>,
+        run_dir: Option<PathBuf>,
+        state_dir: Option<PathBuf>,
+        exec_bin: Option<PathBuf>,
+        json: bool,
+    },
 }
 
 /// `metrics-labels` 子命令的动作。
@@ -208,7 +216,183 @@ where
             crate::investigate::run(config_root.as_deref(), request, json).await
         }
         Command::Probe(request) => crate::telemetry::metrics::probe_cli::run(request).await,
+        Command::RunPlan {
+            plan_path,
+            run_dir,
+            state_dir,
+            exec_bin,
+            json,
+        } => {
+            run_local_plan(
+                &root,
+                parsed.config_dir.as_deref(),
+                plan_path.expect("parser guarantees --plan for run-plan"),
+                run_dir,
+                state_dir,
+                exec_bin,
+                json,
+            )
+            .await
+        }
     }
+}
+
+/// 本地执行一条 `ActionPlan`：`run-plan --plan <file>`。
+///
+/// 不经网关、不进审批链路：这是**人在机器上跑一条计划**的入口，
+/// 与手工 `rm` 同级；真正的远程派发在 E2 才接。
+async fn run_local_plan(
+    root: &Path,
+    config_dir: Option<&Path>,
+    plan_path: PathBuf,
+    run_dir: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
+    exec_bin: Option<PathBuf>,
+    json: bool,
+) -> AgentdResult<i32> {
+    use wist_contracts::action_result::FinalStatus;
+
+    let config_root = match config_dir {
+        Some(path) => resolve_config_dir_arg(root, path),
+        None => default_config_root(),
+    };
+    // 配置**存在但无效**时不能静默降级：那会让 `run-plan` 跳过本地终审（含验签），
+    // 而“改坏配置文件”比“改开关”容易得多。只有**配置不存在**才走无配置的 CLI 用法。
+    let config_path = crate::config_runtime::resolve_config_path(&config_root);
+    let config = if config_path.exists() {
+        Some(
+            crate::config_runtime::load_from_path(&config_path).map_err(|err| {
+                AgentdReason::system_error().to_err().with_detail(format!(
+                    "配置文件 {} 加载失败（不会跳过本地终审）：{err}",
+                    config_path.display()
+                ))
+            })?,
+        )
+    } else {
+        None
+    };
+    let paths = config
+        .as_ref()
+        .map(|config| config.paths.clone())
+        .unwrap_or_default();
+    let execution = config
+        .as_ref()
+        .map(|config| config.execution.clone())
+        .unwrap_or_default();
+    let instance_id = config
+        .as_ref()
+        .and_then(|config| config.agent.instance_name.clone())
+        .unwrap_or_else(|| "cli".to_string());
+
+    let run_dir = run_dir.unwrap_or_else(|| PathBuf::from(&paths.run_dir));
+    let state_dir = state_dir.unwrap_or_else(|| PathBuf::from(&paths.state_dir));
+    let exec_bin = match exec_bin {
+        Some(path) => path,
+        None => {
+            resolve_exec_bin().source_err(AgentdReason::ExecBinUnavailable, "resolve wist-exec")?
+        }
+    };
+    let log_dir = PathBuf::from(&paths.log_dir);
+    crate::bootstrap::initialize(root, &run_dir, &state_dir, &log_dir).map_err(|err| {
+        AgentdReason::system_error()
+            .to_err()
+            .with_detail(format!("初始化运行目录失败：{err}"))
+    })?;
+
+    let plan: wist_contracts::action_plan::ActionPlan = wist_shared::fs::read_json(&plan_path)
+        .map_err(|err| {
+            AgentdReason::system_error()
+                .to_err()
+                .with_detail(format!("读取计划失败 {}：{err}", plan_path.display()))
+        })?;
+    match config.as_ref() {
+        // 手工执行与网关下发走**同一套**本地终审：过期 / 目标 / 能力 / 审批
+        // 不会因为「是人敲的命令」就被跳过。否则现场会以为验过了。
+        Some(config) => {
+            let outcome = crate::exec::plan_review::review(&plan, config, now_ts_ms()).map_err(
+                |rejection| {
+                    AgentdReason::system_error().to_err().with_detail(format!(
+                        "计划未通过本地终审（{}）：{}",
+                        rejection.code, rejection.detail
+                    ))
+                },
+            )?;
+            if let Some(summary) = outcome.attestation.summary() {
+                eprintln!("attestation: {summary}");
+            }
+        }
+        // 没有 agent 配置就没有身份与能力基线，只能做契约校验 —— 如实说没查什么。
+        None => {
+            wist_validate::action_plan::validate_action_plan(&plan).map_err(|err| {
+                AgentdReason::system_error()
+                    .to_err()
+                    .with_detail(format!("计划校验失败：{}", err.code))
+            })?;
+            eprintln!(
+                "warning: 未加载 agent 配置，已跳过本地终审（expires_at / target / capabilities / approval 未检查）"
+            );
+        }
+    }
+
+    let _submitted = crate::scheduler::submit_local_plan(&crate::scheduler::SchedulerRequest {
+        run_dir: run_dir.clone(),
+        state_dir: state_dir.clone(),
+        plan,
+    })
+    .map_err(|err| {
+        AgentdReason::system_error()
+            .to_err()
+            .with_detail(format!("计划入队失败：{err}"))
+    })?;
+
+    let drained = crate::scheduler::drain_next_with_report_async(&crate::scheduler::DrainRequest {
+        run_dir: run_dir.clone(),
+        state_dir: state_dir.clone(),
+        exec_bin,
+        instance_id,
+        cancel_grace_ms: execution.cancel_grace_ms,
+        stdout_limit_bytes: execution.default_stdout_limit_bytes,
+        stderr_limit_bytes: execution.default_stderr_limit_bytes,
+    })
+    .await?;
+
+    let Some(outcome) = drained else {
+        return Err(AgentdReason::system_error().to_err().with_detail(
+            "计划已入队但没有被调度（队列头被阻塞，或同一 action 正在执行）".to_string(),
+        ));
+    };
+
+    let result = &outcome.report.result;
+    let result_path = run_dir
+        .join(wist_shared::paths::ACTIONS_DIR)
+        .join(&outcome.execution_id)
+        .join(wist_shared::paths::WORKDIR_RESULT_FILE);
+
+    if json {
+        let text = serde_json::to_string_pretty(result).map_err(|err| {
+            AgentdReason::system_error()
+                .to_err()
+                .with_detail(format!("序列化结果失败：{err}"))
+        })?;
+        println!("{text}");
+    } else {
+        println!(
+            "execution_id={} action_id={} status={} steps={}",
+            outcome.execution_id,
+            result.action_id,
+            result.final_status.as_state_name(),
+            result.step_records.len()
+        );
+        if let Some(reason) = result.exit_reason.as_deref() {
+            println!("exit_reason={reason}");
+        }
+        println!("result={}", result_path.display());
+    }
+
+    Ok(match result.final_status {
+        FinalStatus::Succeeded => 0,
+        _ => 1,
+    })
 }
 
 #[cfg(test)]
@@ -487,6 +671,50 @@ where
             index += 1;
             continue;
         }
+        if arg == "run-plan" {
+            if command_explicit {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "multiple commands are not supported",
+                ));
+            }
+            command = Command::RunPlan {
+                plan_path: None,
+                run_dir: None,
+                state_dir: None,
+                exec_bin: None,
+                json: false,
+            };
+            command_explicit = true;
+            index += 1;
+            continue;
+        }
+        if arg == "--plan" || arg == "--run-dir" || arg == "--state-dir" || arg == "--exec-bin" {
+            let value = option_value(&args, index + 1, arg.to_str().unwrap_or("flag"))?;
+            match &mut command {
+                Command::RunPlan {
+                    plan_path,
+                    run_dir,
+                    state_dir,
+                    exec_bin,
+                    ..
+                } => match arg.to_str().unwrap_or_default() {
+                    "--plan" => *plan_path = Some(PathBuf::from(value)),
+                    "--run-dir" => *run_dir = Some(PathBuf::from(value)),
+                    "--state-dir" => *state_dir = Some(PathBuf::from(value)),
+                    "--exec-bin" => *exec_bin = Some(PathBuf::from(value)),
+                    _ => unreachable!("flag was matched above"),
+                },
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{arg:?} is only supported with run-plan"),
+                    ));
+                }
+            }
+            index += 2;
+            continue;
+        }
         if arg == "--no-wait" {
             match &mut command {
                 Command::RefreshFacts { wait_secs } | Command::Refresh { wait_secs, .. } => {
@@ -640,10 +868,15 @@ where
                     index += 1;
                     continue;
                 }
+                Command::RunPlan { json, .. } => {
+                    *json = true;
+                    index += 1;
+                    continue;
+                }
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "--json is only supported with diagnose / investigate / probe",
+                        "--json is only supported with diagnose / investigate / probe / run-plan",
                     ));
                 }
             }
@@ -674,7 +907,7 @@ where
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "unknown argument or command: {display}{suggestion} (supported: help | version | init-config [--stdout] | service <print|install|uninstall|status> | enroll | diagnose [--json] [--offline] | refresh-facts [--wait <secs> | --no-wait] | refresh <--all | --only policies,work,facts,metrics-labels[,credentials[,uplink]]> [--wait <secs> | --no-wait] | metrics-labels <show|refresh|clear-cache> | investigate [topic] [--path <dir>] [--top <n>] [--min-size <size>] [--depth <n>] [--max-seconds <n>] [--json] | probe <pg|mysql|doris|kafka> [--addr <host:port>] [--password-file <path>] [--out <dir|file>] [--timeout-ms <n>] [--list] [--all] [--security-protocol <p>] [--username <u>] [--ca-file <path>] [--json] | --config-dir <path>)",
+                "unknown argument or command: {display}{suggestion} (supported: help | version | init-config [--stdout] | service <print|install|uninstall|status> | enroll | diagnose [--json] [--offline] | refresh-facts [--wait <secs> | --no-wait] | refresh <--all | --only policies,work,facts,metrics-labels[,credentials[,uplink]]> [--wait <secs> | --no-wait] | metrics-labels <show|refresh|clear-cache> | investigate [topic] [--path <dir>] [--top <n>] [--min-size <size>] [--depth <n>] [--max-seconds <n>] [--json] | probe <pg|mysql|doris|kafka> [--addr <host:port>] [--password-file <path>] [--out <dir|file>] [--timeout-ms <n>] [--list] [--all] [--security-protocol <p>] [--username <u>] [--ca-file <path>] [--json] | run-plan --plan <file> [--run-dir <dir>] [--state-dir <dir>] [--exec-bin <path>] [--json] | --config-dir <path>)",
             ),
         ));
     }
@@ -686,6 +919,16 @@ where
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "refresh needs a scope: --all or --only <sources>",
+        ));
+    }
+
+    // `run-plan` 没有计划文件就什么也做不了。
+    if let Command::RunPlan { plan_path, .. } = &command
+        && plan_path.is_none()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "run-plan needs --plan <file>",
         ));
     }
 
@@ -723,6 +966,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "metrics-labels",
     "investigate",
     "probe",
+    "run-plan",
 ];
 
 /// `investigate` 的取值参数（题目本身的选项）。
@@ -879,6 +1123,10 @@ fn looks_like_option(value: &OsString) -> bool {
                 | "--min-size"
                 | "--depth"
                 | "--max-seconds"
+                | "--plan"
+                | "--run-dir"
+                | "--state-dir"
+                | "--exec-bin"
         )
     })
 }

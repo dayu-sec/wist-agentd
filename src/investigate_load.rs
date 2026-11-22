@@ -30,7 +30,7 @@
 use std::fs;
 use std::time::Duration;
 
-use sysinfo::{ProcessesToUpdate, System};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use crate::config::agent_config::AgentConfig;
 use crate::doctor::Status;
@@ -121,6 +121,10 @@ pub(crate) fn investigate(
 pub(crate) struct ProcessSample {
     pub pid: u32,
     pub name: String,
+    /// 父进程 pid；读不到时为 `None`。
+    pub ppid: Option<u32>,
+    /// 属主 uid；读不到时为 `None`。
+    pub uid: Option<u32>,
     /// CPU 占用（百分比；多线程进程会超过 100）。
     pub cpu: f32,
     /// 常驻内存（字节）。
@@ -250,39 +254,29 @@ fn sample_window(max_seconds: u64) -> Duration {
     )
 }
 
-/// 采一次样：两次刷新之间的增量就是 CPU 占用的定义。
-fn sample(request: &InvestigateRequest, config: Option<&AgentConfig>) -> Result<Snapshot, String> {
-    let window = sample_window(request.max_seconds);
-    let mut system = System::new();
-    // 第一次刷新只是把「基准」立起来；sysinfo 的 CPU% 需要前后两次才能算出来。
-    system.refresh_cpu_all();
-    system.refresh_processes(ProcessesToUpdate::All, true);
-    system.refresh_memory();
-    let stat_before = cpu_times_before();
-    // cgroup 累计值：CPU 时间的**权威口径**（不依赖进程采样，窗口内起落的也算得到）。
-    let pids: Vec<u32> = system.processes().keys().map(|pid| pid.as_u32()).collect();
-    let cgroup_before = collect_cgroup_usage(&pids, None);
-    // 计时从**基准读完**开始：分母取真实经过的时间，而不是我们想等的 `window`。
-    let started = std::time::Instant::now();
+/// 一轮进程表刷新。
+///
+/// 必须走 `refresh_processes_specifics` 而不是 `refresh_processes`：后者**不刷 user**，
+/// 于是 `uid` 永远是 `None`，而 `process.list` 的 `uid` 过滤会静默地一个都不命中。
+fn refresh_processes(system: &mut System) {
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_memory()
+            .with_cpu()
+            .with_disk_usage()
+            .with_exe(UpdateKind::OnlyIfNotSet)
+            .with_user(UpdateKind::OnlyIfNotSet)
+            .with_tasks(),
+    );
+}
 
-    std::thread::sleep(window);
-
-    system.refresh_cpu_all();
-    system.refresh_processes(ProcessesToUpdate::All, true);
-    system.refresh_memory();
-    let stat_after = cpu_times_before();
-    let cgroup_after = collect_cgroup_usage(&[], Some(&cgroup_before));
-    let elapsed = started.elapsed().max(window);
-
-    let load = System::load_average();
-    let logical_cores = system.cpus().len();
-    let mut cores: Vec<f64> = system
-        .cpus()
-        .iter()
-        .map(|cpu| cpu.cpu_usage() as f64)
-        .collect();
-    cores.sort_by(|a, b| b.total_cmp(a));
-
+/// 把一轮 `sysinfo` 快照映射成进程样本（**不含 argv**），并返回 D 状态计数。
+///
+/// 抽出来是为了让调查（`load`）与执行器（`process.list`）用同一份映射：
+/// 两边各写一份，字段与脱敏迟早会分叉。
+fn collect_processes(system: &System, config: Option<&AgentConfig>) -> (Vec<ProcessSample>, usize) {
     let mut processes: Vec<ProcessSample> = Vec::new();
     let mut d_state = 0usize;
     let mut labels = LabelCache::default();
@@ -304,6 +298,8 @@ fn sample(request: &InvestigateRequest, config: Option<&AgentConfig>) -> Result<
             } else {
                 name
             },
+            ppid: process.parent().map(|parent| parent.as_u32()),
+            uid: process.user_id().map(|uid| **uid),
             cpu: process.cpu_usage(),
             rss: process.memory(),
             state: state.to_string(),
@@ -319,6 +315,74 @@ fn sample(request: &InvestigateRequest, config: Option<&AgentConfig>) -> Result<
             .then_with(|| b.rss.cmp(&a.rss))
             .then_with(|| a.pid.cmp(&b.pid))
     });
+    (processes, d_state)
+}
+
+/// `process.list` 用：一次全量采样（含 1s CPU 窗口），**不截断**。
+///
+/// 返回 `(全量进程表, 采样窗口毫秒)`。过滤与截断由调用方做 —— 否则「按名字过滤」
+/// 只能在前 N 个里过滤，结果会静默变小。
+pub(crate) fn sample_processes_for_opcode(
+    config: Option<&AgentConfig>,
+) -> Result<(Vec<ProcessSample>, u64), String> {
+    let window = Duration::from_millis(SAMPLE_WINDOW_FLOOR_MS);
+    let mut system = System::new();
+    system.refresh_cpu_all();
+    refresh_processes(&mut system);
+    std::thread::sleep(window);
+    system.refresh_cpu_all();
+    refresh_processes(&mut system);
+    let (processes, _) = collect_processes(&system, config);
+    Ok((processes, window.as_millis() as u64))
+}
+
+/// 只取一次进程快照：**不睡采样窗口、不算 CPU%**。
+///
+/// 给不需要 CPU 的 opcode 用（`service.status` 只要 pid / rss / 归属）。
+/// 返回的 `cpu` 恒为 0（sysinfo 需要两次刷新才有增量）——调用方**不要**上报它。
+pub(crate) fn snapshot_processes_once(
+    config: Option<&AgentConfig>,
+) -> Result<Vec<ProcessSample>, String> {
+    let mut system = System::new();
+    refresh_processes(&mut system);
+    let (processes, _) = collect_processes(&system, config);
+    Ok(processes)
+}
+
+/// 采一次样：两次刷新之间的增量就是 CPU 占用的定义。
+fn sample(request: &InvestigateRequest, config: Option<&AgentConfig>) -> Result<Snapshot, String> {
+    let window = sample_window(request.max_seconds);
+    let mut system = System::new();
+    // 第一次刷新只是把「基准」立起来；sysinfo 的 CPU% 需要前后两次才能算出来。
+    system.refresh_cpu_all();
+    refresh_processes(&mut system);
+    system.refresh_memory();
+    let stat_before = cpu_times_before();
+    // cgroup 累计值：CPU 时间的**权威口径**（不依赖进程采样，窗口内起落的也算得到）。
+    let pids: Vec<u32> = system.processes().keys().map(|pid| pid.as_u32()).collect();
+    let cgroup_before = collect_cgroup_usage(&pids, None);
+    // 计时从**基准读完**开始：分母取真实经过的时间，而不是我们想等的 `window`。
+    let started = std::time::Instant::now();
+
+    std::thread::sleep(window);
+
+    system.refresh_cpu_all();
+    refresh_processes(&mut system);
+    system.refresh_memory();
+    let stat_after = cpu_times_before();
+    let cgroup_after = collect_cgroup_usage(&[], Some(&cgroup_before));
+    let elapsed = started.elapsed().max(window);
+
+    let load = System::load_average();
+    let logical_cores = system.cpus().len();
+    let mut cores: Vec<f64> = system
+        .cpus()
+        .iter()
+        .map(|cpu| cpu.cpu_usage() as f64)
+        .collect();
+    cores.sort_by(|a, b| b.total_cmp(a));
+
+    let (mut processes, d_state) = collect_processes(&system, config);
     let process_total = processes.len();
     // agent 的账要在**截断前**算：它可能 CPU 很低、根本进不了前 N。
     let (agent_cpu, agent_rss, agent_processes) = processes
@@ -1586,6 +1650,8 @@ mod tests {
         ProcessSample {
             pid,
             name: name.to_string(),
+            ppid: None,
+            uid: None,
             cpu,
             rss,
             state: "R".to_string(),

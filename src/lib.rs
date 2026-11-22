@@ -34,6 +34,8 @@ pub mod state_store;
 pub mod sys_compat;
 /// 本机进程事实（一轮一张表）：指标采集与发现侧共用同一个取数入口。
 pub(crate) mod sys_proc;
+/// 本机套接字事实（`/proc/net/*` + `/proc/<pid>/fd`）：调查面与 `socket.list` 共用解析。
+pub(crate) mod sys_sockets;
 pub(crate) mod telemetry;
 /// 升级执行体（`wist-upgrader` 二进制的全部逻辑；见模块注释里的取向说明）。
 pub mod upgrade;

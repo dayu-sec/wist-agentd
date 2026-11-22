@@ -15,6 +15,7 @@ use wist_api::status::{
     AgentCommand, AgentCommandAck, AgentStatusAck, AgentStatusReport, AgentWorkState,
     AgentWorkStateChange, command_kind, command_outcome, refresh_what,
 };
+use wist_contracts::action_plan::ActionPlan;
 use wist_contracts::agent_uplink::AgentUplinkState;
 use wist_contracts::capability_report::LogsCapabilities;
 use wist_contracts::discovery::DiscoverySnapshot;
@@ -571,6 +572,8 @@ async fn report_status_to_control_plane(
         // 调查能力：网关据此在**入队前**判断“这台机器会不会这道题”（`None` = 旧 agentd）。
         // 与采集能力同源：从 `investigate::TOPICS` 取，不另写一份名单。
         investigation_capabilities: Some(crate::investigate::capabilities()),
+        // 执行能力：注册表里真实存在的 opcode（`None` = 旧 agentd）。
+        exec_capabilities: Some(crate::exec::opcode::capabilities()),
         command_acks: command_acks.to_vec(),
     };
     let client = match enrollment_http_client(config) {
@@ -1175,6 +1178,12 @@ enum CommandVerdict {
     AcceptRefreshSources(Vec<String>),
     /// `refresh` 的参数读不懂（空表 / 未知来源 / 把 `uplink` 塞进 `--all` 之类的越权组合）。
     BadRefreshParams(String),
+    /// 下发了一条 `ActionPlan`：本地终审 + 入队（执行由调度器在后续 tick 负责）。
+    ///
+    /// 装箱：`ActionPlan` 比其它变体大得多，不装箱会让整个 verdict 变胖。
+    AcceptActionPlan(Box<ActionPlan>),
+    /// 计划解析失败（JSON 不合法）。终审的拒绝走处理分支，不在这里。
+    BadActionPlanParams(String),
 }
 
 /// `refresh` 命令可接受的来源词表（与 [`refresh_what`] 同值）。
@@ -1221,6 +1230,17 @@ fn evaluate_command(
         return match crate::investigate::InvestigateRequest::from_params(&command.params) {
             Ok(request) => CommandVerdict::AcceptInvestigate(request),
             Err(detail) => CommandVerdict::BadInvestigateParams(detail),
+        };
+    }
+    if command.kind == command_kind::ACTION_PLAN {
+        if now_ms.saturating_sub(command.requested_at_ms) > COMMAND_STALE_MS {
+            return CommandVerdict::Stale;
+        }
+        return match serde_json::from_str::<ActionPlan>(&command.params) {
+            Ok(plan) => CommandVerdict::AcceptActionPlan(Box::new(plan)),
+            Err(err) => {
+                CommandVerdict::BadActionPlanParams(format!("计划不是合法 ActionPlan JSON：{err}"))
+            }
         };
     }
     if command.kind == command_kind::REFRESH {
@@ -1560,6 +1580,115 @@ async fn handle_command_queue(
                 let (outcome, detail) =
                     crate::control::preflight::report_path_probe(config, &paths).await;
                 let ack = record_command(history, &command, outcome, detail, now_ts_ms());
+                turn.history_dirty = true;
+                if source == CommandSource::Remote {
+                    turn.acks.push(ack);
+                }
+                continue;
+            }
+            CommandVerdict::AcceptActionPlan(plan) => {
+                // 本地终审（结构 / 过期 / 目标 / 能力 / 审批）过了才入队；
+                // 执行交给调度器（下一次 drain），这里只回 ack。
+                let plan = *plan;
+                let action_id = plan.meta.action_id.clone();
+                let (outcome, detail) = match crate::exec::plan_review::review(
+                    &plan, config, now_ms,
+                ) {
+                    Ok(review) => {
+                        // 签发证明的结论必须留痕：enforced=false 时它不拦，但必须看得见。
+                        let attestation_note = review
+                            .attestation
+                            .summary()
+                            .map(|summary| format!("；{summary}"))
+                            .unwrap_or_default();
+                        if review.attestation.checked && !review.attestation.verified {
+                            log::warn!(
+                                "event=ActionPlanAttestationNotVerified command_id={} action_id={action_id} enforced={} detail=\"{}\"",
+                                command.command_id,
+                                review.attestation.enforced,
+                                review
+                                    .attestation
+                                    .failure
+                                    .as_ref()
+                                    .map(|failure| failure.detail.as_str())
+                                    .unwrap_or("")
+                            );
+                        }
+                        let submitted = crate::scheduler::submit_local_plan(
+                            &crate::scheduler::SchedulerRequest {
+                                run_dir: PathBuf::from(&config.paths.run_dir),
+                                state_dir: PathBuf::from(&config.paths.state_dir),
+                                plan,
+                            },
+                        );
+                        match submitted {
+                            Ok(outcome) => {
+                                log::info!(
+                                    "event=ActionPlanAccepted command_id={} action_id={} execution_id={}",
+                                    command.command_id,
+                                    action_id,
+                                    outcome.execution_id
+                                );
+                                (
+                                    command_outcome::ACCEPTED,
+                                    format!(
+                                        "计划已入队 action_id={action_id} execution_id={}{attestation_note}",
+                                        outcome.execution_id
+                                    ),
+                                )
+                            }
+                            Err(err) => {
+                                let text = err.to_string();
+                                // 重发 / 重放：已跟踪过的计划不再执行，但对网关仍算「已受理」。
+                                if text.contains(crate::scheduler::DUPLICATE_PLAN_MARKER) {
+                                    log::info!(
+                                        "event=ActionPlanDuplicate command_id={} action_id={action_id}",
+                                        command.command_id
+                                    );
+                                    (
+                                        command_outcome::ACCEPTED,
+                                        format!(
+                                            "计划已在本地（action_id={action_id}），未重复执行{attestation_note}"
+                                        ),
+                                    )
+                                } else {
+                                    log::warn!(
+                                        "event=ActionPlanEnqueueFailed command_id={} action_id={action_id} detail=\"{text}\"",
+                                        command.command_id
+                                    );
+                                    (command_outcome::FAILED, format!("计划入队失败：{text}"))
+                                }
+                            }
+                        }
+                    }
+                    Err(rejection) => {
+                        log::warn!(
+                            "event=ActionPlanRejected command_id={} action_id={action_id} code={} detail=\"{}\"",
+                            command.command_id,
+                            rejection.code,
+                            rejection.detail
+                        );
+                        (
+                            command_outcome::FAILED,
+                            format!("plan_rejected:{}:{}", rejection.code, rejection.detail),
+                        )
+                    }
+                };
+                let ack = record_command(history, &command, outcome, detail, now_ts_ms());
+                turn.history_dirty = true;
+                if source == CommandSource::Remote {
+                    turn.acks.push(ack);
+                }
+                continue;
+            }
+            CommandVerdict::BadActionPlanParams(detail) => {
+                let ack = record_command(
+                    history,
+                    &command,
+                    command_outcome::FAILED,
+                    detail,
+                    now_ts_ms(),
+                );
                 turn.history_dirty = true;
                 if source == CommandSource::Remote {
                     turn.acks.push(ack);
@@ -7902,6 +8031,167 @@ mod tests {
             history.find("c-1").map(|record| record.outcome.as_str()),
             Some(command_outcome::FAILED)
         );
+    }
+    fn sample_plan_for_agent(agent_id: &str) -> wist_contracts::action_plan::ActionPlan {
+        use wist_contracts::action_plan::{
+            ActionPlan, ActionPlanConstraints, ActionPlanMeta, ActionPlanProgram, ActionPlanStep,
+            ActionPlanTarget, ApprovalMode, RiskLevel,
+        };
+        ActionPlan::new(
+            ActionPlanMeta {
+                action_id: "act-plan-1".to_string(),
+                request_id: "req-plan-1".to_string(),
+                template_id: None,
+                tenant_id: "tenant".to_string(),
+                environment_id: "dev".to_string(),
+                plan_version: 1,
+                compiled_at: "2026-01-01T00:00:00Z".to_string(),
+                expires_at: "2031-01-01T00:00:00Z".to_string(),
+            },
+            ActionPlanTarget {
+                agent_id: agent_id.to_string(),
+                instance_id: None,
+                node_id: "node".to_string(),
+                host_name: None,
+                platform: "linux".to_string(),
+                arch: "x86_64".to_string(),
+                selectors: Default::default(),
+            },
+            ActionPlanConstraints {
+                risk_level: RiskLevel::R0,
+                approval_ref: None,
+                approval_mode: ApprovalMode::NotRequired,
+                requested_by: "tester".to_string(),
+                reason: None,
+                max_total_duration_ms: 30_000,
+                step_timeout_default_ms: 10_000,
+                execution_profile: "agent_exec_v1".to_string(),
+                required_capabilities: vec!["disk.cleanup.preview".to_string()],
+                allow: None,
+            },
+            ActionPlanProgram {
+                entry: "s1".to_string(),
+                steps: vec![ActionPlanStep {
+                    id: "s1".to_string(),
+                    kind: "invoke".to_string(),
+                    op: Some("disk.cleanup.preview".to_string()),
+                    args: Some(serde_json::json!({ "target": "tmp" })),
+                }],
+            },
+        )
+    }
+
+    #[test]
+    fn an_action_plan_command_is_parsed_into_a_plan() {
+        let now = now_ts_ms();
+        let plan = sample_plan_for_agent("agent-x");
+        let mut command = sample_command("c-plan", command_kind::ACTION_PLAN, now);
+        command.params = serde_json::to_string(&plan).expect("encode plan");
+
+        match evaluate_command(&command, false, None, Duration::from_secs(60), now) {
+            CommandVerdict::AcceptActionPlan(parsed) => {
+                assert_eq!(parsed.meta.action_id, "act-plan-1");
+                assert_eq!(parsed.target.agent_id, "agent-x");
+            }
+            other => panic!("unexpected verdict: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_broken_action_plan_is_reported_not_guessed() {
+        let now = now_ts_ms();
+        let mut command = sample_command("c-bad-plan", command_kind::ACTION_PLAN, now);
+        command.params = "{nope".to_string();
+        match evaluate_command(&command, false, None, Duration::from_secs(60), now) {
+            CommandVerdict::BadActionPlanParams(detail) => {
+                assert!(detail.contains("ActionPlan"), "{detail}");
+            }
+            other => panic!("unexpected verdict: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_action_plan_command_is_reviewed_and_queued() {
+        let root = local_state_dir("plan-queue");
+        let mut config = test_config();
+        config.paths.run_dir = root.join("run").display().to_string();
+        config.paths.state_dir = root.join("state").display().to_string();
+        config.paths.log_dir = root.join("log").display().to_string();
+        std::fs::create_dir_all(root.join("run")).expect("run dir");
+        std::fs::create_dir_all(root.join("state")).expect("state dir");
+
+        let now = now_ts_ms();
+        let plan = sample_plan_for_agent("agent-x");
+        let mut command = sample_command("c-plan-queue", command_kind::ACTION_PLAN, now);
+        command.params = serde_json::to_string(&plan).expect("encode plan");
+
+        let mut inflight = Vec::new();
+        let mut history = commands::CommandHistory::default();
+        let mut last_refresh: Option<Instant> = None;
+        let turn = handle_command_queue(
+            vec![(command, CommandSource::Remote)],
+            &config,
+            &mut inflight,
+            &mut history,
+            &mut last_refresh,
+            Duration::from_secs(60),
+            now,
+        )
+        .await;
+
+        assert_eq!(turn.acks.len(), 1);
+        assert_eq!(turn.acks[0].outcome, command_outcome::ACCEPTED);
+        let queue_path =
+            crate::state_store::execution_queue::path_for(Path::new(&config.paths.state_dir));
+        let queue =
+            crate::state_store::execution_queue::load_or_default(&queue_path).expect("queue");
+        assert_eq!(queue.items.len(), 1, "plan must be enqueued once");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_plan_for_another_agent_is_rejected_with_a_stable_code() {
+        let root = local_state_dir("plan-wrong-agent");
+        let mut config = test_config();
+        config.paths.run_dir = root.join("run").display().to_string();
+        config.paths.state_dir = root.join("state").display().to_string();
+        std::fs::create_dir_all(root.join("run")).expect("run dir");
+        std::fs::create_dir_all(root.join("state")).expect("state dir");
+
+        let now = now_ts_ms();
+        let plan = sample_plan_for_agent("some-other-agent");
+        let mut command = sample_command("c-plan-wrong", command_kind::ACTION_PLAN, now);
+        command.params = serde_json::to_string(&plan).expect("encode plan");
+
+        let mut inflight = Vec::new();
+        let mut history = commands::CommandHistory::default();
+        let mut last_refresh: Option<Instant> = None;
+        let turn = handle_command_queue(
+            vec![(command, CommandSource::Remote)],
+            &config,
+            &mut inflight,
+            &mut history,
+            &mut last_refresh,
+            Duration::from_secs(60),
+            now,
+        )
+        .await;
+
+        assert_eq!(turn.acks.len(), 1);
+        assert_eq!(turn.acks[0].outcome, command_outcome::FAILED);
+        assert!(
+            turn.acks[0].detail.contains("target_mismatch"),
+            "{}",
+            turn.acks[0].detail
+        );
+        let queue_path =
+            crate::state_store::execution_queue::path_for(Path::new(&config.paths.state_dir));
+        let queue =
+            crate::state_store::execution_queue::load_or_default(&queue_path).expect("queue");
+        assert!(queue.items.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 

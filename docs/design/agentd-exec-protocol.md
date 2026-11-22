@@ -334,6 +334,10 @@ v1 建议：
 - capability 不满足
 - allow/limits 越界
 
+判断边界：**只要此前已经有过成功的步骤，就记 `failed` 而不是 `rejected`**——
+契约（`wist_validate::action_result`）不允许 `rejected` 的结果里出现成功步，
+而“已经删掉一半”的情况把它叫 rejected 也是假话。
+
 ### 9.2 `failed`
 
 计划已进入执行，但执行失败。

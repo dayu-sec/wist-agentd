@@ -47,6 +47,12 @@ pub struct AgentConfig {
     /// 在 daemon 启动早期交给 `wist_log::init`。
     #[serde(default)]
     pub log: wist_log::LogSection,
+    /// 计划签发证明（`[attestation]`）的本地信任锚与强制开关。
+    ///
+    /// 单列一段而不是塞进 `[execution]`：它回答的是「本机凭什么相信这份计划」，
+    /// 与 `max_running_actions` 这类执行调优旋钮不是一件事；改它意味着换信任锚。
+    #[serde(default)]
+    pub attestation: AttestationSection,
 }
 
 impl AgentConfig {
@@ -70,6 +76,7 @@ impl AgentConfig {
             postgres: PgSection::default(),
             doris: PgSection::default(),
             log: wist_log::LogSection::default(),
+            attestation: AttestationSection::default(),
         }
     }
 
@@ -382,6 +389,38 @@ impl Default for ExecutionSection {
             default_stderr_limit_bytes: default_stderr_limit_bytes(),
         }
     }
+}
+
+/// 计划签发证明的本地策略（`[attestation]`）。
+///
+/// 两个字段各自独立：`enforced` 决定「验不过时拦不拦」，`trusted_keys` 决定「信谁」。
+/// 灰度靠翻开关，不需要发版 —— 这是刻意的：出问题时第一个动作应该是把开关关掉，
+/// 而不是回滚整台机器的 agentd。
+///
+/// **被控主机 root 挡不住**：拿到 root 的人可以改这个开关、换公钥、甚至绕过 agentd 直接
+/// 删文件。本段的语义是「在 agentd 正常运行时，计划必须由持有私钥的那一方签发」，
+/// 它不是对抗本机 root 的机制。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Discovery", module = "Discovery.Config")]
+#[serde(deny_unknown_fields)]
+pub struct AttestationSection {
+    /// `true` = R2/R3 计划**没有可信签发证明就拒绝执行**；`false` = 只记录不拦。
+    #[serde(default)]
+    pub enforced: bool,
+    /// 信任锚。空表 + `enforced = true` ⇒ 所有 R2/R3 计划都会被拒（`unknown_signing_key`）。
+    #[serde(default)]
+    pub trusted_keys: Vec<AttestationKeySection>,
+}
+
+/// 一把可信的公钥。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Discovery", module = "Discovery.Config")]
+#[serde(deny_unknown_fields)]
+pub struct AttestationKeySection {
+    /// 与签发方 `attestation.key_id` 对应。换锚时新旧两把可并存，靠它区分。
+    pub key_id: String,
+    /// Ed25519 公钥（SPKI PEM）文件。**必须绝对路径** —— 信任锚不允许随配置目录漂移。
+    pub public_key_pem_file: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ::jumo_derive::Jumo)]

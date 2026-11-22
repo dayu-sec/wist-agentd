@@ -87,14 +87,16 @@ pub(crate) fn sample_plan() -> ActionPlan {
             max_total_duration_ms: 30_000,
             step_timeout_default_ms: 10_000,
             execution_profile: "agent_exec_v1".to_string(),
-            required_capabilities: vec!["process.list".to_string()],
+            required_capabilities: vec!["disk.cleanup.preview".to_string()],
+            allow: None,
         },
         ActionPlanProgram {
             entry: "step_collect".to_string(),
             steps: vec![ActionPlanStep {
                 id: "step_collect".to_string(),
                 kind: "invoke".to_string(),
-                op: Some("process.list".to_string()),
+                op: Some("disk.cleanup.preview".to_string()),
+                args: Some(serde_json::json!({ "target": "tmp" })),
             }],
         },
     )

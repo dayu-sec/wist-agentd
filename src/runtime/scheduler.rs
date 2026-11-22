@@ -13,6 +13,12 @@ use crate::execution_support::find_duplicate_execution;
 use crate::local_exec::next_execution_id;
 use crate::state_store::execution_queue::{self, ExecutionQueueItem};
 
+/// 重复计划的错误文案标记。
+///
+/// 控制面（daemon）要按它把「重投」当成已受理，而不是 `failed`：网关在收到 ack 前会重发，
+/// 而本地已经跟踪过这份计划。标记集中在这里，避免两边各抄一份字面量。
+pub const DUPLICATE_PLAN_MARKER: &str = "duplicate action plan";
+
 #[path = "scheduler_queue_head.rs"]
 mod queue_head_support;
 
@@ -67,7 +73,7 @@ pub fn submit_local_plan(request: &SchedulerRequest) -> RuntimeResult<SchedulerO
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!(
-                "duplicate action plan already tracked locally: action_id={} plan_digest={} execution_id={existing_execution_id}",
+                "{DUPLICATE_PLAN_MARKER} already tracked locally: action_id={} plan_digest={} execution_id={existing_execution_id}",
                 request.plan.meta.action_id, plan_digest
             ),
         )

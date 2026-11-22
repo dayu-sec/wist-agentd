@@ -3,6 +3,205 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.40.0] - 2026-11-22
+
+### 新增（B 线：计划签发证明的**本地验签**）
+
+本地终审从 4 项扩到 5 项。第 5 项只做 `wist-validate` 做不了的三个判断：
+
+- **签的是不是这一份**：本地用 `plan_digest` 重算并与 `attestation.plan_digest` 比对；
+- **本机信不信这把钥匙**：`key_id` 必须命中 `[attestation] trusted_keys`；
+- **政策下限**：`attestation.risk_level` 不能低于计划声明（防「批了 R1、跑 R2」），
+  且 `required_approvers` 不能低于本机硬编码下限（R2 = 1、R3 = 2）。签发方可以更严，不能更松。
+
+新配置段（顶层，因为它是「凭什么相信这份计划」，不是执行调优旋钮）：
+
+```toml
+[attestation]
+enforced = false            # 灰度开关：false = 只记录不拦
+trusted_keys = [
+  { key_id = "gw-plan-k1", public_key_pem_file = "/etc/wist-agentd/gateway-signing.pub" },
+]
+```
+
+- 公钥**只能来自本地绝对路径**：绝不「每次向网关要公钥」，否则验签退化成装饰。
+- `enforced = false` 时仍然**会验**，只是不拦；结论记进日志（`event=ActionPlanAttestationNotVerified`）
+  与命令结果的 `detail`（`attestation 已验签` / `校验失败（…，仅记录）`）。
+- `enforced = true` 且信任锚为空 ⇒ 所有 R2/R3 计划都会被拒（`unknown_signing_key`）——
+  fail-closed，不是「没配就不查」。
+
+新错误码：`attestation_missing`、`plan_digest_mismatch`、`signature_invalid`、
+`unknown_signing_key`、`attestation_key_unavailable`、`attestation_key_invalid`、
+`approval_mismatch`、`approval_risk_mismatch`、`approval_insufficient`、`attestation_expired`。
+
+### 依赖
+
+- 新增直依赖 `ring = "0.17"`（本来就在依赖树里，只是不再靠 rustls 转接）。
+
+### 升级顺序（重要）
+
+`AgentConfig` 是 `deny_unknown_fields`：**旧 agentd 读到 `[attestation]` 段会直接拒启**。
+所以配置下发必须在升级**之后**：
+
+1. 先升 agentd 到 0.40；
+2. 再把 `[attestation]` 段写进 `agentd.toml`（可以先 `enforced = false` 观察）；
+3. 确认日志里出现 `attestation 已验签` 后再翻 `enforced = true`。
+
+反向操作（先推配置）会让机器停在启动失败 —— 这是 `deny_unknown_fields` 的既有代价，
+与其它配置段一致。
+
+### 真机验证（Ubuntu 24.04 / Linux 6.8）
+
+四条路径全部按预期：未签名 → `attestation_missing`；改签名 → `signature_invalid`；
+改内容 → `plan_digest_mismatch`；有效签名 → `final_status=succeeded`（删 3 个旧临时文件、
+保留 1 个新的）。`enforced=false` 时未签名计划被执行，且日志明确标注「仅记录」。
+
+## [0.39.0] - 2026-11-22
+
+### 新增（E3：日志归档与轮转）
+
+- `log.archive`（R2）：把日志复制到同目录的 `<原文件名>.<UTC 时间戳>.archive`（0600），
+  **不动原文件**。写完**复读校验**（sha256 + 长度）：对不上就删掉残缺归档、原文件未动，
+  报 `archive_incomplete`。
+- `log.rotate`（R2）：归档 → 校验通过 → 原地截断 → 复核长度为 0。截断失败时归档仍在，
+  detail 会说明「内容没丢、归档在哪」。
+- 源的词表与 `log.read_range` **同一份**（`syslog` / `auth` / `kern`，各映射一组写死的
+  候选路径）；`journald` / `audit` 依然是 `unsupported_target`。
+- copytruncate 的两条代价写进 `notes`：复制到截断之间写入的行会丢（毫秒级窗口）；
+  写者需以 `O_APPEND` 打开，否则截断后会留空洞。
+- 归档名 `<原文件名>.<UTC 时间戳>.archive` 刻意**不匹配** `disk.cleanup` 的轮转词表
+  （`*.gz` / `*.[0-9]` …）：归档什么时候删是运维的决定，不该被「清理过期临时文件」顺手带走。
+- 同一秒内再归档（`archive` 紧跟 `rotate` 就是这个形状）会在时间戳后追加 `-2`、`-3` …：
+  候选名用 `create_new` 原子地「检查 + 创建」，**任何情况下都不覆盖已有归档**。
+- 新错误码：`archive_incomplete`。
+
+### 刻意不做（写清理由）
+
+- **不实现 `service.reload` / `service.restart`**。本机没有可靠的主 pid 来源：systemd 的
+  `ExecReload` 只有它自己知道，而不 exec / 不走 D-Bus 时只能猜 cgroup 里哪个是主进程 ——
+  猜错就是给 worker 发信号（重载变重启、worker 被打死）。要做就得先引入 D-Bus 客户端，
+  或把「允许 reload 的 unit → 命令」做成白名单；这是需要单独评审的架构决定，不在本版偷做。
+
+## [0.38.0] - 2026-11-22
+
+### 新增（E3 第一块：可回滚的配置变更）
+
+- `config.backup`（R2）：把目标文件原样 + 元数据（摘要 / 大小 / mode / uid / gid）存进
+  `<state>/action_backups/<action_id>/<sha16>-<basename>/`。同一 `action_id` 里
+  **只保留第一份前像**（重跑不会把已经改动过的内容当成原始快照）。
+- `config.apply`（R2）：`path` + `source`（暂存的新文件）+ **必填** `source_sha256`，
+  两者都必须在 `allow.paths` 内。写之前四道闸：本次有备份记录、source 摘要匹配、
+  目标仍等于备份时那份、内容能按需解析；写之后重读验摘要 + 语法，不过就**自动回滚**
+  并报 `verify_failed`（回滚也失败会在 detail 里直接说）。
+- `config.rollback`（R2）：按备份记录还原，支持 `expect_sha256`（只回滚“我们写进去的那一版”），
+  目标被删掉也能恢复；回滚的语义是“原样放回去”，所以**不做格式闸门**（解析结果只作信息）。
+- 写盘一律是“同目录临时文件 → fsync → 保留 mode/owner → rename”，并在 rename 前完成
+  `fchown`；属主保不住就报错，不默默把 `root:nginx` 变成 `root:root`。
+- 执行器新增 `--backup-dir`（由 agentd 从 `state` 目录传入）：**没给就不允许做变更**
+  （`backup_unavailable`），绝不悄悄跳过备份。`config.*` 的 `backup_missing` /
+  `backup_unavailable` 属于计划级拒绝（`rejected`）。
+- 新错误码：`backup_unavailable` / `backup_missing` / `source_hash_mismatch` /
+  `target_changed` / `invalid_config` / `verify_failed` / `write_failed`。
+
+### 变更（内部结构）
+
+- `exec/opcode/config.rs` → `exec/opcode/config/`（`inspect` / `backup` / `change` / `store`）：
+  四个 `config.*` op 共用同一套解析器与路径白名单。
+- `OpInput` 新增 `backups: Option<&BackupContext>`；`wist-exec` 的 `execute()` 新增
+  `backup_dir` 参数。
+
+## [0.37.0] - 2026-11-22
+
+### 新增（E0：执行器内核 + 清理）
+
+- `wist-exec` 不再空跑：按 `program.entry` 顺序执行，`invoke` 走 opcode 注册表，
+  `output` 空操作，`abort` 中止，`branch` / `guard` 明确拒绝（`unsupported_step_kind`）；
+  `StepRecord` 记录真实耗时与稳定错误码。
+- 新增 opcode 注册表（`exec/opcode`）：闭集 + 风险等级 + 平台 + 预算 + 统一错误码
+  （`unknown_op` / `invalid_args` / `budget_exceeded` / `risk_understated` …）。
+- 新增 `disk.cleanup.preview`（R0，只读）与 `disk.cleanup.apply`（R2，仅 Linux）：
+  `target` 闭集（`tmp` / `rotated_logs`），根目录写死；年龄下沉 + 硬上限；
+  符号链接 / 硬链接 / 跨挂载点 / 受保护名 / 被占用文件全部跳过并计数；
+  `apply` 扫描不完整或超上限时**一个文件都不删**。
+- 新增 `wist-agentd run-plan --plan <file>` 本地入口 + 两份示例计划（`examples/cleanup-tmp.*.plan.json`）。
+- 风险守卫：计划风险低于 opcode 要求时拒绝（`risk_understated`），例如 `R0` 计划里放 `apply`。
+
+### 新增（E1：只读 opcode + 执行能力上报）
+
+- `process.list`（R0）：全量进程表，支持 `top` / `name`（子串）/ `uid` / `state` 过滤；
+  **不含 argv**，复用 `investigate_load` 的同一份映射。
+- `process.tree`（R0）：按 `pid` 或 `name` 向上追父进程链（≤ 32 层）。
+- `process.open_files`（R1，仅 Linux）：读 `/proc/<pid>/fd`，区分文件 / socket / pipe / anon；
+  已删除仍打开的文件单列。
+- `file.stat`（R0）/ `file.read_range`（R1）：**必须**命中 `plan.constraints.allow.paths`；
+  canonicalize 后做前缀匹配，符号链接逃逸无效；读取上限 64 KiB，二进制不回传正文。
+- `AgentStatusReport.exec_capabilities`：从注册表取（不另写名单）。
+- `service.status`（R0，仅 Linux/systemd）：**不 exec `systemctl`、不走 D-Bus**。从文件事实给出
+  单元文件位置（local `/etc` / generated `/run` / packaged `/usr/lib`）、`Description=`、
+  `enabled`（`*.wants`/`*.requires` 链接）、`masked`（→ `/dev/null`），并用 cgroup 归属
+  回答「现在有没有进程」。`state` 只有 `running` / `no_process_observed` / `unknown`，
+  `state_source` 写明口径 —— systemd 自己的 `ActiveState`/`SubState`/`NRestarts` 本版拿不到，
+  **不假装知道**。
+- `file.find`（R0）：按**文件名** glob 搜索（`pattern` 不许含路径分隔符），受 `allow.paths`
+  约束（空列表 = 全拒绝），`max_depth`（默认 4 / 上限 16）与条目/时间预算都有界；
+  **永不跟随符号链接**（只列链接本身，不展开目标）；`matched` 不受 `limit` 影响，
+  所以 `truncated` 如实。
+- `socket.list`（R0，仅 Linux）：读 `/proc/net/{tcp,tcp6,udp,udp6}`，**不 exec `ss`/`netstat`**。
+  `proto?`（`tcp`/`udp`，各自含 v4/v6）、`listening_only?`（默认 `true`）；同一
+  `(proto, addr, port, uid, state)` 的多个 socket（`SO_REUSEPORT`）聚合成一行并保留 inode；
+  属于同一组的多个 pid 合并在 `pids`/`processes`。非 root 时 `owners_visible=false`，
+  并在 `notes` 里说「属主不可见 ≠ 没有属主」；快照/netns 两条局限每次输出都带。
+- `file.hash`（R0）：`sha256`，受 `allow.paths` 约束；**只对完整文件算摘要** ——
+  超过 `max_bytes`（默认/上限 256 MiB）或读取中变大时 `sha256=null` + `truncated=true`
+  （半截哈希看起来像真哈希，比没有更危险）。空文件也给确定值。
+- `config.inspect`（R1）：解析 `toml` / `json` / `env`（`format=auto` 时按扩展名再依次试），
+  回结构不回值：`parsed` / `error{kind,line,column}` / `root` / `top_level_keys` / `leaf_count` /
+  `selected[{selector,found,value_type}]`。解析错误**只报行列**，不回放出错行的原文
+  ——那等于绕过「不回值」的承诺。
+- `log.read_range`（R1）：`source` 闭集（`syslog` / `auth` / `kern`，各映射 Debian 与 RHEL 的
+  候选路径），只读尾部：`tail_bytes`（默认 64 KiB / 上限 1 MiB）+ `since_minutes`（1..1440）。
+  `since` 支持 RFC3339 与传统 syslog（`Nov 22 10:00:00`）两种行首时间：后者没带时区，
+  用本机 `localtime_r` 的偏移还原（跨 DST 可能差一小时）；认不出时间的行**不丢**，
+  但 `since.applied=false` 会如实说「本次没有按时间过滤」。**不支持 journald**。
+- `audit.list`（R1，仅 Linux）：只读 `/var/log/audit/audit.log` 尾部，把每行解析成
+  `{type, seq, timestamp_unix, key, exe, comm, uid}`（时间来自 `msg=audit(<sec>.<frac>:<seq>)`，
+  不从行文本猜）；支持 `types` 过滤与 `since_minutes`，并给 `type_counts`。
+  多记录事件**不合并**，在 `notes` 里说明。
+
+### 变更（内部结构）
+
+- 新增 `sys_sockets`：`/proc/net/*` 与 `/proc/<pid>/fd` 的解析/归属从 `investigate_exposure`
+  抽出，调查面与 `socket.list` **共用同一份**（避免字段与过滤条件分叉）。
+- `socket_owners` 增加可选 deadline：时间或 fd 条数任一用完都报「没扫完」，不假装全部归属。
+
+### 新增（E2：下发计划 + 本地终审）
+
+- 新增命令 `kind = action_plan`：`params` 是完整 `ActionPlan`；入队后由调度器执行，
+  ack 回 `accepted` / `failed`（拒绝原因形如 `plan_rejected:<code>:<detail>`）。
+- 本地终审（`exec/plan_review.rs`）：结构 → 过期（与当前时刻比）→ 目标身份 →
+  `required_capabilities` 都在注册表里 → `approval_mode=required` 必须带 `approval_ref`。
+  签名校验**不在本版**（没有信任锚），不假装验过。
+- 路径白名单在执行侧逐次校验（`path_not_allowed`），不在入队时判。
+
+### 修正（发布前实现审查）
+
+- `final_status` 语义收敛：**计划级缺陷**（`unknown_op` / `unsupported_step_kind` /
+  `unsupported_platform` / `unsupported_target` / `invalid_args` / `risk_understated` /
+  `budget_exceeds_step_timeout`）且此前没有任何步骤成功 → `rejected`；
+  运行时失败（`op_failed` / `target_not_found` / `scan_incomplete` / `budget_exceeded`）→ `failed`。
+- `disk.cleanup.apply` 删除前逐条复核：仍是普通文件、`nlink == 1`、mtime 仍早于
+  `min_age_hours`；不成立就不删并记 `changed_since_scan`（防“重建的同名新文件被顺手删”）。
+- `file.stat` / `file.read_range`：`allow.paths` 里出现相对路径 → `invalid_args`
+  （此前静默跳过，会让现场误以为白名单没生效）。
+- `disk.cleanup.*` 输出加 `scan.duration_ms`（`apply` 也带 `scan` 块），便于判断预算是否够用。
+- `run-plan` CLI 现在也过本地终审（`exec/plan_review.rs`）；没有 agent 配置时只做契约校验，
+  并**明确打印未检查的项**。
+
+### 变更（依赖）
+
+- 对齐 `wist-contracts 0.13.0` / `wist-validate 0.11.0` / `wist-api 0.13.1` / `wist-metrics 0.20.1`。
+  `[patch.crates-io]` 已临时指向本地路径，**发布后逐行注释回去**。
+
 ## [0.36.0-alpha] - 2026-11-21
 
 ### 新增（关键进程指标：按授权选目标）

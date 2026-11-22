@@ -1,0 +1,15 @@
+schema_version = "v1"
+
+[agent]
+agent_id = "e2e-agent"
+instance_name = "e2e-instance"
+
+[paths]
+root_dir = "/root/wist-e2e/root"
+
+# 真机验证专用：只信这一把公钥，且 R2/R3 没证明就拒。
+[attestation]
+enforced = true
+trusted_keys = [
+  { key_id = "e2e-k1", public_key_pem_file = "/root/wist-e2e/signing.pub.pem" },
+]

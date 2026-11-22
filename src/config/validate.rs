@@ -51,6 +51,22 @@ pub fn validate_config(contract: &AgentConfig) -> Result<(), ValidationError> {
 
     validate_logs_section(&contract.telemetry.logs)?;
     validate_kafka_section(&contract.kafka)?;
+    // `[attestation]`：强制开了却没有可用的信任锚，就是「所有 R2/R3 都会被拒」。
+    // 启动期就拒，比等到第一份计划到达才报 `unknown_signing_key` 好。
+    if contract.attestation.enforced {
+        if contract.attestation.trusted_keys.is_empty() {
+            return Err(ValidationError::new("missing_attestation_trusted_keys"));
+        }
+        for key in &contract.attestation.trusted_keys {
+            require_non_empty(&key.key_id, "missing_attestation_key_id")?;
+            // 信任锚不允许随配置目录漂移：相对路径会让「当前目录」变成信任边界的一部分。
+            if !std::path::Path::new(&key.public_key_pem_file).is_absolute() {
+                return Err(ValidationError::new(
+                    "attestation_key_path_must_be_absolute",
+                ));
+            }
+        }
+    }
     // `[metrics.labels]` **不再校验**：它已废弃、不再生效（选择类 label 由网关下发）。
     // 保留解析而不是拒收，是为了让带旧字段的 toml 仍能启动（`deny_unknown_fields` 会
     // 让“删掉结构体”变成“旧配置启动失败”）。
@@ -242,6 +258,51 @@ mod tests {
     fn a_config_with_explicit_logs_passes() {
         let config = base_config().with_telemetry(TelemetrySection { logs: valid_logs() });
         validate_config(&config).expect("valid explicit logs config");
+    }
+
+    #[test]
+    fn enforced_attestation_requires_a_trust_anchor() {
+        let mut config = base_config();
+        config.attestation.enforced = true;
+        assert_code(validate_config(&config), "missing_attestation_trusted_keys");
+
+        config.attestation.trusted_keys =
+            vec![crate::config::agent_config::AttestationKeySection {
+                key_id: "gw-plan-k1".to_string(),
+                public_key_pem_file: "/etc/wist-agentd/gw.pub".to_string(),
+            }];
+        validate_config(&config).expect("absolute path with a name is fine");
+    }
+
+    #[test]
+    fn attestation_keys_must_be_named_and_absolute() {
+        let mut config = base_config();
+        config.attestation.enforced = true;
+        config.attestation.trusted_keys =
+            vec![crate::config::agent_config::AttestationKeySection {
+                key_id: String::new(),
+                public_key_pem_file: "/etc/wist-agentd/gw.pub".to_string(),
+            }];
+        assert_code(validate_config(&config), "missing_attestation_key_id");
+
+        config.attestation.trusted_keys =
+            vec![crate::config::agent_config::AttestationKeySection {
+                key_id: "gw-plan-k1".to_string(),
+                public_key_pem_file: "gw.pub".to_string(),
+            }];
+        assert_code(
+            validate_config(&config),
+            "attestation_key_path_must_be_absolute",
+        );
+    }
+
+    /// 灰度：开关关着时可以不配钥匙（只记录不拦），不能因此把配置拒掉。
+    #[test]
+    fn observed_mode_does_not_require_a_trust_anchor() {
+        let mut config = base_config();
+        config.attestation.enforced = false;
+        config.attestation.trusted_keys.clear();
+        validate_config(&config).expect("observe mode may have no key");
     }
 
     /// `[metrics.labels]` 已废弃：**解析**要留着（旧 toml 必须还能启动），但**不再校验、
