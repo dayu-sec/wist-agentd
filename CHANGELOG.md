@@ -3,6 +3,25 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.42.0-alpha] - 2026-11-22
+
+### 修复（执行结果从来没有上报给网关）
+
+**症状**：页面发起响应 → 预览一下发就停住；命令队列里那条 `action_plan` 停在 `claimed`
+（agent 已回报 `accepted`）而 `outcome` 一直为空；网关的 `action_result` 表没有任何记录。
+
+**根因**：调度器把结果写成 `state/reporting/<execution>.report.json` 之后，**没有任何代码把它
+POST 出去** —— `drain_next_async` 把 `DrainOutcome` 连同 `report` 一起丢掉（`.is_some()`），
+`run-plan` CLI 也只打印到 stdout。网关侧的 `POST /api/v1/agent/action-results` 收货端点与
+测试一直都在，**agentd 这侧的发送线从未接上**。
+
+- 新增 `control/action_results.rs`：每拍扫描 `state/reporting/*.report.json` 并上报。
+  - 成功后删信封与状态文件；删不掉最多重发一次（网关按 `(agent_id, action_id)` 幂等）。
+  - 网关不可达时本拍收手、下一拍重试 —— daemon 重启与离线期间产出的结果不会丢。
+  - 4xx 跳过该条（报文/身份问题重试无意义）；5xx 与网络错误留待下拍。
+- 为什么以**磁盘**为队列而不是在 drain 里顺手发：drain 的返回值可能因进程重启丢失，
+  而信封已经落盘；扫盘还能补发「当时网关联不上」的历史积压。
+
 ## [0.41.0-alpha] - 2026-11-22
 
 ### 变更（审批策略：多票 → **单次审批**）

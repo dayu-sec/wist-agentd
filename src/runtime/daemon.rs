@@ -3219,6 +3219,12 @@ async fn run_once_with_failure_cache(
     })
     .await?;
 
+    // 把本地已产出、还没送出去的执行结果发掉。
+    //
+    // `drain_next_async` 只告诉我们「这一拍有没有跑完一份」，它**不负责上报**：
+    // 结果信封已经落在 `state/reporting/`，以磁盘为准发送（daemon 重启 / 网关宕机都能续）。
+    crate::control::action_results::send_pending_action_reports(loop_ctx.config, state_dir).await;
+
     let queue =
         execution_queue::load_or_default_async(&execution_queue::path_for(state_dir)).await?;
     let running_count = count_running_entries_async(state_dir).await?;

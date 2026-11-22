@@ -17,6 +17,7 @@ pub mod log_sources;
 pub mod source_search_policy;
 // 选择类 label（env / cluster / app / …）：网关下发、本机只缓存。
 // 合并与准入都在网关，agentd 复核后贴到指标上（[metrics.labels] 已废弃）。
+pub mod action_results;
 pub mod metrics_labels;
 pub mod work;
 
