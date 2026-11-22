@@ -120,13 +120,17 @@ impl AttestationReport {
 
 /// 风险等级要求的最少审批人数（**硬编码下限**，不允许被计划声明调低）。
 ///
+/// **策略只有两档**：`0`（R0/R1 只读，免审）/ `1`（R2/R3 写，单次审批）。
+/// R3 不再要求两人 —— 多票机制已去掉（单 admin token 下凑不出第二个身份）。
+/// 本机从这个版本起只把 `1` 当作下限：旧网关注入 `required_approvers = 2` 的证明仍然接受
+/// （`2 >= 1`），不会把已发出的计划误拒。
+///
 /// 这里与契约里的 `required_approvers` 是两层：本函数是「执行侧不接受更松的」，`required_approvers`
 /// 是「签发方声明的」（可以更严）。两者都要满足。
 pub fn policy_min_approvers(risk: RiskLevel) -> u8 {
     match risk {
         RiskLevel::R0 | RiskLevel::R1 => 0,
-        RiskLevel::R2 => 1,
-        RiskLevel::R3 => 2,
+        RiskLevel::R2 | RiskLevel::R3 => 1,
     }
 }
 
@@ -551,7 +555,8 @@ mod tests {
         plan.constraints.risk_level = risk;
         plan.constraints.approval_mode = ApprovalMode::Required;
         plan.constraints.approval_ref = Some("apv-1".to_string());
-        let required = if risk == RiskLevel::R3 { 2 } else { 1 };
+        // 单票制：签发方声明的 `required_approvers` 恒为 1（R3 不再要两人）。
+        let required = 1;
         let mut attestation = ActionPlanAttestation {
             api_version: API_VERSION_V1.to_string(),
             plan_digest: plan_digest(&plan),
@@ -709,35 +714,15 @@ mod tests {
     }
 
     #[test]
-    fn r3_policy_minimum_cannot_be_understated_by_the_issuer() {
-        let signer = Signer::new("r3-policy");
+    fn r3_needs_only_one_approver_under_the_single_approval_policy() {
+        let signer = Signer::new("r3-single");
         let config = enforced_config(&signer);
-        let mut plan = plan("2030-01-01T00:00:00Z");
-        plan.constraints.risk_level = RiskLevel::R3;
-        plan.constraints.approval_mode = ApprovalMode::Required;
-        plan.constraints.approval_ref = Some("apv-1".to_string());
-        // 形状合法（2 个审批人 ≥ 声明的 1 人），但本机政策要求 R3 至少 2 人声明。
-        let mut attestation = ActionPlanAttestation {
-            api_version: API_VERSION_V1.to_string(),
-            plan_digest: plan_digest(&plan),
-            approval: ActionPlanApproval {
-                approval_id: "apv-1".to_string(),
-                approvers: vec!["user:alice".to_string(), "user:bob".to_string()],
-                required_approvers: 1,
-                approved_at: "2026-05-31T00:00:00Z".to_string(),
-            },
-            risk_level: RiskLevel::R3,
-            issued_by: "gateway:test".to_string(),
-            key_id: signer.key_id.clone(),
-            algorithm: ATTESTATION_ALGORITHM_ED25519.to_string(),
-            signed_at: "2026-05-31T00:00:00Z".to_string(),
-            expires_at: "2030-01-01T00:00:00Z".to_string(),
-            signature: String::new(),
-        };
-        attestation.signature = signer.sign(&attestation.signing_payload());
-        plan.attestation = Some(attestation);
-        let err = review(&plan, &config, NOW_MS).expect_err("policy minimum is 2");
-        assert_eq!(err.code, codes::APPROVAL_INSUFFICIENT);
+        let plan = attested_plan(&signer, RiskLevel::R3, &["user:alice"]);
+        let outcome = review(&plan, &config, NOW_MS).expect("one approver is enough for R3");
+        assert!(outcome.attestation.verified);
+        assert_eq!(outcome.attestation.approvers, 1);
+        // 本机下限已经是 1：不再有「R3 至少要两人」这条策略。
+        assert_eq!(policy_min_approvers(RiskLevel::R3), 1);
     }
 
     #[test]

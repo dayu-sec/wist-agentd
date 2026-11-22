@@ -3,7 +3,20 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [0.40.0] - 2026-11-22
+## [0.41.0-alpha] - 2026-11-22
+
+### 变更（审批策略：多票 → **单次审批**）
+
+- `plan_review::policy_min_approvers`：R3 的下限从 **2 降到 1**。R2 / R3 都只要求
+  「一人批一次」。
+  - 为什么：网关只有单一 Admin Token，所有票共享同一指纹，凑不出第二个身份；
+    留着 2 票只会让 R3 变成「永远批不了」。
+  - 兼容性：本机只把 `1` 当下限，所以**旧网关签发的「2 人」证明仍然接受**（`2 >= 1`），
+    不会把已发出的计划误拒。
+  - 契约不变：`ActionPlanApproval.required_approvers` 字段保留（它在签名覆盖范围内），
+    将来 center 接手身份体系要恢复多票时，改策略即可，不用动 contracts。
+
+## [0.40.0-alpha] - 2026-11-22
 
 ### 新增（B 线：计划签发证明的**本地验签**）
 
@@ -56,7 +69,7 @@ trusted_keys = [
 改内容 → `plan_digest_mismatch`；有效签名 → `final_status=succeeded`（删 3 个旧临时文件、
 保留 1 个新的）。`enforced=false` 时未签名计划被执行，且日志明确标注「仅记录」。
 
-## [0.39.0] - 2026-11-22
+## [0.39.0-alpha] - 2026-11-22
 
 ### 新增（E3：日志归档与轮转）
 
@@ -82,7 +95,7 @@ trusted_keys = [
   猜错就是给 worker 发信号（重载变重启、worker 被打死）。要做就得先引入 D-Bus 客户端，
   或把「允许 reload 的 unit → 命令」做成白名单；这是需要单独评审的架构决定，不在本版偷做。
 
-## [0.38.0] - 2026-11-22
+## [0.38.0-alpha] - 2026-11-22
 
 ### 新增（E3 第一块：可回滚的配置变更）
 
@@ -110,7 +123,7 @@ trusted_keys = [
 - `OpInput` 新增 `backups: Option<&BackupContext>`；`wist-exec` 的 `execute()` 新增
   `backup_dir` 参数。
 
-## [0.37.0] - 2026-11-22
+## [0.37.0-alpha] - 2026-11-22
 
 ### 新增（E0：执行器内核 + 清理）
 
