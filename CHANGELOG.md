@@ -3,6 +3,31 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.43.1-alpha] - 2026-11-24
+
+### 修复（日志句柄按 inode 归属，别名不再各开一次）
+
+`FileFamilyProcessor` 观测走 `display` 路径、续读判定走 `canonicalize(display)`，两个不同的
+key 指向同一个文件，而 `LogFileHandles` 按**路径字符串**缓存 → 同一文件被 `open` 两次、
+占两个 fd。macOS 上 `/var` 是 `/private/var` 的软链，k8s 的 `/var/log/containers/*.log`
+是指向 `/var/log/pods/...` 的软链 —— 这两种现场都会把本模块要消掉的 open 放大又加回来。
+
+- `LogFileHandles::acquire` 改为按 `(device, inode)` 归属：命中已持有的 inode 就复用句柄，
+  只把条目改挂到本次请求的路径。稳态仍是 0 次 `open`，且同一真实文件只占一个句柄。
+- 这条在 CI 上表现为 `a_second_family_batch_reuses_every_open_handle` 失败
+  （`left: 4, right: 2`）；本地 `TMPDIR` 已是规范路径，所以看不到。
+
+### 修复（测试不再依赖 runner 的路径布局）
+
+- `macos_cmdline_reads_our_own_argv` 原先断言 argv[0] 里含 `deps`，而 CI 的 macOS runner
+  把测试二进制放在 `target/release/build/.../out/` 下，于是这条从 v0.40 起连红。
+  改为断言 argv[0] 指向本进程的可执行文件（文件名相同，或 canonicalize 后相同）。
+
+### 测试
+
+- `acquire_shares_one_handle_across_two_paths_to_the_same_inode`：symlink 别名与真名
+  交替调用只产生 1 次 `open`、句柄表只占 1 条。
+
 ## [0.43.0-alpha] - 2026-11-24
 
 ### 新增（`disk.cleanup.apply` 支持 macOS）

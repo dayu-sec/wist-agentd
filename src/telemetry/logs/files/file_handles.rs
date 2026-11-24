@@ -66,10 +66,15 @@ impl LogFileHandles {
 
     /// 拿这个路径当前的句柄。
     ///
-    /// * 缓存里有、且与路径现在的 `(device, inode)` 一致 → 直接复用（**0 次 open**）；
+    /// * 已持有同一个 `(device, inode)` 的句柄 → 直接复用（**0 次 open**）；
     /// * 路径换了文件（轮转 / 被重建）、或还没缓存 → 重开一次。
     ///
     /// 身份判定用 `stat`（不 open）而不是「先 open 再看」：这正是要消掉的那个动作。
+    ///
+    /// 归属按 **inode** 而不是路径字符串：同一个真实文件会以多个路径出现 ——
+    /// macOS 的 `/var` 是 `/private/var` 的软链，k8s 的 `/var/log/containers/*.log`
+    /// 是指向 `/var/log/pods/...` 的软链。按字符串缓存会让这些别名各开一次、各占一个 fd，
+    /// 正好把本模块要消掉的 open 放大又加回来（一条输入两个路径 = 稳态 2 个 fd）。
     pub async fn acquire(&mut self, path: &Path) -> io::Result<&mut OpenLogFile> {
         let observed = match path_identity_async(path).await {
             Ok(identity) => identity,
@@ -79,32 +84,37 @@ impl LogFileHandles {
                 return Err(err);
             }
         };
-        let reusable = self
+        let held = self
             .entries
-            .get(path)
-            .is_some_and(|entry| entry.file.points_at(observed.0, observed.1));
+            .iter()
+            .find(|(_, entry)| entry.file.points_at(observed.0, observed.1))
+            .map(|(key, _)| key.clone());
         self.seq += 1;
         let seq = self.seq;
-        if reusable {
-            if let Some(entry) = self.entries.get_mut(path) {
+        match held {
+            Some(key) => {
+                let mut entry = self.entries.remove(&key).expect("上面刚找到这条");
                 entry.last_used = seq;
+                // 改挂到本次请求的路径：下一轮用同一个路径就命中，不必再遍历别名。
+                self.entries.insert(path.to_path_buf(), entry);
             }
-        } else {
-            let file = match OpenLogFile::open(path).await {
-                Ok(file) => file,
-                Err(err) => {
-                    self.entries.remove(path);
-                    return Err(err);
-                }
-            };
-            self.opens += 1;
-            self.entries.insert(
-                path.to_path_buf(),
-                Entry {
-                    file,
-                    last_used: seq,
-                },
-            );
+            None => {
+                let file = match OpenLogFile::open(path).await {
+                    Ok(file) => file,
+                    Err(err) => {
+                        self.entries.remove(path);
+                        return Err(err);
+                    }
+                };
+                self.opens += 1;
+                self.entries.insert(
+                    path.to_path_buf(),
+                    Entry {
+                        file,
+                        last_used: seq,
+                    },
+                );
+            }
         }
         Ok(&mut self
             .entries
@@ -228,6 +238,35 @@ mod tests {
         assert_eq!(handles.len(), 1, "旧路径的句柄已被替换");
         fs::remove_file(path).ok();
         fs::remove_file(rotated).ok();
+    }
+
+    /// 同一个真实文件以两个路径出现（symlink 别名 / macOS 的 `/var` → `/private/var`）时，
+    /// 句柄必须共用：按路径字符串缓存会把每个文件的 open 和 fd 都翻一倍。
+    #[cfg(unix)]
+    #[test]
+    fn acquire_shares_one_handle_across_two_paths_to_the_same_inode() {
+        let real = temp_path("alias-real");
+        fs::write(&real, "x\n").expect("write file");
+        let alias = temp_path("alias-link");
+        std::os::unix::fs::symlink(&real, &alias).expect("symlink");
+
+        let mut handles = LogFileHandles::new();
+        block_on(async { handles.acquire(&real).await.map(|_| ()) }).expect("real path");
+        block_on(async { handles.acquire(&alias).await.map(|_| ()) }).expect("alias path");
+
+        assert_eq!(
+            handles.open_count(),
+            1,
+            "同一 inode 的别名只能 open 一次，否则 fd 与 open 次数都翻倍"
+        );
+        assert_eq!(handles.len(), 1, "别名不该在句柄表里多占一条");
+
+        // 别名和真名交替出现也不该重开：归属看 inode，不看路径。
+        block_on(async { handles.acquire(&real).await.map(|_| ()) }).expect("real again");
+        assert_eq!(handles.open_count(), 1, "交替路径也必须复用同一个句柄");
+
+        fs::remove_file(&alias).ok();
+        fs::remove_file(&real).ok();
     }
 
     /// 路径没了就把句柄放掉：否则一个被删掉的文件会被句柄钉着，磁盘块也不归还。

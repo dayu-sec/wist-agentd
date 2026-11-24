@@ -1030,15 +1030,24 @@ mod tests {
         );
     }
 
-    /// 真 sysctl：自己的 argv 读得回来（cargo test 的 argv[0] 在 `target/.../deps/` 下）。
+    /// 真 sysctl：自己的 argv 读得回来。
+    ///
+    /// 断言只比「argv[0] 是不是本进程的可执行文件」，不比路径形状：CI 的 macOS runner
+    /// 会把测试二进制放在 `target/release/build/.../out/` 下，本地 cargo 放在 `deps/`，
+    /// 拿目录名做断言等于把 runner 的布局写进测试（这条因此在 CI 连红过）。
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_cmdline_reads_our_own_argv() {
         let argv = RealProc.cmdline(std::process::id());
         assert!(!argv.is_empty(), "KERN_PROCARGS2 读不到自己的 argv");
+        let argv0 = std::path::Path::new(&argv[0]);
+        let exe = std::env::current_exe().expect("current_exe");
+        let canonical_argv0 = std::fs::canonicalize(argv0).ok();
+        let canonical_exe = std::fs::canonicalize(&exe).ok();
         assert!(
-            argv.iter().any(|arg| arg.contains("deps")),
-            "argv={argv:?} 应包含测试二进制路径"
+            argv0.file_name() == exe.file_name()
+                || (canonical_argv0.is_some() && canonical_argv0 == canonical_exe),
+            "argv={argv:?} 的 argv[0] 指向的不是本进程的可执行文件（{exe:?}）"
         );
     }
 
