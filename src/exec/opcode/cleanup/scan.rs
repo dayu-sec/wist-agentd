@@ -16,8 +16,8 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 
 /// 单次扫描最多看多少条目。
 pub(super) const MAX_ENTRIES: u64 = 200_000;
-/// 扫描 `/proc/<pid>/fd` 的预算：与调查面同一量级。
-#[cfg(target_os = "linux")]
+/// 扫描「谁打开了哪些文件」的预算：与调查面同一量级。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_FD_LINKS: u64 = 200_000;
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -53,7 +53,7 @@ pub(super) struct ScanOutput {
     pub duration_ms: u64,
     /// `false` = 有一块没扫完（预算 / 权限 / 占用检查被截断）。`apply` 必须因此中止。
     pub complete: bool,
-    /// 非 Linux 没有免依赖的占用检查。
+    /// 本平台有没有「不 exec 就能查占用」的能力（Linux `/proc`、macOS libproc）。
     pub open_files_checked: bool,
 }
 
@@ -287,64 +287,135 @@ fn never_rotated(name: &str) -> bool {
 }
 
 fn open_paths(req: &ScanRequest<'_>) -> OpenScan {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "linux")]
+    {
+        open_paths_linux(req)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        open_paths_macos(req)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = req;
         OpenScan::Unsupported
     }
-    #[cfg(target_os = "linux")]
-    {
-        let mut paths = BTreeSet::new();
-        let mut budget = MAX_FD_LINKS;
-        let Ok(procs) = fs::read_dir("/proc") else {
+}
+
+#[cfg(target_os = "linux")]
+fn open_paths_linux(req: &ScanRequest<'_>) -> OpenScan {
+    let mut paths = BTreeSet::new();
+    let mut budget = MAX_FD_LINKS;
+    let Ok(procs) = fs::read_dir("/proc") else {
+        return OpenScan::Supported {
+            paths,
+            complete: false,
+        };
+    };
+    for proc_entry in procs.flatten() {
+        if budget == 0 || Instant::now() >= req.deadline {
             return OpenScan::Supported {
                 paths,
                 complete: false,
             };
+        }
+        let name = proc_entry.file_name();
+        if !name
+            .to_string_lossy()
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+        {
+            continue;
+        }
+        let Ok(fds) = fs::read_dir(proc_entry.path().join("fd")) else {
+            continue;
         };
-        for proc_entry in procs.flatten() {
+        for fd in fds.flatten() {
             if budget == 0 || Instant::now() >= req.deadline {
                 return OpenScan::Supported {
                     paths,
                     complete: false,
                 };
             }
-            let name = proc_entry.file_name();
-            if !name
-                .to_string_lossy()
-                .bytes()
-                .all(|byte| byte.is_ascii_digit())
-            {
-                continue;
-            }
-            let Ok(fds) = fs::read_dir(proc_entry.path().join("fd")) else {
+            budget -= 1;
+            let Ok(target) = fs::read_link(fd.path()) else {
                 continue;
             };
-            for fd in fds.flatten() {
-                if budget == 0 || Instant::now() >= req.deadline {
+            // 只收绝对路径；`socket:[..]` / `pipe:[..]` / 已删除文件都不算占用。
+            if !target.is_absolute() {
+                continue;
+            }
+            if target.to_string_lossy().ends_with(" (deleted)") {
+                continue;
+            }
+            paths.insert(target);
+        }
+    }
+    OpenScan::Supported {
+        paths,
+        complete: true,
+    }
+}
+
+/// macOS：`proc_listallpids` → 每个 pid 的 vnode fd → `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)`。
+///
+/// 与 Linux 的 `/proc` 同一套口径：
+/// * 看不到某个 pid（权限不足 / 刚退出）就跳过它 —— 和 `/proc/<pid>/fd` 读不开时一样，
+///   不把「看不了」当成「除没被占用之外的东西」（两端都是 root 才看得全，agentd 作为
+///   系统服务以 root 跑）；
+/// * 预算 / deadline 用尽 = 没扫完，`apply` 必须中止；
+/// * 只收 vnode（普通文件）路径，socket / pipe / kqueue 不参与。
+///
+/// 另外一条比 Linux 更严的守闸：拿到的路径**不是绝对路径**时直接认定「没扫完」。
+/// 正常 vnode 不会给相对路径；出现这种情况只可能是超长路径被内核截成了尾段，
+/// 那这个 fd 到底指向哪个文件就无法确定了 —— 宁可不删，也不猜。
+#[cfg(target_os = "macos")]
+fn open_paths_macos(req: &ScanRequest<'_>) -> OpenScan {
+    use crate::sys_libproc;
+
+    let mut paths = BTreeSet::new();
+    let mut budget = MAX_FD_LINKS;
+    let Ok(pids) = sys_libproc::list_all_pids() else {
+        return OpenScan::Supported {
+            paths,
+            complete: false,
+        };
+    };
+    for pid in pids {
+        if budget == 0 || Instant::now() >= req.deadline {
+            return OpenScan::Supported {
+                paths,
+                complete: false,
+            };
+        }
+        let Ok(fds) = sys_libproc::list_fds(pid) else {
+            continue;
+        };
+        for fd in fds {
+            if budget == 0 || Instant::now() >= req.deadline {
+                return OpenScan::Supported {
+                    paths,
+                    complete: false,
+                };
+            }
+            budget -= 1;
+            if fd.proc_fdtype as libc::c_int != libc::PROX_FDTYPE_VNODE {
+                continue;
+            }
+            if let Some(path) = sys_libproc::vnode_path(pid, fd.proc_fd) {
+                if !path.is_absolute() {
                     return OpenScan::Supported {
                         paths,
                         complete: false,
                     };
                 }
-                budget -= 1;
-                let Ok(target) = fs::read_link(fd.path()) else {
-                    continue;
-                };
-                // 只收绝对路径；`socket:[..]` / `pipe:[..]` / 已删除文件都不算占用。
-                if !target.is_absolute() {
-                    continue;
-                }
-                if target.to_string_lossy().ends_with(" (deleted)") {
-                    continue;
-                }
-                paths.insert(target);
+                paths.insert(path);
             }
         }
-        OpenScan::Supported {
-            paths,
-            complete: true,
-        }
+    }
+    OpenScan::Supported {
+        paths,
+        complete: true,
     }
 }
 
@@ -453,6 +524,32 @@ mod tests {
         assert!(out.complete, "a missing root must not block apply");
         assert_eq!(out.skipped.missing_roots, 1);
         assert_eq!(out.candidates.len(), 1);
+    }
+
+    /// 占用检查：本进程打开着的文件不进候选（删了也不释放空间）。
+    ///
+    /// 两端走不同内核接口（Linux `/proc/<pid>/fd`、macOS libproc 的 vnode fd），
+    /// 所以这个用例同时也是 macOS 侧 `open_paths_macos` 的第一条真实验证。
+    #[test]
+    fn files_held_open_are_skipped_unless_requested() {
+        let dir = temp_dir("open");
+        let path = dir.join("held.tmp");
+        write_old(&path, 10, Duration::from_secs(48 * 3600));
+        let _held = fs::File::open(&path).expect("hold open");
+
+        let roots = vec![dir.clone()];
+        let out = scan(&request(&roots, Duration::from_secs(3600)));
+        assert!(out.open_files_checked, "本平台必须能查占用");
+        assert_eq!(out.skipped.open, 1, "打开着的文件必须被跳过并计数");
+        assert!(out.candidates.is_empty());
+        assert!(path.exists(), "跳过 ≠ 删除");
+
+        // `preview` 允许列出被占用的文件（只是标上 `open`）。
+        let mut listing = request(&roots, Duration::from_secs(3600));
+        listing.include_open_files = true;
+        let out = scan(&listing);
+        assert_eq!(out.candidates.len(), 1);
+        assert!(out.candidates[0].open);
     }
 
     #[test]

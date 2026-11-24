@@ -32,6 +32,9 @@ pub(crate) mod single_instance;
 pub mod state_store;
 /// 老内核（< 3.17）上没有 `getrandom(2)` 时的熵源回退（仅 Linux + 静态 musl）。
 pub mod sys_compat;
+/// macOS `libproc` 公共层（进程表 / fd 表 / vnode 路径）：发现侧与清理侧共用。
+#[cfg(target_os = "macos")]
+pub(crate) mod sys_libproc;
 /// 本机进程事实（一轮一张表）：指标采集与发现侧共用同一个取数入口。
 pub(crate) mod sys_proc;
 /// 本机套接字事实（`/proc/net/*` + `/proc/<pid>/fd`）：调查面与 `socket.list` 共用解析。

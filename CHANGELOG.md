@@ -3,26 +3,46 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [0.42.1-alpha] - 2026-11-24
+## [0.43.0-alpha] - 2026-11-24
 
-### 修复（能力上报把「仅 Linux」的 op 也报给网关）
+### 新增（`disk.cleanup.apply` 支持 macOS）
 
 **症状**：在 macOS 机器上派一条 `disk.cleanup.apply`，网关一路放行并下发，机器执行时才拒：
-命令队列显示 `执行结束：rejected（unsupported_platform）` —— 看不出是「这个 op 不支持这个平台」。
+命令队列显示 `执行结束：rejected（unsupported_platform）`。
 
-- `capabilities()` 现在按 `spec.platforms` 过滤，只报**本机能跑**的 op。
-  网关的 `ensure_plan_capable` 因此在**签发/下发前**就回 `action_plan_capability_missing`
-  （`agent does not support op(s) …`），不再排一条注定失败的活。
-  （`disk.cleanup.preview` 支持 linux+macos，仍会上报；`disk.cleanup.apply` 仅 Linux。）
+原因不是权限，是这个 op 之前只登记了 Linux。`apply` 的硬前提是**先查清哪些文件正被占用** ——
+删掉一个被打开的文件不释放空间（inode 要等最后一个句柄关闭），进程还会继续往一个看不见的
+文件里写，现场看到的是「清理了但磁盘没变」。而这个检查原先只实现了 Linux 的
+`/proc/<pid>/fd`。
+
+- macOS 侧改用 **libproc** 实现同一件事：`proc_listallpids` → `PROC_PIDLISTFDS` →
+  `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)`。与发现侧**共用**新增的 `sys_libproc` 公共层
+  （pid 表 / fd 表 / vnode 路径），不各写一套 FFI。
+  - 口径与 Linux 一致：看不到的进程跳过、预算/截止时间用尽算「没扫完」（`apply` 因此中止）、
+    只收 vnode（普通文件）—— socket / pipe / kqueue 不参与。
+  - 路径按**原始字节**比较（不走 `to_string_lossy`）：非 UTF-8 文件名不会被误判成“没人占用”。
+- `APPLY_SPEC.platforms` 改为 `["linux", "macos"]`；能力上报随之在 macOS 上带上
+  `disk.cleanup.apply`，网关的能力闸不再把它当成“这台机器跑不了”。
+
+### 修复（能力上报与本机实际能力对齐）
+
+- `capabilities()` 按 `spec.platforms` 过滤（此前不过滤，把“注册表里有”当成了“本机能跑”）。
+  这是一道通用防线：以后任何 op 收窄平台，网关都会在**签发/下发前**回
+  `action_plan_capability_missing`，而不是排一条注定失败的活。
 - 失败步的 `stderr_summary` 现在带 `OpError.detail`
   （如 `op disk.cleanup.apply 不支持当前平台 macos`）；`exit_reason` 仍保持**机器码**，
   不破坏文档/日志里按 code 检索的口径。网关会把它拼进回执。
 
 ### 测试
 
+- `files_held_open_are_skipped_unless_requested`（占用检查；macOS 侧即 libproc 的真实校验）
+- `a_file_held_open_by_this_process_is_visible`、`the_pid_list_contains_the_current_process`
+  （libproc 取数地基）
 - `capabilities_report_exactly_what_this_platform_can_run`（双向：支持的不许漏报、不支持的不许上报）
-- `cleanup_apply_is_only_advertised_on_linux`（含 preview 不被误滤）
+- `cleanup_apply_is_advertised_on_every_supported_platform`
 - `failed_step_carries_the_human_detail`
+- `tests/local_exec/cleanup_execution.rs::sandbox` 现在 **Linux 与 macOS 都跑**
+  （真二进制 + `WIST_CLEANUP_ROOT` 沙箱根，验证删哪些、跳过哪些、释放字节数）
 
 ## [0.42.0-alpha] - 2026-11-22
 

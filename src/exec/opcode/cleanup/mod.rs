@@ -48,16 +48,21 @@ pub const PREVIEW_SPEC: OpSpec = OpSpec {
     handler: preview,
 };
 
-/// `apply` 只在 Linux 上开放：macOS 没有「不 exec 就能查占用」的做法，
-/// 删除正在被写的文件不会释放空间，还会让进程继续写一个看不见的文件。
+/// `apply` 在 Linux 与 macOS 上开放：两边的占用检查都走「不 exec 就能查」的内核接口
+/// （Linux 读 `/proc/<pid>/fd`，macOS 走 libproc 的 vnode fd，见 `scan::open_paths`）。
 ///
-/// `budget.max_duration_ms` 封的是**扫描**（含 `/proc/*/fd` 占用检查）；
+/// 为什么占用检查是硬前提：删掉一个被进程打开着的文件**不释放空间**（inode 要等最后一个
+/// 句柄关闭），而且进程会继续往一个看不见的文件里写 —— 现场看到的是「清理了但磁盘没变」。
+/// 查不了占用的平台宁可不上报这个 op，也不赌一把（另：`apply` 本身也不接受
+/// `include_open_files=true`）。
+///
+/// `budget.max_duration_ms` 封的是**扫描**（含占用检查）；
 /// 删除阶段不再看时间，它的上限是 `max_files`（≤5000）—— 中途按时间停手会留下
 /// “删了一半”的不可预测状态，比多删几个已过期的临时文件更糟。
 pub const APPLY_SPEC: OpSpec = OpSpec {
     id: "disk.cleanup.apply",
     risk: RiskLevel::R2,
-    platforms: &["linux"],
+    platforms: &["linux", "macos"],
     budget: OpBudget::new(15_000, MAX_APPLY_FILES as usize, MAX_APPLY_BYTES),
     handler: apply_cleanup,
 };
@@ -449,7 +454,8 @@ mod tests {
     fn op_metadata_matches_the_plan() {
         assert_eq!(PREVIEW_SPEC.risk, RiskLevel::R0);
         assert_eq!(APPLY_SPEC.risk, RiskLevel::R2);
+        // 两端的占用检查都基于内核接口（`/proc` / libproc），所以两端都能上 `apply`。
         assert!(APPLY_SPEC.platforms.contains(&"linux"));
-        assert!(!APPLY_SPEC.platforms.contains(&"macos"));
+        assert!(APPLY_SPEC.platforms.contains(&"macos"));
     }
 }

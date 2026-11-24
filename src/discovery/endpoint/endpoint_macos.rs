@@ -20,6 +20,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use super::ObservedServiceEndpoint;
 use crate::process_control::process_identity;
+use crate::sys_libproc::{ProcFileInfo, VinfoStat, list_all_pids, list_fds};
 
 /// `sys/proc_info.h`: `PROC_PIDFDSOCKETINFO`。libc 只导出了 `PROC_PIDLISTFDS`。
 const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
@@ -43,49 +44,14 @@ const PROC_PIDPATH_MAX: usize = 4096;
 
 // ── libproc 结构体 ─────────────────────────────────────────
 //
-// libc 只导出 `proc_fdinfo` 和三个函数，其余结构体得自己按
-// `sys/proc_info.h` 声明。字段顺序和类型必须逐字对齐 —— 一个偏移错了，
-// 读出来的端口就是别的字段的前半截。
+// 与 fd / vnode 无关的公共部分（`proc_fileinfo`、`vinfo_stat`、pid 与 fd 枚举）
+// 在 `crate::sys_libproc`，清理侧用的是同一份声明 —— 两边各写一套迟早漂。
+// 这里只留 socket 专属的结构体；字段顺序和类型必须与 `sys/proc_info.h`
+// 逐字对齐 —— 一个偏移错了，读出来的端口就是别的字段的前半截。
 //
 // `soi_proto` 的真实大小由最大的 union 成员 `un_sockinfo`（528B）决定；
 // 这里开 1024B 余量。libproc 只要求 buffersize **不小于**所需大小，
 // 超出部分是安全的（内核按自己的尺寸 copyout 并返回该尺寸）。
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct ProcFileInfo {
-    fi_openflags: u32,
-    fi_status: u32,
-    fi_offset: i64,
-    fi_type: i32,
-    fi_guardflags: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct VinInfoStat {
-    vst_dev: u32,
-    vst_mode: u16,
-    vst_nlink: u16,
-    vst_ino: u64,
-    vst_uid: u32,
-    vst_gid: u32,
-    vst_atime: i64,
-    vst_atimensec: i64,
-    vst_mtime: i64,
-    vst_mtimensec: i64,
-    vst_ctime: i64,
-    vst_ctimensec: i64,
-    vst_birthtime: i64,
-    vst_birthtimensec: i64,
-    vst_size: i64,
-    vst_blocks: i64,
-    vst_blksize: i32,
-    vst_flags: u32,
-    vst_gen: u32,
-    vst_rdev: u32,
-    vst_qspare: [i64; 2],
-}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -169,7 +135,7 @@ union SoiProto {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct SocketInfo {
-    soi_stat: VinInfoStat,
+    soi_stat: VinfoStat,
     soi_so: u64,
     soi_pcb: u64,
     soi_type: i32,
@@ -302,66 +268,12 @@ fn discover_listening_sockets() -> io::Result<Vec<RawListener>> {
     Ok(listeners)
 }
 
-fn list_all_pids() -> io::Result<Vec<u32>> {
-    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-    if count <= 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // 枚举期间会有进程创建/退出，多留一点余量再截断。
-    let capacity = count as usize + 32;
-    let mut pids = vec![0 as libc::pid_t; capacity];
-    let written = unsafe {
-        libc::proc_listallpids(
-            pids.as_mut_ptr() as *mut c_void,
-            (capacity * mem::size_of::<libc::pid_t>()) as libc::c_int,
-        )
-    };
-    if written <= 0 {
-        return Err(io::Error::last_os_error());
-    }
-    pids.truncate(written as usize);
-    Ok(pids
-        .into_iter()
-        .filter(|pid| *pid > 0)
-        .map(|pid| pid as u32)
-        .collect())
-}
-
 fn list_socket_fds(pid: u32) -> io::Result<Vec<i32>> {
-    let pid = pid as libc::c_int;
-    let bytes =
-        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
-    if bytes <= 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let fd_size = mem::size_of::<libc::proc_fdinfo>();
-    let capacity = bytes as usize / fd_size + 8;
-    let mut buffer = vec![0u8; capacity * fd_size];
-    let written = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDLISTFDS,
-            0,
-            buffer.as_mut_ptr() as *mut c_void,
-            buffer.len() as libc::c_int,
-        )
-    };
-    if written <= 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let count = written as usize / fd_size;
-    let mut fds = Vec::with_capacity(count);
-    for index in 0..count {
-        let offset = index * fd_size;
-        let info: libc::proc_fdinfo =
-            unsafe { std::ptr::read_unaligned(buffer.as_ptr().add(offset) as *const _) };
-        if info.proc_fdtype as libc::c_int == libc::PROX_FDTYPE_SOCKET {
-            fds.push(info.proc_fd);
-        }
-    }
-    Ok(fds)
+    Ok(list_fds(pid)?
+        .into_iter()
+        .filter(|fd| fd.proc_fdtype as libc::c_int == libc::PROX_FDTYPE_SOCKET)
+        .map(|fd| fd.proc_fd)
+        .collect())
 }
 
 /// 读一个 socket fd 的详情；不是「在监听」就返回 `None`。

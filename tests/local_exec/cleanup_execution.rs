@@ -1,7 +1,7 @@
 //! E0 端到端：清理计划的真实执行。
 //!
 //! 只读部分（`preview`）在所有平台上都跑真二进制；写入部分（`apply`）只在
-//! `test-cleanup-roots` 特性 + Linux 下用沙箱目录跑，避免测试删到开发机的临时文件。
+//! `test-cleanup-roots` 特性下用沙箱目录跑（Linux / macOS 都跑，避免删到开发机的临时文件）。
 
 use wist_agentd::bootstrap;
 use wist_agentd::scheduler::{
@@ -322,7 +322,7 @@ fn the_same_plan_is_not_executed_twice() {
     assert!(second.is_err(), "duplicate plan must be rejected");
 }
 
-#[cfg(all(feature = "test-cleanup-roots", target_os = "linux"))]
+#[cfg(feature = "test-cleanup-roots")]
 mod sandbox {
     use std::fs;
     use std::os::unix::fs::MetadataExt;
@@ -359,7 +359,8 @@ mod sandbox {
         fs::hard_link(&hard_a, &hard_b).expect("hardlink");
         std::os::unix::fs::symlink(&old, root.join("link.tmp")).expect("symlink");
 
-        // 让 `open.tmp` 真被本进程占用：扫描会读 `/proc/<pid>/fd`。
+        // 让 `open.tmp` 真被本进程占用：扫描会读 `/proc/<pid>/fd`（Linux）
+        // 或 libproc 的 vnode fd（macOS）。
         let _held = fs::File::open(&open).expect("hold open");
 
         // SAFETY: 由 `ENV_LOCK` 串行化；测试进程内没有其它线程读这个变量。

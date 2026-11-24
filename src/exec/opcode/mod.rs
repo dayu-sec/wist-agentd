@@ -206,9 +206,12 @@ fn registry() -> impl Iterator<Item = &'static OpSpec> {
 /// 从实现处取，不另写一份名单）。
 ///
 /// 必须按 `spec.platforms` 过滤：网关拿这份名单做**下发前**的能力闸
-/// （`ensure_plan_capable`）。不过滤的话，macOS 机器会声称自己能跑仅 Linux 的
-/// `disk.cleanup.apply`，网关把计划排进队列，机器执行时才回 `unsupported_platform`
+/// （`ensure_plan_capable`）。不过滤的话，机器会声称自己能跑本平台并不支持的 op，
+/// 网关把计划排进队列，机器执行时才回 `unsupported_platform`
 /// —— 现场看到的就是「命令已下发，几秒后变成一条看不懂的失败回执」。
+///
+/// 例子：`disk.cleanup.apply` 依赖占用检查（Linux `/proc` / macOS libproc），
+/// 哪天某个平台没有这一层，只需收窄它的 `platforms`，这里自动跟上。
 pub fn capabilities() -> wist_contracts::capability_report::ExecCapabilities {
     let platform = current_platform();
     wist_contracts::capability_report::ExecCapabilities {
@@ -366,17 +369,15 @@ mod tests {
         );
     }
 
-    /// 具体到那条踩过的 op：`disk.cleanup.apply` 仅 Linux。
+    /// 具体到那条踩过的 op：`disk.cleanup.apply` 的占用检查两端都实现了
+    /// （Linux `/proc` / macOS libproc），所以两端都必须上报。
     #[test]
-    fn cleanup_apply_is_only_advertised_on_linux() {
+    fn cleanup_apply_is_advertised_on_every_supported_platform() {
         let reported = capabilities().opcodes;
-        let listed = reported.iter().any(|op| op == "disk.cleanup.apply");
-        if cfg!(target_os = "linux") {
-            assert!(listed, "Linux 上必须上报 disk.cleanup.apply");
-        } else {
-            assert!(!listed, "非 Linux 上不能上报 disk.cleanup.apply");
-        }
-        // preview 两边都支持，所以“过滤”不能把只读路径一起滤掉。
+        assert!(
+            reported.iter().any(|op| op == "disk.cleanup.apply"),
+            "apply 在 linux/macos 上都能跑，必须在能力名单里"
+        );
         assert!(
             reported.iter().any(|op| op == "disk.cleanup.preview"),
             "disk.cleanup.preview 支持 linux+macos，不该被平台过滤掉"
