@@ -3,6 +3,27 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.42.1-alpha] - 2026-11-24
+
+### 修复（能力上报把「仅 Linux」的 op 也报给网关）
+
+**症状**：在 macOS 机器上派一条 `disk.cleanup.apply`，网关一路放行并下发，机器执行时才拒：
+命令队列显示 `执行结束：rejected（unsupported_platform）` —— 看不出是「这个 op 不支持这个平台」。
+
+- `capabilities()` 现在按 `spec.platforms` 过滤，只报**本机能跑**的 op。
+  网关的 `ensure_plan_capable` 因此在**签发/下发前**就回 `action_plan_capability_missing`
+  （`agent does not support op(s) …`），不再排一条注定失败的活。
+  （`disk.cleanup.preview` 支持 linux+macos，仍会上报；`disk.cleanup.apply` 仅 Linux。）
+- 失败步的 `stderr_summary` 现在带 `OpError.detail`
+  （如 `op disk.cleanup.apply 不支持当前平台 macos`）；`exit_reason` 仍保持**机器码**，
+  不破坏文档/日志里按 code 检索的口径。网关会把它拼进回执。
+
+### 测试
+
+- `capabilities_report_exactly_what_this_platform_can_run`（双向：支持的不许漏报、不支持的不许上报）
+- `cleanup_apply_is_only_advertised_on_linux`（含 preview 不被误滤）
+- `failed_step_carries_the_human_detail`
+
 ## [0.42.0-alpha] - 2026-11-22
 
 ### 修复（执行结果从来没有上报给网关）

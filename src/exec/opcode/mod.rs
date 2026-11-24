@@ -202,15 +202,19 @@ fn registry() -> impl Iterator<Item = &'static OpSpec> {
     PROD_REGISTRY.iter().chain(TEST_REGISTRY.iter())
 }
 
-/// 本机**执行能力**：注册表里真实存在的 op（与 `investigate::capabilities` 同一条纪律：
+/// 本机**执行能力**：注册表里**当前平台能跑**的 op（与 `investigate::capabilities` 同一条纪律：
 /// 从实现处取，不另写一份名单）。
 ///
-/// 平台不支持/暂时不可用的 op 也照样列出：网关据此判断“这台机器会不会”，
-/// 真正的平台拒绝在 `execute` 里。
+/// 必须按 `spec.platforms` 过滤：网关拿这份名单做**下发前**的能力闸
+/// （`ensure_plan_capable`）。不过滤的话，macOS 机器会声称自己能跑仅 Linux 的
+/// `disk.cleanup.apply`，网关把计划排进队列，机器执行时才回 `unsupported_platform`
+/// —— 现场看到的就是「命令已下发，几秒后变成一条看不懂的失败回执」。
 pub fn capabilities() -> wist_contracts::capability_report::ExecCapabilities {
+    let platform = current_platform();
     wist_contracts::capability_report::ExecCapabilities {
         opcodes: PROD_REGISTRY
             .iter()
+            .filter(|spec| platform.is_some_and(|current| spec.platforms.contains(&current)))
             .map(|spec| spec.id.to_string())
             .collect(),
         execution_profiles: vec!["agent_exec_v1".to_string()],
@@ -326,39 +330,56 @@ mod tests {
         }
     }
 
+    /// 能力上报 = 注册表 ∩ 「当前平台能跑」。
+    ///
+    /// 两个方向都要锁：
+    /// * **不能少报**：支持当前平台的 op 没报 → 网关会拒一条本可以跑的计划；
+    /// * **不能多报**（曾经的 bug）：不支持当前平台的 op 也报 → 网关放行，
+    ///   机器执行时才回 `unsupported_platform`，现场只看到一条“看不懂的失败回执”。
     #[test]
-    fn capabilities_report_exactly_the_production_registry() {
+    fn capabilities_report_exactly_what_this_platform_can_run() {
+        let platform = current_platform().expect("tests run on linux or macos");
         let reported = capabilities().opcodes;
-        for id in [
-            "disk.cleanup.preview",
-            "disk.cleanup.apply",
-            "process.list",
-            "process.tree",
-            "process.open_files",
-            "service.status",
-            "socket.list",
-            "file.stat",
-            "file.read_range",
-            "file.find",
-            "file.hash",
-            "config.inspect",
-            "config.backup",
-            "config.apply",
-            "config.rollback",
-            "log.read_range",
-            "audit.list",
-            "log.archive",
-            "log.rotate",
-        ] {
-            assert!(
-                reported.iter().any(|op| op == id),
-                "capabilities 必须上报 {id}"
-            );
+
+        for spec in PROD_REGISTRY {
+            let supported = spec.platforms.contains(&platform);
+            let listed = reported.iter().any(|op| op == spec.id);
+            if supported {
+                assert!(listed, "{} 支持 {platform}，但能力上报里没有它", spec.id);
+            } else {
+                assert!(
+                    !listed,
+                    "{} 不支持 {platform}，却上报了：网关会派一条注定失败的活",
+                    spec.id
+                );
+            }
         }
+
+        let expected = PROD_REGISTRY
+            .iter()
+            .filter(|spec| spec.platforms.contains(&platform))
+            .count();
         assert_eq!(
             reported.len(),
-            PROD_REGISTRY.len(),
-            "上报的名单与注册表不能是两份"
+            expected,
+            "上报数量必须等于平台可执行的 op 数"
+        );
+    }
+
+    /// 具体到那条踩过的 op：`disk.cleanup.apply` 仅 Linux。
+    #[test]
+    fn cleanup_apply_is_only_advertised_on_linux() {
+        let reported = capabilities().opcodes;
+        let listed = reported.iter().any(|op| op == "disk.cleanup.apply");
+        if cfg!(target_os = "linux") {
+            assert!(listed, "Linux 上必须上报 disk.cleanup.apply");
+        } else {
+            assert!(!listed, "非 Linux 上不能上报 disk.cleanup.apply");
+        }
+        // preview 两边都支持，所以“过滤”不能把只读路径一起滤掉。
+        assert!(
+            reported.iter().any(|op| op == "disk.cleanup.preview"),
+            "disk.cleanup.preview 支持 linux+macos，不该被平台过滤掉"
         );
     }
 

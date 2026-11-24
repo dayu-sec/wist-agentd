@@ -9,7 +9,7 @@
 //! | `output` | 空操作，只记 `StepRecord` |
 //! | `abort` | 立即结束，`failed` + `exit_reason = "aborted"` |
 //! | `branch` / `guard` | **明确拒绝**：`rejected` + `unsupported_step_kind` |
-//! | 失败 | 首个失败步之后不再执行；`exit_reason = error_code` |
+//! | 失败 | 首个失败步之后不再执行；`exit_reason = error_code`，人读原因在失败步的 `stderr_summary` |
 //!
 //! 不做线程 / 子进程级抢占：handler 自己按预算计时，总超时由 agentd 的进程级 deadline 兜底。
 
@@ -167,13 +167,17 @@ pub fn execute(workdir: &ExecutionWorkdir, backup_dir: Option<&Path>) -> io::Res
                 break;
             }
             Err(err) => {
-                step_records.push(step_record(
+                let mut record = step_record(
                     step,
                     StepStatus::Failed,
                     step_started_at,
                     duration_ms,
                     Some(err.code),
-                ));
+                );
+                // 人读的原因跟着步骤走：网关的回执 / 结果详情都拿它做说明。
+                // （旧版本只丢了 code，现场只能看到 `unsupported_platform` 一个词。）
+                record.stderr_summary = Some(err.detail.clone());
+                step_records.push(record);
                 // `rejected` = 「这份计划根本没跑」；`failed` = 「跑起来之后出错」。
                 // 计划级缺陷 + 此前没有任何步骤成功 → rejected；其余一律 failed。
                 // 「此前已成功过」这条必须保留：契约规定 rejected 的结果里不许出现成功步
@@ -302,5 +306,39 @@ fn step_record(
         stdout_summary: None,
         stderr_summary: None,
         resource_usage: None,
+    }
+}
+
+/// `exit_reason` 保持**机器码**（`unsupported_platform` 这种字符串在文档、日志检索、
+/// 告警规则里都被当作 token 用）；人读的原因写到失败步的 `stderr_summary`，
+/// 由网关拼进回执（`执行结束：rejected（unsupported_platform：op … 不支持当前平台 macos）`）。
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_step_carries_the_human_detail() {
+        let step = ActionPlanStep {
+            id: "s1".to_string(),
+            kind: STEP_KIND_INVOKE.to_string(),
+            op: Some("disk.cleanup.apply".to_string()),
+            args: None,
+        };
+        let mut record = step_record(
+            &step,
+            StepStatus::Failed,
+            now_rfc3339(),
+            1,
+            Some("unsupported_platform"),
+        );
+        assert_eq!(record.error_code.as_deref(), Some("unsupported_platform"));
+        record.stderr_summary = Some("op disk.cleanup.apply 不支持当前平台 macos".to_string());
+        assert!(
+            record
+                .stderr_summary
+                .as_deref()
+                .is_some_and(|text| text.contains("不支持当前平台")),
+            "失败步必须带人读原因（否则回执只能看到一个 code）"
+        );
     }
 }
