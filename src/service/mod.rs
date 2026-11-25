@@ -72,11 +72,25 @@ impl ServicePlatform {
     }
 }
 
-/// Linux 主机的服务管理器：systemd 优先，其次 upstart（RHEL / CentOS 6）。
+/// Linux 主机的服务管理器：**正在跑的** systemd 优先，其次 upstart（RHEL / CentOS 6）。
+///
+/// 判据是"systemd 在不在跑"（[`systemd_running`]），不是"装没装 `systemctl`"：
+/// CentOS 6 / RHEL 6 的 PID 1 是 upstart，机器上却可能留着 systemd 的组件。
+/// 把这种机器判成 systemd 的后果很具体：升级到「换完件、该重启了」那一步会跑
+/// `systemctl restart` 而必然失败，于是整个升级回滚，真正在管它的 `initctl` 一次都没试。
+/// 升级器拉起时用的是同一条判据（见 `upgrade::spawn_upgrader`）。
 fn linux_platform() -> ServicePlatform {
-    if systemd_available() {
+    linux_platform_from(systemd_running(), upstart_available())
+}
+
+/// 平台选择的纯函数形式（两个探针由调用方喂，便于把四种组合逐个锁住）。
+///
+/// 注意第二个探针叫 `upstart_available` 而不是 `systemctl_available`：
+/// “装了 `systemctl`” 从来不是选 systemd 的理由，见 [`linux_platform`]。
+fn linux_platform_from(systemd_running: bool, upstart_available: bool) -> ServicePlatform {
+    if systemd_running {
         ServicePlatform::Systemd
-    } else if upstart_available() {
+    } else if upstart_available {
         ServicePlatform::Upstart
     } else {
         // 两者都没有（Alpine / 精简容器）：保持旧行为 —— 写 systemd unit，
@@ -85,18 +99,26 @@ fn linux_platform() -> ServicePlatform {
     }
 }
 
-/// systemd 是 PID 1（`/run/systemd/system` 存在），或至少装了 `systemctl`
-/// （容器里 systemd 没在跑，但 `--no-activate` 仍要能写出 unit）。
+/// systemd 的运行时标记目录（PID 1 是 systemd 时它才存在）。
+const SYSTEMD_RUNTIME_DIR: &str = "/run/systemd/system";
+
+/// systemd 是不是**真的在管这台机器**。
 ///
-/// 不能只看 `PATH`：`install.sh` / CM 可能用受限环境变量拉起本命令，
-/// 登进 `root` 的 `PATH` 与本进程拿到的 `PATH` 不是一回事。
-fn systemd_available() -> bool {
-    Path::new("/run/systemd/system").is_dir()
-        || program_in_path("systemctl")
-        || has_any_binary(&["/usr/bin/systemctl", "/bin/systemctl"])
+/// `/run/systemd/system` 是 systemd 自己启动时创建、也是它判断「我在不在跑」用的标记。
+/// 不能退化成「`systemctl` 在不在 PATH」：那会把一台 upstart 机器当成 systemd（见 [`linux_platform`]）。
+pub fn systemd_running() -> bool {
+    systemd_running_at(Path::new(SYSTEMD_RUNTIME_DIR))
 }
 
-/// upstart：job 目录 `/etc/init` 在，且 `initctl` 可用（绝对路径优先，理由同上）。
+/// 判据本体（不读固定路径，便于单测只覆盖「目录在不在」这一层）。
+fn systemd_running_at(runtime_dir: &Path) -> bool {
+    runtime_dir.is_dir()
+}
+
+/// upstart：job 目录 `/etc/init` 在，且 `initctl` 可用。
+///
+/// 绝对路径优先、再查 `PATH`：`install.sh` / CM 可能用受限环境变量拉起本命令，
+/// 登进 root 的 `PATH` 与本进程拿到的 `PATH` 不是一回事。
 fn upstart_available() -> bool {
     Path::new("/etc/init").is_dir()
         && (has_any_binary(&["/sbin/initctl", "/usr/sbin/initctl"]) || program_in_path("initctl"))

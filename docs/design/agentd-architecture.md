@@ -461,10 +461,24 @@ agentd 发现进度停在 `running` 而心跳超过 60s 没动，就判定这个
 杀掉：记录停在 `restart`、心跳断 60s，新版 agentd 启动后把它判死并报成 `failed` —— 一次**成功**的
 升级反而被记成失败（机器其实已经换好并跑起来了）。
 
-Linux 上 agentd 用 `systemd-run` 把升级器拉成一个**独立的瞬态 unit**（`wist-upgrader-<work_id>`，
-`--collect` 退出即清，日志仍旧去 `log_dir/wist-upgrader.log`）：它自带新 cgroup，`systemctl restart
-wist-agentd` 收不到它，`wait_ready` 才能跑完并上报成功。没有 `systemd-run`（容器 / 非 systemd 环境）
-时退回分离进程；launchd 路径不变。
+Linux 上 agentd 用 `systemd-run` 把升级器拉成一个**独立的瞬态 unit**（`wist-upgrader-<work_id>`）：
+它自带新 cgroup，`systemctl restart wist-agentd` 收不到它，`wait_ready` 才能跑完并上报成功。
+没有正在跑的 systemd（upstart / 容器 / macOS）时退回分离进程；launchd 路径不变。
+
+两个容易被现场踩到的判定：
+
+- **判「systemd 在不在跑」，不判「`systemd-run` 在不在」。** CentOS 6 / RHEL 6 的 PID 1 是 upstart，
+  机器上却可能装着 systemd 的组件：`systemd-run` 能被 exec，但一跑就失败
+  （`Unknown assignment ...`），升级被直接判死，而本该走通的 `setsid` 分离进程一次都没试。
+  现在以 `/run/systemd/system` 为判据 —— 那正是 systemd 自己判断「我在不在跑」用的标记。
+- **瞬态 unit 的参数按 systemd 版本降级。** `--collect`（237+）、`StandardOutput=append:`（240+）
+  在旧版上会让整条 `systemd-run` 失败（门槛取的是在发行版 man page 上核实过的下界：
+  232 没有 `--collect`、237 有；237 的 `systemd.exec` 只有 `file:`，到 240 才有 `append:`）。
+  `--service-type=exec` **一律不传**：`Type=exec` 在 232 / 237 / 239 的 man page 上都还没有，
+  具体从哪版起才认说不准，而传一个不认的值是硬失败；少它的代价只是 execve 失败时晚一个
+  心跳周期才判死（升级器二进制在派发前已经查过存在）。旧版只留任何版本都认的
+  `--unit` / `--property`：日志改由 journal 承接（仍带 `SyslogIdentifier=wist-upgrader-<work_id>`），
+  不再写 `log_dir/wist-upgrader.log`。
 
 另外，`wist-agentd diagnose` 也把这一状态报出来（`upgrade.local`）：读 `state/upgrade.json` +
 `state/upgrade.heartbeat`，用与守护进程**同一套**判据（`heartbeat_is_fresh` / `UPGRADER_DEAD_AFTER`）

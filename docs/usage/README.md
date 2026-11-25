@@ -56,8 +56,12 @@ agentd 只装**系统级**：Linux 系统 unit（`/etc/systemd/system/wist-agent
 
 > 用户级（`systemctl --user` / launchd `gui/<uid>`）已移除，不再支持。
 
-服务管理器**按运行态自动选**：有 `systemctl` 走 systemd；没有但 `/etc/init` + `initctl` 在就走 upstart；
-两者都没有时退回写 systemd unit（供 `--no-activate` + CM 分发）。`service status` 第一行 `platform=` 即是实际选择。
+服务管理器**按运行态自动选**：systemd **真的在跑**（`/run/systemd/system` 存在）走 systemd；
+没有但 `/etc/init` + `initctl` 在就走 upstart；两者都没有时退回写 systemd unit（供 `--no-activate` + CM 分发）。
+`service status` 第一行 `platform=` 即是实际选择。
+
+> 判据不是「装没装 `systemctl`」：CentOS 6 / RHEL 6 上可能留着 systemd 的组件，
+> 但 PID 1 仍是 upstart —— 那种机器上 `systemctl restart` 必失败（升级会卡在重启并回滚）。
 
 `sudo` 下 uid=0，install.sh 因此一律落到 `system` 域。
 
@@ -101,8 +105,11 @@ upstart `respawn limit unlimited`（固定 `post-stop` 5s 间隔）。
 - 只停不 disable：macOS 的 plist 还在 → 下次图形登录重新加载；Linux 的 unit 仍 enabled → **重启机器**会再起。
 - 停止是优雅的：`ExitTimeOut=30` / `TimeoutStopSec=30`（先 SIGTERM，30s 后 SIGKILL）。Linux
   `KillMode=control-group` 会连 `wist-exec` 一起收走，未完成的执行由下次启动的 crash recovery 重排。
-- 唯一的例外是升级器：Linux 上它被拉成独立的瞬态 unit（`systemd-run`），不会被这次回收冲掉 —— 
-  否则「换件成功、刚重启」那一步会被连坐杀死，升级会被误判成失败。
+- 唯一的例外是升级器：Linux 上只要 systemd 真的在跑（`/run/systemd/system`），它被拉成独立的瞬态 unit
+  （`systemd-run`），不会被这次回收冲掉 —— 否则「换件成功、刚重启」那一步会被连坐杀死，升级会被误判成失败。
+  upstart（CentOS 6 / RHEL 6）没有 cgroup 回收，用 `setsid` 分离进程就够。
+- 升级器日志：systemd 240+ 落 `log_dir/wist-upgrader.log`；更老的 systemd 不认 `append:`，
+  日志在 journal（`journalctl -t wist-upgrader-<work_id>`）。
 - `uninstall` 不删配置、state、日志（保留 agent 身份，便于复装）。
 - 谁拉起来的：macOS `launchctl blame system/com.dayu-sec.wist-agentd`；
   Linux `systemctl show wist-agentd -p NRestarts`。

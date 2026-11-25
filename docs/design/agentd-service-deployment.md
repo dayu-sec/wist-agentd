@@ -91,7 +91,9 @@ supervisor。后者让“谁在管、怎么重启、日志去哪”都有唯一�
 **为什么支持 upstart（CentOS 6 / RHEL 6）。** 静态 musl 制品能在 kernel 2.6.32 上跑（采测：发现、指标、
 上送链路全通），但 RHEL 6 的 PID 1 是 upstart 0.6.5，没有 systemd。如果 `service install` 写死 systemd，
 这类主机就只能手写 init 脚本，网关 `install.sh` 也会在 `systemctl` 那一步失败。因此平台改为**按运行态判定**：
-有 `systemctl` 走 systemd，否则 `/etc/init` + `initctl` 走 upstart，两者都没有时退回旧行为（写 unit）。
+systemd **真的在跑**（`/run/systemd/system`）走 systemd，否则 `/etc/init` + `initctl` 走 upstart，
+两者都没有时退回旧行为（写 unit）。注意判据不能是「`systemctl` 在不在」：CentOS 6 上可能留着
+systemd 的组件，而 PID 1 仍是 upstart，那时 `systemctl restart` 必失败、`initctl` 才是对的。
 
 与 systemd 的语义对齐有两个坑：（1）upstart 的 `start` 在已 running 时是 no-op（报
 `Job is already running`），所以 `--force` 重装不能只 `start`，激活序列必须是

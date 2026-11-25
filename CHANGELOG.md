@@ -3,6 +3,34 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.43.2-alpha] - 2026-11-25
+
+### 修复（CentOS 6 / RHEL 6 的自动升级不再必然失败）
+
+现场：机器上留着 systemd 组件、但 PID 1 仍是 upstart 时，agentd 会把升级器交给
+`systemd-run` —— 它一跑就报 `Unknown assignment StandardOutput=append:...`，升级当场判死；
+即便起得来，最后一步也会去跑 `systemctl restart`，而真正在管它的 `initctl` 一次都没试。
+
+- **按「systemd 在不在跑」选服务管理器，不再按「装没装 `systemctl`」**
+  （判据 `/run/systemd/system`）。同一条判据也用于 `service install/status` 与 `diagnose`。
+- **`systemd-run` 的参数按版本降级**：只有 `--collect`（237+）与
+  `StandardOutput=append:`（240+）才传；更老的 systemd 上升级器日志在 journal
+  （tag `wist-upgrader-<work_id>`）。
+- **不再传 `--service-type=exec`**：它在 systemd 239 及以前都不存在，传错会让整条
+  `systemd-run` 失败 —— 那正是这次故障的形状。
+
+### 注意
+
+已经在报这个错的老机器需要**手工换一次三件套**（`wist-agentd` / `wist-exec` /
+`wist-upgrader`）：修的是 agentd 自己的派发逻辑，卡住的那台没法自己升上来。
+
+### 测试
+
+- 六个 systemd 版本（219 / 232 / 237 / 239 / 240 / 255）的 `systemd-run` 参数逐一锁定，
+  多带一个旧版不认的参数就会红；
+- 平台选择四种组合，包含「装了 `systemctl` 但 systemd 没跑」这条回归；
+- 版本探测不到时退最保守参数。
+
 ## [0.43.1-alpha] - 2026-11-24
 
 ### 修复（日志句柄按 inode 归属，别名不再各开一次）

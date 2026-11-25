@@ -107,8 +107,10 @@ wait_until() {
 case "$(uname -s)" in
   Darwin) PLATFORM="launchd" ;;
   Linux)
-    # 与 agentd 自己的判定一致：有 systemctl 走 systemd，否则 /etc/init + initctl 走 upstart。
-    if command -v systemctl >/dev/null 2>&1; then
+    # 与 agentd 自己的判定一致：systemd **真的在跑**（`/run/systemd/system`）才走 systemd，
+    # 否则 /etc/init + initctl 走 upstart。不能只看 `systemctl` 在不在 ——
+    # CentOS 6 / RHEL 6 上留着 systemd 组件时，`systemctl` 能起、一跑就失败。
+    if [ -d /run/systemd/system ]; then
       PLATFORM="systemd"
     elif [ -d /etc/init ] && command -v initctl >/dev/null 2>&1; then
       PLATFORM="upstart"

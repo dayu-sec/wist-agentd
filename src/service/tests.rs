@@ -354,6 +354,38 @@ fn program_in_paths_looks_only_at_the_given_path_variable() {
     assert!(!program_in_paths(None, "initctl"));
 }
 
+/// 平台判据是"systemd 在不在跑"，不是"装没装 systemctl"。
+///
+/// 这条直接决定升级走到哪：判成 systemd 就会用 `systemctl restart` 重启 agentd，
+/// 在 PID 1 是 upstart 的 CentOS 6 / RHEL 6 上必失败（升级回滚），而 `initctl` 一次都没试。
+#[test]
+fn systemd_running_only_looks_at_the_runtime_marker() {
+    let root = temp_dir("systemd-marker");
+    let marker = root.join("systemd").join("system");
+    assert!(!systemd_running_at(&marker), "没建目录就是不在跑");
+    fs::create_dir_all(&marker).expect("create marker");
+    assert!(systemd_running_at(&marker));
+    let _ = fs::remove_dir_all(root);
+}
+
+/// 平台选择的四种组合（回归：曾在「装了 systemctl 但 PID 1 是 upstart」的
+/// CentOS 6 / RHEL 6 上判成 systemd，于是升级最后一步跑 `systemctl restart`
+/// 必失败、整次升级回滚，而真正在管它的 `initctl` 一次都没试）。
+#[test]
+fn platform_needs_a_running_systemd_not_an_installed_systemctl() {
+    use ServicePlatform::{Systemd, Upstart};
+
+    // systemd 真在跑：不管 upstart 组件在不在，都是 systemd 在管。
+    assert_eq!(linux_platform_from(true, true), Systemd);
+    assert_eq!(linux_platform_from(true, false), Systemd);
+
+    // systemd 没在跑（PID 1 是 upstart，哪怕装了 systemctl 组件）：必须是 upstart。
+    assert_eq!(linux_platform_from(false, true), Upstart);
+
+    // 两者都没有（精简容器）：仍写 systemd unit，交给运维 / CM（`--no-activate`）。
+    assert_eq!(linux_platform_from(false, false), Systemd);
+}
+
 #[test]
 fn install_writes_definition_and_is_guarded_by_force() {
     let root = temp_dir("install");

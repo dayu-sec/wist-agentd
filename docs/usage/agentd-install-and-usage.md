@@ -175,7 +175,8 @@ wist-agentd service status                  # platform=upstart
 initctl status wist-agentd && tail -f /var/log/wist-agentd/agentd.err
 ```
 
-`service install` 在本机**自动识别**服务管理器（有 `systemctl` 走 systemd，否则有 `/etc/init` + `initctl` 走 upstart），
+`service install` 在本机**自动识别**服务管理器（systemd **真的在跑**（`/run/systemd/system`）→ systemd；
+否则 `/etc/init` + `initctl` 在 → upstart；两者都没有则退回写 unit），
 写 `/etc/init/wist-agentd.conf` 并 `initctl reload-configuration` + `stop` + `start`。要点：
 
 - **开机自启**：`start on runlevel [2345]`，与系统自带 upstart job 同一机制，不需要 `chkconfig`。

@@ -1066,29 +1066,117 @@ pub fn upgrader_unit_name(work_id: &str) -> String {
     name
 }
 
+/// `systemd-run` 里**要新版本才认**的那几个参数，按主版本一次性定下来。
+///
+/// 老 systemd 收到不认识的赋值是**整条命令失败**（`Unknown assignment ...`），
+/// 升级直接卡在「起不来」—— 比少一个锦上添花的参数严重得多。所以一律
+/// 「新的才用，旧的就地降级」，且每个门槛都取**在发行版 man page 上核实过的下界**，
+/// 不是凭印象的版本号：
+///
+/// - `--collect`：Debian 9（232）的 `systemd-run` 还没有，Ubuntu 18.04（237）有。
+/// - `StandardOutput=append:`：Ubuntu 18.04（237）的 `systemd.exec` 只到 `file:`，
+///   240 的提交才把 `append:` 接进 `systemd-run` 的属性白名单。
+///
+/// 刻意**没有** `--service-type=exec`：`Type=exec` 在 232 / 237 / 239 的 man page 上都还没有
+/// （`Type=` 只到 `idle`），具体从哪版起才认说不准 —— 而传一个不认的值是整条 `systemd-run`
+/// 失败，比少这条严重得多。少它的代价只是「execve 失败时晚一个心跳周期才判死」：
+/// 升级器二进制在派发前已经查过存在（见 [`resolve_upgrader_bin`]），这条路径本来就极窄。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(target_os = "linux", test))]
+struct SystemdCapabilities {
+    /// `StandardOutput=append:` / `StandardError=append:`（systemd 240+）。
+    /// 旧版能用的只有 `file:`，而它是**截断**写（每次升级都会清掉上一次的日志），
+    /// 所以干脆不传：输出进 journal，靠 `SyslogIdentifier` 定位。
+    log_append: bool,
+    /// `--collect`（`CollectMode=`，systemd 237+）：退出即清，不留下 failed unit。
+    collect: bool,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl SystemdCapabilities {
+    fn for_version(major: u32) -> Self {
+        Self {
+            log_append: major >= 240,
+            collect: major >= 237,
+        }
+    }
+
+    /// 版本探测不到时的最保守一套：只留 systemd 很早就有、任何能跑 `systemd-run`
+    /// 的机器都认的参数（`--unit` / `--property` / `--`）。
+    fn legacy() -> Self {
+        Self {
+            log_append: false,
+            collect: false,
+        }
+    }
+}
+
+/// 从 `systemctl --version` 的首行（`systemd 219` / `systemd 255 (255.4-1ubuntu8)`）取主版本。
+#[cfg(any(target_os = "linux", test))]
+fn parse_systemd_major(report: &str) -> Option<u32> {
+    let line = report.lines().next()?;
+    let mut tokens = line.split_whitespace();
+    tokens.next()?;
+    let version = tokens.next()?;
+    let digits: String = version
+        .chars()
+        .take_while(|ch: &char| ch.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+/// 探测本机 systemd 的版本能力（每种能力各自降级，不整体押一个高版本）。
+#[cfg(target_os = "linux")]
+fn systemd_capabilities() -> SystemdCapabilities {
+    let report = std::process::Command::new("systemctl")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned());
+    capabilities_from_report(report.as_deref())
+}
+
+/// 版本报告 → 能力（纯函数，便于单测）。
+///
+/// 探测不到（`systemctl` 不在 `PATH`）或读不懂时一律退最保守的一套：
+/// 赌一个高版本，输掉的是「升级能不能起得来」。
+#[cfg(any(target_os = "linux", test))]
+fn capabilities_from_report(report: Option<&str>) -> SystemdCapabilities {
+    report
+        .and_then(parse_systemd_major)
+        .map(SystemdCapabilities::for_version)
+        .unwrap_or_else(SystemdCapabilities::legacy)
+}
+
 /// 把升级器包进一个**独立的 systemd 瞬态 unit**（纯构造，便于单测）。
 ///
 /// 为什么必须独立成 unit：`wist-agentd.service` 用 `KillMode=control-group`，`systemctl restart`
 /// 是按 **cgroup** 回收进程的；升级器是 agentd 的子进程，`setsid()` 只换会话、换不掉 cgroup，
 /// 于是会被这次 restart 一起杀掉（记录停在 `restart`，心跳断 60s 后即被判死）。
 /// 拉成瞬态 unit 后它自带一个新 cgroup，restart 收不到它，`wait_ready` 才有机会跑完并上报成功。
-pub fn build_systemd_run_launch(
+#[cfg(any(target_os = "linux", test))]
+fn build_systemd_run_launch(
     inner: &UpgradeLaunch,
     unit_name: &str,
     log_path: &Path,
     env_file: &Path,
+    caps: SystemdCapabilities,
 ) -> UpgradeLaunch {
     let mut args = Vec::new();
     args.push(format!("--unit={unit_name}"));
     // 退出即清（成功失败都清）：留着同名 unit 会让下一次同 work_id 的升级起不来。
-    args.push("--collect".to_string());
-    // `exec`：让 systemd-run 等到 `execve` 成功才算起 unit 成功。默认的 `simple` 在 execve
-    // **之前**就报成功 —— 那样一个起不来的升级器会被当成“已派发”，白白占住互斥锁。
-    args.push("--service-type=exec".to_string());
+    if caps.collect {
+        args.push("--collect".to_string());
+    }
     // 日志仍去 agentd 那份文件（与不包 unit 时一致，运维不用换地方找）。
-    let log = systemd_property_path_escape(&log_path.display().to_string());
-    args.push(format!("--property=StandardOutput=append:{log}"));
-    args.push(format!("--property=StandardError=append:{log}"));
+    // `append:` 是 systemd 240 才有的；老版本不认这个赋值，整条 systemd-run 会失败，
+    // 于是这里干脆不传 —— 输出按默认进 journal，靠下面的 `SyslogIdentifier` 定位。
+    if caps.log_append {
+        let log = systemd_property_path_escape(&log_path.display().to_string());
+        args.push(format!("--property=StandardOutput=append:{log}"));
+        args.push(format!("--property=StandardError=append:{log}"));
+    }
     // 瞬态 unit 跑在 systemd 给的干净环境里，**不继承** agentd 的进程环境；长期环境变量
     // （代理等）得显式指向 agentd 用的同一份 EnvironmentFile。
     let env = systemd_property_path_escape(&env_file.display().to_string());
@@ -1109,6 +1197,7 @@ pub fn build_systemd_run_launch(
 ///
 /// 不转义的话，URL 里的百分号编码（如 `%2F`）会被当成 specifier 吞掉，`$` 会被当变量展开 ——
 /// 而走 [`launch_detached`] 时这些参数是逐字传的，两条路径的语义必须一致。
+#[cfg(any(target_os = "linux", test))]
 fn systemd_exec_escape(arg: &str) -> String {
     arg.replace('$', "$$").replace('%', "%%")
 }
@@ -1117,15 +1206,16 @@ fn systemd_exec_escape(arg: &str) -> String {
 ///
 /// 属性值不做 `$` 展开，所以**不能**顺手把 `$` 也转了（那会把一个 `$` 写成两个）——
 /// 只转 `%`。这也跟 unit 文件里对 `EnvironmentFile=` / `StandardOutput=` 路径的处理一致。
+#[cfg(any(target_os = "linux", test))]
 fn systemd_property_path_escape(value: &str) -> String {
     value.replace('%', "%%")
 }
 
 /// 拉起升级器，并保证它能**活过**紧接着的 `systemctl restart wist-agentd`。
 ///
-/// Linux/systemd 上包成独立瞬态 unit（见 [`build_systemd_run_launch`]）；没有 `systemd-run`
-///（容器 / 非 systemd 发行版）或其他平台（launchd 按进程组回收，`setsid` 已足够）沿用
-/// [`launch_detached`]。返回一个用于日志的句柄：瞬态 unit 名，或分离进程的 pid。
+/// 只有「systemd 真的在跑」才包成独立瞬态 unit（见 [`build_systemd_run_launch`]）；
+/// upstart（CentOS 6 / RHEL 6）、容器里没有 systemd、以及 macOS（launchd 按进程组回收，
+/// `setsid` 已足够）都沿用 [`launch_detached`]。返回一个用于日志的句柄：瞬态 unit 名，或分离进程的 pid。
 pub fn spawn_upgrader(
     launch: &UpgradeLaunch,
     log_path: &Path,
@@ -1139,28 +1229,35 @@ pub fn spawn_upgrader(
         {
             std::fs::create_dir_all(parent).map_err(|err| format!("create log dir: {err}"))?;
         }
-        let unit = upgrader_unit_name(work_id);
-        let wrapped = build_systemd_run_launch(launch, &unit, log_path, env_file);
-        match std::process::Command::new(&wrapped.program)
-            .args(&wrapped.args)
-            .output()
-        {
-            // 起 unit 成功即返回：`systemd-run` 只是个 D-Bus 客户端，立刻退出；升级器在那个
-            // 瞬态 unit 里继续跑（不等它：它的生命周期比本次调用长得多）。
-            Ok(output) if output.status.success() => return Ok(unit),
-            // `systemd-run` 在，但没起起来（权限 / 总线不可达 / 重名）：如实报错，绝不确认这活。
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let detail = if stderr.trim().is_empty() {
-                    format!("exit status {}", output.status)
-                } else {
-                    stderr.trim().to_string()
-                };
-                return Err(format!("systemd-run {unit}: {detail}"));
+        // 关键判定：不是「有没有 systemd-run 这个命令」，而是「systemd 在不在管这台机器」
+        // （判据与 `service manage` 选平台时同一条，理由见 `service::systemd_running`）。
+        // 判错方向会把一台 upstart 机器当成 systemd 机器：systemd-run 能起、立刻失败，
+        // 而本该走通的分离进程路径一次都没试。
+        if crate::service::systemd_running() {
+            let unit = upgrader_unit_name(work_id);
+            let wrapped =
+                build_systemd_run_launch(launch, &unit, log_path, env_file, systemd_capabilities());
+            match std::process::Command::new(&wrapped.program)
+                .args(&wrapped.args)
+                .output()
+            {
+                // 起 unit 成功即返回：`systemd-run` 只是个 D-Bus 客户端，立刻退出；升级器在那个
+                // 瞬态 unit 里继续跑（不等它：它的生命周期比本次调用长得多）。
+                Ok(output) if output.status.success() => return Ok(unit),
+                // `systemd-run` 在，但没起起来（权限 / 总线不可达 / 重名）：如实报错，绝不确认这活。
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let detail = if stderr.trim().is_empty() {
+                        format!("exit status {}", output.status)
+                    } else {
+                        stderr.trim().to_string()
+                    };
+                    return Err(format!("systemd-run {unit}: {detail}"));
+                }
+                // systemd 在跑却没有 systemd-run：退回到分离进程。
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(format!("run systemd-run: {err}")),
             }
-            // 没有 systemd-run：不是 systemd 环境，退回到分离进程。
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(format!("run systemd-run: {err}")),
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -1788,7 +1885,13 @@ mod tests {
         let log = Path::new("/var/log/wist-agentd/wist-upgrader.log");
         let env_file = Path::new("/etc/wist-agentd/agentd.env");
 
-        let system = build_systemd_run_launch(&inner, "wist-upgrader-work-1", log, env_file);
+        let system = build_systemd_run_launch(
+            &inner,
+            "wist-upgrader-work-1",
+            log,
+            env_file,
+            SystemdCapabilities::for_version(255),
+        );
         assert_eq!(system.program, PathBuf::from("systemd-run"));
         assert!(
             system
@@ -1798,8 +1901,16 @@ mod tests {
         );
         // `--collect`：退出即清，免得同名 unit 残留挡住下一次同 work_id 的升级。
         assert!(system.args.iter().any(|arg| arg == "--collect"));
-        // `exec`：起 unit 成功要到 execve 成功为止，否则起不来的升级器会被误当成已派发。
-        assert!(system.args.iter().any(|arg| arg == "--service-type=exec"));
+        // `--service-type=exec` 一律不传：`Type=exec` 在 239 及以前的 man page 上都没有，
+        // 而传一个不认的值是整条 systemd-run 失败（就是这次报错的形状）。
+        assert!(
+            !system
+                .args
+                .iter()
+                .any(|arg| arg.starts_with("--service-type")),
+            "{:?}",
+            system.args
+        );
         assert!(
             system
                 .args
@@ -1855,6 +1966,7 @@ mod tests {
             "wist-upgrader-w",
             Path::new("/var/log/x.log"),
             Path::new("/etc/wist-agentd/agentd.env"),
+            SystemdCapabilities::for_version(255),
         );
         let sep = wrapped.args.iter().position(|a| a == "--").expect("--");
         // `$`→`$$`、`%`→`%%`；不含这两个字符的参数原样不动。
@@ -1874,6 +1986,7 @@ mod tests {
             "wist-upgrader-w",
             Path::new("/var/log/%d/up.log"),
             Path::new("/etc/%n/agentd.env"),
+            SystemdCapabilities::for_version(255),
         );
         assert!(
             wrapped
@@ -1886,6 +1999,188 @@ mod tests {
                 .args
                 .iter()
                 .any(|arg| arg == "--property=EnvironmentFile=-/etc/%%n/agentd.env")
+        );
+    }
+
+    /// 老 systemd（RHEL/CentOS 7 的 219）不认 `append:` / `--collect`：
+    /// 硬塞会得到 `Unknown assignment StandardOutput=append:...`，整条 systemd-run 直接失败。
+    /// 所以旧版只留最保守的参数，日志交给 journal（仍有 `SyslogIdentifier` 可定位）。
+    #[test]
+    fn systemd_run_launch_degrades_on_an_old_systemd() {
+        let inner = UpgradeLaunch {
+            program: PathBuf::from("/usr/local/bin/wist-upgrader"),
+            args: vec![
+                "apply".to_string(),
+                "--work-id".to_string(),
+                "w".to_string(),
+            ],
+        };
+        let wrapped = build_systemd_run_launch(
+            &inner,
+            "wist-upgrader-w",
+            Path::new("/var/log/wist-agentd/wist-upgrader.log"),
+            Path::new("/etc/wist-agentd/agentd.env"),
+            SystemdCapabilities::for_version(219),
+        );
+
+        for unsupported in [
+            "--collect",
+            "--property=StandardOutput=append:/var/log/wist-agentd/wist-upgrader.log",
+            "--property=StandardError=append:/var/log/wist-agentd/wist-upgrader.log",
+        ] {
+            assert!(
+                !wrapped.args.iter().any(|arg| arg == unsupported),
+                "旧版 systemd 不认 {unsupported}，传了会让升级起不来：{:?}",
+                wrapped.args
+            );
+        }
+        // 但「包成独立 unit」这件事本身不能降级：cgroup 回收才是这条路径存在的理由。
+        assert!(
+            wrapped
+                .args
+                .iter()
+                .any(|arg| arg == "--unit=wist-upgrader-w")
+        );
+        assert!(
+            wrapped
+                .args
+                .iter()
+                .any(|arg| arg == "--property=EnvironmentFile=-/etc/wist-agentd/agentd.env")
+        );
+        assert!(
+            wrapped
+                .args
+                .iter()
+                .any(|arg| arg == "--property=SyslogIdentifier=wist-upgrader-w"),
+            "没有文件日志时，journal 里的 tag 是唯一找得到它的线索"
+        );
+        let sep = wrapped.args.iter().position(|arg| arg == "--").expect("--");
+        assert_eq!(wrapped.args[sep + 1], "/usr/local/bin/wist-upgrader");
+        assert_eq!(&wrapped.args[sep + 2..], &inner.args[..]);
+    }
+
+    /// 两项能力的门槛都是**核实过的下界**，不是凭印象：
+    /// `--collect` 在 Debian 9（232）还没有、Ubuntu 18.04（237）有；
+    /// `append:` 在 237 的 `systemd.exec` 里还只有 `file:`，到 240 才接进属性白名单。
+    /// 取“核实过的下界”意味着只会**少用**，不会把一个旧版不认的参数塞进去。
+    #[test]
+    fn systemd_capabilities_follow_verified_lower_bounds() {
+        let at = |major| SystemdCapabilities::for_version(major);
+
+        assert!(!at(219).collect && !at(219).log_append);
+        assert!(!at(232).collect, "232 的 systemd-run 还没有 --collect");
+        assert!(at(237).collect);
+        assert!(!at(237).log_append, "237 只有 file:，没有 append:");
+        assert!(at(240).log_append);
+        // 探测不到版本时全部降级（保守的一套在任何版本上都认）。
+        assert_eq!(SystemdCapabilities::legacy(), at(0));
+    }
+
+    #[test]
+    fn parse_systemd_major_reads_the_first_line() {
+        assert_eq!(parse_systemd_major("systemd 219\n+PAM +AUDIT\n"), Some(219));
+        // RHEL / CentOS 7 的真实输出（带补丁版本号）。
+        assert_eq!(
+            parse_systemd_major("systemd 219 (219-78.el7_9.9)\n+PAM +AUDIT\n"),
+            Some(219)
+        );
+        assert_eq!(
+            parse_systemd_major("systemd 255 (255.4-1ubuntu8)\n+PAM +AUDIT\n"),
+            Some(255)
+        );
+        assert_eq!(parse_systemd_major(""), None);
+        assert_eq!(parse_systemd_major("garbage"), None);
+    }
+
+    /// 回归：现场报错就是「把新版才认的参数塞给旧 systemd-run」。
+    ///
+    /// 按发行版逐个锁死「该版本能收到什么」：232 = Debian 9、237 = Ubuntu 18.04、
+    /// 239 = RHEL / CentOS 8、240 = 第一个认 `append:` 的版本。任何一格对不上，
+    /// 那一版机器上的升级就会在 `systemd-run` 这一行直接失败（而不是降级）。
+    #[test]
+    fn systemd_run_argv_never_carries_flags_the_host_version_rejects() {
+        let inner = UpgradeLaunch {
+            program: PathBuf::from("/usr/local/bin/wist-upgrader"),
+            args: vec!["apply".to_string()],
+        };
+        const LOG: &str = "/var/log/wist-agentd/wist-upgrader.log";
+        let stdout = format!("--property=StandardOutput=append:{LOG}");
+        let stderr = format!("--property=StandardError=append:{LOG}");
+
+        // (主版本, 认不认 --collect, 认不认 append:)
+        for (major, collect, appends) in [
+            (219, false, false),
+            (232, false, false),
+            (237, true, false),
+            (239, true, false),
+            (240, true, true),
+            (255, true, true),
+        ] {
+            let args = build_systemd_run_launch(
+                &inner,
+                "wist-upgrader-w",
+                Path::new(LOG),
+                Path::new("/etc/wist-agentd/agentd.env"),
+                SystemdCapabilities::for_version(major),
+            )
+            .args;
+            let has = |needle: &str| args.iter().any(|arg| arg == needle);
+
+            assert_eq!(
+                has("--collect"),
+                collect,
+                "systemd {major} 的 --collect：{args:?}"
+            );
+            assert_eq!(
+                has(&stdout),
+                appends,
+                "systemd {major} 的 StandardOutput：{args:?}"
+            );
+            assert_eq!(
+                has(&stderr),
+                appends,
+                "systemd {major} 的 StandardError：{args:?}"
+            );
+            // `Type=exec` 在 239 及以前都没有 —— 任何版本都不传。
+            assert!(
+                !args.iter().any(|arg| arg.starts_with("--service-type")),
+                "systemd {major} 不该带 --service-type：{args:?}"
+            );
+            // 与版本无关、任何能跑 systemd-run 的机器都认的部分必须一直在：
+            // 没有 unit 名分不清是哪件升级；没有 EnvironmentFile 拿不到代理等长期变量；
+            // 没有 SyslogIdentifier，则在没文件日志的旧版上连 journal 都定位不到。
+            for required in [
+                "--unit=wist-upgrader-w",
+                "--property=EnvironmentFile=-/etc/wist-agentd/agentd.env",
+                "--property=SyslogIdentifier=wist-upgrader-w",
+                "--",
+                "/usr/local/bin/wist-upgrader",
+            ] {
+                assert!(has(required), "systemd {major} 少了 {required}：{args:?}");
+            }
+        }
+    }
+
+    /// 探测不到 systemd 版本（`systemctl` 不在 `PATH` / 输出读不懂）时只能退最保守的一套：
+    /// 猜一个高版本赌的是「升级能不能起来」。
+    #[test]
+    fn an_unreadable_systemd_version_report_degrades_instead_of_guessing() {
+        for report in [
+            None,
+            Some(""),
+            Some("systemd\n"),
+            Some("not systemd at all\n"),
+        ] {
+            assert_eq!(
+                capabilities_from_report(report),
+                SystemdCapabilities::legacy(),
+                "报告 = {report:?}"
+            );
+        }
+        assert_eq!(
+            capabilities_from_report(Some("systemd 219 (219-78.el7_9.9)\n+PAM +AUDIT\n")),
+            SystemdCapabilities::for_version(219),
+            "RHEL / CentOS 7 的真实输出必须能认出来"
         );
     }
 

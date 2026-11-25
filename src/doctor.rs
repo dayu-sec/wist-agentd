@@ -1746,7 +1746,8 @@ fn upgrade_dead_hint(platform: Option<crate::service::ServicePlatform>) -> &'sta
              确认当前版本后到管理面重派升级"
         }
         _ => {
-            "看升级器日志与那个瞬态 unit：`journalctl -u wist-agentd`、日志目录下的 \
+            "看升级器日志与那个瞬态 unit：`journalctl -u wist-agentd`、`journalctl -t wist-upgrader-<work_id>`\
+             （systemd 240 以前没有 `append:`，升级器日志只在 journal）、日志目录下的 \
              `wist-upgrader.log`、`systemctl status wist-upgrader-<work_id>`；\
              确认当前版本后到管理面重派升级"
         }
