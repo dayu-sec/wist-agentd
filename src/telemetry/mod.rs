@@ -3,6 +3,7 @@
 pub mod buffer;
 pub mod container_ref;
 pub mod exporters;
+pub mod flows;
 pub mod logs;
 pub mod metrics;
 pub mod pod_log_ref;

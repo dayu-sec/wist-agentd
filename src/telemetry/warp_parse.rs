@@ -214,6 +214,23 @@ impl TelemetryRecordSink {
     pub(crate) fn carries_investigation_frames(&self) -> bool {
         matches!(self, Self::Tcp(_))
     }
+
+    /// 上送一帧**流记录**（` FLOW: ` 标记 + `HostFlowRecord` JSON）。
+    ///
+    /// 为什么单开标记：数据面按**标记**分 sink，流记录与日志/事实的保留期和消费者
+    /// 都不同（窄、短时、量大；见设计文档 §5.2）。file sink 只承载日志，这里静默跳过 —
+    /// 由调用方的 [`Self::carries_flow_frames`] 在发送前判断。
+    pub(crate) async fn write_flow(&mut self, envelope: &DataFrame, body: &[u8]) -> io::Result<()> {
+        match self {
+            Self::File(_) => Ok(()),
+            Self::Tcp(sink) => sink.write_flow(envelope, body).await,
+        }
+    }
+
+    /// 这条 sink 能不能承载流记录帧（只有数据面 TCP 能）。
+    pub(crate) fn carries_flow_frames(&self) -> bool {
+        matches!(self, Self::Tcp(_))
+    }
 }
 
 #[derive(Debug, Clone, ::jumo_derive::Jumo)]
@@ -490,6 +507,13 @@ impl TcpRecordSink {
             .await
     }
 
+    /// 写入一帧流记录（` FLOW: ` 标记 + `HostFlowRecord` JSON 正文）。
+    pub(crate) async fn write_flow(&mut self, envelope: &DataFrame, body: &[u8]) -> io::Result<()> {
+        let frame = build_flow_frame(envelope, body)?;
+        self.write_payload(&build_payload_bytes(&frame, self.framing))
+            .await
+    }
+
     /// 测试用：缩短退避窗口，避免真实等待默认的 1s。
     #[cfg(test)]
     fn with_backoff(mut self, initial: Duration) -> Self {
@@ -692,6 +716,20 @@ fn build_investigation_frame(envelope: &DataFrame, body: &[u8]) -> io::Result<Ve
     let mut frame = serde_json::to_vec(envelope)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     frame.extend_from_slice(b" IVSREP: ");
+    frame.extend_from_slice(body);
+    Ok(frame)
+}
+
+/// TCP 流记录帧：与事实/快照帧同构，但帧标记为 ` FLOW: `（host flow record），
+/// 正文是 `host_flow/v1` 的一条窗口记录。
+///
+/// 为什么不蹭 `LOGRAW`：`LOGRAW` 的正文是「原文、不转义」，要走各采集面的 WPL + raw_log
+/// 兜底 —— 流记录会变成“日志”，占日志保留期且抽不出五元组；为什么不蹭 `METRICS`：
+/// 那是 VM 单样本 `{metric,values,timestamps}`，进指标存储，不是事件。
+fn build_flow_frame(envelope: &DataFrame, body: &[u8]) -> io::Result<Vec<u8>> {
+    let mut frame = serde_json::to_vec(envelope)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    frame.extend_from_slice(b" FLOW: ");
     frame.extend_from_slice(body);
     Ok(frame)
 }
@@ -1375,6 +1413,31 @@ mod tests {
         assert_eq!(parsed_body, String::from_utf8_lossy(body));
         // 不许蹭别的帧标记：数据面按标记分 sink，串台会把报告写进日志/事实的保留策略里。
         for other in [" LOGRAW: ", " METRICS: ", " OBSFACT: ", " DSNAP: "] {
+            assert!(!text.contains(other), "must not carry {other}: {text}");
+        }
+    }
+
+    #[test]
+    fn flow_frame_uses_flow_marker_and_keeps_body() {
+        let envelope = DataFrame::new("agent-001", "2026-11-26T00:00:00Z", 45);
+        let body = br#"{"record_schema":"wist.host_flow/v1","direction":"out"}"#;
+
+        let frame = super::build_flow_frame(&envelope, body).expect("build frame");
+        let text = String::from_utf8_lossy(&frame);
+        let (env, parsed_body) = text.split_once(" FLOW: ").expect("FLOW marker");
+
+        let parsed_env: serde_json::Value = serde_json::from_str(env).expect("valid envelope");
+        assert_eq!(parsed_env["agent"], "agent-001");
+        assert_eq!(parsed_env["seq"], 45);
+        assert_eq!(parsed_body, String::from_utf8_lossy(body));
+        // 流记录不能蹭日志/事实/指标/快照/报告的标记（保留期与消费者都不同）。
+        for other in [
+            " LOGRAW: ",
+            " METRICS: ",
+            " OBSFACT: ",
+            " DSNAP: ",
+            " IVSREP: ",
+        ] {
             assert!(!text.contains(other), "must not carry {other}: {text}");
         }
     }

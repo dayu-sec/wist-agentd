@@ -143,6 +143,17 @@ pub struct DorisGrant {
     pub interval: Option<Duration>,
 }
 
+/// 从工作折算出来的一份**流记录授权**（`HostFlow` 来源）。
+///
+/// 与 [`WorkLogInput`] / 导出器运行平行：流记录既不是 tail 一个文件，也不是周期跑一条命令，
+/// 而是常驻的 tc/eBPF 观测。网卡由 agentd 按**本机事实**选，所以 `target` 只认空/`auto`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkFlowGrant {
+    pub work_id: String,
+    pub family: String,
+    pub unit_id: String,
+}
+
 /// 从工作折算出来的一条日志采集任务。
 ///
 /// 带上 `work_id`/`family`/`unit_id` 是为了审计：日志里出现某个采集任务的异常时，
@@ -711,6 +722,43 @@ impl AppliedWorkGrant {
             }
         }
         runs
+    }
+
+    /// 折算出的流记录授权（只来自**正在干活**且本机能采的单元）。
+    ///
+    /// `target` 只认空 / `auto`：观测哪张网卡是本机事实，工作里写死接口名（`eth0`）
+    /// 一律不算授权 —— 它会进 [`Self::unsupported_units`] 并被如实报出来。
+    ///
+    /// 本方法只回答「**授权**要不要流记录」，不回答「本机现在能不能采」：后者是能力探测
+    /// （内核/权限/qdisc），由采集层负责报 `unsupported`/`permission`/`run_failed`。
+    pub fn flow_grants(&self) -> Vec<WorkFlowGrant> {
+        let mut grants = Vec::new();
+        for (work_id, work) in &self.works {
+            if !work.is_working() {
+                continue;
+            }
+            let Some(spec) = work.spec.as_ref() else {
+                continue;
+            };
+            for unit in &spec.units {
+                if unit.capability != "collect_logs" {
+                    continue;
+                }
+                let granted = unit.sources.iter().any(|source| {
+                    is_host_flow_source(&source.kind)
+                        && (source.target.trim().is_empty()
+                            || source.target.trim().eq_ignore_ascii_case("auto"))
+                });
+                if granted {
+                    grants.push(WorkFlowGrant {
+                        work_id: work_id.clone(),
+                        family: work.family.clone(),
+                        unit_id: unit.unit_id.clone(),
+                    });
+                }
+            }
+        }
+        grants
     }
 
     /// 指标上送的周期；`None` = 现在不该上送（没有授权的指标工作）。
@@ -1567,6 +1615,44 @@ mod tests {
             "原因要说清是「本版还没采集器」：{}",
             unsupported[0].detail
         );
+    }
+
+    /// `flow_grants()` 只认「在干活 + HostFlow + auto」：暂停的不算，写死网卡的不算。
+    #[test]
+    fn flow_grants_need_an_active_work_and_an_auto_target() {
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![
+                standing(
+                    "w-flow",
+                    "NetworkFlow",
+                    1,
+                    "active",
+                    &spec(&[("flow", "collect_logs", "HostFlow:auto")]),
+                ),
+                standing(
+                    "w-flow-paused",
+                    "NetworkFlow",
+                    1,
+                    "paused",
+                    &spec(&[("flow2", "collect_logs", "HostFlow:auto")]),
+                ),
+                standing(
+                    "w-flow-pinned",
+                    "NetworkFlow",
+                    1,
+                    "active",
+                    &spec(&[("flow3", "collect_logs", "HostFlow:eth0")]),
+                ),
+            ],
+        ));
+
+        let grants = applied.flow_grants();
+        assert_eq!(grants.len(), 1, "{grants:?}");
+        assert_eq!(grants[0].work_id, "w-flow");
+        assert_eq!(grants[0].unit_id, "flow");
+        assert_eq!(grants[0].family, "NetworkFlow");
     }
 
     /// 写死网卡名要给出**另一条**可操作的原因（只认 `auto`）。
