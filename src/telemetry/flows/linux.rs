@@ -260,6 +260,8 @@ impl Collector {
                 skb_count: value.skb_count,
                 gso_skb_count: value.gso_skb_count,
                 dropped: value.dropped,
+                // 近似：BPF 侧只知道「自上次读取以来有没有失败过」，没有按窗口分桶。
+                // 宁可多报一轮（truncated=true），也不要在丢过数据时静默报完整。
                 truncated: drops > 0,
             };
             if agg.is_empty() {
@@ -578,10 +580,12 @@ mod tests {
         assert!(!iface.name.is_empty() && iface.ifindex > 0);
     }
 
-    /// 真机冒烟：必须 root + tc。生成 UDP 出向流量，断言五元组与**精确字节数**。
+    /// 真机冒烟（root + tc）：一次挂载里验四件事 ——
+    /// 1) UDP 出向的**精确 L3 字节**；2) 不同目的端口不合并；3) 大报文仍按 L3 计；
+    /// 4) ICMP echo 进得到 `protocol=1` + `icmp_type=8`。
     #[test]
     #[ignore = "需要 root + tc + 真实流量（在 Linux 真机上跑）"]
-    fn counts_an_egress_udp_flow() {
+    fn counts_real_flows_on_a_live_interface() {
         let snapshot = interfaces();
         let chosen = select_observed(&snapshot);
         let iface = (*chosen.first().expect("默认出口网卡")).clone();
@@ -589,62 +593,107 @@ mod tests {
         let refs: Vec<&IfaceSnapshot> = ifaces.iter().collect();
         let mut collector = Collector::start(&refs).expect("attach tc");
 
-        // 每个 UDP 报文 = 14(eth) + 20(ip) + 8(udp) + 15(payload) = 57 字节 L3 = 43（不含 eth）
-        // 这里断言的是 L3 字节：43 * n。
-        const PAYLOAD: usize = 15;
-        const L3_PER_PACKET: u64 = 20 + 8 + PAYLOAD as u64;
-        const SENT: u64 = 5;
-
         let gateway = default_gateway_v4().expect("默认网关");
+        let local_v4 = iface
+            .addrs
+            .iter()
+            .find_map(|addr| match addr {
+                IpAddr::V4(v4) => Some(*v4),
+                IpAddr::V6(_) => None,
+            })
+            .expect("网卡应有一个 v4 地址");
+
         let socket = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind");
-        let dst_port = 9u16;
-        for _ in 0..SENT {
-            socket
-                .send_to(&[b'x'; PAYLOAD], (gateway, dst_port))
-                .expect("send");
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+        let send = |payload: usize, port: u16, count: u64| {
+            let body = vec![b'x'; payload];
+            for _ in 0..count {
+                socket.send_to(&body, (gateway, port)).expect("send");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        // 同一个目的地址、三个不同端口；第三个是大报文（1400B payload）。
+        send(15, 9, 5);
+        send(15, 10, 3);
+        send(1400, 11, 2);
         std::thread::sleep(std::time::Duration::from_millis(300));
 
         let flows = collector.snapshot_all();
-        let hit = flows.iter().find(|flow| {
-            flow.ifindex == iface.ifindex
-                && flow.key.direction == Direction::Out
-                && flow.key.protocol == 17
-                && flow.key.dst_port == dst_port
-        });
-        let hit = hit.unwrap_or_else(|| {
-            panic!(
-                "没数到出向 UDP 到 {}:{}；已看到 {:?}",
-                gateway,
-                dst_port,
-                flows
-                    .iter()
-                    .map(|flow| (
-                        flow.key.protocol,
-                        flow.key.direction,
-                        flow.key.dst.to_string(),
-                        flow.key.dst_port,
-                        flow.agg.bytes
-                    ))
-                    .collect::<Vec<_>>()
-            )
-        });
-        assert_eq!(hit.agg.packets, SENT, "报文数（Σ gso_segs）");
-        assert_eq!(
-            hit.agg.bytes,
-            L3_PER_PACKET * SENT,
-            "L3 字节必须精确等于每包 L3 长度 × 包数"
-        );
-        assert_eq!(
-            hit.key.src,
-            iface
-                .addrs
+        for (port, count, per_packet_l3) in [
+            (9u16, 5u64, 20u64 + 8 + 15),
+            (10, 3, 20u64 + 8 + 15),
+            (11, 2, 20u64 + 8 + 1400),
+        ] {
+            let flow = flows
                 .iter()
-                .copied()
-                .find(|addr| { matches!(addr, IpAddr::V4(_)) })
-                .expect("v4 addr"),
-            "源地址应是本机网卡地址"
-        );
+                .find(|flow| {
+                    flow.ifindex == iface.ifindex
+                        && flow.key.direction == Direction::Out
+                        && flow.key.protocol == 17
+                        && flow.key.dst_port == port
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "没数到出向 UDP 到 {}:{port}；已看到 {:?}",
+                        gateway,
+                        flows
+                            .iter()
+                            .map(|flow| (
+                                flow.key.protocol,
+                                flow.key.direction,
+                                flow.key.dst_port,
+                                flow.agg.packets,
+                                flow.agg.bytes
+                            ))
+                            .collect::<Vec<_>>()
+                    )
+                });
+            assert_eq!(flow.agg.packets, count, "端口 {port} 的报文数");
+            assert_eq!(
+                flow.agg.bytes,
+                per_packet_l3 * count,
+                "端口 {port} 的 L3 字节（不含以太头）"
+            );
+            assert_eq!(flow.key.src, IpAddr::V4(local_v4), "源地址");
+            assert_eq!(flow.key.dst, IpAddr::V4(gateway), "目的地址");
+            // 本版不读 5.14+ 的 wire_len：口径必须如实说 unavailable。
+            assert!(flow.agg.wire_bytes.is_none(), "wire_bytes 应报 unavailable");
+        }
+
+        // ICMP echo：走 ping（root 下是 raw socket）。
+        // **不要求 ping 成功**：很多 VPC 网关不回 ICMP，但出向 echo request 一定会经过
+        // 我们的 hook —— 这正是要验的东西（回包有没有是网络策略的事，不是采集器的事）。
+        let status = std::process::Command::new("ping")
+            .args(["-c", "3", "-W", "1", "-q", &gateway.to_string()])
+            .status()
+            .expect("run ping");
+        eprintln!("ping {gateway} exit={status}");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let flows = collector.snapshot_all();
+        let echo = flows
+            .iter()
+            .find(|flow| {
+                flow.ifindex == iface.ifindex
+                    && flow.key.protocol == 1
+                    && flow.key.direction == Direction::Out
+                    && flow.key.icmp_type == Some(8)
+                    && flow.key.dst == IpAddr::V4(gateway)
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "没数到 ICMP echo；已看到 {:?}",
+                    flows
+                        .iter()
+                        .map(|flow| (
+                            flow.key.protocol,
+                            flow.key.direction,
+                            flow.key.icmp_type,
+                            flow.key.dst.to_string()
+                        ))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert!(echo.agg.packets >= 1, "至少 1 个 echo request");
+        assert!(echo.agg.bytes >= 3 * (20 + 8), "ICMP 至少含 IP + ICMP 头");
     }
 }

@@ -167,11 +167,18 @@ static __always_inline int handle(struct __sk_buff *skb, __u8 direction)
     else
         return TC_ACT_OK;
 
+    /* 剥 VLAN：单层 802.1Q 与 QinQ（802.1ad + 802.1Q）各一层，最多剥两层。
+     * 每层 4 字节（TCI + 内层 ethertype）。 */
     __u32 l3 = ETH_HLEN;
     __u16 eth_proto = (__u16)((buf[12] << 8) | buf[13]);
-    if (eth_proto == ETH_P_8021Q || eth_proto == ETH_P_8021AD) {
-        l3 = ETH_HLEN + 4;
-        eth_proto = (__u16)((buf[16] << 8) | buf[17]);
+#pragma unroll
+    for (int tag = 0; tag < 2; tag++) {
+        if (eth_proto != ETH_P_8021Q && eth_proto != ETH_P_8021AD)
+            break;
+        if (have < l3 + 4)
+            return TC_ACT_OK;
+        l3 += 4;
+        eth_proto = (__u16)((buf[l3 - 2] << 8) | buf[l3 - 1]);
     }
 
     struct flow_key key = {};
