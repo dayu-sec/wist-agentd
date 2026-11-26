@@ -6,7 +6,7 @@
 //! 其余桶按差值回推 —— 不需要把墙钟写进 BPF。
 
 use crate::telemetry::flows::iface::IfaceSnapshot;
-use crate::telemetry::flows::record::{Direction, FlowKey, WindowAgg};
+use crate::telemetry::flows::record::{Direction, FLUSH_LAG_WINDOWS, FlowKey, WindowAgg, is_late};
 use crate::telemetry::flows::support::{FlowSupport, Unavailable};
 use crate::telemetry::flows::{FlushedFlow, WatchedIface};
 use aya::maps::{HashMap, MapData, PerCpuArray};
@@ -108,6 +108,10 @@ pub(crate) struct Collector {
     ifaces: Vec<WatchedIface>,
     /// 上次读到的 drops 累计值（per-cpu 计数器本身不清零，只算增量）。
     last_drops: u64,
+    /// 已经 flush 到哪个桶（含）。再落进这个桶的包是**迟到**，只能计丢，不能再发一条。
+    flushed_through: u64,
+    /// 迟到包数（补发会破坏「一个键一个窗口一条记录」，所以只记数）。
+    late_dropped: u64,
 }
 
 fn attach_error(ifname: &str, err: ProgramError) -> Unavailable {
@@ -177,6 +181,8 @@ impl Collector {
         Ok(Self {
             bpf,
             last_drops: 0,
+            flushed_through: 0,
+            late_dropped: 0,
             ifaces: ifaces
                 .iter()
                 .map(|iface| WatchedIface {
@@ -210,9 +216,15 @@ impl Collector {
         delta
     }
 
-    /// flush 掉已经结束满 `lag` 个窗口的桶。
-    pub(crate) fn flush(&mut self, now_bucket: u64, lag_windows: u64) -> Vec<FlushedFlow> {
+    /// 迟到包数（上一次 flush 之后落进已 flush 窗口的包）。自观测用。
+    pub(crate) fn take_late_dropped(&mut self) -> u64 {
+        std::mem::take(&mut self.late_dropped)
+    }
+
+    /// flush 掉已经结束满 `FLUSH_LAG_WINDOWS` 个窗口的桶。
+    pub(crate) fn flush(&mut self, now_bucket: u64) -> Vec<FlushedFlow> {
         let drops = self.take_drops();
+        let horizon = now_bucket.saturating_sub(FLUSH_LAG_WINDOWS);
         let Some(map) = self.bpf.map_mut(MAP_NAME) else {
             return Vec::new();
         };
@@ -224,7 +236,7 @@ impl Collector {
         let mut candidates: Vec<RawFlowKey> = Vec::new();
         for entry in hash.iter() {
             let Ok((key, _)) = entry else { continue };
-            if key.window_id + lag_windows <= now_bucket {
+            if key.window_id <= horizon {
                 candidates.push(key);
             }
         }
@@ -235,6 +247,11 @@ impl Collector {
                 continue;
             };
             let _ = hash.remove(&key);
+            // 迟到：这个桶在上一轮已经 flush 过，再发一条就是同一幂等键的第二条记录。
+            if is_late(key.window_id, self.flushed_through) {
+                self.late_dropped = self.late_dropped.saturating_add(1);
+                continue;
+            }
             let agg = WindowAgg {
                 packets: value.packets,
                 bytes: value.bytes,
@@ -258,6 +275,7 @@ impl Collector {
                 agg,
             });
         }
+        self.flushed_through = self.flushed_through.max(horizon);
         flushed
     }
     /// 不按窗口过滤地把表里的条目全取出来（只给真机冒烟测试用）。
@@ -437,54 +455,196 @@ fn default_egress_iface() -> Option<String> {
     None
 }
 
+/// 默认路由的网关（v4），给真机冒烟测试选一个本机确实会经 eth0 走的目的地址。
+fn default_gateway_v4() -> Option<std::net::Ipv4Addr> {
+    let text = std::fs::read_to_string("/proc/net/route").ok()?;
+    for line in text.lines().skip(1) {
+        let mut fields = line.split_whitespace();
+        let _iface = fields.next()?;
+        let dest = fields.next()?;
+        let gateway = fields.next()?;
+        if dest == "00000000" {
+            // /proc/net/route 里的地址是「按小端打印的 32 位值」。
+            let raw = u32::from_str_radix(gateway, 16).ok()?;
+            return Some(std::net::Ipv4Addr::from(raw.to_be()));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::flows::iface::{self, select_observed};
+    use std::mem::{offset_of, size_of};
 
-    fn interface(name: &str) -> Option<IfaceSnapshot> {
-        interfaces().into_iter().find(|iface| iface.name == name)
+    /// C 与 Rust 两边的结构必须逐字节一致：改了任一边而没改另一边，map 会解析出垃圾。
+    #[test]
+    fn raw_struct_layout_matches_the_bpf_object() {
+        assert_eq!(size_of::<RawFlowKey>(), 60, "flow_key 大小");
+        assert_eq!(size_of::<RawFlowVal>(), 48, "flow_val 大小");
+        assert_eq!(offset_of!(RawFlowKey, window_id), 0);
+        assert_eq!(offset_of!(RawFlowKey, ifindex), 8);
+        assert_eq!(offset_of!(RawFlowKey, direction), 12);
+        assert_eq!(offset_of!(RawFlowKey, protocol), 13);
+        assert_eq!(offset_of!(RawFlowKey, family), 14);
+        assert_eq!(offset_of!(RawFlowKey, flags), 15);
+        assert_eq!(offset_of!(RawFlowKey, src), 16);
+        assert_eq!(offset_of!(RawFlowKey, dst), 32);
+        assert_eq!(offset_of!(RawFlowKey, src_port), 48);
+        assert_eq!(offset_of!(RawFlowKey, dst_port), 50);
+        assert_eq!(offset_of!(RawFlowKey, icmp_type), 52);
+        assert_eq!(offset_of!(RawFlowKey, pad), 54);
+        assert_eq!(offset_of!(RawFlowVal, packets), 0);
+        assert_eq!(offset_of!(RawFlowVal, wire_bytes), 16);
+        assert_eq!(offset_of!(RawFlowVal, dropped), 40);
+        assert_eq!(offset_of!(RawFlowVal, flags), 44);
     }
 
-    /// 真机冒烟：必须 root + tc。生成一条 UDP 出向流量，断言 map 里有对应五元组。
+    fn raw_key(family: u8, direction: u8, protocol: u8, flags: u8) -> RawFlowKey {
+        RawFlowKey {
+            window_id: 7,
+            ifindex: 2,
+            direction,
+            protocol,
+            family,
+            flags,
+            src: [0; 16],
+            dst: [0; 16],
+            // 端口在 map 里是网络序：0x1f90 = 8080。
+            src_port: 0x1f90u16.to_be(),
+            dst_port: 0x01bbu16.to_be(),
+            icmp_type: 0,
+            icmp_code: 0,
+            pad: [0; 6],
+        }
+    }
+
     #[test]
-    #[ignore = "需要 root + tc + 真实流量（在 Linux 真机上跑 dev/verify-flow-ebpf.sh）"]
+    fn decodes_a_v4_tcp_key() {
+        let mut raw = raw_key(4, 1, 6, 0);
+        raw.src[..4].copy_from_slice(&[10, 118, 0, 14]);
+        raw.dst[..4].copy_from_slice(&[88, 214, 25, 121]);
+        let key = decode_key(&raw).expect("decode");
+        assert_eq!(key.direction, Direction::Out);
+        assert_eq!(key.protocol, 6);
+        assert_eq!(key.src.to_string(), "10.118.0.14");
+        assert_eq!(key.dst.to_string(), "88.214.25.121");
+        assert_eq!(key.src_port, 8080, "网络序要转回来");
+        assert_eq!(key.dst_port, 443);
+        assert!(key.icmp_type.is_none(), "TCP 不该带 icmp 字段");
+        assert!(!key.port_unavailable);
+    }
+
+    #[test]
+    fn decodes_a_v6_icmp_key_and_the_unavailable_flag() {
+        let mut raw = raw_key(6, 0, 58, FLAG_PORT_UNAVAILABLE);
+        raw.src = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        raw.dst = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        raw.icmp_type = 128;
+        raw.icmp_code = 1;
+        let key = decode_key(&raw).expect("decode");
+        assert_eq!(key.direction, Direction::In);
+        assert_eq!(key.src.to_string(), "2001:db8::1");
+        assert_eq!(key.dst.to_string(), "fd00::2");
+        assert_eq!(key.icmp_type, Some(128));
+        assert_eq!(key.icmp_code, Some(1));
+        assert!(key.port_unavailable);
+    }
+
+    #[test]
+    fn rejects_unknown_family_and_direction() {
+        assert!(decode_key(&raw_key(0, 1, 6, 0)).is_none(), "family 0");
+        assert!(decode_key(&raw_key(5, 1, 6, 0)).is_none(), "family 5");
+        assert!(decode_key(&raw_key(4, 2, 6, 0)).is_none(), "direction 2");
+        assert!(decode_key(&raw_key(4, 9, 6, 0)).is_none(), "direction 9");
+    }
+
+    #[test]
+    fn interface_snapshot_finds_the_default_egress_with_a_routable_addr() {
+        // 纯读：任何 Linux 主机都该有默认出口；没有就说明这台机不适合做流采集。
+        let snapshot = interfaces();
+        let chosen = select_observed(&snapshot);
+        assert!(
+            !chosen.is_empty(),
+            "没有可观测网卡：{:?}",
+            snapshot
+                .iter()
+                .map(|iface| (&iface.name, iface.is_default_egress))
+                .collect::<Vec<_>>()
+        );
+        let iface = chosen[0];
+        assert!(iface.addrs.iter().any(|addr| iface::is_flow_addr(*addr)));
+        assert!(!iface.name.is_empty() && iface.ifindex > 0);
+    }
+
+    /// 真机冒烟：必须 root + tc。生成 UDP 出向流量，断言五元组与**精确字节数**。
+    #[test]
+    #[ignore = "需要 root + tc + 真实流量（在 Linux 真机上跑）"]
     fn counts_an_egress_udp_flow() {
-        let iface = interface("eth0").expect("eth0");
-        assert!(iface.is_default_egress, "eth0 应是默认出口");
+        let snapshot = interfaces();
+        let chosen = select_observed(&snapshot);
+        let iface = (*chosen.first().expect("默认出口网卡")).clone();
         let ifaces = [iface.clone()];
         let refs: Vec<&IfaceSnapshot> = ifaces.iter().collect();
         let mut collector = Collector::start(&refs).expect("attach tc");
 
+        // 每个 UDP 报文 = 14(eth) + 20(ip) + 8(udp) + 15(payload) = 57 字节 L3 = 43（不含 eth）
+        // 这里断言的是 L3 字节：43 * n。
+        const PAYLOAD: usize = 15;
+        const L3_PER_PACKET: u64 = 20 + 8 + PAYLOAD as u64;
+        const SENT: u64 = 5;
+
+        let gateway = default_gateway_v4().expect("默认网关");
         let socket = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind");
-        for _ in 0..5 {
+        let dst_port = 9u16;
+        for _ in 0..SENT {
             socket
-                .send_to(b"wist-flow-probe", ("10.11.0.1", 9))
+                .send_to(&[b'x'; PAYLOAD], (gateway, dst_port))
                 .expect("send");
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         std::thread::sleep(std::time::Duration::from_millis(300));
 
         let flows = collector.snapshot_all();
-        for flow in &flows {
-            eprintln!(
-                "seen proto={} dir={:?} {}:{} -> {}:{} bytes={} pkts={}",
-                flow.key.protocol,
-                flow.key.direction,
-                flow.key.src,
-                flow.key.src_port,
-                flow.key.dst,
-                flow.key.dst_port,
-                flow.agg.bytes,
-                flow.agg.packets
-            );
-        }
-        let hit = flows.iter().any(|flow| {
+        let hit = flows.iter().find(|flow| {
             flow.ifindex == iface.ifindex
                 && flow.key.direction == Direction::Out
                 && flow.key.protocol == 17
-                && flow.key.dst_port == 9
-                && flow.agg.bytes > 0
+                && flow.key.dst_port == dst_port
         });
-        assert!(hit, "没数到出向 UDP 流：{flows:#?}");
+        let hit = hit.unwrap_or_else(|| {
+            panic!(
+                "没数到出向 UDP 到 {}:{}；已看到 {:?}",
+                gateway,
+                dst_port,
+                flows
+                    .iter()
+                    .map(|flow| (
+                        flow.key.protocol,
+                        flow.key.direction,
+                        flow.key.dst.to_string(),
+                        flow.key.dst_port,
+                        flow.agg.bytes
+                    ))
+                    .collect::<Vec<_>>()
+            )
+        });
+        assert_eq!(hit.agg.packets, SENT, "报文数（Σ gso_segs）");
+        assert_eq!(
+            hit.agg.bytes,
+            L3_PER_PACKET * SENT,
+            "L3 字节必须精确等于每包 L3 长度 × 包数"
+        );
+        assert_eq!(
+            hit.key.src,
+            iface
+                .addrs
+                .iter()
+                .copied()
+                .find(|addr| { matches!(addr, IpAddr::V4(_)) })
+                .expect("v4 addr"),
+            "源地址应是本机网卡地址"
+        );
     }
 }

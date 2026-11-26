@@ -106,16 +106,28 @@ impl Collector {
         }
     }
 
-    /// flush 已经结束满 `lag` 个窗口的桶。
-    pub(crate) fn flush(&mut self, now_bucket: u64, lag_windows: u64) -> Vec<FlushedFlow> {
+    /// flush 已经结束满 `FLUSH_LAG_WINDOWS` 个窗口的桶。
+    pub(crate) fn flush(&mut self, now_bucket: u64) -> Vec<FlushedFlow> {
         #[cfg(all(target_os = "linux", have_flow_bpf))]
         {
-            return self.inner.flush(now_bucket, lag_windows);
+            return self.inner.flush(now_bucket);
         }
         #[cfg(not(all(target_os = "linux", have_flow_bpf)))]
         {
-            let _ = (now_bucket, lag_windows);
+            let _ = now_bucket;
             Vec::new()
+        }
+    }
+
+    /// 上一轮 flush 之后落进已 flush 窗口的包数（迟到，不补发）。
+    pub(crate) fn take_late_dropped(&mut self) -> u64 {
+        #[cfg(all(target_os = "linux", have_flow_bpf))]
+        {
+            return self.inner.take_late_dropped();
+        }
+        #[cfg(not(all(target_os = "linux", have_flow_bpf)))]
+        {
+            0
         }
     }
 }

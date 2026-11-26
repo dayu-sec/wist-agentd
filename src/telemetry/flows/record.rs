@@ -77,6 +77,14 @@ pub(crate) const fn is_flushable(window: u64, now_secs: u64) -> bool {
     window + WINDOW_SECONDS * FLUSH_LAG_WINDOWS <= now_secs
 }
 
+/// 这个窗口是否**已经 flush 过**：之后再落进这个窗口的包就是迟到。
+///
+/// 迟到包不能补发 —— 同一 `(五元组, 窗口)` 的幂等键只允许出现一条记录，
+/// 补发会让下游把同一段流量算两次。采集层把它们计入 `late_dropped`（可见，但不重复）。
+pub(crate) const fn is_late(window: u64, flushed_through: u64) -> bool {
+    window <= flushed_through
+}
+
 /// 把 BPF 的**单调桶**换算成 UTC 对齐的窗口起点。
 ///
 /// BPF 侧只拿得到 `bpf_ktime_get_ns()`（单调时钟），它分出的桶边界不对齐墙钟。
@@ -348,6 +356,16 @@ mod tests {
         assert_eq!(window_start(1789469802), 1789469760);
         // 窗口结束正好等于 start + 60：下一条记录从这里开始（半开区间）。
         assert_eq!(window_start(1789469820), 1789469820);
+    }
+
+    #[test]
+    fn late_windows_are_recognised_after_flush() {
+        // 已经 flush 到 100：100 及更早都算迟到（100 本身上一轮已发过）。
+        assert!(is_late(100, 100));
+        assert!(is_late(99, 100));
+        assert!(!is_late(101, 100));
+        // 还没 flush 过任何桶时，桶 0 也算迟到（它是远古数据，绝不能补发）。
+        assert!(is_late(0, 0));
     }
 
     #[test]

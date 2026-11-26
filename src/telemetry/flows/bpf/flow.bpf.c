@@ -2,7 +2,7 @@
  * 主机流记录：tc clsact 上的 egress / ingress 计数程序。
  *
  * 设计见 docs/design/host-ebpf-flow-collection.md：
- * - 只在 `__sk_buff` 暴露的字段上取值（len / gso_segs / wire_len），**不用 CO-RE**，
+ * - 只在 `__sk_buff` 暴露的字段上取值（len / gso_segs），**不用 CO-RE**，
  *   因此不依赖目标内核的 BTF；
  * - 在 BPF 侧按 (窗口, 网卡, 方向, 五元组) 聚合，用户态按窗口扫表 —— 不逐包上送；
  * - 不认识的协议、链路本地/组播、ICMPv6 邻居发现一律丢掉，并计入 drops。
@@ -59,7 +59,7 @@ struct flow_key {
 struct flow_val {
     __u64 packets;    /* Σ gso_segs：估算的 L3 报文数 */
     __u64 bytes;      /* Σ skb->len：L3 字节，不含 L2 */
-    __u64 wire_bytes; /* Σ wire_len：5.14+ 才有 */
+    __u64 wire_bytes; /* Σ wire_len：本版恒 0（不读 5.14+ 的 ctx 字段），保留字段给变体 */
     __u64 skb_count;  /* 观察到的 skb 数 */
     __u64 gso_skb_count;
     __u32 dropped;
@@ -113,36 +113,38 @@ static __always_inline void note_drop(void)
         *counter += 1;
 }
 
-/* 只收两个参数：BPF inline 函数超过 5 个参数 clang 会退化成栈传参而拒绝编译。 */
-static __always_inline int account(struct __sk_buff *skb, struct flow_key *key)
+/* 只收三个参数：BPF inline 函数超过 5 个参数 clang 会退化成栈传参而拒绝编译。
+ *
+ * `l2_len` 必须传进来：tc 上 `skb->len` **包含以太头**（实测 57 = 14 + 43），
+ * 而记录的 `bytes` 口径是 **L3**（设计 §8）。`wire_len` 是线缆长度，保持原样。 */
+static __always_inline int account(struct __sk_buff *skb, struct flow_key *key, __u32 l2_len)
 {
     key->window_id = bpf_ktime_get_ns() / FLOW_WINDOW_NS;
     key->ifindex = skb->ifindex;
 
     __u32 segments = skb->gso_segs ? skb->gso_segs : 1;
-    __u32 wire_len = skb->wire_len;
+    __u32 l3_len = skb->len > l2_len ? skb->len - l2_len : skb->len;
 
     struct flow_val *value = bpf_map_lookup_elem(&flow_map, key);
     if (value) {
         value->packets += segments;
-        value->bytes += skb->len;
+        value->bytes += l3_len;
         value->skb_count += 1;
         if (segments > 1)
             value->gso_skb_count += 1;
-        if (wire_len)
-            value->wire_bytes += wire_len;
-        else
-            value->flags |= FLAG_WIRE_BYTES_MISSING;
+        /* `skb->wire_len` 是 5.14+ 的 ctx 字段：在 5.4/5.10 上访问它会让 verifier
+         * **拒绝加载整个程序**（不是退化成 0）。为了守住 5.4 基线，这里不读它，
+         * 线缆字节统一报 unavailable；5.14+ 的精确口径留给后续的程序变体。 */
+        value->flags |= FLAG_WIRE_BYTES_MISSING;
         return TC_ACT_OK;
     }
 
     struct flow_val fresh = {};
     fresh.packets = segments;
-    fresh.bytes = skb->len;
+    fresh.bytes = l3_len;
     fresh.skb_count = 1;
     fresh.gso_skb_count = segments > 1;
-    fresh.wire_bytes = wire_len;
-    fresh.flags = wire_len ? 0 : FLAG_WIRE_BYTES_MISSING;
+    fresh.flags = FLAG_WIRE_BYTES_MISSING;
     if (bpf_map_update_elem(&flow_map, key, &fresh, BPF_ANY) != 0) {
         /* LRU 满时会淘汰旧条目；更新失败说明真丢了，必须让用户态看见。 */
         note_drop();
@@ -177,6 +179,9 @@ static __always_inline int handle(struct __sk_buff *skb, __u8 direction)
 
     __u8 version = buf[l3] >> 4;
     if (eth_proto == ETH_P_IP && version == 4) {
+        /* 截断帧：头都没读全时地址会是 0。宁可少一条，也不要一条 0.0.0.0 的假流。 */
+        if (have < l3 + 20)
+            return TC_ACT_OK;
         __u32 ihl = (__u32)(buf[l3] & 0x0f) * 4;
         if (ihl < 20 || ihl > 40)
             return TC_ACT_OK;
@@ -208,13 +213,20 @@ static __always_inline int handle(struct __sk_buff *skb, __u8 direction)
                 key.icmp_code = buf[port_at + 1];
             }
         }
-        return account(skb, &key);
+        return account(skb, &key, l3);
     }
 
     if (eth_proto == ETH_P_IPV6 && version == 6) {
-        __u8 protocol = buf[l3 + 6];
-        if (!proto_collected(protocol))
+        if (have < l3 + 40)
             return TC_ACT_OK;
+        __u8 protocol = buf[l3 + 6];
+        if (!proto_collected(protocol)) {
+            /* 扩展头（0 hop-by-hop / 43 routing / 44 fragment / 60 dest-opts）本版不解析。
+             * 但要让这部分**可见**（进 drops）：否则 v6 主机上这段流量会无声消失。 */
+            if (protocol == 0 || protocol == 43 || protocol == 44 || protocol == 60)
+                note_drop();
+            return TC_ACT_OK;
+        }
         const __u8 *src = &buf[l3 + 8];
         const __u8 *dst = &buf[l3 + 24];
         if (v6_noise(src) || v6_noise(dst)) {
@@ -230,7 +242,7 @@ static __always_inline int handle(struct __sk_buff *skb, __u8 direction)
         __u32 port_at = l3 + 40;
         if (port_at + 4 > have) {
             key.flags |= FLAG_PORT_UNAVAILABLE;
-            return account(skb, &key);
+            return account(skb, &key, l3);
         }
         if (proto_has_ports(protocol)) {
             __builtin_memcpy(&key.src_port, &buf[port_at], 2);
@@ -244,7 +256,7 @@ static __always_inline int handle(struct __sk_buff *skb, __u8 direction)
                 return TC_ACT_OK;
             }
         }
-        return account(skb, &key);
+        return account(skb, &key, l3);
     }
 
     return TC_ACT_OK;

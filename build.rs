@@ -43,18 +43,13 @@ fn main() {
     match result {
         Ok(output) if output.status.success() => println!("cargo:rustc-cfg=have_flow_bpf"),
         Ok(output) => {
-            // 把 clang 的原话带出来：埋掉的编译错误等于让 CI 只看到「unsupported」。
+            // clang 在、但编不过 = **构建坏了**：静默降级会让制品看起来正常却没有采集器。
             let stderr = String::from_utf8_lossy(&output.stderr);
-            for line in stderr.lines().take(12) {
-                println!("cargo:warning=flow.bpf.c: {line}");
-            }
-            println!(
-                "cargo:warning=flow.bpf.c 编译失败（{}）：流记录采集将报 unsupported",
-                output.status
-            );
+            panic!("flow.bpf.c 编译失败（{}）：\n{}", output.status, stderr);
         }
-        Err(err) => println!(
-            "cargo:warning=找不到 clang（{err}）：流记录采集将报 unsupported（设置 CLANG 可指定）"
-        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            println!("cargo:warning=找不到 clang：流记录采集将报 unsupported（设置 CLANG 可指定）")
+        }
+        Err(err) => panic!("无法执行 clang（{}）：{err}", clang),
     }
 }
