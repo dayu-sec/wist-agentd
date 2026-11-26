@@ -45,6 +45,7 @@ wist-agentd（edge daemon）实现时最重要的设计文档。
 - [macos-agent-uplink-to-warp-parse.md](./macos-agent-uplink-to-warp-parse.md) — macOS P0 采集端到端方案
 - [macos-security-audit-log-sources.md](./macos-security-audit-log-sources.md) — macOS 安全/审计日志源清单
 - [linux-security-audit-log-sources.md](./linux-security-audit-log-sources.md) — Linux 采集源清单（计算/数据服务器；**未核对**，规则/样本为零）
+- [host-ebpf-flow-collection.md](./host-ebpf-flow-collection.md) — 主机流记录（eBPF `FLOW:` 帧）采集：三层契约 / 窗口聚合 / 统计口径 / 选型与基线
 
 ## 模块对照（src 目录化后）
 
