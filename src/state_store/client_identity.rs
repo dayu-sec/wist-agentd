@@ -9,10 +9,28 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rcgen::{CertificateParams, KeyPair};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use x509_parser::prelude::{FromDer, X509Certificate};
+
+/// 身份材料的**写入代数**：每次写证书 / 续签台账都 +1。
+///
+/// 为什么需要它：证书状态的缓存 key 原本只看文件 mtime，而 ext4 的 mtime 只有**毫秒**
+/// 精度（真机实测：同一毫秒内重写两次，`mtime` 一模一样）。续签、测试里的连续重写都落在
+/// 同一刻度里，缓存就会把「刚换的证书」当成旧的，最多旧 `CERT_STATUS_TTL`（60s）。
+/// 写入方自己发信号，比让读者猜文件系统精度可靠。
+static IDENTITY_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// 当前写入代数（只增；缓存 key 用）。
+pub fn identity_generation() -> u64 {
+    IDENTITY_GENERATION.load(Ordering::Relaxed)
+}
+
+fn bump_identity_generation() {
+    IDENTITY_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
 
 /// 本地客户端私钥（相对 state 目录）。
 pub const CLIENT_KEY_RELATIVE_PATH: &str = "identity/client.key.pem";
@@ -76,7 +94,10 @@ pub fn store_client_certificate(
     paths: &ClientIdentityPaths,
     certificate_pem: &str,
 ) -> io::Result<()> {
-    write_private(&paths.cert_file, certificate_pem.as_bytes())
+    write_private(&paths.cert_file, certificate_pem.as_bytes())?;
+    // 写成功才换代：失败时不能让读者以为「换过了」。
+    bump_identity_generation();
+    Ok(())
 }
 
 /// 本地证书的有效期状态（§5.4：过期由 agent 本地判定，不靠服务端错误码）。
@@ -148,7 +169,9 @@ pub struct RenewalLedger {
 
 pub fn store_renewal_ledger(paths: &ClientIdentityPaths, ledger: &RenewalLedger) -> io::Result<()> {
     let body = serde_json::to_vec_pretty(ledger).map_err(io::Error::other)?;
-    write_private(&paths.renewal_file, &body)
+    write_private(&paths.renewal_file, &body)?;
+    bump_identity_generation();
+    Ok(())
 }
 
 pub fn read_renewal_ledger(paths: &ClientIdentityPaths) -> io::Result<Option<RenewalLedger>> {

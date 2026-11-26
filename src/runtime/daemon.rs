@@ -381,18 +381,23 @@ fn local_certificate_status(
 fn certificate_status_cache_key(config: &AgentConfig) -> String {
     let state_dir = Path::new(&config.paths.state_dir);
     let paths = crate::state_store::client_identity::ClientIdentityPaths::under(state_dir);
+    // mtime 在 ext4 上只有毫秒精度：同一毫秒内重写（续签、连续写）它一模一样，
+    // 所以**必须**再带上写入代数（agentd 自己写证书/台账时 +1）与文件大小。
     let stamp = |path: &Path| {
         std::fs::metadata(path)
             .ok()
-            .and_then(|meta| meta.modified().ok())
-            .map(|time| format!("{time:?}"))
+            .map(|meta| {
+                let modified = meta.modified().ok();
+                format!("{modified:?}:{}", meta.len())
+            })
             .unwrap_or_else(|| "-".to_string())
     };
     format!(
-        "{}|{}|{}",
+        "{}|{}|{}|g{}",
         state_dir.display(),
         stamp(&paths.cert_file),
-        stamp(&paths.renewal_file)
+        stamp(&paths.renewal_file),
+        crate::state_store::client_identity::identity_generation()
     )
 }
 
@@ -4320,6 +4325,37 @@ mod tests {
         assert_eq!(renewal.outcome, "renewed");
         assert_eq!(renewal.checked_at, "2026-10-08T00:00:00Z");
 
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    /// 同一个 state_dir 重写证书，缓存 key **必须**变。
+    ///
+    /// 回归位：key 曾经只含 mtime，而 ext4 的 mtime 只有毫秒精度 —— 同一毫秒内重写两次
+    /// 时间戳完全一样，缓存会把旧证书的状态一直返回（现场表现：续签后仍显示"未到期"，
+    /// 直到 60s TTL 过期）。
+    #[test]
+    fn rewriting_the_certificate_invalidates_the_status_cache_key() {
+        let state_dir = local_state_dir("cache-key-probe");
+        let mut config = test_config();
+        config.paths.state_dir = state_dir.display().to_string();
+        let paths = crate::state_store::client_identity::ClientIdentityPaths::under(&state_dir);
+
+        let mut keys = Vec::new();
+        for days in [37, 10, -1, 30] {
+            store_identity(&paths, days);
+            keys.push(super::certificate_status_cache_key(&config));
+        }
+        let unique: std::collections::BTreeSet<_> = keys.iter().collect();
+        assert_eq!(unique.len(), keys.len(), "重写后 key 重复：{keys:?}");
+
+        // 状态必须与最新写入一致（这正是原来偶发失败的路径）。
+        store_identity(&paths, 10);
+        assert_eq!(
+            super::local_certificate_status(&config)
+                .expect("due status")
+                .state,
+            "renew_due"
+        );
         let _ = std::fs::remove_dir_all(state_dir);
     }
 
