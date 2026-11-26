@@ -95,6 +95,11 @@ wist-validate = { version = "0.12" }
 [lib]
 path = "src/lib.rs"
 
+# eBPF 加载器：**只** Linux 编译（macOS 构建不该为它付依赖与安全审阅成本）。
+# 程序本身在 build.rs 里用 clang 编成 .o 后嵌入。
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = "0.16"
+
 [[bin]]
 name = "wist-agentd"
 path = "src/main.rs"

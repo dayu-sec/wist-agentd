@@ -77,6 +77,15 @@ pub(crate) const fn is_flushable(window: u64, now_secs: u64) -> bool {
     window + WINDOW_SECONDS * FLUSH_LAG_WINDOWS <= now_secs
 }
 
+/// 把 BPF 的**单调桶**换算成 UTC 对齐的窗口起点。
+///
+/// BPF 侧只拿得到 `bpf_ktime_get_ns()`（单调时钟），它分出的桶边界不对齐墙钟。
+/// 桶与桶之间永远是 60s，所以「落后几个桶」等价于「往前几个 UTC 整分窗口」。
+pub(crate) fn window_from_bucket(now_wall: u64, now_bucket: u64, bucket: u64) -> u64 {
+    let behind = now_bucket.saturating_sub(bucket);
+    window_start(now_wall.saturating_sub(behind.saturating_mul(WINDOW_SECONDS)))
+}
+
 /// 一条记录的观测上下文（同一窗口内所有记录共享）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WindowCtx {
@@ -339,6 +348,19 @@ mod tests {
         assert_eq!(window_start(1789469802), 1789469760);
         // 窗口结束正好等于 start + 60：下一条记录从这里开始（半开区间）。
         assert_eq!(window_start(1789469820), 1789469820);
+    }
+
+    #[test]
+    fn bucket_maps_back_to_utc_aligned_windows() {
+        let now_wall = 1_789_469_820; // 正好落在 UTC 整分
+        let now_bucket = 100;
+        assert_eq!(window_from_bucket(now_wall, now_bucket, 100), 1_789_469_820);
+        assert_eq!(
+            window_from_bucket(now_wall, now_bucket, 98),
+            window_start(now_wall) - 120
+        );
+        // 桶差比实际时间差距大（重启/时钟异常）时不能下溢。
+        assert_eq!(window_from_bucket(10, 100, 0), 0);
     }
 
     #[test]

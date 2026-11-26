@@ -1,0 +1,490 @@
+//! tc/eBPF 采集器（Linux + 构建期有 clang 时编译）。
+//!
+//! 只做三件事：加载/挂载、按窗口扫表、把原始累计量还原成 [`FlowKey`] + [`WindowAgg`]。
+//! 窗口的**墙钟归属**由调用方用「桶差」换算（见 [`crate::telemetry::flows::window_from_bucket`]）：
+//! BPF 侧用 `bpf_ktime_get_ns()` 分桶（单调时钟），用户态把当前桶对齐到 UTC 整分，
+//! 其余桶按差值回推 —— 不需要把墙钟写进 BPF。
+
+use crate::telemetry::flows::iface::IfaceSnapshot;
+use crate::telemetry::flows::record::{Direction, FlowKey, WindowAgg};
+use crate::telemetry::flows::support::{FlowSupport, Unavailable};
+use crate::telemetry::flows::{FlushedFlow, WatchedIface};
+use aya::maps::{HashMap, MapData, PerCpuArray};
+use aya::programs::ProgramError;
+use aya::programs::tc::{SchedClassifier, TcAttachType};
+use aya::{Ebpf, EbpfError};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+/// 构建期由 build.rs 编好并嵌入。对齐要求来自 aya（map/程序结构需要 8 字节对齐）。
+static FLOW_BPF: &[u8] = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/flow.bpf.o"));
+
+const MIN_KERNEL: (u32, u32) = (5, 4);
+const PROG_EGRESS: &str = "flow_egress";
+const PROG_INGRESS: &str = "flow_ingress";
+const MAP_NAME: &str = "flow_map";
+const MAP_DROPS: &str = "drops";
+
+/// BPF map 的键（与 `flow.bpf.c` 的 `struct flow_key` 逐字节一致）。
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RawFlowKey {
+    window_id: u64,
+    ifindex: u32,
+    direction: u8,
+    protocol: u8,
+    family: u8,
+    flags: u8,
+    src: [u8; 16],
+    dst: [u8; 16],
+    src_port: u16,
+    dst_port: u16,
+    icmp_type: u8,
+    icmp_code: u8,
+    pad: [u8; 6],
+}
+// SAFETY: `repr(C, packed)`、字段全是整数数组，没有指针也没有未初始化字节。
+unsafe impl aya::Pod for RawFlowKey {}
+
+/// BPF map 的值（与 `flow.bpf.c` 的 `struct flow_val` 逐字节一致）。
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RawFlowVal {
+    packets: u64,
+    bytes: u64,
+    wire_bytes: u64,
+    skb_count: u64,
+    gso_skb_count: u64,
+    dropped: u32,
+    flags: u32,
+}
+// SAFETY: 同上。
+unsafe impl aya::Pod for RawFlowVal {}
+
+const FLAG_PORT_UNAVAILABLE: u8 = 1;
+const FLAG_WIRE_BYTES_MISSING: u32 = 2;
+
+/// 读内核版本（`uname -r` 的前两个数字）。
+pub(crate) fn kernel_release() -> Option<String> {
+    let mut buf: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut buf) } != 0 {
+        return None;
+    }
+    let bytes: Vec<u8> = buf
+        .release
+        .iter()
+        .take_while(|byte| **byte != 0)
+        .map(|byte| *byte as u8)
+        .collect();
+    String::from_utf8(bytes).ok()
+}
+
+fn parse_kernel(release: &str) -> Option<(u32, u32)> {
+    let mut parts = release.split(|ch: char| !ch.is_ascii_digit());
+    let major = parts.find(|p| !p.is_empty())?.parse().ok()?;
+    let minor = parts.find(|p| !p.is_empty())?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// 本机能采吗（只判内核；权限/挂载在 `start` 里才会暴露）。
+pub(crate) fn probe() -> FlowSupport {
+    let Some(release) = kernel_release() else {
+        return FlowSupport::Unavailable(Unavailable::KernelTooOld {
+            running: "unknown".to_string(),
+            required: "5.4".to_string(),
+        });
+    };
+    match parse_kernel(&release) {
+        Some(version) if version >= MIN_KERNEL => FlowSupport::Available,
+        _ => FlowSupport::Unavailable(Unavailable::KernelTooOld {
+            running: release,
+            required: "5.4".to_string(),
+        }),
+    }
+}
+
+/// 已挂载的观测器。`Drop` 时 aya 负责摘掉 filter（不删除宿主已有的 qdisc）。
+pub(crate) struct Collector {
+    bpf: Ebpf,
+    ifaces: Vec<WatchedIface>,
+    /// 上次读到的 drops 累计值（per-cpu 计数器本身不清零，只算增量）。
+    last_drops: u64,
+}
+
+fn attach_error(ifname: &str, err: ProgramError) -> Unavailable {
+    let text = err.to_string();
+    // EPERM/EACCES 是能力问题，其余（EBUSY/ENOENT/verifier）按运行失败报。
+    if text.contains("Operation not permitted") || text.contains("Permission denied") {
+        Unavailable::PermissionDenied {
+            capability: "CAP_NET_ADMIN/CAP_BPF".to_string(),
+        }
+    } else {
+        Unavailable::QdiscConflict {
+            ifname: ifname.to_string(),
+            detail: text,
+        }
+    }
+}
+
+impl Collector {
+    pub(crate) fn start(ifaces: &[&IfaceSnapshot]) -> Result<Self, Unavailable> {
+        let mut bpf = Ebpf::load(FLOW_BPF).map_err(|err: EbpfError| Unavailable::LoadFailed {
+            detail: err.to_string(),
+        })?;
+
+        // 先各加载一次（挂到多张网卡时复用同一个已加载程序）。
+        for name in [PROG_EGRESS, PROG_INGRESS] {
+            let program: &mut SchedClassifier = bpf
+                .program_mut(name)
+                .ok_or_else(|| Unavailable::LoadFailed {
+                    detail: format!("program {name} missing from flow.bpf.o"),
+                })?
+                .try_into()
+                .map_err(|err: ProgramError| Unavailable::LoadFailed {
+                    detail: err.to_string(),
+                })?;
+            program
+                .load()
+                .map_err(|err: ProgramError| Unavailable::LoadFailed {
+                    detail: err.to_string(),
+                })?;
+        }
+
+        for iface in ifaces {
+            for (name, attach_type) in [
+                (PROG_EGRESS, TcAttachType::Egress),
+                (PROG_INGRESS, TcAttachType::Ingress),
+            ] {
+                let program: &mut SchedClassifier = bpf
+                    .program_mut(name)
+                    .expect("checked above")
+                    .try_into()
+                    .map_err(|err: ProgramError| Unavailable::LoadFailed {
+                        detail: err.to_string(),
+                    })?;
+                // aya 会在需要时创建 clsact；失败按「装不上」归类，**不强行删已有 qdisc**。
+                let cname = std::ffi::CString::new(iface.name.as_str()).map_err(|_| {
+                    Unavailable::QdiscConflict {
+                        ifname: iface.name.clone(),
+                        detail: "interface name contains a NUL byte".to_string(),
+                    }
+                })?;
+                program
+                    .attach(cname.as_c_str(), attach_type)
+                    .map_err(|err| attach_error(&iface.name, err))?;
+            }
+        }
+
+        Ok(Self {
+            bpf,
+            last_drops: 0,
+            ifaces: ifaces
+                .iter()
+                .map(|iface| WatchedIface {
+                    name: iface.name.clone(),
+                    ifindex: iface.ifindex,
+                    mac: iface.mac.clone(),
+                    addrs: iface.addrs.clone(),
+                })
+                .collect(),
+        })
+    }
+
+    pub(crate) fn watched(&self) -> &[WatchedIface] {
+        &self.ifaces
+    }
+
+    /// 读「表满/更新失败」计数并返回**增量**（per-cpu 计数器只增不清，避免重置语义）。
+    fn take_drops(&mut self) -> u64 {
+        let Some(map) = self.bpf.map_mut(MAP_DROPS) else {
+            return 0;
+        };
+        let Ok(counter) = PerCpuArray::<_, u64>::try_from(map) else {
+            return 0;
+        };
+        let total: u64 = match counter.get(&0, 0) {
+            Ok(values) => values.iter().map(|value| *value).sum(),
+            Err(_) => return 0,
+        };
+        let delta = total.saturating_sub(self.last_drops);
+        self.last_drops = total;
+        delta
+    }
+
+    /// flush 掉已经结束满 `lag` 个窗口的桶。
+    pub(crate) fn flush(&mut self, now_bucket: u64, lag_windows: u64) -> Vec<FlushedFlow> {
+        let drops = self.take_drops();
+        let Some(map) = self.bpf.map_mut(MAP_NAME) else {
+            return Vec::new();
+        };
+        let Ok(mut hash) = HashMap::<&mut MapData, RawFlowKey, RawFlowVal>::try_from(map) else {
+            return Vec::new();
+        };
+
+        // 先收集候选（迭代中删除会破坏遍历），再逐条取走。
+        let mut candidates: Vec<RawFlowKey> = Vec::new();
+        for entry in hash.iter() {
+            let Ok((key, _)) = entry else { continue };
+            if key.window_id + lag_windows <= now_bucket {
+                candidates.push(key);
+            }
+        }
+
+        let mut flushed = Vec::with_capacity(candidates.len());
+        for key in candidates {
+            let Ok(value) = hash.get(&key, 0) else {
+                continue;
+            };
+            let _ = hash.remove(&key);
+            let agg = WindowAgg {
+                packets: value.packets,
+                bytes: value.bytes,
+                wire_bytes: (value.flags & FLAG_WIRE_BYTES_MISSING == 0)
+                    .then_some(value.wire_bytes),
+                skb_count: value.skb_count,
+                gso_skb_count: value.gso_skb_count,
+                dropped: value.dropped,
+                truncated: drops > 0,
+            };
+            if agg.is_empty() {
+                continue;
+            }
+            let Some(decoded) = decode_key(&key) else {
+                continue;
+            };
+            flushed.push(FlushedFlow {
+                ifindex: key.ifindex,
+                key: decoded,
+                window_bucket: key.window_id,
+                agg,
+            });
+        }
+        flushed
+    }
+    /// 不按窗口过滤地把表里的条目全取出来（只给真机冒烟测试用）。
+    #[cfg(test)]
+    pub(crate) fn snapshot_all(&mut self) -> Vec<FlushedFlow> {
+        let Some(map) = self.bpf.map_mut(MAP_NAME) else {
+            return Vec::new();
+        };
+        let Ok(hash) = HashMap::<&mut MapData, RawFlowKey, RawFlowVal>::try_from(map) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in hash.iter() {
+            let Ok((key, value)) = entry else { continue };
+            let Some(decoded) = decode_key(&key) else {
+                continue;
+            };
+            out.push(FlushedFlow {
+                ifindex: key.ifindex,
+                key: decoded,
+                window_bucket: key.window_id,
+                agg: WindowAgg {
+                    packets: value.packets,
+                    bytes: value.bytes,
+                    wire_bytes: (value.flags & FLAG_WIRE_BYTES_MISSING == 0)
+                        .then_some(value.wire_bytes),
+                    skb_count: value.skb_count,
+                    gso_skb_count: value.gso_skb_count,
+                    dropped: value.dropped,
+                    truncated: false,
+                },
+            });
+        }
+        out
+    }
+}
+
+fn decode_key(raw: &RawFlowKey) -> Option<FlowKey> {
+    let family = raw.family;
+    let src = match family {
+        4 => IpAddr::V4(Ipv4Addr::new(
+            raw.src[0], raw.src[1], raw.src[2], raw.src[3],
+        )),
+        6 => IpAddr::V6(Ipv6Addr::from(raw.src)),
+        _ => return None,
+    };
+    let dst = match family {
+        4 => IpAddr::V4(Ipv4Addr::new(
+            raw.dst[0], raw.dst[1], raw.dst[2], raw.dst[3],
+        )),
+        6 => IpAddr::V6(Ipv6Addr::from(raw.dst)),
+        _ => return None,
+    };
+    let direction = match raw.direction {
+        0 => Direction::In,
+        1 => Direction::Out,
+        _ => return None,
+    };
+    let icmp = matches!(raw.protocol, 1 | 58).then_some((raw.icmp_type, raw.icmp_code));
+    Some(FlowKey {
+        direction,
+        protocol: raw.protocol,
+        src,
+        dst,
+        src_port: u16::from_be(raw.src_port),
+        dst_port: u16::from_be(raw.dst_port),
+        icmp_type: icmp.map(|(kind, _)| kind),
+        icmp_code: icmp.map(|(_, code)| code),
+        port_unavailable: raw.flags & FLAG_PORT_UNAVAILABLE != 0,
+    })
+}
+
+// ── 网卡发现（Linux 事实，平台不指定）────────────────────────────────────────
+
+/// 当前接口快照：名字/ifindex/MAC/地址 + 是不是默认路由出口。
+///
+/// 只读 `/sys`、`/proc/net/route` 与 libc 的 `getifaddrs`：不依赖 `ip` 命令，
+/// 也不打开 netlink 长连接（这里只需要"现在是什么样"）。
+pub(crate) fn interfaces() -> Vec<IfaceSnapshot> {
+    use std::collections::HashMap;
+
+    let mut addrs: HashMap<String, Vec<IpAddr>> = HashMap::new();
+    let mut raw: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut raw) } == 0 {
+        let mut cursor = raw;
+        while !cursor.is_null() {
+            let entry = unsafe { &*cursor };
+            if !entry.ifa_addr.is_null() {
+                let family = unsafe { (*entry.ifa_addr).sa_family as i32 };
+                if family == libc::AF_INET || family == libc::AF_INET6 {
+                    let name = unsafe { std::ffi::CStr::from_ptr(entry.ifa_name) }
+                        .to_string_lossy()
+                        .into_owned();
+                    if let Some(ip) = sockaddr_to_ip(entry.ifa_addr) {
+                        addrs.entry(name).or_default().push(ip);
+                    }
+                }
+            }
+            cursor = entry.ifa_next;
+        }
+        unsafe { libc::freeifaddrs(raw) };
+    }
+
+    let default_egress = default_egress_iface();
+
+    let mut snapshot: Vec<IfaceSnapshot> = Vec::new();
+    let mut raw_names: *mut libc::if_nameindex = std::ptr::null_mut();
+    raw_names = unsafe { libc::if_nameindex() };
+    if raw_names.is_null() {
+        return snapshot;
+    }
+    let mut index = 0usize;
+    loop {
+        let entry = unsafe { *raw_names.add(index) };
+        if entry.if_index == 0 {
+            break;
+        }
+        // SAFETY: `if_nameindex()` 返回的 name 以 NUL 结尾，且在本循环内有效。
+        let name = unsafe { std::ffi::CStr::from_ptr(entry.if_name) }
+            .to_string_lossy()
+            .into_owned();
+        let mut iface_addrs = addrs.remove(&name).unwrap_or_default();
+        iface_addrs.sort();
+        iface_addrs.dedup();
+        snapshot.push(IfaceSnapshot {
+            mac: read_mac(&name),
+            name: name.clone(),
+            ifindex: entry.if_index,
+            addrs: iface_addrs,
+            is_default_egress: default_egress.as_deref() == Some(name.as_str()),
+        });
+        index += 1;
+    }
+    unsafe { libc::if_freenameindex(raw_names) };
+    snapshot
+}
+
+fn sockaddr_to_ip(addr: *const libc::sockaddr) -> Option<IpAddr> {
+    let family = unsafe { (*addr).sa_family as i32 };
+    match family {
+        libc::AF_INET => {
+            let sin = unsafe { &*(addr as *const libc::sockaddr_in) };
+            Some(IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(
+                sin.sin_addr.s_addr,
+            ))))
+        }
+        libc::AF_INET6 => {
+            let sin6 = unsafe { &*(addr as *const libc::sockaddr_in6) };
+            Some(IpAddr::V6(std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr)))
+        }
+        _ => None,
+    }
+}
+
+fn read_mac(ifname: &str) -> Option<String> {
+    let text = std::fs::read_to_string(format!("/sys/class/net/{ifname}/address")).ok()?;
+    let mac = text.trim();
+    (!mac.is_empty()).then(|| mac.to_string())
+}
+
+/// 默认路由出口（`/proc/net/route` 里 dest=0 且带 RTF_UP 的那条）。
+fn default_egress_iface() -> Option<String> {
+    let text = std::fs::read_to_string("/proc/net/route").ok()?;
+    for line in text.lines().skip(1) {
+        let mut fields = line.split_whitespace();
+        let iface = fields.next()?;
+        let dest = fields.next()?;
+        let _gateway = fields.next()?;
+        let flags = fields.next()?;
+        if dest == "00000000" {
+            let flags = u32::from_str_radix(flags, 16).unwrap_or(0);
+            if flags & 0x1 != 0 {
+                return Some(iface.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn interface(name: &str) -> Option<IfaceSnapshot> {
+        interfaces().into_iter().find(|iface| iface.name == name)
+    }
+
+    /// 真机冒烟：必须 root + tc。生成一条 UDP 出向流量，断言 map 里有对应五元组。
+    #[test]
+    #[ignore = "需要 root + tc + 真实流量（在 Linux 真机上跑 dev/verify-flow-ebpf.sh）"]
+    fn counts_an_egress_udp_flow() {
+        let iface = interface("eth0").expect("eth0");
+        assert!(iface.is_default_egress, "eth0 应是默认出口");
+        let ifaces = [iface.clone()];
+        let refs: Vec<&IfaceSnapshot> = ifaces.iter().collect();
+        let mut collector = Collector::start(&refs).expect("attach tc");
+
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind");
+        for _ in 0..5 {
+            socket
+                .send_to(b"wist-flow-probe", ("10.11.0.1", 9))
+                .expect("send");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let flows = collector.snapshot_all();
+        for flow in &flows {
+            eprintln!(
+                "seen proto={} dir={:?} {}:{} -> {}:{} bytes={} pkts={}",
+                flow.key.protocol,
+                flow.key.direction,
+                flow.key.src,
+                flow.key.src_port,
+                flow.key.dst,
+                flow.key.dst_port,
+                flow.agg.bytes,
+                flow.agg.packets
+            );
+        }
+        let hit = flows.iter().any(|flow| {
+            flow.ifindex == iface.ifindex
+                && flow.key.direction == Direction::Out
+                && flow.key.protocol == 17
+                && flow.key.dst_port == 9
+                && flow.agg.bytes > 0
+        });
+        assert!(hit, "没数到出向 UDP 流：{flows:#?}");
+    }
+}
