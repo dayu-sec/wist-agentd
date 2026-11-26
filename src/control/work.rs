@@ -42,6 +42,25 @@ pub(crate) fn is_key_process_source(kind: &str, target: &str) -> bool {
         && CollectionSourceKind::KeyProcessMetrics.accepts_target(target)
 }
 
+/// 主机流记录来源的 `kind`。
+///
+/// 这个 kind 从 `wist-contracts 0.15` 起在契约里算「可执行」，但 agentd 侧**还没有**流记录
+/// 采集器（eBPF/tc）。所以它必须在这里被**单独拦下来如实报 unsupported** —— 否则会出现
+/// 「授权了、页面上有、永远没数据、也不报错」的静默失败（设计见
+/// `docs/design/host-ebpf-flow-collection.md` §11）。
+///
+/// 用字符串而不是 `CollectionSourceKind::HostFlow`：当前依赖的 contracts 还没有这个变体。
+/// 等依赖升到 0.15、且 `flow_inputs()` 真实落地后，删掉
+/// [`AppliedWorkGrant::unsupported_units`] 里的提前返回即可（本常量继续用作判定）。
+pub(crate) const HOST_FLOW_SOURCE_KIND: &str = "HostFlow";
+
+/// 这条来源是不是「主机流记录」（只看 kind）。
+///
+/// 不看 `target`：写错目标（如 `eth0`）也要报出来，只是原因不同（见 `unsupported_reason`）。
+pub(crate) fn is_host_flow_source(kind: &str) -> bool {
+    kind == HOST_FLOW_SOURCE_KIND
+}
+
 /// 关键进程指标的授权：按哪些签名认。
 ///
 /// 不携带周期：采多密由 [`AppliedWorkGrant::metrics_interval`] 统一算（这个来源也是一个
@@ -914,6 +933,16 @@ impl AppliedWorkGrant {
             };
             for unit in &spec.units {
                 for source in &unit.sources {
+                    // 先拦 `HostFlow`：契约从 0.15 起认它“可执行”，但 agentd 没有采集器。
+                    // 不走下面的“可执行就跳过”，否则它既不产出输入、也不进 unsupported。
+                    if is_host_flow_source(&source.kind) {
+                        unsupported.push(UnsupportedUnit {
+                            work_id: work_id.clone(),
+                            unit_id: unit.unit_id.clone(),
+                            detail: unsupported_reason(source),
+                        });
+                        continue;
+                    }
                     // 先看 contracts 的口径，再补上 agentd 自己新增的 Kafka 来源：
                     // `wist-contracts 0.10` 还不认识 `KafkaCluster`，不补这一步会把
                     // 已经能采的单元误报成 unsupported。
@@ -1048,6 +1077,21 @@ fn unsupported_reason(source: &WorkSpecSource) -> String {
              (only `auto`: the FE is self-discovered on this host)",
             source.target
         ),
+        // 主机流记录：kind 认识，但本版 agentd 还没有采集器；或目标写死了网卡名。
+        HOST_FLOW_SOURCE_KIND => {
+            let target = source.target.trim();
+            if target.is_empty() || target.eq_ignore_ascii_case("auto") {
+                "HostFlow is not collectable on this agent yet: the flow-record \
+                 (eBPF/tc) collector is not shipped in this version"
+                    .to_string()
+            } else {
+                format!(
+                    "HostFlow target {:?} is not supported \
+                     (only `auto`: the watched NIC is a local fact, not a platform setting)",
+                    source.target
+                )
+            }
+        }
         _ => format!(
             "source kind {} is not collectable on this agent",
             source.kind
@@ -1495,6 +1539,59 @@ mod tests {
 
         assert!(applied.key_process_grant().is_none());
         assert_eq!(applied.unsupported_units().len(), 1);
+    }
+
+    /// `HostFlow` 从 contracts 0.15 起算“可执行”，但 agentd 还没有流记录采集器：
+    /// 必须进 unsupported（带明确原因），且**不能**凭空多出一条日志输入 ——
+    /// 否则就是「授权了、没数据、也不报错」的静默失败。
+    #[test]
+    fn host_flow_is_reported_unsupported_instead_of_silently_dropped() {
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![standing(
+                "w-flow",
+                "NetworkFlow",
+                1,
+                "active",
+                &spec(&[("flow", "collect_logs", "HostFlow:auto")]),
+            )],
+        ));
+
+        assert!(applied.log_inputs().is_empty(), "流记录不能变成文件输入");
+        let unsupported = applied.unsupported_units();
+        assert_eq!(unsupported.len(), 1);
+        assert!(
+            unsupported[0].detail.contains("HostFlow")
+                && unsupported[0].detail.contains("flow-record"),
+            "原因要说清是「本版还没采集器」：{}",
+            unsupported[0].detail
+        );
+    }
+
+    /// 写死网卡名要给出**另一条**可操作的原因（只认 `auto`）。
+    #[test]
+    fn host_flow_with_a_pinned_interface_says_only_auto() {
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![standing(
+                "w-flow",
+                "NetworkFlow",
+                1,
+                "active",
+                &spec(&[("flow", "collect_logs", "HostFlow:eth0")]),
+            )],
+        ));
+
+        assert!(applied.log_inputs().is_empty());
+        let unsupported = applied.unsupported_units();
+        assert_eq!(unsupported.len(), 1);
+        assert!(
+            unsupported[0].detail.contains("only `auto`"),
+            "{}",
+            unsupported[0].detail
+        );
     }
 
     /// 日志单元里出现 `KeyProcessMetrics` 不能变成指标授权。
