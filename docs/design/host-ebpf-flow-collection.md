@@ -2,7 +2,6 @@
 
 > 状态：**设计（待评审）**。§12 的真机探针实验完成前，§6/§8 中标注「待实测」的条目不得当作已定结论。
 > 对应 issue：`dayu-sec/wist-agentd#50`。
-> 落地目标位置：`docs/design/host-ebpf-flow-collection.md`。
 
 ## 1. 目的与范围
 
