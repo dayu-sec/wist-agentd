@@ -24,6 +24,7 @@
 #define ETH_P_IPV6 0x86DD
 #define ETH_P_8021Q 0x8100
 #define ETH_P_8021AD 0x88A8
+#define ETH_P_9100 0x9100 /* 历史 QinQ TPID（部分厂商） */
 
 #define DIR_IN 0
 #define DIR_OUT 1
@@ -158,11 +159,12 @@ static __always_inline int handle(struct __sk_buff *skb, __u8 direction)
      * - 固定读 64 会让小于 64 字节的包（TCP ACK、UDP 探测、DNS 查询）整个失败；
      * - 用固定的几档（64/42/34）又会让"中间长度"的包丢端口 —— 例如 58 字节的 QinQ 帧
      *   （14 + 8 标签 + 20 + 8 + 8）端口落在 46，档位 42 就够不着。
+     * 上限 80 而不是 64：QinQ(22) + IPv6 头(40) + 端口(4) = 66，64 会把端口切掉。
      * 栈缓冲先清零：未加载的尾部是 0，verifier 也只接受已初始化的读。 */
-    __u8 buf[64] = {};
+    __u8 buf[80] = {};
     __u32 want = skb->len;
-    if (want > 64)
-        want = 64;
+    if (want > 80)
+        want = 80;
     /* 下界 34 = 以太(14) + IPv4(20)：再短连地址都读不全。
      * 必须给下界，否则 verifier 会按"可能为 0"拒绝变长读。 */
     if (want < 34)
@@ -177,7 +179,8 @@ static __always_inline int handle(struct __sk_buff *skb, __u8 direction)
     __u16 eth_proto = (__u16)((buf[12] << 8) | buf[13]);
 #pragma unroll
     for (int tag = 0; tag < 2; tag++) {
-        if (eth_proto != ETH_P_8021Q && eth_proto != ETH_P_8021AD)
+        if (eth_proto != ETH_P_8021Q && eth_proto != ETH_P_8021AD &&
+            eth_proto != ETH_P_9100)
             break;
         if (have < l3 + 4)
             return TC_ACT_OK;

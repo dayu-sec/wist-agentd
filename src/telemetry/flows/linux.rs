@@ -474,48 +474,13 @@ fn default_gateway_v4() -> Option<std::net::Ipv4Addr> {
     None
 }
 
-/// 发一个手工构造的 **QinQ** 帧（802.1ad 外层 + 802.1Q 内层）。
+/// 发一个原始以太帧。
 ///
-/// 用 AF_PACKET 直接发原始帧：不需要建 VLAN 设备/网桥，也不依赖交换机，
-/// 这样"两层 tag 的解析"就能在没有网络设备的机器上被验证。
+/// 用 AF_PACKET 直接发：不需要建 VLAN 设备/网桥，也不依赖交换机 —— 这样 VLAN / QinQ /
+/// IPv6 这些「现场不一定造得出来」的形态都能在任意一台 Linux 上被验证。
 #[cfg(test)]
-fn send_qinq_udp(
-    ifindex: u32,
-    src_mac: [u8; 6],
-    src: std::net::Ipv4Addr,
-    dst: std::net::Ipv4Addr,
-    src_port: u16,
-    dst_port: u16,
-) -> std::io::Result<()> {
-    let payload = b"qnq-test";
-    let mut frame: Vec<u8> = Vec::with_capacity(64);
-    frame.extend_from_slice(&[0xff; 6]); // 目的 MAC：广播（L2 谁收不重要）
-    frame.extend_from_slice(&src_mac);
-    frame.extend_from_slice(&0x88a8u16.to_be_bytes()); // 外层：802.1ad
-    frame.extend_from_slice(&0x0064u16.to_be_bytes()); // TCI: VID 100
-    frame.extend_from_slice(&0x8100u16.to_be_bytes()); // 内层：802.1Q
-    frame.extend_from_slice(&0x00c8u16.to_be_bytes()); // TCI: VID 200
-    frame.extend_from_slice(&0x0800u16.to_be_bytes()); // 内层 ethertype：IPv4
-    // IPv4
-    let total_len = (20 + 8 + payload.len()) as u16;
-    frame.push(0x45);
-    frame.push(0);
-    frame.extend_from_slice(&total_len.to_be_bytes());
-    frame.extend_from_slice(&0u16.to_be_bytes()); // id
-    frame.extend_from_slice(&0x4000u16.to_be_bytes()); // DF
-    frame.push(64); // ttl
-    frame.push(17); // udp
-    frame.extend_from_slice(&0u16.to_be_bytes()); // checksum（采集器不校验）
-    frame.extend_from_slice(&src.octets());
-    frame.extend_from_slice(&dst.octets());
-    // UDP
-    frame.extend_from_slice(&src_port.to_be_bytes());
-    frame.extend_from_slice(&dst_port.to_be_bytes());
-    frame.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
-    frame.extend_from_slice(&0u16.to_be_bytes());
-    frame.extend_from_slice(payload);
-
-    // SAFETY: 只是把一个已构造好的字节缓冲交给内核；fd 立即关闭，地址结构指向栈上值。
+fn send_raw(ifindex: u32, frame: &[u8]) -> std::io::Result<()> {
+    // SAFETY: 只把已构造的字节缓冲交给内核；fd 立即关闭，地址结构指向栈上值。
     unsafe {
         let fd = libc::socket(
             libc::AF_PACKET,
@@ -546,6 +511,76 @@ fn send_qinq_udp(
         }
     }
     Ok(())
+}
+
+/// 以太 + 若干层 VLAN/TPID（每层 4 字节：TPID + TCI）+ 内层 ethertype。
+#[cfg(test)]
+fn tagged_head(src_mac: [u8; 6], tags: &[(u16, u16)], inner: u16) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(32);
+    frame.extend_from_slice(&[0xff; 6]); // 目的 MAC：广播（L2 谁收不影响观测）
+    frame.extend_from_slice(&src_mac);
+    for (tpid, vid) in tags {
+        frame.extend_from_slice(&tpid.to_be_bytes());
+        frame.extend_from_slice(&vid.to_be_bytes());
+    }
+    frame.extend_from_slice(&inner.to_be_bytes());
+    frame
+}
+
+#[cfg(test)]
+fn build_tagged_udp4(
+    src_mac: [u8; 6],
+    tags: &[(u16, u16)],
+    src: std::net::Ipv4Addr,
+    dst: std::net::Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload_len: usize,
+) -> Vec<u8> {
+    let mut frame = tagged_head(src_mac, tags, 0x0800);
+    let total_len = (20 + 8 + payload_len) as u16;
+    frame.push(0x45);
+    frame.push(0);
+    frame.extend_from_slice(&total_len.to_be_bytes());
+    frame.extend_from_slice(&0u16.to_be_bytes()); // id
+    frame.extend_from_slice(&0x4000u16.to_be_bytes()); // DF
+    frame.push(64); // ttl
+    frame.push(17); // udp
+    frame.extend_from_slice(&0u16.to_be_bytes()); // checksum（采集器不校验）
+    frame.extend_from_slice(&src.octets());
+    frame.extend_from_slice(&dst.octets());
+    frame.extend_from_slice(&src_port.to_be_bytes());
+    frame.extend_from_slice(&dst_port.to_be_bytes());
+    frame.extend_from_slice(&((8 + payload_len) as u16).to_be_bytes());
+    frame.extend_from_slice(&0u16.to_be_bytes());
+    frame.extend(std::iter::repeat_n(b'q', payload_len));
+    frame
+}
+
+#[cfg(test)]
+fn build_tagged_udp6(
+    src_mac: [u8; 6],
+    tags: &[(u16, u16)],
+    src: std::net::Ipv6Addr,
+    dst: std::net::Ipv6Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload_len: usize,
+) -> Vec<u8> {
+    let mut frame = tagged_head(src_mac, tags, 0x86dd);
+    frame.push(0x60);
+    frame.extend_from_slice(&[0, 0, 0]);
+    frame.extend_from_slice(&((8 + payload_len) as u16).to_be_bytes());
+    frame.push(17); // next header: udp
+    frame.push(64); // hop limit
+    frame.extend_from_slice(&src.octets());
+    frame.extend_from_slice(&dst.octets());
+    frame.extend_from_slice(&src_port.to_be_bytes());
+    frame.extend_from_slice(&dst_port.to_be_bytes());
+    frame.extend_from_slice(&((8 + payload_len) as u16).to_be_bytes());
+    frame.extend_from_slice(&0u16.to_be_bytes());
+    frame.extend(std::iter::repeat_n(b'q', payload_len));
+    frame
 }
 
 #[cfg(test)]
@@ -769,7 +804,7 @@ mod tests {
             });
         assert!(echo.agg.packets >= 1, "至少 1 个 echo request");
 
-        // 5) QinQ：手工构造双 tag 帧（不需要网桥/VLAN 设备）。
+        // 5) VLAN / QinQ / IPv6 / 截断：手工构造帧（不需要网桥或 VLAN 设备）。
         let src_mac: [u8; 6] = {
             let text = std::fs::read_to_string(format!("/sys/class/net/{}/address", iface.name))
                 .expect("mac");
@@ -779,53 +814,99 @@ mod tests {
             }
             mac
         };
-        const QINQ_PAYLOAD: u64 = 8;
-        const QINQ_SRC_PORT: u16 = 40000;
-        const QINQ_DST_PORT: u16 = 12;
-        const QINQ_SENT: u64 = 3;
-        for _ in 0..QINQ_SENT {
-            send_qinq_udp(
-                iface.ifindex,
+        const PAY: usize = 8;
+        // (名字, 标签层, 源端口, 目的端口) —— 每层是 (TPID, VID)。
+        let cases: [(&str, &[(u16, u16)], u16, u16); 4] = [
+            ("单层 802.1Q", &[(0x8100, 100)], 20000, 20),
+            ("QinQ 802.1ad", &[(0x88a8, 100), (0x8100, 200)], 20001, 21),
+            ("双层 802.1Q", &[(0x8100, 100), (0x8100, 200)], 20002, 22),
+            ("QinQ 0x9100", &[(0x9100, 100), (0x8100, 200)], 20003, 23),
+        ];
+        for (_name, tags, src_port, dst_port) in cases.iter() {
+            for _ in 0..2 {
+                let frame =
+                    build_tagged_udp4(src_mac, tags, local_v4, gateway, *src_port, *dst_port, PAY);
+                send_raw(iface.ifindex, &frame).expect("send tagged v4");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        // IPv6 + QinQ：v6 头 40 字节，端口落在偏移 62~66 —— 覆盖"缓冲要够长"这条。
+        let v6_src: Ipv6Addr = "2001:db8::1".parse().expect("v6 src");
+        let v6_dst: Ipv6Addr = "2001:db8::2".parse().expect("v6 dst");
+        for _ in 0..2 {
+            let frame = build_tagged_udp6(
                 src_mac,
-                local_v4,
-                gateway,
-                QINQ_SRC_PORT,
-                QINQ_DST_PORT,
-            )
-            .expect("send qinq frame");
+                &[(0x88a8, 100), (0x8100, 200)],
+                v6_src,
+                v6_dst,
+                20004,
+                24,
+                PAY,
+            );
+            send_raw(iface.ifindex, &frame).expect("send tagged v6");
             std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // 截断内层：以太 + 一层 tag + 只有 4 字节的"IPv4"→ 不能产出任何流。
+        {
+            let mut frame = tagged_head(src_mac, &[(0x8100, 100)], 0x0800);
+            frame.extend_from_slice(&[0x45, 0x00, 0x00, 0x00]);
+            send_raw(iface.ifindex, &frame).expect("send truncated");
         }
         std::thread::sleep(std::time::Duration::from_millis(300));
 
         let flows = collector.snapshot_all();
-        let qinq = flows
+        let dump = || {
+            flows
+                .iter()
+                .map(|flow| {
+                    (
+                        flow.key.protocol,
+                        flow.key.direction,
+                        flow.key.src_port,
+                        flow.key.dst_port,
+                        flow.agg.packets,
+                        flow.agg.bytes,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for (name, _tags, src_port, dst_port) in cases.iter() {
+            let flow = flows
+                .iter()
+                .find(|flow| {
+                    flow.ifindex == iface.ifindex
+                        && flow.key.direction == Direction::Out
+                        && flow.key.protocol == 17
+                        && flow.key.src_port == *src_port
+                        && flow.key.dst_port == *dst_port
+                })
+                .unwrap_or_else(|| panic!("{name} 没被解析；已看到 {:?}", dump()));
+            assert_eq!(flow.agg.packets, 2, "{name} 的包数");
+            assert_eq!(
+                flow.agg.bytes,
+                (20 + 8 + PAY as u64) * 2,
+                "{name} 的 L3 字节（tag 不计入 L3）"
+            );
+        }
+
+        let v6_flow = flows
             .iter()
             .find(|flow| {
                 flow.ifindex == iface.ifindex
                     && flow.key.direction == Direction::Out
                     && flow.key.protocol == 17
-                    && flow.key.src_port == QINQ_SRC_PORT
-                    && flow.key.dst_port == QINQ_DST_PORT
+                    && flow.key.src_port == 20004
             })
-            .unwrap_or_else(|| {
-                panic!(
-                    "双层 VLAN 帧没被解析出来；已看到 {:?}",
-                    flows
-                        .iter()
-                        .map(|flow| (
-                            flow.key.protocol,
-                            flow.key.src_port,
-                            flow.key.dst_port,
-                            flow.agg.packets
-                        ))
-                        .collect::<Vec<_>>()
-                )
-            });
-        assert_eq!(qinq.agg.packets, QINQ_SENT, "QinQ 帧数");
-        assert_eq!(
-            qinq.agg.bytes,
-            (20 + 8 + QINQ_PAYLOAD) * QINQ_SENT,
-            "QinQ 帧的 L3 字节（两层 tag 不算进 L3）"
+            .unwrap_or_else(|| panic!("QinQ+v6 没被解析；已看到 {:?}", dump()));
+        assert_eq!(v6_flow.key.src, IpAddr::V6(v6_src), "v6 源地址");
+        assert_eq!(v6_flow.key.dst, IpAddr::V6(v6_dst), "v6 目的地址");
+        assert_eq!(v6_flow.key.dst_port, 24, "v6 端口不该被 64 字节缓冲切掉");
+        assert_eq!(v6_flow.agg.packets, 2);
+        assert_eq!(v6_flow.agg.bytes, (40 + 8 + PAY as u64) * 2, "v6 L3 字节");
+
+        assert!(
+            !flows.iter().any(|flow| flow.key.dst_port == 9999),
+            "截断帧不该产出流"
         );
         assert!(echo.agg.bytes >= 3 * (20 + 8), "ICMP 至少含 IP + ICMP 头");
     }
