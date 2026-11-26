@@ -39,6 +39,10 @@
 
 #define FLOW_WINDOW_NS 60000000000ULL
 
+/* 802.1ad 的上限就是两层（S-tag + C-tag）。三层以上是非标准形态：不解析，
+ * 但要让它们**可见**（进 drops），而不是无声消失。 */
+#define MAX_VLAN_TAGS 2
+
 /* 与 Rust 侧 RawFlowKey 逐字节一致（packed，无隐式填充）。 */
 struct flow_key {
     __u64 window_id;
@@ -178,7 +182,7 @@ static __always_inline int handle(struct __sk_buff *skb, __u8 direction)
     __u32 l3 = ETH_HLEN;
     __u16 eth_proto = (__u16)((buf[12] << 8) | buf[13]);
 #pragma unroll
-    for (int tag = 0; tag < 2; tag++) {
+    for (int tag = 0; tag < MAX_VLAN_TAGS; tag++) {
         if (eth_proto != ETH_P_8021Q && eth_proto != ETH_P_8021AD &&
             eth_proto != ETH_P_9100)
             break;
@@ -186,6 +190,12 @@ static __always_inline int handle(struct __sk_buff *skb, __u8 direction)
             return TC_ACT_OK;
         l3 += 4;
         eth_proto = (__u16)((buf[l3 - 2] << 8) | buf[l3 - 1]);
+    }
+    /* 剥完上限仍是 VLAN TPID：三层以上标签，本版不解析。计 drop，别让它无声消失。 */
+    if (eth_proto == ETH_P_8021Q || eth_proto == ETH_P_8021AD ||
+        eth_proto == ETH_P_9100) {
+        note_drop();
+        return TC_ACT_OK;
     }
 
     struct flow_key key = {};

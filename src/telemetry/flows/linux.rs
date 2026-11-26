@@ -280,6 +280,21 @@ impl Collector {
         self.flushed_through = self.flushed_through.max(horizon);
         flushed
     }
+    /// drops 的**累计**值（只给真机测试用；`take_drops` 会推进增量基线，这里不动）。
+    #[cfg(test)]
+    pub(crate) fn drops_total(&mut self) -> u64 {
+        let Some(map) = self.bpf.map_mut(MAP_DROPS) else {
+            return 0;
+        };
+        let Ok(counter) = PerCpuArray::<_, u64>::try_from(map) else {
+            return 0;
+        };
+        match counter.get(&0, 0) {
+            Ok(values) => values.iter().map(|value| *value).sum(),
+            Err(_) => 0,
+        }
+    }
+
     /// 不按窗口过滤地把表里的条目全取出来（只给真机冒烟测试用）。
     #[cfg(test)]
     pub(crate) fn snapshot_all(&mut self) -> Vec<FlushedFlow> {
@@ -846,6 +861,21 @@ mod tests {
             send_raw(iface.ifindex, &frame).expect("send tagged v6");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        // 三层 tag（非标准）：本版不解析，但**必须可见**（drops 增长），且不能产出一条看似正常的流。
+        let drops_before = collector.drops_total();
+        {
+            let frame = build_tagged_udp4(
+                src_mac,
+                &[(0x88a8, 100), (0x8100, 200), (0x8100, 300)],
+                local_v4,
+                gateway,
+                20005,
+                25,
+                PAY,
+            );
+            send_raw(iface.ifindex, &frame).expect("send triple-tagged");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         // 截断内层：以太 + 一层 tag + 只有 4 字节的"IPv4"→ 不能产出任何流。
         {
             let mut frame = tagged_head(src_mac, &[(0x8100, 100)], 0x0800);
@@ -907,6 +937,14 @@ mod tests {
         assert!(
             !flows.iter().any(|flow| flow.key.dst_port == 9999),
             "截断帧不该产出流"
+        );
+        assert!(
+            !flows.iter().any(|flow| flow.key.dst_port == 25),
+            "三层 tag 超出 MAX_VLAN_TAGS，不该产出流（应进 drops）"
+        );
+        assert!(
+            collector.drops_total() > drops_before,
+            "三层 tag 必须让 drops 增长（否则这段流量就是无声消失）"
         );
         assert!(echo.agg.bytes >= 3 * (20 + 8), "ICMP 至少含 IP + ICMP 头");
     }

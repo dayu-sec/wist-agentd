@@ -9,6 +9,10 @@
 //! 这里给出的 [`Collector`] 是**跨平台门面**：非 Linux 或没编进 BPF 对象时，
 //! `start` 返回 `NotBuilt`，调用方据此如实上报，而不是假装能采。
 
+// 采集器还没接到 daemon：`Collector` / `probe()` 目前只被测试与下一步接线使用。
+// **接线后删掉这条 allow**，它会掩盖真正的死代码。
+#![allow(dead_code)]
+
 pub mod iface;
 pub mod record;
 pub mod support;
