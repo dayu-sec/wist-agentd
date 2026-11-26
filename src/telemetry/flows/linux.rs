@@ -474,6 +474,80 @@ fn default_gateway_v4() -> Option<std::net::Ipv4Addr> {
     None
 }
 
+/// 发一个手工构造的 **QinQ** 帧（802.1ad 外层 + 802.1Q 内层）。
+///
+/// 用 AF_PACKET 直接发原始帧：不需要建 VLAN 设备/网桥，也不依赖交换机，
+/// 这样"两层 tag 的解析"就能在没有网络设备的机器上被验证。
+#[cfg(test)]
+fn send_qinq_udp(
+    ifindex: u32,
+    src_mac: [u8; 6],
+    src: std::net::Ipv4Addr,
+    dst: std::net::Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+) -> std::io::Result<()> {
+    let payload = b"qnq-test";
+    let mut frame: Vec<u8> = Vec::with_capacity(64);
+    frame.extend_from_slice(&[0xff; 6]); // 目的 MAC：广播（L2 谁收不重要）
+    frame.extend_from_slice(&src_mac);
+    frame.extend_from_slice(&0x88a8u16.to_be_bytes()); // 外层：802.1ad
+    frame.extend_from_slice(&0x0064u16.to_be_bytes()); // TCI: VID 100
+    frame.extend_from_slice(&0x8100u16.to_be_bytes()); // 内层：802.1Q
+    frame.extend_from_slice(&0x00c8u16.to_be_bytes()); // TCI: VID 200
+    frame.extend_from_slice(&0x0800u16.to_be_bytes()); // 内层 ethertype：IPv4
+    // IPv4
+    let total_len = (20 + 8 + payload.len()) as u16;
+    frame.push(0x45);
+    frame.push(0);
+    frame.extend_from_slice(&total_len.to_be_bytes());
+    frame.extend_from_slice(&0u16.to_be_bytes()); // id
+    frame.extend_from_slice(&0x4000u16.to_be_bytes()); // DF
+    frame.push(64); // ttl
+    frame.push(17); // udp
+    frame.extend_from_slice(&0u16.to_be_bytes()); // checksum（采集器不校验）
+    frame.extend_from_slice(&src.octets());
+    frame.extend_from_slice(&dst.octets());
+    // UDP
+    frame.extend_from_slice(&src_port.to_be_bytes());
+    frame.extend_from_slice(&dst_port.to_be_bytes());
+    frame.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+    frame.extend_from_slice(&0u16.to_be_bytes());
+    frame.extend_from_slice(payload);
+
+    // SAFETY: 只是把一个已构造好的字节缓冲交给内核；fd 立即关闭，地址结构指向栈上值。
+    unsafe {
+        let fd = libc::socket(
+            libc::AF_PACKET,
+            libc::SOCK_RAW,
+            i32::from(0x0003u16.to_be()), // ETH_P_ALL
+        );
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut addr: libc::sockaddr_ll = std::mem::zeroed();
+        addr.sll_family = libc::AF_PACKET as u16;
+        addr.sll_protocol = 0x0003u16.to_be();
+        addr.sll_ifindex = ifindex as i32;
+        addr.sll_halen = 6;
+        addr.sll_addr[..6].copy_from_slice(&[0xff; 6]);
+        let sent = libc::sendto(
+            fd,
+            frame.as_ptr() as *const libc::c_void,
+            frame.len(),
+            0,
+            &addr as *const libc::sockaddr_ll as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+        );
+        let err = std::io::Error::last_os_error();
+        libc::close(fd);
+        if sent < 0 {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,6 +768,65 @@ mod tests {
                 )
             });
         assert!(echo.agg.packets >= 1, "至少 1 个 echo request");
+
+        // 5) QinQ：手工构造双 tag 帧（不需要网桥/VLAN 设备）。
+        let src_mac: [u8; 6] = {
+            let text = std::fs::read_to_string(format!("/sys/class/net/{}/address", iface.name))
+                .expect("mac");
+            let mut mac = [0u8; 6];
+            for (slot, part) in mac.iter_mut().zip(text.trim().split(':')) {
+                *slot = u8::from_str_radix(part, 16).expect("mac octet");
+            }
+            mac
+        };
+        const QINQ_PAYLOAD: u64 = 8;
+        const QINQ_SRC_PORT: u16 = 40000;
+        const QINQ_DST_PORT: u16 = 12;
+        const QINQ_SENT: u64 = 3;
+        for _ in 0..QINQ_SENT {
+            send_qinq_udp(
+                iface.ifindex,
+                src_mac,
+                local_v4,
+                gateway,
+                QINQ_SRC_PORT,
+                QINQ_DST_PORT,
+            )
+            .expect("send qinq frame");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let flows = collector.snapshot_all();
+        let qinq = flows
+            .iter()
+            .find(|flow| {
+                flow.ifindex == iface.ifindex
+                    && flow.key.direction == Direction::Out
+                    && flow.key.protocol == 17
+                    && flow.key.src_port == QINQ_SRC_PORT
+                    && flow.key.dst_port == QINQ_DST_PORT
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "双层 VLAN 帧没被解析出来；已看到 {:?}",
+                    flows
+                        .iter()
+                        .map(|flow| (
+                            flow.key.protocol,
+                            flow.key.src_port,
+                            flow.key.dst_port,
+                            flow.agg.packets
+                        ))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(qinq.agg.packets, QINQ_SENT, "QinQ 帧数");
+        assert_eq!(
+            qinq.agg.bytes,
+            (20 + 8 + QINQ_PAYLOAD) * QINQ_SENT,
+            "QinQ 帧的 L3 字节（两层 tag 不算进 L3）"
+        );
         assert!(echo.agg.bytes >= 3 * (20 + 8), "ICMP 至少含 IP + ICMP 头");
     }
 }

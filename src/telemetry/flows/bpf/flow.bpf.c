@@ -154,18 +154,22 @@ static __always_inline int account(struct __sk_buff *skb, struct flow_key *key, 
 
 static __always_inline int handle(struct __sk_buff *skb, __u8 direction)
 {
-    /* 按包长分级加载：小于 64 字节的包（TCP ACK、UDP 探测、DNS 查询）一次读 64 会整个失败。
-     * 栈缓冲先清零，未加载的尾部就是 0（verifier 也只接受已初始化的读）。 */
+    /* 按**包长**加载（上限 64）：
+     * - 固定读 64 会让小于 64 字节的包（TCP ACK、UDP 探测、DNS 查询）整个失败；
+     * - 用固定的几档（64/42/34）又会让"中间长度"的包丢端口 —— 例如 58 字节的 QinQ 帧
+     *   （14 + 8 标签 + 20 + 8 + 8）端口落在 46，档位 42 就够不着。
+     * 栈缓冲先清零：未加载的尾部是 0，verifier 也只接受已初始化的读。 */
     __u8 buf[64] = {};
-    __u32 have = 0;
-    if (bpf_skb_load_bytes(skb, 0, buf, 64) == 0)
-        have = 64;
-    else if (bpf_skb_load_bytes(skb, 0, buf, 42) == 0)
-        have = 42;
-    else if (bpf_skb_load_bytes(skb, 0, buf, 34) == 0)
-        have = 34;
-    else
+    __u32 want = skb->len;
+    if (want > 64)
+        want = 64;
+    /* 下界 34 = 以太(14) + IPv4(20)：再短连地址都读不全。
+     * 必须给下界，否则 verifier 会按"可能为 0"拒绝变长读。 */
+    if (want < 34)
         return TC_ACT_OK;
+    if (bpf_skb_load_bytes(skb, 0, buf, want) < 0)
+        return TC_ACT_OK;
+    __u32 have = want;
 
     /* 剥 VLAN：单层 802.1Q 与 QinQ（802.1ad + 802.1Q）各一层，最多剥两层。
      * 每层 4 字节（TCI + 内层 ethertype）。 */
