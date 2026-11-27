@@ -149,6 +149,18 @@ impl Check {
         }
     }
 
+    /// 「无法判定」：数据拿到了，但**本版没资格解释它**（比如快照格式是更新的一版）。
+    /// 用 Warn/Fail 都会让人以为查出了什么，而实际是「这里没有结论」。
+    fn unknown(id: &'static str, title: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            id,
+            status: Status::Unknown,
+            title: title.into(),
+            detail: detail.into(),
+            hint: None,
+        }
+    }
+
     fn hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
         self
@@ -1237,6 +1249,23 @@ fn flows_check_at(path: &Path) -> Check {
             .hint("文件损坏时删掉它：下一拍会自动重写");
         }
     };
+
+    // 格式版本不匹配时**不解释**：字段语义可能已经变了（`load` 只做 JSON 解析、
+    // 且结构体不吃未知键），继续按本版的字段名渲染只会给出一个看着正常、口径已经错的结论。
+    // 这类“读到了但不可信”正是 `Status::Unknown` 的用途（红/黄都会让人以为查出了什么）。
+    if status.schema_version != crate::state_store::flows::SCHEMA_VERSION {
+        return Check::unknown(
+            "flows.status",
+            "流记录运行态版本不认识",
+            format!(
+                "{} 是 {}，本版只读 {}（升级/降级窗口里两边的字段语义可能不同）",
+                path.display(),
+                status.schema_version,
+                crate::state_store::flows::SCHEMA_VERSION
+            ),
+        )
+        .hint("现场可直接 `cat` 那个文件看原始字段；要正常判读请升到能读它的 agentd 版本");
+    }
 
     let c = &status.counters;
     let detail = format!(
@@ -3890,6 +3919,36 @@ mod tests {
             check.detail.contains("ifaces=-"),
             "空列表不能渲染成 `ifaces=`：{}",
             check.detail
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 格式版本对不上时**不解释**（Unknown，而不是 OK/Warn）：
+    /// 字段语义可能已经变了，按本版的字段名继续渲染会给出一个“看着正常、口径已经错”的结论。
+    #[test]
+    fn flows_check_reports_an_unknown_schema_version_as_unknown() {
+        let dir = flow_status_dir("schema");
+        let mut status = flow_status(true, None);
+        status.schema_version = "agentd.flow_status/v2".to_string();
+        let path = write_flow_status(&dir, &status);
+
+        let check = flows_check_at(&path);
+        assert_eq!(check.status, Status::Unknown, "{}", check.detail);
+        assert!(
+            check.detail.contains("agentd.flow_status/v2"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check
+                .detail
+                .contains(crate::state_store::flows::SCHEMA_VERSION),
+            "要把本版能读的版本号一并说出来：{}",
+            check.detail
+        );
+        assert!(
+            check.hint.expect("hint").contains("cat"),
+            "要点出现场直接看原文件"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
