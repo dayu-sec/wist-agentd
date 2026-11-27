@@ -6,7 +6,7 @@
 //! 2. 能不能采由**本机事实**决定（`flows::probe` / `Collector::start` / 网卡选择）：
 //!    采不了必须进采集状态（[`FlowReport::failures`]），**不静默** —— 那正是设计 §11 要防的
 //!    「授权了、没数据、也不报错」；
-//! 3. 记录的构造只有一处（`HostFlowRecord::from_window`），这里只填上下文：
+//! 3. 记录的构造只有一处（`record::record_from_window`），这里只填上下文：
 //!    `host_id`/`host_name` 与 `OBSFACT` 同源（事实摘要），云侧身份一律不碰。
 
 use std::io;
@@ -23,7 +23,7 @@ use crate::state_store::log_seq_state;
 use crate::telemetry::flows::iface::{is_flow_addr, select_observed};
 use crate::telemetry::flows::record::{
     HostFlowRecord, MAX_FLOWS_PER_FLUSH, PartialReason, WINDOW_SECONDS, WindowCtx, is_flushable,
-    window_from_bucket,
+    record_from_window, window_from_bucket,
 };
 use crate::telemetry::flows::support::{FlowSupport, Unavailable};
 use crate::telemetry::flows::{self, Collector, WatchedIface};
@@ -656,7 +656,7 @@ impl FlowRuntime {
             if flow.agg.truncated {
                 report.truncated_windows += 1;
             }
-            records.push(HostFlowRecord::from_window(
+            records.push(record_from_window(
                 &window_ctx(host, iface, &self.kernel),
                 &flow.key,
                 start,
@@ -906,7 +906,7 @@ mod tests {
             dropped: 0,
             truncated: false,
         };
-        HostFlowRecord::from_window(&ctx, &key, start, WINDOW_SECONDS as u32, &agg, None)
+        record_from_window(&ctx, &key, start, WINDOW_SECONDS as u32, &agg, None)
     }
 
     async fn tcp_listener() -> Option<(TcpListener, u16)> {

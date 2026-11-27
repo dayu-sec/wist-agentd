@@ -7,18 +7,21 @@
 //! 2. 只有窗口内**有字节**才产出记录 —— 空闲长连接每窗发一条零记录会爆量；
 //! 3. 云侧身份与判决字段**一律不出现**（`instance-id`/`action`/`log-status`/…），
 //!    富化与判决是平台的事。
+//!
+//! 形状本身**只在契约里定义一份**（`wist-contracts::host_flow`）：数据面与平台按同一份
+//! 解析，agentd 这边只负责把它填出来。本地不另存结构体 —— 两份定义迟早会漂。
 
-use serde::Serialize;
 use std::net::IpAddr;
 
-/// 记录契约版本。改字段语义要升它（不要悄悄改）。
-pub(crate) const RECORD_SCHEMA: &str = "wist.host_flow/v1";
-/// 观测来源：主机侧 eBPF（下游据此与云侧记录**择一**使用，不相加）。
-pub(crate) const SOURCE: &str = "host_ebpf";
-/// 覆盖标记：主机视角，看不到到达网卡前就被云侧策略丢弃的流量。
-pub(crate) const COVERAGE: &str = "host_partial";
-/// 窗口时长（秒），UTC 整分对齐。
-pub(crate) const WINDOW_SECONDS: u64 = 60;
+pub(crate) use wist_contracts::host_flow::HostFlowRecord;
+use wist_contracts::host_flow::{
+    CAPTURE_TC_EGRESS, CAPTURE_TC_INGRESS, COVERAGE_HOST_PARTIAL, DIRECTION_IN, DIRECTION_OUT,
+    RECORD_SCHEMA_V1, SOURCE_HOST_EBPF, WINDOW_SECONDS_DEFAULT, WIRE_BYTES_SOURCE_UNAVAILABLE,
+    WIRE_BYTES_SOURCE_WIRE_LEN,
+};
+
+/// 窗口时长（秒），UTC 整分对齐（与契约的默认窗口同一个数，不各写一份）。
+pub(crate) const WINDOW_SECONDS: u64 = WINDOW_SECONDS_DEFAULT as u64;
 /// flush 延迟（按窗口计）：只 flush **结束至少这么多窗**的桶，给迟到包留收敛时间。
 pub(crate) const FLUSH_LAG_WINDOWS: u64 = 2;
 
@@ -49,16 +52,16 @@ impl Direction {
     /// 与云侧词表一致（不是 `ingress`/`egress`）。
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
-            Self::In => "in",
-            Self::Out => "out",
+            Self::In => DIRECTION_IN,
+            Self::Out => DIRECTION_OUT,
         }
     }
 
     /// hook 标识：记录里保留它，排障时能一眼看出观测点。
     pub(crate) const fn capture(self) -> &'static str {
         match self {
-            Self::In => "tc_ingress",
-            Self::Out => "tc_egress",
+            Self::In => CAPTURE_TC_INGRESS,
+            Self::Out => CAPTURE_TC_EGRESS,
         }
     }
 }
@@ -203,66 +206,18 @@ pub(crate) enum PartialReason {
 
 impl PartialReason {
     pub(crate) const fn as_str(self) -> &'static str {
+        use wist_contracts::host_flow::{
+            PARTIAL_REASON_AGENT_START, PARTIAL_REASON_CLOCK_CHANGED,
+            PARTIAL_REASON_INTERFACE_CHANGED, PARTIAL_REASON_PAUSED, PARTIAL_REASON_SHUTDOWN,
+        };
         match self {
-            Self::AgentStart => "agent_start",
-            Self::Paused => "paused",
-            Self::InterfaceChanged => "interface_changed",
-            Self::Shutdown => "shutdown",
-            Self::ClockChanged => "clock_changed",
+            Self::AgentStart => PARTIAL_REASON_AGENT_START,
+            Self::Paused => PARTIAL_REASON_PAUSED,
+            Self::InterfaceChanged => PARTIAL_REASON_INTERFACE_CHANGED,
+            Self::Shutdown => PARTIAL_REASON_SHUTDOWN,
+            Self::ClockChanged => PARTIAL_REASON_CLOCK_CHANGED,
         }
     }
-}
-
-/// 一条 `FLOW:` 记录。
-///
-/// 字段与设计文档 §6 一一对应；不出现的键（`null`）一律靠 `skip_serializing_if` 省掉，
-/// 避免下游把「没这个字段」读成「值为 null」。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct HostFlowRecord {
-    pub record_schema: &'static str,
-    pub source: &'static str,
-    pub coverage: &'static str,
-    pub capture: &'static str,
-    pub collector_instance_id: String,
-    pub host_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub host_name: Option<String>,
-    pub kernel: String,
-    pub ifname: String,
-    pub ifindex: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub if_mac: Option<String>,
-    pub local_addrs: Vec<String>,
-    pub direction: &'static str,
-    pub protocol: String,
-    pub srcaddr: String,
-    pub dstaddr: String,
-    pub srcport: String,
-    pub dstport: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub icmp_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub icmp_code: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub port_unavailable: Option<bool>,
-    pub start: u64,
-    pub end: u64,
-    pub window_seconds: u32,
-    pub packets: u64,
-    pub bytes: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub wire_bytes: Option<u64>,
-    pub wire_bytes_source: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub skb_count: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gso_skb_count: Option<u64>,
-    pub truncated: bool,
-    pub dropped: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub partial: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub partial_reason: Option<&'static str>,
 }
 
 /// 一个聚合键（BPF map key 的 Rust 侧镜像，**不含** `window_id`）。
@@ -279,68 +234,70 @@ pub(crate) struct FlowKey {
     pub port_unavailable: bool,
 }
 
-impl HostFlowRecord {
-    /// 由键 + 累计量 + 上下文构造一条记录。
-    ///
-    /// `window` 是窗口起点；`partial` 只在窗口被提前截断时给。
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn from_window(
-        ctx: &WindowCtx,
-        key: &FlowKey,
-        window: u64,
-        window_seconds: u32,
-        agg: &WindowAgg,
-        partial: Option<PartialReason>,
-    ) -> Self {
-        let (srcport, dstport) = if proto_has_ports(key.protocol) && !key.port_unavailable {
-            (key.src_port.to_string(), key.dst_port.to_string())
+/// 由键 + 累计量 + 上下文构造一条记录（**唯一构造点**）。
+///
+/// `window` 是窗口起点；`partial` 只在窗口被提前截断时给。
+///
+/// 为什么是自由函数而不是 `impl HostFlowRecord`：类型定义在 `wist-contracts`，
+/// 跨 crate 不能写 inherent impl（E0116）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_from_window(
+    ctx: &WindowCtx,
+    key: &FlowKey,
+    window: u64,
+    window_seconds: u32,
+    agg: &WindowAgg,
+    partial: Option<PartialReason>,
+) -> HostFlowRecord {
+    let (srcport, dstport) = if proto_has_ports(key.protocol) && !key.port_unavailable {
+        (key.src_port.to_string(), key.dst_port.to_string())
+    } else {
+        ("0".to_string(), "0".to_string())
+    };
+    let (icmp_type, icmp_code) = match (key.icmp_type, key.icmp_code) {
+        (Some(kind), Some(code)) => (Some(kind.to_string()), Some(code.to_string())),
+        _ => (None, None),
+    };
+    HostFlowRecord {
+        record_schema: RECORD_SCHEMA_V1.to_string(),
+        source: SOURCE_HOST_EBPF.to_string(),
+        coverage: COVERAGE_HOST_PARTIAL.to_string(),
+        capture: key.direction.capture().to_string(),
+        collector_instance_id: ctx.collector_instance_id.clone(),
+        host_id: ctx.host_id.clone(),
+        host_name: ctx.host_name.clone(),
+        kernel: ctx.kernel.clone(),
+        ifname: ctx.ifname.clone(),
+        ifindex: ctx.ifindex,
+        if_mac: ctx.if_mac.clone(),
+        local_addrs: ctx.local_addrs.iter().map(ToString::to_string).collect(),
+        direction: key.direction.as_str().to_string(),
+        protocol: key.protocol.to_string(),
+        srcaddr: key.src.to_string(),
+        dstaddr: key.dst.to_string(),
+        srcport,
+        dstport,
+        icmp_type,
+        icmp_code,
+        port_unavailable: key.port_unavailable.then_some(true),
+        start: window,
+        end: window + u64::from(window_seconds),
+        window_seconds,
+        packets: agg.packets,
+        bytes: agg.bytes,
+        wire_bytes: agg.wire_bytes,
+        wire_bytes_source: if agg.wire_bytes.is_some() {
+            WIRE_BYTES_SOURCE_WIRE_LEN
         } else {
-            ("0".to_string(), "0".to_string())
-        };
-        let (icmp_type, icmp_code) = match (key.icmp_type, key.icmp_code) {
-            (Some(kind), Some(code)) => (Some(kind.to_string()), Some(code.to_string())),
-            _ => (None, None),
-        };
-        Self {
-            record_schema: RECORD_SCHEMA,
-            source: SOURCE,
-            coverage: COVERAGE,
-            capture: key.direction.capture(),
-            collector_instance_id: ctx.collector_instance_id.clone(),
-            host_id: ctx.host_id.clone(),
-            host_name: ctx.host_name.clone(),
-            kernel: ctx.kernel.clone(),
-            ifname: ctx.ifname.clone(),
-            ifindex: ctx.ifindex,
-            if_mac: ctx.if_mac.clone(),
-            local_addrs: ctx.local_addrs.iter().map(ToString::to_string).collect(),
-            direction: key.direction.as_str(),
-            protocol: key.protocol.to_string(),
-            srcaddr: key.src.to_string(),
-            dstaddr: key.dst.to_string(),
-            srcport,
-            dstport,
-            icmp_type,
-            icmp_code,
-            port_unavailable: key.port_unavailable.then_some(true),
-            start: window,
-            end: window + u64::from(window_seconds),
-            window_seconds,
-            packets: agg.packets,
-            bytes: agg.bytes,
-            wire_bytes: agg.wire_bytes,
-            wire_bytes_source: if agg.wire_bytes.is_some() {
-                "wire_len"
-            } else {
-                "unavailable"
-            },
-            skb_count: Some(agg.skb_count),
-            gso_skb_count: Some(agg.gso_skb_count),
-            truncated: agg.truncated,
-            dropped: agg.dropped,
-            partial: partial.map(|_| true),
-            partial_reason: partial.map(PartialReason::as_str),
+            WIRE_BYTES_SOURCE_UNAVAILABLE
         }
+        .to_string(),
+        skb_count: Some(agg.skb_count),
+        gso_skb_count: Some(agg.gso_skb_count),
+        truncated: agg.truncated,
+        dropped: agg.dropped,
+        partial: partial.map(|_| true),
+        partial_reason: partial.map(|reason| reason.as_str().to_string()),
     }
 }
 
@@ -475,8 +432,7 @@ mod tests {
 
     #[test]
     fn tcp_record_carries_no_icmp_and_no_wire_bytes_when_unavailable() {
-        let record =
-            HostFlowRecord::from_window(&ctx(), &tcp_key(), 1_789_469_760, 60, &agg(), None);
+        let record = record_from_window(&ctx(), &tcp_key(), 1_789_469_760, 60, &agg(), None);
         let text = serde_json::to_string(&record).expect("serialize");
         assert!(text.contains("\"protocol\":\"6\""));
         assert!(text.contains("\"direction\":\"out\""));
@@ -507,7 +463,7 @@ mod tests {
             icmp_code: Some(0),
             port_unavailable: false,
         };
-        let record = HostFlowRecord::from_window(&ctx(), &key, 1_789_469_760, 60, &agg(), None);
+        let record = record_from_window(&ctx(), &key, 1_789_469_760, 60, &agg(), None);
         assert_eq!(record.srcport, "0");
         assert_eq!(record.dstport, "0");
         assert_eq!(record.icmp_type.as_deref(), Some("8"));
@@ -520,7 +476,7 @@ mod tests {
     fn fragmented_packets_mark_ports_unavailable() {
         let mut key = tcp_key();
         key.port_unavailable = true;
-        let record = HostFlowRecord::from_window(&ctx(), &key, 1_789_469_760, 60, &agg(), None);
+        let record = record_from_window(&ctx(), &key, 1_789_469_760, 60, &agg(), None);
         assert_eq!(record.srcport, "0");
         assert_eq!(record.dstport, "0");
         assert_eq!(record.port_unavailable, Some(true));
@@ -528,7 +484,7 @@ mod tests {
 
     #[test]
     fn partial_windows_say_why() {
-        let record = HostFlowRecord::from_window(
+        let record = record_from_window(
             &ctx(),
             &tcp_key(),
             1_789_469_760,
@@ -537,7 +493,7 @@ mod tests {
             Some(PartialReason::Paused),
         );
         assert_eq!(record.partial, Some(true));
-        assert_eq!(record.partial_reason, Some("paused"));
+        assert_eq!(record.partial_reason.as_deref(), Some("paused"));
         assert_eq!(record.end, 1_789_469_790, "短窗按实际秒数结束");
         assert_eq!(record.window_seconds, 30);
     }
@@ -545,8 +501,7 @@ mod tests {
     /// 云侧字段一个都不许出现：它们由平台富化（`action` 更不能塞 `observed` 进枚举）。
     #[test]
     fn cloud_side_fields_never_appear() {
-        let record =
-            HostFlowRecord::from_window(&ctx(), &tcp_key(), 1_789_469_760, 60, &agg(), None);
+        let record = record_from_window(&ctx(), &tcp_key(), 1_789_469_760, 60, &agg(), None);
         let text = serde_json::to_string(&record).expect("serialize");
         for forbidden in [
             "\"action\"",

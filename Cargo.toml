@@ -49,15 +49,15 @@ tokio = { version = "1.48", features = ["full"] }
 # 下限必须是 0.10.4：本仓用 `AgentLocalStandingWork.collection`（采集面采集结果），
 # 0.10.3 没这个字段。写成 `0.10.3` 时一个 `cargo update -Z minimal-versions`
 # 或 CI 的最小版本任务就能解析到编译不过的版本。
-wist-contracts = { version = "0.14" }
+wist-contracts = { version = "0.16" }
 # 本地联调：切 path（整条链一起切）
 #wist-contracts = { version = "0.12", path = "../wist-contracts" }
 # 跨进程 seam 报文（enrollment / agent_status / gateway / work / agent_uplink）。
-wist-api = { version = "0.13" }
+wist-api = { version = "0.15" }
 # 本地联调：切 path（整条链一起切）
 #wist-api = { version = "0.13", path = "../wist-api" }
 # 规范指标名 / label 键 / 单位换算（与网关写入侧共用）。
-wist-metrics = { version = "0.20" }
+wist-metrics = { version = "0.22" }
 # 本地联调：切 path（整条链一起切）
 #wist-metrics = { version = "0.20", path = "../wist-metrics" }
 wist-shared = { version = "0.2" }
@@ -88,7 +88,7 @@ sqlx = { version = "0.9", default-features = false, features = [
 ] }
 wist-log = { version = "0.1" }
 #wist-log = { version = "0.1", path = "../wist-log" }
-wist-validate = { version = "0.12" }
+wist-validate = { version = "0.14" }
 # 本地联调：切 path（整条链一起切）
 #wist-validate = { version = "0.10", path = "../wist-validate" }
 
@@ -132,6 +132,8 @@ path = "src/bin/wist-upgrader.rs"
 # 2026-11-22：四个 crate 已全部上 crates.io（contracts 0.14.0 / api 0.13.2 / metrics 0.20.2 /
 # validate 0.12.0），patch 保持注释；留着会让 CI 报
 # `patch location ... does not contain packages`（wist-gateway v0.52.0-alpha 首次发布就这样红过）。
+# 2026-11-27：升到 contracts 0.16.0 / api 0.15.0 / metrics 0.22.0 / validate 0.14.0（host_flow
+# 记录契约），四个均已上 crates.io，patch 同样保持注释。
 # wist-contracts = { path = "../wist-contracts" }
 # wist-api = { path = "../wist-api" }
 # wist-validate = { path = "../wist-validate" }

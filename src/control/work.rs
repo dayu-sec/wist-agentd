@@ -42,7 +42,7 @@ pub(crate) fn is_key_process_source(kind: &str, target: &str) -> bool {
         && CollectionSourceKind::KeyProcessMetrics.accepts_target(target)
 }
 
-/// 主机流记录来源的 `kind`。
+/// 主机流记录来源的 `kind`（与 `wist-contracts` 同一份定义，不再各写一个字符串）。
 ///
 /// 这个 kind 从 `wist-contracts 0.15` 起在契约里算「可执行」，agentd 自本版起也真的接了
 /// 采集器（`crate::telemetry::flows`）。所以它**不再**在 [`AppliedWorkGrant::unsupported_units`]
@@ -50,9 +50,7 @@ pub(crate) fn is_key_process_source(kind: &str, target: &str) -> bool {
 /// 见设计 `docs/design/host-ebpf-flow-collection.md` §11。
 ///
 /// 「能不能采」不在这里判：那是**本机能力探测**的事，只有采集层看得到。
-///
-/// 用字符串而不是 `CollectionSourceKind::HostFlow`：当前依赖的 contracts 还没有这个变体。
-pub(crate) const HOST_FLOW_SOURCE_KIND: &str = "HostFlow";
+pub(crate) const HOST_FLOW_SOURCE_KIND: &str = CollectionSourceKind::HostFlow.as_str();
 
 /// 这条来源是不是「主机流记录」（只看 kind）。
 ///
@@ -65,9 +63,9 @@ pub(crate) fn is_host_flow_source(kind: &str) -> bool {
 ///
 /// 这个判定有**两个**消费者（[`AppliedWorkGrant::flow_grants`] 与
 /// [`AppliedWorkGrant::unsupported_units`]），写两份就会漂移成「授权了但判成 unsupported」。
+/// 口径本身在契约里（`accepts_target`）—— 这里只给它一个本地的意图名字。
 fn is_flow_target_auto(target: &str) -> bool {
-    let target = target.trim();
-    target.is_empty() || target.eq_ignore_ascii_case("auto")
+    CollectionSourceKind::HostFlow.accepts_target(target)
 }
 
 /// 关键进程指标的授权：按哪些签名认。
@@ -988,15 +986,9 @@ impl AppliedWorkGrant {
             };
             for unit in &spec.units {
                 for source in &unit.sources {
-                    // HostFlow：agentd 自己接了采集器，所以**不看 contracts 的词表**
-                    // （依赖的 0.14 还没有这个 kind，0.15 起才认）—— 只认空/auto。
-                    // 写死网卡名（`eth0`）仍要如实报：观测哪张网卡是本机事实。
-                    if is_host_flow_source(&source.kind) && is_flow_target_auto(&source.target) {
-                        continue;
-                    }
-                    // 先看 contracts 的口径，再补上契约里不吃的那几类自探域与关键进程指标：
-                    // `wist-contracts 0.14` 还不认识 `KafkaCluster` 等，不补这一步会把
-                    // 已经能采的单元误报成 unsupported。
+                    // 先看 contracts 的口径（`FileGlob` / `MetricInterval` / `Exporter` /
+                    // `HostFlow`），再补上契约不吃的那几类自探域与关键进程指标（它们由上面的
+                    // `is_*_source` 统一判，不在这里各写一份）。
                     if wist_contracts::work::is_executable_source(&source.kind, &source.target)
                         || is_kafka_cluster_source(&source.kind, &source.target)
                         || is_mysql_instance_source(&source.kind, &source.target)

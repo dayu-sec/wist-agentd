@@ -21,6 +21,12 @@ ICMP / ICMPv6 的五元组聚合流，按 60 秒整分窗口聚成一条条记�
   `truncated` / `lost` / `clock_jumps` 等计数）。
 - 输出只支持 tcp 上行：本地 `file` 输出承载不了 ` FLOW: ` 帧，此时不会采集并在日志里说明。
 
+### 变更（依赖）
+
+- 升到 `wist-contracts 0.16`（连带 `wist-api 0.15` / `wist-metrics 0.22` / `wist-validate 0.14`）：
+  流记录的形状现在**只有一份定义**（`wist_contracts::host_flow::HostFlowRecord`），
+  agentd 只负责构造与序列化，不再维护一份同构结构体。
+
 ### 测试
 
 - 流记录的形状、窗口切分（半开区间 / flush 滞后 / 迟到不补发）、选卡、IP 分片与

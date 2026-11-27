@@ -64,11 +64,8 @@
 
 约束：
 
-- **记录形状只在 `wist-contracts` 定义一份**（`wist_contracts::host_flow::HostFlowRecord`，0.16 起），
-  第 ②/③ 层与 agentd 按同一份解析；agentd 侧目前保留一个**同形状**的本地序列化结构
-  （依赖链 `wist-api`/`wist-metrics`/`wist-validate` 还钉在 `wist-contracts 0.14`，单个 crate
-  升上去会解析出两份 contracts），两侧字段集由单测各自锁死；链路抬到 0.16 后切回契约类型。
-  纪律不变：**谁构造契约对象只应有一处**（agentd 是 `HostFlowRecord::from_window`）。
+- **`HostFlowRecord` 定义在 `wist-contracts`**（`wist_contracts::host_flow`，0.16 起），agentd 只负责构造与序列化、
+  不重建（与 `OBSFACT` 同一纪律：谁构造契约对象只应有一处 —— agentd 侧是 `record::record_from_window`）。
 - 第 ① 层出现"推断字段"即视为设计错误。`needs_enrichment` 属于第 ③ 层。
 - `wist-atlas` 侧按 `doc/architecture/network-modeling-analysis.md` §10 处理：流记录是 **runtime evidence**，先落地为观测证据，不得直接 materialize 成 network inventory。
 
