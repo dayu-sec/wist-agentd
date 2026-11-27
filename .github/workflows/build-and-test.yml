@@ -71,6 +71,9 @@ jobs:
   flow-ebpf:
     name: Host flow (real eBPF)
     runs-on: ubuntu-24.04
+    # 真机用例自身已有 30s 的收帧上限；这层是兜底：作业永远不会再挂到
+    # 被人手动取消（曾经 netlink 路径挂死 20 分钟）。
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -113,8 +116,10 @@ jobs:
           for mode in tcx netlink; do
             echo "=== attach path: $mode ==="
             set +e
-            sudo env "PATH=$PATH" WIST_FLOW_TC="$mode" \
-              "$BIN" flows --ignored --nocapture --test-threads=1 \
+            # `timeout` + `stdbuf -oL`：卡住要变成“明确的失败”，而不是让日志
+            # 一直看不到卡在哪条用例（stdout 接管道是块缓冲，不强制行缓冲就只会看到半行）。
+            sudo env "PATH=$PATH" WIST_FLOW_TC="$mode" timeout 300 \
+              stdbuf -oL -eL "$BIN" flows --ignored --nocapture --test-threads=1 \
               2>&1 | tee "$RUNNER_TEMP/flows-$mode.log"
             mode_rc=${PIPESTATUS[0]}
             set -e
@@ -128,6 +133,13 @@ jobs:
             echo ""
             echo "- 退出码：\`$rc\`"
             echo "- attach 路径：TCX + netlink"
+            if [ "$rc" -ne 0 ]; then
+              echo ""
+              echo "失败/超时的最后 40 行："
+              echo '```'
+              tail -n 40 "$RUNNER_TEMP"/flows-*.log
+              echo '```'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$rc" -eq 0 ] && grep -qh '^skip:' "$RUNNER_TEMP"/flows-*.log; then
             echo "::warning::runner 环境无法验证 eBPF（缺 root / 网卡 / 内核能力），部分用例被跳过（这不是“通过”）"

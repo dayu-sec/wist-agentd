@@ -937,6 +937,25 @@ mod tests {
         })
     }
 
+    /// 等采集层把帧交过来：**必须有上限**。
+    ///
+    /// 真机验收里「环境不满足」应当是失败/跳过，而不是把整个 CI 挂住 —— 实测过：
+    /// netlink 路径在某些 runner 上一条帧都拿不到，没有上限的 `server.await`
+    /// 会一直等下去（20 分钟才被人工取消）。
+    /// 失败信息里带 `attach_path`，现场一眼能看出走的是哪条路径。
+    #[cfg(all(target_os = "linux", have_flow_bpf))]
+    async fn await_frames(server: tokio::task::JoinHandle<String>) -> String {
+        match tokio::time::timeout(std::time::Duration::from_secs(30), server).await {
+            Ok(Ok(body)) => body,
+            Ok(Err(err)) => panic!("收帧任务失败：{err}"),
+            Err(_) => panic!(
+                "30s 内一条帧都没收到（attach_path={}）：采集器可能没挂上，\
+                 或挂上了但没看到这条流量",
+                crate::telemetry::flows::attach_path()
+            ),
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn write_flow_uplink_sends_one_flow_frame_per_record() {
         let Some((listener, port)) = tcp_listener().await else {
@@ -1343,7 +1362,7 @@ mod tests {
         assert!(!stopped.collecting, "撤授权后必须卸掉采集器");
         drop(sink);
 
-        let body = server.await.expect("join");
+        let body = await_frames(server).await;
         assert!(!body.is_empty(), "停采时应该把在途窗口发出来");
         assert!(body.contains("\"schema\":\"v1\""), "{body}");
         let udp = body
@@ -1424,7 +1443,7 @@ mod tests {
             .await;
         drop(sink);
 
-        let body = server.await.expect("join");
+        let body = await_frames(server).await;
         let udp = body
             .lines()
             .filter(|line| line.contains(" FLOW: "))
