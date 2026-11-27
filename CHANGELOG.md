@@ -3,6 +3,42 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.44.0-alpha] - 2026-11-27
+
+### 新增（主机侧流记录：`HostFlow` 采集面）
+
+平台下发 `HostFlow:auto` 的采集授权后，agentd 直接在本机对外网卡上采 TCP / UDP /
+ICMP / ICMPv6 的五元组聚合流，按 60 秒整分窗口聚成一条条记录，走现有上行帧
+` FLOW: `（JSON 信封不变）发给数据面。
+
+- **它是云 VPC 流日志的补充来源，不是替代**：主机视角看不到「到网卡之前就被云侧
+  策略丢弃」的流量（记录里 `coverage = host_partial` 说的就是这件事），两侧**不可相加**。
+- 记录字段是观测事实 + 平台 join 键，**不含任何云侧身份**（`instance-id`/`vpc-id`/…）
+  与推断字段（`action`/`needs_enrichment`）—— 富化与判决在平台做。
+- 采集可用条件：Linux 内核 ≥ 5.4、root（或 `CAP_BPF`/`CAP_NET_ADMIN`）、对外网卡可用。
+  采不了时**不静默**：采集状态面会给出 `unsupported` / `permission` / `run_failed` 与原因，
+  `agentd diagnose` 也新增一项 `flows.status`（含 `ifaces` / `sent` / `late_dropped` /
+  `truncated` / `lost` / `clock_jumps` 等计数）。
+- 输出只支持 tcp 上行：本地 `file` 输出承载不了 ` FLOW: ` 帧，此时不会采集并在日志里说明。
+
+### 测试
+
+- 流记录的形状、窗口切分（半开区间 / flush 滞后 / 迟到不补发）、选卡、IP 分片与
+  QinQ/VLAN、IPv6 默认路由、墙钟跳变、采集状态映射都有单测；eBPF 采集器另有一组
+  需要真实网卡的用例（TCX 与 netlink 两条 attach 路径各跑一遍）。
+
+### 构建 / CI
+
+- **CI 与发布机现在强制带 eBPF 采集器**：缺 clang 时构建直接失败（`WIST_REQUIRE_FLOW_BPF=1`），
+  避免发出一个「授权了却永远采不到」的包。clang 版本集中在 `dev/ci/flow-clang.txt`。
+
+### 升级注意
+
+- **数据面必须先认识 ` FLOW: ` 帧**，否则上行会被当成坏帧。本火车已一并发布
+  `wist-gateway-stack 0.19.15-alpha`（含 `agent_uplink_flow_frame` 规则与 `agent-flows` sink），
+  建议同步升级。
+- 没有 `HostFlow` 授权时完全不启用采集，也不会加载 BPF 对象 —— 不授权即零开销。
+
 ## [0.43.2-alpha] - 2026-11-25
 
 ### 修复（CentOS 6 / RHEL 6 的自动升级不再必然失败）
