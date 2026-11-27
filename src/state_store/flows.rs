@@ -148,4 +148,59 @@ mod tests {
         assert!(!text.contains("last_error"), "{text}");
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// 损坏的快照**不是**「从没跑过」：后者是 `Ok(None)`（本来就这么判），
+    /// 前者必须是一个带路径的错误 —— 否则 `diagnose` 会把「文件写坏了」报成
+    /// 「agent 没跑过流采集」，现场会去查版本/授权。
+    #[test]
+    fn a_corrupt_file_is_an_error_not_an_absent_status() {
+        let dir = std::env::temp_dir().join(format!(
+            "wist-flow-status-corrupt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let path = path_for(&dir);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(&path, b"{not json").expect("write");
+
+        let err = load(&path).expect_err("corrupt snowflake must not read as absent");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("status.json"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 旧版本写的快照少几个计数器键时按 0 读（`#[serde(default)]`）：
+    /// 升级不能被一份旧文件卡住 —— 这些计数本来就是“本进程这次运行”的统计，
+    /// 缺就是 0。
+    #[test]
+    fn an_old_snapshot_without_newer_counters_still_loads() {
+        let dir = std::env::temp_dir().join(format!(
+            "wist-flow-status-old-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let path = path_for(&dir);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(
+            &path,
+            br#"{"schema_version":"agentd.flow_status/v1","updated_at":"t","collecting":false,
+                 "attach_path":"netlink","kernel":"5.4.0","ifaces":["eth0"],
+                 "counters":{"windows_sent":7}}"#,
+        )
+        .expect("write");
+
+        let status = load(&path).expect("load").expect("present");
+        assert_eq!(status.counters.windows_sent, 7);
+        // 旧文件里没有的计数器 = 0，而不是解析失败。
+        assert_eq!(status.counters.clock_jumps, 0);
+        assert_eq!(status.counters.uplink_failures, 0);
+        assert_eq!(status.last_error, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

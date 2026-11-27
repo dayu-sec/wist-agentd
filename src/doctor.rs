@@ -3788,4 +3788,109 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
     }
+
+    // ── 主机流记录运行态（`flows.status`）───────────────────────────
+    //
+    // 这是现场回答「为什么没有流数据」的第一站：agentd → 网关的 v1 报文是
+    // `deny_unknown_fields` 的，自观测只能落本地文件，由 `diagnose` 直接读。
+    // 五个分支各有各的处置（没跑过 / 文件坏了 / 有 last_error / 在采 / 停了），
+    // 逐个钉住 —— 它们就是现场拿到的原话。
+
+    fn flow_status_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("doctor-flow-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    fn flow_status(
+        collecting: bool,
+        last_error: Option<&str>,
+    ) -> crate::state_store::flows::FlowStatus {
+        crate::state_store::flows::FlowStatus {
+            schema_version: crate::state_store::flows::SCHEMA_VERSION.to_string(),
+            updated_at: "2026-11-27T00:00:00Z".to_string(),
+            collecting,
+            attach_path: "tcx".to_string(),
+            kernel: "6.8.0-138-generic".to_string(),
+            ifaces: vec!["eth0".to_string()],
+            counters: crate::state_store::flows::FlowCounters {
+                windows_sent: 42,
+                late_dropped: 3,
+                ..Default::default()
+            },
+            last_error: last_error.map(ToString::to_string),
+        }
+    }
+
+    fn write_flow_status(
+        dir: &std::path::Path,
+        status: &crate::state_store::flows::FlowStatus,
+    ) -> std::path::PathBuf {
+        let path = crate::state_store::flows::path_for(dir);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(&path, serde_json::to_vec(status).expect("json")).expect("write");
+        path
+    }
+
+    #[test]
+    fn flows_check_fails_when_the_status_file_is_corrupt() {
+        let dir = flow_status_dir("corrupt");
+        let path = crate::state_store::flows::path_for(&dir);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(&path, b"{not json").expect("write");
+
+        let check = flows_check_at(&path);
+        assert_eq!(check.status, Status::Fail, "{}", check.title);
+        assert!(check.title.contains("读不出来"), "{}", check.title);
+        assert!(check.hint.expect("hint").contains("删掉它"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn flows_check_fails_on_last_error_even_while_collecting() {
+        let dir = flow_status_dir("error");
+        let path = write_flow_status(&dir, &flow_status(true, Some("cap_bpf: permission denied")));
+
+        let check = flows_check_at(&path);
+        // 采集器声称自己在采、但同时记了失败：失败优先（不能报 OK）。
+        assert_eq!(check.status, Status::Fail, "{}", check.detail);
+        assert!(check.detail.contains("cap_bpf"), "{}", check.detail);
+        assert!(
+            check.detail.contains("sent=42"),
+            "计数也要一起看：{}",
+            check.detail
+        );
+        assert!(check.hint.expect("hint").contains("cap_"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn flows_check_warns_when_collection_is_stopped() {
+        let dir = flow_status_dir("idle");
+        let path = write_flow_status(&dir, &flow_status(false, None));
+
+        let check = flows_check_at(&path);
+        assert_eq!(check.status, Status::Warn, "{}", check.detail);
+        let hint = check.hint.expect("hint");
+        // 三个最常见的「没在采」原因都要能对上。
+        assert!(hint.contains("HostFlow"), "{hint}");
+        assert!(hint.contains("file"), "{hint}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn flows_check_renders_an_empty_interface_list_as_a_dash() {
+        let dir = flow_status_dir("no-iface");
+        let mut status = flow_status(false, None);
+        status.ifaces.clear();
+        let path = write_flow_status(&dir, &status);
+
+        let check = flows_check_at(&path);
+        assert!(
+            check.detail.contains("ifaces=-"),
+            "空列表不能渲染成 `ifaces=`：{}",
+            check.detail
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
