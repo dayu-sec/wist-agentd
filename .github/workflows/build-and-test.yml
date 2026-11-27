@@ -109,6 +109,10 @@ jobs:
           set -o pipefail
           BIN="$FLOW_TEST_BIN"
           echo "test binary: $BIN"
+          # 先留下环境快照：内核/网卡/默认路由决定「该看哪张网卡」与 attach 走的路径。
+          uname -r
+          ip -br link
+          ip route show default || true
 
           # 两条 attach 路径都要跑：默认（6.6+ 走 TCX）与强制 netlink
           # （老内核的那条路 —— 它才是有“崩溃残留”问题的那一条）。

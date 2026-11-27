@@ -884,6 +884,36 @@ mod tests {
         let refs: Vec<&IfaceSnapshot> = ifaces.iter().collect();
         let mut collector = Collector::start(&refs).expect("attach tc");
 
+        // 诊断：attach **成功但看不到包**时，光靠断言分不清是「没挂上」还是「挂错位置」。
+        // 把选了哪张网卡、attach 后这张网卡上的 tc 实际状态打进 stderr ——
+        // stderr 不缓冲，CI 日志与真机终端里都立即可见。
+        eprintln!(
+            "观察网卡 {} ifindex={} attach_path={}",
+            iface.name,
+            iface.ifindex,
+            crate::telemetry::flows::attach_path()
+        );
+        for (label, args) in [
+            ("qdisc", vec!["qdisc", "show", "dev", iface.name.as_str()]),
+            (
+                "filter egress",
+                vec!["filter", "show", "dev", iface.name.as_str(), "egress"],
+            ),
+            (
+                "filter ingress",
+                vec!["filter", "show", "dev", iface.name.as_str(), "ingress"],
+            ),
+        ] {
+            match std::process::Command::new("tc").args(&args).output() {
+                Ok(out) => eprintln!(
+                    "tc {label}:\n{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+                Err(err) => eprintln!("tc {label}: 跑不起来：{err}"),
+            }
+        }
+
         let gateway = default_gateway_v4().expect("默认网关");
         let local_v4 = iface
             .addrs
