@@ -364,6 +364,31 @@ x86_64 与 aarch64 均为小端，**一个 `.o` 两架构共用**。
 | 容器部署 | **首版不支持**（需 hostNetwork + 高权限），避免做未验证的承诺 |
 | 降级 | 不满足基线 / 无权限 / qdisc 装不上 → **不采集并如实上报**（映射到 `collection-status.md` 的 `blocked` + `unsupported`/`permission`），不得退化成 conntrack 或 `ss` 轮询（口径不同，会制造不可解释的差异） |
 
+### 10.1 两条 attach 路径的覆盖差异（重要）
+
+| | TCX（内核 ≥ 6.6） | netlink `tc filter`（< 6.6 的兜底） |
+|---|---|---|
+| 载体 | BPF link | `clsact` 上的 `SchedClassifier` filter |
+| 异常退出 | 进程死 fd 关，内核自动摘 | 会把 prog 与 map 钉在内核里（所以挂前按程序名清残留） |
+| **与别人的 tc 过滤器共存** | 不受影响 | **受限**：`tc filter` 按 `pref` 升序执行，先返回非 `PIPE` 的那个终止整条链 |
+
+netlink 路径挂在自己的 `pref`（不给别人抢位置），因此**只要这台机器上已有更小 `pref` 的
+`direct-action` 过滤器（很多 CNI / 安全 agent / 云厂商镜像会装），我们的 filter 就永远不会
+被调用** —— 此时采集器会报“在采”，但一条流也不会出现。
+
+实测例子：GitHub 的 `ubuntu-24.04` runner 在 `eth0` 上自带 `pref 1` 的
+`tc_egress_traffic` / `tc_ingress_traffic`，我们挂的 `pref 49152` 被完全遮蔽；同一台
+机器改走 TCX 就能采到。
+
+因此：
+
+- **能用 TCX 就用 TCX**（6.6+ 默认），现网 6.6+ 的机器不受这条限制影响；
+- 老内核上要确认这张网卡的 clsact 上没有比我们更早的 `direct-action` 过滤器
+  （`tc -d filter show dev <if> egress`）；
+- **已知短板**：运行期还不会自动识别这种“被遮蔽”状态（没有计数器能证明“本该有包却没进来”），
+  只能靠现场对账（对比云侧流日志或 `ss`/`nstat`）发现。彻底解决要自己 dump tc 过滤器做 pref 比对，
+  属于后续项（§15 slice 3）。
+
 ## 11. 失败模式与自观测
 
 失败分类**不新开通道**，复用既有 `AgentLocalCollection`（见 [`collection-status.md`](./collection-status.md)）的 `prerequisites` / `result` / `reasons[{kind, subject, detail}]`：
@@ -463,6 +488,8 @@ x86_64 与 aarch64 均为小端，**一个 `.o` 两架构共用**。
 - 四侧同源：网关 `content.rs` 校验、web `agentWorkStatus.ts` 判据与文案；
 - 知识库：`HostFlow` family + 单元 `active` + `catalog_version` 单独抬；
 - 能力协商与降级重发；
+- **netlink 路径的“被遮蔽”自检**（§10.1）：dump 同 hook 上的 tc 过滤器，若存在更小 `pref`
+  的 `direct-action` 过滤器，就把这一面报成 `unsupported`/`run_failed`，而不是“在采但一条流都没有”；
 - 容器部署（若需要）。
 
 ## 16. 上线顺序与兼容

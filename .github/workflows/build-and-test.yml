@@ -125,15 +125,36 @@ jobs:
 
           # 两条 attach 路径都要跑：默认（6.6+ 走 TCX）与强制 netlink
           # （老内核的那条路 —— 它才是有“崩溃残留”问题的那一条）。
+          #
+          # netlink 路径跑在一个**干净 netns** 里：`tc filter` 按 pref 顺序执行，
+          # runner 镜像在 eth0 上已有 `pref 1` 的 direct-action 过滤器，
+          # 我们挂的 `pref 49152` 永远轮不到（TCX 是 bpf_link，不受影响）。
+          # 这不是用例的毛病，是老内核上用 tc filter 的先天限制（见设计 §10）。
           rc=0
           for mode in tcx netlink; do
             echo "=== attach path: $mode ==="
             set +e
-            # `timeout` + `stdbuf -oL`：卡住要变成“明确的失败”，而不是让日志
-            # 一直看不到卡在哪条用例（stdout 接管道是块缓冲，不强制行缓冲就只会看到半行）。
-            sudo env "PATH=$PATH" WIST_FLOW_TC="$mode" timeout 300 \
-              stdbuf -oL -eL "$BIN" flows --ignored --nocapture --test-threads=1 \
-              2>&1 | tee "$RUNNER_TEMP/flows-$mode.log"
+            if [ "$mode" = "netlink" ]; then
+              sudo ip netns add wistflow 2>/dev/null
+              sudo ip netns exec wistflow ip link set lo up
+              sudo ip link add wistout type veth peer name eth0 netns wistflow 2>/dev/null
+              sudo ip link set wistout up
+              sudo ip addr add 10.200.0.1/24 dev wistout 2>/dev/null
+              sudo ip netns exec wistflow ip link set eth0 up
+              sudo ip netns exec wistflow ip addr add 10.200.0.2/24 dev eth0 2>/dev/null
+              sudo ip netns exec wistflow ip route add default via 10.200.0.1 2>/dev/null
+              sudo ip netns exec wistflow ip -br link
+              sudo ip netns exec wistflow ip route show default
+              # `timeout` + `stdbuf -oL`：卡住要变成“明确的失败”，而不是让日志
+              # 一直看不到卡在哪条用例（stdout 接管道是块缓冲）。
+              sudo ip netns exec wistflow env "PATH=$PATH" WIST_FLOW_TC="$mode" timeout 300 \
+                stdbuf -oL -eL "$BIN" flows --ignored --nocapture --test-threads=1 \
+                2>&1 | tee "$RUNNER_TEMP/flows-$mode.log"
+            else
+              sudo env "PATH=$PATH" WIST_FLOW_TC="$mode" timeout 300 \
+                stdbuf -oL -eL "$BIN" flows --ignored --nocapture --test-threads=1 \
+                2>&1 | tee "$RUNNER_TEMP/flows-$mode.log"
+            fi
             mode_rc=${PIPESTATUS[0]}
             set -e
             if [ "$mode_rc" -ne 0 ]; then
