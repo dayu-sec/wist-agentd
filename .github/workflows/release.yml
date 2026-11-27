@@ -38,7 +38,16 @@ jobs:
 
       - name: Install musl toolchain
         if: contains(matrix.target, 'musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        run: |
+          set -euo pipefail
+          if command -v musl-gcc >/dev/null; then
+            echo "already present: $(musl-gcc --version | head -1)"
+            exit 0
+          fi
+          # 与 clang 同口径：第三方源偶发 403 会把 `apt-get update` 弄成非零退出。
+          sudo rm -f /etc/apt/sources.list.d/*microsoft* /etc/apt/sources.list.d/*azure* || true
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
 
       # 流记录采集器的 BPF 对象是**构建期**用 clang 编进制品的（`build.rs`）。
       # 版本钉在 `dev/ci/flow-clang.txt`（**单一来源**，两个工作流共用）：
@@ -49,8 +58,13 @@ jobs:
         run: |
           set -euo pipefail
           CLANG_BIN="$(cat dev/ci/flow-clang.txt)"
-          sudo apt-get update
-          sudo apt-get install -y "$CLANG_BIN"
+          # 镜像本身带 clang 时直接用；否则先摘掉第三方源（它们偶发 403，会把
+          # 整条 `apt-get update` 弄成非零退出，连坐掉这一步）。与 build-and-test 同口径。
+          if ! command -v "$CLANG_BIN" >/dev/null; then
+            sudo rm -f /etc/apt/sources.list.d/*microsoft* /etc/apt/sources.list.d/*azure* || true
+            sudo apt-get update
+            sudo apt-get install -y "$CLANG_BIN"
+          fi
           "$CLANG_BIN" --version
 
       - name: Cargo build

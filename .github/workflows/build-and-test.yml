@@ -89,6 +89,15 @@ jobs:
         run: |
           set -euo pipefail
           CLANG_BIN="$(cat dev/ci/flow-clang.txt)"
+          # runner 镜像本身就带 clang 与 iproute2：有就直接用，不必碰 apt。
+          if command -v "$CLANG_BIN" >/dev/null && command -v tc >/dev/null; then
+            echo "already present: $("$CLANG_BIN" --version | head -1) / $(tc -V | head -1)"
+            exit 0
+          fi
+          # 镜像里的第三方源（packages.microsoft.com 等）偶发 403，会让整条
+          # `apt-get update` 非零退出，把「装 clang」连坐弄红。这条作业只需要
+          # ubuntu 主仓里的 clang / iproute2，先把第三方源摘掉再更新。
+          sudo rm -f /etc/apt/sources.list.d/*microsoft* /etc/apt/sources.list.d/*azure* || true
           sudo apt-get update
           sudo apt-get install -y "$CLANG_BIN" iproute2
 
