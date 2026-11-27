@@ -21,12 +21,13 @@ use wist_contracts::local_work::{
 };
 use wist_metrics::provider::MetricsCollectionOutcome;
 
+use super::flows_support::FlowReport;
 use super::metrics_support::MetricsTick;
 use super::telemetry_support::{
     ExporterFailure, ExporterFailureKind, ExporterReport, TelemetryFailure, TelemetryFailureKind,
     TelemetryTick,
 };
-use crate::control::work::{AppliedWorkGrant, UnsupportedUnit, WorkExporterRun};
+use crate::control::work::{AppliedWorkGrant, UnsupportedUnit, WorkExporterRun, WorkFlowGrant};
 use crate::state_store::work::StandingWorkRecord;
 use wist_contracts::work::CollectionSourceKind;
 
@@ -56,12 +57,17 @@ impl CollectionHealth {
     ///
     /// 每 tick 全量重算而不是增量累积：状态要能**恢复**（上一轮失败、这一轮好了就该回到
     /// `ok`），增量记账很容易忘了清。
+    ///
+    /// 参数多是因为每个都是**不同来源**的一手证据（日志/指标/导出器/流记录 + 关闸态），
+    /// 打包成结构体只会把这份清单搬到另一个地方。
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn observe(
         &mut self,
         work: &AppliedWorkGrant,
         telemetry: &TelemetryTick,
         metrics: &MetricsTick,
         exporter_report: &ExporterReport,
+        flow: &FlowReport,
         uplink_enabled: bool,
         now: &str,
     ) {
@@ -73,6 +79,7 @@ impl CollectionHealth {
         let spec_failures: BTreeMap<String, String> = work.spec_failures().into_iter().collect();
         let unsupported = work.unsupported_units();
         let exporters = work.exporter_runs();
+        let flow_grants = work.flow_grants();
         // 导出器失败按「下次成功运行」清，不按 tick 清（见字段说明）。
         for failure in &exporter_report.failures {
             self.exporter_failures
@@ -119,6 +126,8 @@ impl CollectionHealth {
                     &failures,
                     &metrics.failures,
                     outcomes,
+                    &flow_grants,
+                    flow,
                     uplink_enabled,
                     now,
                 ),
@@ -180,6 +189,8 @@ fn assess(
     telemetry_failures: &[TelemetryFailure],
     metrics_failures: &[super::metrics_support::MetricsFailure],
     metric_outcomes: &[MetricsCollectionOutcome],
+    flow_grants: &[WorkFlowGrant],
+    flow: &FlowReport,
     uplink_enabled: bool,
     now: &str,
 ) -> AgentLocalCollection {
@@ -426,8 +437,70 @@ fn assess(
     let task_hard = hard_inputs.len();
     hard += task_hard;
     let task_healthy = task_ids.len().saturating_sub(task_hard);
-    let healthy = task_healthy + exporter_healthy + metric_healthy;
-    let has_content = !task_ids.is_empty() || !runs.is_empty() || has_metrics_units;
+    // 主机流记录（HostFlow）：常驻 tc/eBPF 观测，与文件任务/导出器/指标并列。
+    // 严重度按设计 §11 的映射表：内核/构建不支持、缺 CAP → 前置条件缺失（没执行，不是失败）；
+    // 没有可用网卡 / 输出承载不了 → 还没就绪（等网络 / 等配置）；其余（qdisc、verifier、上送）→ 真没采成。
+    let flow_granted = flow_grants
+        .iter()
+        .any(|grant| grant.work_id == standing.work_id);
+    let mut flow_healthy = 0usize;
+    if flow_granted {
+        for failure in &flow.failures {
+            match failure.kind {
+                collection_reason_kind::UNSUPPORTED | collection_reason_kind::PERMISSION => {
+                    blocked_tool += 1;
+                }
+                collection_reason_kind::SOURCE_NOT_READY
+                | collection_reason_kind::TARGET_NOT_READY => {
+                    blocked_input += 1;
+                }
+                // 采到了但少了一部分（网卡在窗口结束前消失、聚合表淘汰）：软问题，不当失败。
+                collection_reason_kind::INCOMPLETE_DATA | collection_reason_kind::TRUNCATED => {
+                    soft += 1;
+                }
+                _ => hard += 1,
+            }
+            push_reason(
+                &mut reasons,
+                reason(
+                    failure.kind,
+                    failure.subject.clone(),
+                    failure.detail.clone(),
+                ),
+            );
+        }
+        // 窗口级的 `truncated` 是软问题（早就进记录里了）；这里只把它提升成「整体持续被截断」。
+        if flow.truncated_windows > 0 {
+            soft += 1;
+            push_reason(
+                &mut reasons,
+                reason(
+                    collection_reason_kind::TRUNCATED,
+                    "flow_map",
+                    format!(
+                        "{} 条窗口记录带着聚合表淘汰（truncated=true，量级不可解释）",
+                        flow.truncated_windows
+                    ),
+                ),
+            );
+        }
+        if flow.collecting {
+            flow_healthy = 1;
+        } else if flow.failures.is_empty() {
+            // 授权了、采集器没在跑、也没给出原因：本拍才刚授权（下一拍就有了）。
+            blocked_input += 1;
+            push_reason(
+                &mut reasons,
+                reason(
+                    collection_reason_kind::TARGET_NOT_READY,
+                    "flow_ebpf",
+                    "已授权，采集器尚未启动（本拍刚开始或正在等重试冷却）",
+                ),
+            );
+        }
+    }
+    let healthy = task_healthy + exporter_healthy + metric_healthy + flow_healthy;
+    let has_content = !task_ids.is_empty() || !runs.is_empty() || has_metrics_units || flow_granted;
     let has_unsupported = !unsupported.is_empty();
 
     if !has_content && !has_unsupported {
@@ -580,6 +653,7 @@ fn reason_kind_for_telemetry(kind: &TelemetryFailureKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::super::flows_support::FlowFailure;
     use super::*;
     use crate::control::work::UnsupportedUnit;
     use crate::state_store::work::{StandingWorkRecord, WorkTaskRecord};
@@ -641,6 +715,8 @@ mod tests {
             failures,
             &[],
             &[],
+            &[],
+            &FlowReport::default(),
             true,
             "2026-11-08T00:00:00Z",
         )
@@ -903,6 +979,8 @@ mod tests {
             )],
             &[],
             &[],
+            &[],
+            &FlowReport::default(),
             false,
             "2026-11-08T00:00:00Z",
         );
@@ -951,6 +1029,8 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
+            &FlowReport::default(),
             true,
             "2026-11-08T00:00:00Z",
         );
@@ -990,6 +1070,8 @@ mod tests {
             &[],
             &[],
             &[outcome],
+            &[],
+            &FlowReport::default(),
             true,
             "2026-11-08T00:00:00Z",
         );
@@ -1038,6 +1120,8 @@ mod tests {
             &[],
             &[],
             &[outcome],
+            &[],
+            &FlowReport::default(),
             true,
             "2026-11-08T00:00:00Z",
         );
@@ -1090,6 +1174,8 @@ mod tests {
             &[],
             &[],
             &[process],
+            &[],
+            &FlowReport::default(),
             true,
             "2026-11-08T00:00:00Z",
         );
@@ -1145,6 +1231,8 @@ mod tests {
             &[],
             &[],
             &[outcome],
+            &[],
+            &FlowReport::default(),
             true,
             "2026-11-08T00:00:00Z",
         );
@@ -1167,6 +1255,8 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
+            &FlowReport::default(),
             true,
             "2026-11-08T00:00:00Z",
         );
@@ -1207,6 +1297,8 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
+            &FlowReport::default(),
             true,
             "2026-11-08T00:00:00Z",
         );
@@ -1234,6 +1326,8 @@ mod tests {
             )],
             &[],
             &[],
+            &[],
+            &FlowReport::default(),
             true,
             "2026-11-08T00:00:00Z",
         );
@@ -1270,6 +1364,8 @@ mod tests {
             &[],
             &[],
             &outcomes,
+            &[],
+            &FlowReport::default(),
             true,
             "2026-11-08T00:00:00Z",
         );
@@ -1298,6 +1394,8 @@ mod tests {
             &[],
             &[],
             &outcomes,
+            &[],
+            &FlowReport::default(),
             true,
             "2026-11-08T00:00:00Z",
         );
@@ -1319,6 +1417,8 @@ mod tests {
             &[],
             &[],
             &outcomes,
+            &[],
+            &FlowReport::default(),
             true,
             "2026-11-08T00:00:00Z",
         );
@@ -1347,6 +1447,8 @@ mod tests {
             &[],
             &failures,
             &[],
+            &[],
+            &FlowReport::default(),
             true,
             "2026-11-08T00:00:00Z",
         );
@@ -1383,6 +1485,7 @@ mod tests {
                 }],
                 succeeded: Vec::new(),
             },
+            &FlowReport::default(),
             true,
             "2026-11-08T00:00:00Z",
         );
@@ -1430,6 +1533,7 @@ mod tests {
                 }],
                 succeeded: Vec::new(),
             },
+            &FlowReport::default(),
             true,
             "2026-11-08T00:00:00Z",
         );
@@ -1473,6 +1577,7 @@ mod tests {
                 }],
                 succeeded: Vec::new(),
             },
+            &FlowReport::default(),
             true,
             "2026-11-08T00:00:00Z",
         );
@@ -1515,6 +1620,7 @@ mod tests {
                 failures: vec![failure],
                 succeeded: Vec::new(),
             },
+            &FlowReport::default(),
             true,
             "2026-11-08T00:00:00Z",
         );
@@ -1529,6 +1635,7 @@ mod tests {
             &TelemetryTick::silent(),
             &quiet_metrics(),
             &ExporterReport::default(),
+            &FlowReport::default(),
             true,
             "2026-11-08T00:00:03Z",
         );
@@ -1546,6 +1653,7 @@ mod tests {
                 failures: Vec::new(),
                 succeeded: vec![run.input_id.clone()],
             },
+            &FlowReport::default(),
             true,
             "2026-11-08T00:00:06Z",
         );
@@ -1578,6 +1686,7 @@ mod tests {
                 }],
                 succeeded: Vec::new(),
             },
+            &FlowReport::default(),
             true,
             "2026-11-08T00:00:00Z",
         );
@@ -1589,6 +1698,7 @@ mod tests {
             &TelemetryTick::silent(),
             &quiet_metrics(),
             &ExporterReport::default(),
+            &FlowReport::default(),
             true,
             "2026-11-08T00:00:03Z",
         );
@@ -1598,6 +1708,7 @@ mod tests {
             &TelemetryTick::silent(),
             &quiet_metrics(),
             &ExporterReport::default(),
+            &FlowReport::default(),
             true,
             "2026-11-08T00:00:06Z",
         );
@@ -1629,6 +1740,7 @@ mod tests {
             &paused,
             &quiet_metrics(),
             &ExporterReport::default(),
+            &FlowReport::default(),
             true,
             "2026-11-08T00:00:00Z",
         );
@@ -1642,12 +1754,194 @@ mod tests {
             &TelemetryTick::silent(),
             &quiet_metrics(),
             &ExporterReport::default(),
+            &FlowReport::default(),
             true,
             "2026-11-08T00:00:03Z",
         );
         assert_eq!(
             health.get("work-l").expect("entry").status,
             collection_status::OK
+        );
+    }
+
+    // ── 主机流记录（HostFlow）────────────────────────────────────────────────
+
+    /// 一份只含 `HostFlow:auto` 的面（与网关实际下发的最小形状一致）。
+    fn flow_grant_record() -> crate::state_store::work::WorkRecord {
+        use wist_contracts::work::WorkSpecSource;
+        crate::state_store::work::WorkRecord {
+            schema_version: crate::state_store::work::SCHEMA_VERSION_V1.to_string(),
+            recorded_at: "2026-11-27T00:00:00Z".to_string(),
+            gateway_sequence: 1,
+            standing: vec![StandingWorkRecord {
+                work_id: "w-flow".to_string(),
+                family: "NetworkFlow".to_string(),
+                status: "active".to_string(),
+                plan_version: 1,
+                acknowledged_version: Some(1),
+                effective_from: "2026-11-27T00:00:00Z".to_string(),
+                units: vec![WorkSpecUnit {
+                    unit_id: "flow".to_string(),
+                    capability: "collect_logs".to_string(),
+                    rule_ref: "r".to_string(),
+                    requires_privilege: "root".to_string(),
+                    sources: vec![WorkSpecSource {
+                        kind: "HostFlow".to_string(),
+                        target: "auto".to_string(),
+                        multiline: "none".to_string(),
+                        exclude_globs: Vec::new(),
+                        filters: Default::default(),
+                        drop_if_contains: Vec::new(),
+                    }],
+                }],
+                tasks: Vec::new(),
+            }],
+            one_shot: Vec::new(),
+            metrics_interval_seconds: None,
+        }
+    }
+
+    fn observe_flow(flow: &FlowReport) -> CollectionHealth {
+        let work = AppliedWorkGrant::restore(&flow_grant_record());
+        let mut health = CollectionHealth::default();
+        health.observe(
+            &work,
+            &TelemetryTick::silent(),
+            &quiet_metrics(),
+            &ExporterReport::default(),
+            flow,
+            true,
+            "2026-11-27T00:00:00Z",
+        );
+        health
+    }
+
+    fn flow_failure(kind: &'static str, subject: &str) -> FlowFailure {
+        FlowFailure {
+            kind,
+            subject: subject.to_string(),
+            detail: format!("{subject} 采不了"),
+        }
+    }
+
+    /// 只含流记录的面、采集器在跑：这是 `success` —— 「本拍没新记录」不等于没采成。
+    #[test]
+    fn a_flow_only_work_that_is_collecting_succeeds() {
+        let health = observe_flow(&FlowReport {
+            collecting: true,
+            flushed: 3,
+            delivered: 0,
+            ..Default::default()
+        });
+        let entry = health.get("w-flow").expect("flow entry");
+        assert_eq!(entry.result, collection_result::SUCCESS);
+        assert_eq!(entry.prerequisites, collection_prerequisites::READY);
+        assert!(entry.reasons.is_empty(), "{:?}", entry.reasons);
+    }
+
+    /// 缺 CAP / 内核太老：**没执行**，所以是 `blocked + cancelled`，不是 failure
+    /// （设计 §11 的映射表；报成红点会让人去查数据面，而实际该去补权限）。
+    #[test]
+    fn a_missing_capability_blocks_the_flow_face_instead_of_failing_it() {
+        let health = observe_flow(&FlowReport {
+            failures: vec![flow_failure(collection_reason_kind::PERMISSION, "cap_bpf")],
+            ..Default::default()
+        });
+        let entry = health.get("w-flow").expect("flow entry");
+        assert_eq!(entry.prerequisites, collection_prerequisites::BLOCKED);
+        assert_eq!(entry.result, collection_result::CANCELLED);
+        assert!(
+            entry
+                .reasons
+                .iter()
+                .any(|reason| reason.kind == collection_reason_kind::PERMISSION
+                    && reason.subject == "cap_bpf"),
+            "{:?}",
+            entry.reasons
+        );
+    }
+
+    /// qdisc 装不上 / verifier 拒绝：真的没采成 —— `ready + failure`。
+    #[test]
+    fn a_qdisc_conflict_is_a_flow_failure() {
+        let health = observe_flow(&FlowReport {
+            failures: vec![flow_failure(
+                collection_reason_kind::RUN_FAILED,
+                "qdisc:eth0",
+            )],
+            ..Default::default()
+        });
+        let entry = health.get("w-flow").expect("flow entry");
+        assert_eq!(entry.prerequisites, collection_prerequisites::READY);
+        assert_eq!(entry.result, collection_result::FAILURE);
+        assert!(
+            entry.detail.contains("qdisc:eth0"),
+            "原因要能定位到哪张网卡：{}",
+            entry.detail
+        );
+    }
+
+    /// 授权了但采集器还没起来（且没有原因）：`pending`，不是 failure。
+    #[test]
+    fn an_authorized_flow_face_that_has_not_started_is_pending() {
+        let health = observe_flow(&FlowReport::default());
+        let entry = health.get("w-flow").expect("flow entry");
+        assert_eq!(entry.prerequisites, collection_prerequisites::BLOCKED);
+        assert_eq!(entry.result, collection_result::PENDING);
+        assert!(
+            entry
+                .reasons
+                .iter()
+                .any(|reason| reason.kind == collection_reason_kind::TARGET_NOT_READY),
+            "{:?}",
+            entry.reasons
+        );
+    }
+
+    /// 聚合表淘汰：`partial` + `truncated` 原因 —— 「采到了但少了一部分」不能报成 ok。
+    #[test]
+    fn flow_map_truncation_is_partial() {
+        let health = observe_flow(&FlowReport {
+            collecting: true,
+            truncated_windows: 2,
+            ..Default::default()
+        });
+        let entry = health.get("w-flow").expect("flow entry");
+        assert_eq!(entry.result, collection_result::PARTIAL);
+        assert!(
+            entry
+                .reasons
+                .iter()
+                .any(|reason| reason.kind == collection_reason_kind::TRUNCATED
+                    && reason.subject == "flow_map"),
+            "{:?}",
+            entry.reasons
+        );
+    }
+
+    /// 丢了几条记录（网卡在窗口结束前消失）：软问题 —— 采集器还在跑，面不该变红。
+    #[test]
+    fn lost_window_records_are_partial_not_failed() {
+        let health = observe_flow(&FlowReport {
+            collecting: true,
+            lost_records: 3,
+            failures: vec![FlowFailure {
+                kind: collection_reason_kind::INCOMPLETE_DATA,
+                subject: "flow_iface".to_string(),
+                detail: "丢弃 3 条窗口记录：找不到对应网卡".to_string(),
+            }],
+            ..Default::default()
+        });
+        let entry = health.get("w-flow").expect("flow entry");
+        assert_eq!(entry.result, collection_result::PARTIAL);
+        assert_eq!(entry.prerequisites, collection_prerequisites::READY);
+        assert!(
+            entry
+                .reasons
+                .iter()
+                .any(|reason| reason.kind == collection_reason_kind::INCOMPLETE_DATA),
+            "{:?}",
+            entry.reasons
         );
     }
 }

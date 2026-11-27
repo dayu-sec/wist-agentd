@@ -40,6 +40,19 @@ jobs:
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      # 流记录采集器的 BPF 对象是**构建期**用 clang 编进制品的（`build.rs`）。
+      # 版本钉在 `dev/ci/flow-clang.txt`（**单一来源**，两个工作流共用）：
+      # 换 runner 镜像时只改那个文件。BPF 对象的字节不随机器漂；
+      # 镜像升级丢了这个包会**装包失败**，比静默出一个“没有采集器”的制品容易发现得多。
+      - name: Install clang (flow eBPF collector)
+        if: contains(matrix.target, 'linux')
+        run: |
+          set -euo pipefail
+          CLANG_BIN="$(cat dev/ci/flow-clang.txt)"
+          sudo apt-get update
+          sudo apt-get install -y "$CLANG_BIN"
+          "$CLANG_BIN" --version
+
       - name: Cargo build
         # aws-lc-sys（rustls 的加密后端）等 C 依赖按 target 取 CC；Rust 侧链接器指向 musl-gcc
         # 才能真静态。macOS 交叉构建见 docs/design/metrics-collection-runtime.md §12.3。
@@ -50,7 +63,28 @@ jobs:
           AR_aarch64_unknown_linux_musl: ar
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-        run: cargo build --release --target ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          # Linux 制品**必须**带上采集器：clang 不在就让构建失败（`build.rs`）。
+          # macOS 制品上这两个变量无意义也不报错（build.rs 看到 target_os != linux 直接返回）。
+          export CLANG="$(cat dev/ci/flow-clang.txt)"
+          export WIST_REQUIRE_FLOW_BPF=1
+          cargo build --release --target ${{ matrix.target }}
+
+      # 制品断言（双保险）：`build.rs` 已经会因缺 clang 失败，这里再从**成品**里
+      # 找一遘三个只可能来自 BPF 对象的符号（程序名 + map 名）。
+      - name: Assert the flow collector is embedded
+        if: contains(matrix.target, 'linux')
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/wist-agentd"
+          for sym in flow_egress flow_ingress flow_map; do
+            if ! strings "$BIN" | grep -qx "$sym"; then
+              echo "::error::artifact 里找不到 $sym：本次构建没带上流记录采集器（见 docs/design/host-ebpf-flow-collection.md §9.5）"
+              exit 1
+            fi
+          done
+          echo "flow collector: embedded ✓"
 
       # 熵源门禁：CI runner 的内核都是新的，直接跑制品**永远复现不出**「老内核没有
       # getrandom(2)」那类故障（发布 0.34.0 就是这么漏出去的：CentOS 6 上任何 TLS 都

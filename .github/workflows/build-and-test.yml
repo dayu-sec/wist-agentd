@@ -14,6 +14,9 @@ on:
 permissions:
   contents: read
 
+# 主机流记录（` FLOW: ` 帧）的 BPF 对象是**构建期**用 clang 编进制品的（`build.rs`）。
+# 版本钉在 `dev/ci/flow-clang.txt`（**单一来源**）：换 runner 镜像时只改那个文件，
+# 两个工作流里所有 install / CLANG / 断言都从它读。
 jobs:
   test:
     runs-on: ${{ matrix.os }}
@@ -30,14 +33,106 @@ jobs:
         with:
           toolchain: stable
 
+      # 主机流记录的 BPF 对象是构建期编进去的（`build.rs` + clang）。装了它，
+      # Linux 的 test 构建才会真的把 `telemetry/flows/linux.rs` 与 `flow.bpf.c` 编进来 —— 
+      # 否则那块代码在 CI 里完全不参与编译，回归只能靠真机。
+      - name: Install clang (flow eBPF collector)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          CLANG_BIN="$(cat dev/ci/flow-clang.txt)"
+          sudo apt-get update
+          sudo apt-get install -y "$CLANG_BIN"
+          "$CLANG_BIN" --version
+
       - name: Cargo fmt
         run: cargo fmt --check
 
+      # macOS 上这两个变量无意义也不报错：`build.rs` 看到 target_os != linux 直接返回，
+      # 所以同一个步骤两个平台共用，不用按 os 分叉。
       - name: Cargo build (release)
-        run: cargo build --release --all
+        run: |
+          export CLANG="$(cat dev/ci/flow-clang.txt)"
+          # Linux 上**必须**编进采集器：缺 clang 就让构建失败（见 `build.rs`）。
+          export WIST_REQUIRE_FLOW_BPF=1
+          cargo build --release --all
 
       - name: Cargo test (release)
-        run: cargo test --release --all
+        run: |
+          export CLANG="$(cat dev/ci/flow-clang.txt)"
+          export WIST_REQUIRE_FLOW_BPF=1
+          cargo test --release --all
+
+  # 主机流记录（eBPF/tc）的**真内核**验收：需要 root + tc + 一张有默认路由的网卡。
+  # 单测证明不了的那一层：BPF 对象在真内核上能过 verifier、tc 挂得上、真流量能被聚合，
+  # 停采/撤授权能把在途窗口按 `partial` 发出去。
+  # 环境不满足（非 root / 无默认路由 / 内核太老）时用例自己打印 `skip:` 并返回 ——
+  # 这里把它变成**明确的 SKIP 告警**，而不是假绿（与 journal-contract / log-acceptance 同口径）。
+  flow-ebpf:
+    name: Host flow (real eBPF)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install clang / iproute2
+        run: |
+          set -euo pipefail
+          CLANG_BIN="$(cat dev/ci/flow-clang.txt)"
+          sudo apt-get update
+          sudo apt-get install -y "$CLANG_BIN" iproute2
+
+      - name: Build tests
+        run: |
+          set -euo pipefail
+          export CLANG="$(cat dev/ci/flow-clang.txt)"
+          export WIST_REQUIRE_FLOW_BPF=1
+          # 把路径交给下一步：那里不能再调一次 cargo ——
+          # 没有 CLANG/WIST_REQUIRE_FLOW_BPF 的重建会把采集器从二进制里去掉（build.rs 会重跑）。
+          BIN=$(cargo test --release --lib --no-run --message-format=json \
+            | jq -r 'select(.profile.test == true) | .executable // empty' | tail -1)
+          echo "test binary: $BIN"
+          echo "FLOW_TEST_BIN=$BIN" >> "$GITHUB_ENV"
+
+      - name: Run flow tests on the real NIC (as root)
+        run: |
+          set -o pipefail
+          BIN="$FLOW_TEST_BIN"
+          echo "test binary: $BIN"
+
+          # 两条 attach 路径都要跑：默认（6.6+ 走 TCX）与强制 netlink
+          # （老内核的那条路 —— 它才是有“崩溃残留”问题的那一条）。
+          rc=0
+          for mode in tcx netlink; do
+            echo "=== attach path: $mode ==="
+            set +e
+            sudo env "PATH=$PATH" WIST_FLOW_TC="$mode" \
+              "$BIN" flows --ignored --nocapture --test-threads=1 \
+              2>&1 | tee "$RUNNER_TEMP/flows-$mode.log"
+            mode_rc=${PIPESTATUS[0]}
+            set -e
+            if [ "$mode_rc" -ne 0 ]; then
+              rc="$mode_rc"
+            fi
+          done
+
+          {
+            echo "### 主机流记录（真 eBPF）"
+            echo ""
+            echo "- 退出码：\`$rc\`"
+            echo "- attach 路径：TCX + netlink"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" -eq 0 ] && grep -qh '^skip:' "$RUNNER_TEMP"/flows-*.log; then
+            echo "::warning::runner 环境无法验证 eBPF（缺 root / 网卡 / 内核能力），部分用例被跳过（这不是“通过”）"
+          fi
+          exit "$rc"
 
   # 内核日志导出器（W3）的**真 journald** 验收：不需要编译，所以单开一个 job，
   # 也不用等 Rust 缓存。验的是「agentd 对 journalctl 的假设」：

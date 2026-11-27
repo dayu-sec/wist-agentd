@@ -11,6 +11,7 @@ pub mod client_identity;
 pub mod commands;
 pub mod execution_queue;
 pub mod fact_report;
+pub mod flows;
 pub mod history;
 pub(crate) mod log_checkpoint_state;
 pub mod log_checkpoints;

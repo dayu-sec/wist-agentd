@@ -85,6 +85,54 @@ pub(crate) const fn is_late(window: u64, flushed_through: u64) -> bool {
     window <= flushed_through
 }
 
+/// 一拍最多取多少个窗口去上送。
+///
+/// 为什么要上限：一个繁忙主机单窗口可能有几万个五元组，一个 tick 里顺序 `await` 几万次写
+/// 会把主循环（日志采集 / 心跳 / 命令认领）拖住。超出的桶**留在 BPF 表里**，下一拍照着取 ——
+/// 不是丢数据，只是分拍。
+pub(crate) const MAX_FLOWS_PER_FLUSH: usize = 4096;
+
+/// 一次 flush 的取桶计划（纯逻辑，跨平台可测）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TakePlan {
+    /// 这一拍取走前多少个（候选已按窗口**升序**排好）。
+    pub(crate) taken: usize,
+    /// `flushed_through` 该推进到哪个窗口（含）。
+    pub(crate) advance_to: u64,
+    /// 还有没取走的（这一拍到了批量上限）。
+    pub(crate) deferred: bool,
+}
+
+/// 决定这一拍取哪些窗口、`flushed_through` 推到哪。
+///
+/// 两条必须成立的性质：
+/// 1. **最老的先走**：批量上限下不能让老窗口一直饿着（LRU 淘汰也会先吃它们）；
+/// 2. `flushed_through` **只能推进到真正取走的那一窗**（推迟的桶不能被判成迟到）。
+///    只有「horizon 以内的都取完了」才可以推进到 `horizon` —— 那之后再有包落进那些
+///    空窗口就是真的迟到，计丢即可。
+pub(crate) fn plan_take(windows_ascending: &[u64], horizon: u64, max: usize) -> TakePlan {
+    if windows_ascending.is_empty() {
+        return TakePlan {
+            taken: 0,
+            advance_to: horizon,
+            deferred: false,
+        };
+    }
+    if max == 0 || windows_ascending.len() <= max {
+        return TakePlan {
+            taken: windows_ascending.len(),
+            advance_to: horizon,
+            deferred: false,
+        };
+    }
+    TakePlan {
+        taken: max,
+        // 取走的最后一个窗口：它才是“已经交出去”的水位。
+        advance_to: windows_ascending[max - 1],
+        deferred: true,
+    }
+}
+
 /// 把 BPF 的**单调桶**换算成 UTC 对齐的窗口起点。
 ///
 /// BPF 侧只拿得到 `bpf_ktime_get_ns()`（单调时钟），它分出的桶边界不对齐墙钟。
@@ -128,23 +176,6 @@ pub(crate) struct WindowAgg {
 }
 
 impl WindowAgg {
-    /// 把一条 BPF map 条目并进窗口累计。
-    ///
-    /// `wire_bytes` 只要有一条取不到就整体退化成 `None` —— 部分窗口有、部分窗口没有的
-    /// 「线缆字节」比没有更误导。
-    pub(crate) fn merge(&mut self, other: &WindowAgg) {
-        self.packets = self.packets.saturating_add(other.packets);
-        self.bytes = self.bytes.saturating_add(other.bytes);
-        self.wire_bytes = match (self.wire_bytes, other.wire_bytes) {
-            (Some(a), Some(b)) => Some(a.saturating_add(b)),
-            _ => None,
-        };
-        self.skb_count = self.skb_count.saturating_add(other.skb_count);
-        self.gso_skb_count = self.gso_skb_count.saturating_add(other.gso_skb_count);
-        self.dropped = self.dropped.saturating_add(other.dropped);
-        self.truncated |= other.truncated;
-    }
-
     /// 没有字节的桶不产出记录（只可能是探测期残留或全被过滤）。
     pub(crate) const fn is_empty(&self) -> bool {
         self.bytes == 0 && self.packets == 0
@@ -157,7 +188,17 @@ pub(crate) enum PartialReason {
     AgentStart,
     Paused,
     InterfaceChanged,
+    /// 进程正常退出（SIGTERM/SIGINT）时用：停机收尾会把在途窗口切开发出去。
+    ///
+    /// 仍然是“窗口不完整”，但原因不同 —— 现场看到 `shutdown` 就知道这次少的那一段
+    /// 是**预期内**的停机边界，不是丢数据。
     Shutdown,
+    /// 墙钟跳变（NTP 回拨/手动改时间）。
+    ///
+    /// 窗口归属靠「单调桶差 + 当前墙钟」换算（见 [`window_from_bucket`]）；墙钟一变，
+    /// 映射就断了。处理方式：按**旧锚点外推**的时间把这些桶归窗（它们确实是那一刻采的，
+    /// 按新墙钟重算会撞幂等键），并标成本原因；下一窗重新锚定。
+    ClockChanged,
 }
 
 impl PartialReason {
@@ -167,6 +208,7 @@ impl PartialReason {
             Self::Paused => "paused",
             Self::InterfaceChanged => "interface_changed",
             Self::Shutdown => "shutdown",
+            Self::ClockChanged => "clock_changed",
         }
     }
 }
@@ -391,6 +433,47 @@ mod tests {
     }
 
     #[test]
+    fn take_plan_keeps_old_windows_first_and_never_skips_advanced_windows() {
+        // 没到上限：全取，水位推到 horizon（空老窗口里的迟到包才算真迟到）。
+        assert_eq!(
+            plan_take(&[10, 20], 30, MAX_FLOWS_PER_FLUSH),
+            TakePlan {
+                taken: 2,
+                advance_to: 30,
+                deferred: false
+            }
+        );
+        // 没有候选：仍然要推进到 horizon（否则迟到包会被永久保留在表里）。
+        assert_eq!(
+            plan_take(&[], 30, MAX_FLOWS_PER_FLUSH),
+            TakePlan {
+                taken: 0,
+                advance_to: 30,
+                deferred: false
+            }
+        );
+
+        // 到上限：只取最老的 N 个，水位只能推到**真取走**的那一窗。
+        let plan = plan_take(&[10, 20, 30], 40, 2);
+        assert_eq!(plan.taken, 2);
+        assert!(plan.deferred);
+        assert_eq!(
+            plan.advance_to, 20,
+            "推迟的 30 不能被推进到水位里，否则下一拍会被当成迟到直接丢掉"
+        );
+
+        // `max = 0` = 不限量（停采时的 drain 用），不能退化成“一条都不取”。
+        assert_eq!(
+            plan_take(&[10, 20], 30, 0),
+            TakePlan {
+                taken: 2,
+                advance_to: 30,
+                deferred: false
+            }
+        );
+    }
+
+    #[test]
     fn tcp_record_carries_no_icmp_and_no_wire_bytes_when_unavailable() {
         let record =
             HostFlowRecord::from_window(&ctx(), &tcp_key(), 1_789_469_760, 60, &agg(), None);
@@ -482,24 +565,6 @@ mod tests {
                 "记录里不该出现 {forbidden}：{text}"
             );
         }
-    }
-
-    #[test]
-    fn merging_keeps_wire_bytes_all_or_nothing() {
-        let mut left = agg();
-        left.wire_bytes = Some(1500);
-        let mut right = agg();
-        right.wire_bytes = Some(900);
-        left.merge(&right);
-        assert_eq!(left.wire_bytes, Some(2400));
-        assert_eq!(left.packets, 26);
-        assert_eq!(left.bytes, 2920);
-
-        // 一边取不到 → 整体退化为 None（部分窗口有线缆字节比没有更误导）。
-        let mut mixed = agg();
-        mixed.wire_bytes = Some(100);
-        mixed.merge(&agg());
-        assert_eq!(mixed.wire_bytes, None);
     }
 
     #[test]

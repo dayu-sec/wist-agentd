@@ -315,6 +315,7 @@ async fn diagnose(config_root: &Path, offline: bool) -> Report {
     checks.push(mysql_discovery_check(&config));
     checks.push(pg_discovery_check(&config));
     checks.push(doris_discovery_check(&config));
+    checks.push(flows_check(&config));
 
     if offline {
         checks.push(Check::warn(
@@ -1199,6 +1200,78 @@ fn doris_discovery_check(config: &AgentConfig) -> Check {
         "discovery.doris",
         "已发现 Doris FE",
         format!("{detail}；采集还要采集面授权（DorisCluster/auto）"),
+    )
+}
+
+/// 主机流记录（` FLOW: ` 帧）的本机运行态（`state/flows/status.json`）。
+///
+/// 为什么在本地读：agentd → 网关的 v1 状态报文是 `deny_unknown_fields` 的，流记录的自观测
+/// 新字段不能进那个报文；而「为什么没有流数据」正是现场的第一个问题 —— `diagnose` 是本机
+/// 能回答它的地方（状态文件由 `daemon_flows` 每 30s 或失败面变化时写入）。
+fn flows_check(config: &AgentConfig) -> Check {
+    flows_check_at(&crate::state_store::flows::path_for(Path::new(
+        &config.paths.state_dir,
+    )))
+}
+
+/// 只看状态文件的那一半（便于单测）。
+fn flows_check_at(path: &Path) -> Check {
+    let status = match crate::state_store::flows::load(path) {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            return Check::warn(
+                "flows.status",
+                "没有流记录运行态",
+                format!("{} 不存在：agent 还没跑过流采集", path.display()),
+            )
+            .hint(
+                "已经下发 `HostFlow` 授权却仍没有这个文件时，先确认 agentd 版本带 eBPF 采集器                 （`agentd diagnose` 的 binary 项）与本机是否拿到工作授权",
+            );
+        }
+        Err(err) => {
+            return Check::fail(
+                "flows.status",
+                "流记录运行态读不出来",
+                format!("{}: {err}", path.display()),
+            )
+            .hint("文件损坏时删掉它：下一拍会自动重写");
+        }
+    };
+
+    let c = &status.counters;
+    let detail = format!(
+        "collecting={} path={} kernel={} ifaces={} sent={} late_dropped={} truncated={} capped={} lost={} load_failures={} iface_changes={} clock_jumps={} uplink_failures={} updated={}",
+        status.collecting,
+        status.attach_path,
+        status.kernel,
+        if status.ifaces.is_empty() {
+            "-".to_string()
+        } else {
+            status.ifaces.join(",")
+        },
+        c.windows_sent,
+        c.late_dropped,
+        c.truncated_windows,
+        c.flush_capped,
+        c.lost_records,
+        c.load_failures,
+        c.interface_changes,
+        c.clock_jumps,
+        c.uplink_failures,
+        status.updated_at,
+    );
+
+    if let Some(error) = &status.last_error {
+        return Check::fail("flows.status", "流记录没采成", format!("{error}（{detail}）"))
+            .hint(
+                "按原因处理：`qdisc:*` → 网卡上的 tc 冲突；`cap_*` → 权限；                 `bpf_load` → verifier 日志；`kernel` → 内核版本；`iface` → 没有可用对外网卡",
+            );
+    }
+    if status.collecting {
+        return Check::ok("flows.status", "流记录在采", detail);
+    }
+    Check::warn("flows.status", "流记录当前不在采", detail).hint(
+        "没有 `HostFlow` 授权 / 输出不是 tcp（file 输出承载不了 FLOW 帧）/ 采集器在起不来的重试冷却",
     )
 }
 
@@ -2638,6 +2711,68 @@ mod tests {
             classify_control_plane_probe(UplinkFetch::Failed("transport: refused".to_string()));
         assert_eq!(failed.status, Status::Fail);
         assert!(failed.detail.contains("refused"));
+    }
+
+    #[test]
+    fn flows_status_reports_missing_collecting_and_failed() {
+        let dir = std::env::temp_dir().join(format!(
+            "wist-doctor-flows-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let path = crate::state_store::flows::path_for(&dir);
+
+        // 1) 从未跑过：是警告（不是失败），且 hint 指向「版本 / 授权」。
+        let missing = flows_check_at(&path);
+        assert_eq!(missing.status, Status::Warn);
+        assert!(missing.hint.expect("hint").contains("HostFlow"));
+
+        // 2) 在采：OK，计数器进 detail。
+        let mut status = crate::state_store::flows::FlowStatus {
+            schema_version: crate::state_store::flows::SCHEMA_VERSION.to_string(),
+            updated_at: "2026-11-27T00:00:00Z".to_string(),
+            collecting: true,
+            attach_path: "tcx".to_string(),
+            kernel: "6.8.0".to_string(),
+            ifaces: vec!["eth0".to_string()],
+            counters: crate::state_store::flows::FlowCounters {
+                windows_sent: 12,
+                late_dropped: 2,
+                ..Default::default()
+            },
+            last_error: None,
+        };
+        std::fs::create_dir_all(path.parent().expect("dir")).expect("mkdir");
+        std::fs::write(&path, serde_json::to_vec(&status).expect("json")).expect("write");
+        let ok = flows_check_at(&path);
+        assert_eq!(ok.status, Status::Ok, "{ok:?}");
+        assert!(ok.detail.contains("sent=12"), "{}", ok.detail);
+        assert!(ok.detail.contains("late_dropped=2"), "{}", ok.detail);
+        assert!(ok.detail.contains("path=tcx"), "{}", ok.detail);
+
+        // 3) 不在采、有原因：FAIL，原因原样带出来。
+        status.collecting = false;
+        status.last_error = Some("permission: cap_bpf HostFlow needs CAP_BPF".to_string());
+        std::fs::write(&path, serde_json::to_vec(&status).expect("json")).expect("write");
+        let failed = flows_check_at(&path);
+        assert_eq!(failed.status, Status::Fail);
+        assert!(failed.detail.contains("cap_bpf"), "{}", failed.detail);
+
+        // 4) 不在采、没原因：WARN（授权撤了 / 输出是 file / 冷却中）。
+        status.last_error = None;
+        std::fs::write(&path, serde_json::to_vec(&status).expect("json")).expect("write");
+        assert_eq!(flows_check_at(&path).status, Status::Warn);
+
+        // 5) 文件坏了：FAIL 且 hint 说可以删。
+        std::fs::write(&path, b"{not json").expect("write");
+        let broken = flows_check_at(&path);
+        assert_eq!(broken.status, Status::Fail);
+        assert!(broken.hint.expect("hint").contains("删掉"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

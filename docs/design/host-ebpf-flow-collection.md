@@ -1,6 +1,11 @@
 # 主机流记录（eBPF）采集设计
 
-> 状态：**设计（待评审）**。§12 的真机探针实验完成前，§6/§8 中标注「待实测」的条目不得当作已定结论。
+> 状态：**slice 1（以及 slice 2 的 ICMP/IPv6/VLAN/接口切换）已在 agentd 落地** ——
+> 采集器在 `src/telemetry/flows/`，daemon 接线在 `src/runtime/daemon_flows.rs`
+> （授权 → 能力探测 → 启停 → 窗口上送 → 采集状态）。
+> **数据面（warp-parse 的 `FLOW:` WPL + `agent-flows` sink）尚未实现**，
+> 所以按 §16 的顺序，**先上数据面再放开 agentd**。
+> §12 的真机探针实验完成前，§6/§8 中标注「待实测」的条目不得当作已定结论。
 > 对应 issue：`dayu-sec/wist-agentd#50`。
 
 ## 1. 目的与范围
@@ -59,7 +64,11 @@
 
 约束：
 
-- **`HostFlowRecord` 定义在 `wist-contracts`**，agentd 只负责序列化、不重建（与 `OBSFACT` 同一纪律：谁构造契约对象只应有一处）。
+- **记录形状只在 `wist-contracts` 定义一份**（`wist_contracts::host_flow::HostFlowRecord`，0.16 起），
+  第 ②/③ 层与 agentd 按同一份解析；agentd 侧目前保留一个**同形状**的本地序列化结构
+  （依赖链 `wist-api`/`wist-metrics`/`wist-validate` 还钉在 `wist-contracts 0.14`，单个 crate
+  升上去会解析出两份 contracts），两侧字段集由单测各自锁死；链路抬到 0.16 后切回契约类型。
+  纪律不变：**谁构造契约对象只应有一处**（agentd 是 `HostFlowRecord::from_window`）。
 - 第 ① 层出现"推断字段"即视为设计错误。`needs_enrichment` 属于第 ③ 层。
 - `wist-atlas` 侧按 `doc/architecture/network-modeling-analysis.md` §10 处理：流记录是 **runtime evidence**，先落地为观测证据，不得直接 materialize 成 network inventory。
 
@@ -159,7 +168,7 @@
 | `truncated` | bool | 是 | 本窗口发生过聚合表上限淘汰 |
 | `dropped` | uint32 | 是 | 本窗口未能计入的事件数（表满、读表竞态、迟到落在已 flush 窗口） |
 | `partial` | bool | 否 | 窗口被截断 |
-| `partial_reason` | string | 条件 | `agent_start` / `paused` / `interface_changed` / `shutdown`；`partial=true` 时必填 |
+| `partial_reason` | string | 条件 | `agent_start` / `paused` / `interface_changed` / `shutdown` / `clock_changed`；`partial=true` 时必填 |
 
 ### 6.6 明确不出现的字段
 
@@ -195,7 +204,8 @@ tc clsact 的 egress 与 ingress 两个 hook，分别对应 `direction=out` / `i
 3. 排除 `lo`、`veth*`、`docker*`、`br-*`、`cni*`、`flannel*`、`cali*` 等虚拟接口；
 4. **bond 记 bond 接口本身，不记 slave**；vlan 子接口首版不观测（记在父接口）。
 
-授权可覆盖：`target = "host_flow:<ifname>"` 固定单接口；缺省 `host_flow` 由 agent 自选。多网卡时每条记录都带 `ifname`/`ifindex`，不做跨接口合并。
+授权**只认 `HostFlow:auto`**（空等同 `auto`）：观测哪张网卡是**本机事实**，平台指定不出来。
+写死接口名会被如实报成 `unsupported`（`reason.subject = flow`），而不是静默不采。多网卡时每条记录都带 `ifname`/`ifindex`，不做跨接口合并。
 
 ### 7.3 窗口
 
@@ -203,7 +213,12 @@ tc clsact 的 egress 与 ingress 两个 hook，分别对应 `direction=out` / `i
 - 半开区间 `[start, end)`，按包到达 hook 的时刻归窗；
 - **只有窗口内有字节才发记录**。零流量窗口不发（空闲长连接每窗发 `bytes=0` 会爆量；"长连接持续产出"的口径即"有流量的窗口持续产出"）；
 - flush 延迟 1 个窗口：只 flush `window_id <= current_window - 2` 的桶，给迟到包留收敛时间；
-- 迟到包落进已 flush 的旧窗口 → 该桶被重建 → 用户态读到 `window_id < flush_horizon` 的桶时，计入当前窗口的 `dropped` 并删除，**不再补发**（避免同一幂等键出现两条记录）。
+- 迟到包落进已 flush 的旧窗口 → 该桶被重建 → 用户态读到 `window_id < flush_horizon` 的桶时，计入当前窗口的 `dropped` 并删除，**不再补发**（避免同一幂等键出现两条记录）；
+- 每拍最多上送 4096 条（其余桶留在表里下拍继续，见 §11）；
+- **墙钟跳变**（NTP 步进 / 手改时间）：窗口归属靠「单调桶差 + 当前墙钟」换算，墙钟一跳映射就断。
+  判据是「拿上一拍锚点外推的墙钟」与真实墙钟相差 ≥ 半个窗口；命中后按**旧锚点外推的时间**
+  给这些桶归窗（它们确实是那一刻采的；按新墙钟重算会撞已发的幂等键），并标
+  `partial_reason=clock_changed`，下一窗重新锚定。
 
 ### 7.4 聚合键与幂等键
 
@@ -300,8 +315,38 @@ tc clsact 的 egress 与 ingress 两个 hook，分别对应 `direction=out` / `i
 ### 9.5 制品与 CI
 
 - BPF `.o` 用 `include_bytes_aligned!` 嵌入 → **制品仍是 3 个二进制**，打包脚本不变；
-- CI 增 `clang`/`llvm`（版本钉死），`clang -target bpfel -O2 -g -mcpu=v2`；x86_64 与 aarch64 均为小端，**一个 `.o` 两架构共用**；
 - BPF 对象随 agent 版本走，不单独发版。
+
+**已落地（GitHub Actions）**：
+
+| 位置 | 做什么 | 为什么 |
+|---|---|---|
+| `build-and-test.yml`（ubuntu 矩阵项） | 装 `dev/ci/flow-clang.txt` 里的 clang + `CLANG=<它>` | 不装的话 `have_flow_bpf` 不置位，`telemetry/flows/linux.rs` 与 `flow.bpf.c` **根本不参与编译**，回归只能靠真机 |
+| 同上，build/test 步骤 | `WIST_REQUIRE_FLOW_BPF=1` | 缺 clang = **构建失败**（`build.rs` panic），而不是出一个“全机队报 unsupported”的包 |
+| `release.yml`（linux 矩阵项） | 同上 + `<clang> --version` | 版本钉死；镜像升级丢包会**装包失败**，比静默出制品容易发现 |
+| `release.yml` | 制品断言 `strings <bin> \| grep -qx flow_egress/flow_ingress/flow_map` | 双保险：从成品里找只可能来自 BPF 对象的符号 |
+| `build-and-test.yml` 的 `flow-ebpf` 作业 | 以 root 跑 `#[ignore]` 的真机用例（attach / 真流量 / 停采 flush），**TCX 与 netlink 两条路径都跑** | 单测盖不到 verifier 与 tc；环境不满足时用例打印 `skip:` → 作业输出 `warning`，不假绿 |
+
+### 维护：换 runner 镜像时改哪里
+
+clang 的版本只有**一个**权威来源：`dev/ci/flow-clang.txt`（单行，无注释 —— 被 `$(cat)` 直接当包名与可执行名用）。
+两个工作流里所有 `apt-get install` / `CLANG=` / 版本打印都从它读，**不用改任何 YAML**。
+
+镜像升级套餐名不再叫 `clang-18` 时（如 ubuntu-26.04），按这个顺序动：
+
+1. 改 `dev/ci/flow-clang.txt` 一行；
+2. 本地跑一次 `cargo test --lib flows`（带 `CLANG=<新版本>`）确认 `flow.bpf.c` 在新版 clang 下仍能编、且真机用例能过；
+3. 同步更新本节表格里的版本描述（“ubuntu-24.04 仓库里的 18”这类文字）。
+
+> 为什么不把 clang 版本写进 `Cargo.toml` / 环境变量默认值：它是**构建机**的属性，不是产品配置；
+> 写进单一文本文件是为了让“改一处”这件事不靠人记住 grep 结果。
+
+macOS 构建（`aarch64-apple-darwin`）不参与：`aya` 只是 linux 依赖，`build.rs` 看到 target_os != linux 直接返回，
+所以同一个 build/test 步骤两个平台共用（macOS 上 `CLANG` / `WIST_REQUIRE_FLOW_BPF` 无意义也不报错）。
+x86_64 与 aarch64 均为小端，**一个 `.o` 两架构共用**。
+
+> 本地开发不受 `WIST_REQUIRE_FLOW_BPF` 影响（默认仍是“没 clang 就报 unsupported”）：
+> 那个开关只该出现在 CI/发布机的环境里。
 
 ### 9.6 测试形态
 
@@ -341,9 +386,27 @@ tc clsact 的 egress 与 ingress 两个 hook，分别对应 `direction=out` / `i
 - **没有记录 ≠ 故障**：窗口内无流量是正常态（`success`）。故障只能由 `prerequisites/result` 表达，不能靠"记录变少"推断。
 - 心跳：窗口内零记录也上报一次采集状态（与 `FLOW` 帧分开），用于区分"没流量"与"采集中断"。
 - 计数器进自观测：`map_full_drops`、`late_bucket_drops`、`load_failures`、`interface_changes`。
+  **已落地**：落在 `state/flows/status.json`（节流 30s，失败面变化时立刻写），
+  由 `agentd diagnose` 的 `flows.status` 项输出。**不进** v1 状态报文 ——
+  那个报文是 `deny_unknown_fields` 的，加字段会让旧读取方整份拒收（见 §16.4）。
 - 采集中断期间的窗口**不补**（没有数据可补），由采集状态 + `dropped` 共同表达。
 
 **安全红线**：只创建/使用自己的 clsact，卸载时只删自己加的 filter；异常退出也要清理。把主机网络搞坏是本功能最不可接受的失败模式，作为实现验收项，不是"注意事项"。
+
+落地补充（与代码同步）：
+
+- **停机**：主循环收到 SIGTERM/SIGINT 时先按 `partial_reason=shutdown` 把在途窗口发出去，再卸 filter；关闸发不出去也要卸（留下的 filter 会一直逐包执行）。
+- **崩溃残留**：≥6.6 用 TCX（BPF link，进程一死内核自动摘）；<6.6 是 netlink clsact filter，
+  所以那条路在挂之前先 `clsact`（不存在则建）+ **按程序名**清掉自己的残留
+  （只会匹配 `flow_egress`/`flow_ingress`，别人的 filter 不碰；不用固定 priority/handle ——
+  那种坐标一旦撞上第三方就会误删）。
+- **clsact 建了不删**：空 qdisc 没有开销，而删它可能连带删掉别人后来挂上的 filter。
+- **批量上限**：一拍最多上送 4096 条记录，其余桶**留在 BPF 表里**下拍继续（最老的先走）；
+  停采那一次不限量（采集器马上要 drop，分批等于丢）。
+- **上下文丢失**：窗口结束时网卡已消失 → 那条记录组不出来（没有 `ifname`），丢弃并计
+  `incomplete_data`（软问题），不静默丢。
+- **现场可见**：`agentd diagnose` 的 `flows.status` 一项直接回答「采没采、为什么没采、丢了多少」
+  （数据源是本机 `state/flows/status.json`，不绕控制面）。原因码与处理方向写在那项的 hint 里。
 
 ## 12. 必须先做的真机探针实验
 
@@ -362,7 +425,7 @@ tc clsact 的 egress 与 ingress 两个 hook，分别对应 `direction=out` / `i
 
 | # | 问题 | 建议 | 阻塞 |
 |---|---|---|---|
-| 1 | 采集层 source kind 名与 target 语法 | `HostFlow`；target 可空或 `host_flow:<ifname>` | 四侧同源 |
+| 1 | 采集层 source kind 名与 target 语法 | `HostFlow`；target **只认空或 `auto`**（首版不支持固定单接口） | 四侧同源 |
 | 2 | 归到哪个 `CollectionFamily` | **新开 `HostFlow`**，不塞进 `NetworkFirewall`（那面的语义是"拦了什么、策略变没变"） | 知识库版本、模板、web 文案 |
 | 3 | 窗口长度是否可下发 | 首版固定 60s；后续再开放目录覆盖 | 契约（`window_seconds` 已能表达） |
 | 4 | 聚合表容量与 LRU 上限默认值 | 等 Q4/量级数据 | 背压 |
@@ -389,7 +452,8 @@ tc clsact 的 egress 与 ingress 两个 hook，分别对应 `direction=out` / `i
 - `wist-contracts`：`HostFlowRecord`；source kind 词表加入 `HostFlow`；`is_executable_source` 认它；单测（词表、记录编解码）；
 - agentd：BPF 程序 + 聚合 + flush + `write_flow` + `carries_flow_frames()`；三类 `unsupported` 分类；自观测计数器；`file` sink 跳过；
 - 数据面：`FLOW:` 的 WPL 分支 + `agent-flows` sink；
-- 真机：`dev/verify-flow-ebpf.sh`。
+- 真机验收：`cargo test --all -- --ignored`（`telemetry::flows` 与 `runtime::daemon_flows` 里的真机用例），
+  TCX 与 netlink 两条 attach 路径各跑一遍（`WIST_FLOW_TC=tcx|netlink`）。
 
 **slice 2（ICMP / IPv6 / 边界）**
 

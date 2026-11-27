@@ -5,13 +5,21 @@
 //! BPF 侧用 `bpf_ktime_get_ns()` 分桶（单调时钟），用户态把当前桶对齐到 UTC 整分，
 //! 其余桶按差值回推 —— 不需要把墙钟写进 BPF。
 
-use crate::telemetry::flows::iface::IfaceSnapshot;
-use crate::telemetry::flows::record::{Direction, FLUSH_LAG_WINDOWS, FlowKey, WindowAgg, is_late};
+use crate::telemetry::flows::iface::{
+    IfaceSnapshot, parse_default_routes_v4, parse_default_routes_v6,
+};
+use crate::telemetry::flows::record::{
+    Direction, FLUSH_LAG_WINDOWS, FlowKey, PROTO_ICMP, PROTO_ICMPV6, WindowAgg, is_late, plan_take,
+    proto_is_collected,
+};
 use crate::telemetry::flows::support::{FlowSupport, Unavailable};
-use crate::telemetry::flows::{FlushedFlow, WatchedIface};
+use crate::telemetry::flows::{FlushBatch, FlushedFlow, WatchedIface};
 use aya::maps::{HashMap, MapData, PerCpuArray};
 use aya::programs::ProgramError;
-use aya::programs::tc::{SchedClassifier, TcAttachType};
+use aya::programs::tc::{
+    NlOptions, SchedClassifier, TcAttach, TcAttachType, TcError, qdisc_add_clsact,
+    qdisc_detach_program,
+};
 use aya::{Ebpf, EbpfError};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -19,6 +27,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 static FLOW_BPF: &[u8] = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/flow.bpf.o"));
 
 const MIN_KERNEL: (u32, u32) = (5, 4);
+/// 内核 6.6 起 aya 的 `attach` 走 TCX（BPF link）：进程死了内核自己摘，不会留东西。
+/// 更老的内核走 netlink clsact filter —— **进程被 SIGKILL 时它会留在网卡上**，
+/// 所以那条路在挂之前必须先清掉自己上一次的残留（见 [`detach_stale_filters`]）。
+const TCX_MIN_KERNEL: (u32, u32) = (6, 6);
 const PROG_EGRESS: &str = "flow_egress";
 const PROG_INGRESS: &str = "flow_ingress";
 const MAP_NAME: &str = "flow_map";
@@ -129,6 +141,131 @@ fn attach_error(ifname: &str, err: ProgramError) -> Unavailable {
     }
 }
 
+/// 走哪条 attach 路径。
+///
+/// `WIST_FLOW_TC=tcx|netlink` 是给**验证与现场兜底**用的：6.6+ 也能强制走 netlink 路径
+/// （真机上验证“同坐标覆盖”），换了厂商内核而 TCX 有怪癖时也能临时绕开。
+fn use_tcx_path() -> bool {
+    match std::env::var("WIST_FLOW_TC").ok().as_deref() {
+        Some("netlink") => false,
+        Some("tcx") => true,
+        // 读不到内核版本时走保守的 netlink 路径（能覆盖自己的残留）。
+        _ => kernel_at_least(&TCX_MIN_KERNEL),
+    }
+}
+
+/// 给自观测用的一句话：当前会走哪条 attach 路径。
+pub(crate) fn attach_path() -> &'static str {
+    if use_tcx_path() { "tcx" } else { "netlink" }
+}
+
+fn kernel_at_least(min: &(u32, u32)) -> bool {
+    kernel_release()
+        .as_deref()
+        .and_then(parse_kernel)
+        .is_some_and(|version| version >= *min)
+}
+
+/// 挂一个方向。
+///
+/// 两条路径的差别不在功能，而在**异常退出时留下什么**：
+/// * 6.6+ 的 TCX 是 BPF link，进程一死 fd 就关，内核自动摘；
+/// * 更老的内核是 netlink clsact filter —— SIGKILL 会把 prog 与它的 map 一直钉在内核里，
+///   所以那条路在挂之前先按**程序名**清掉自己上一次的残留。
+fn attach(
+    program: &mut SchedClassifier,
+    ifname: &str,
+    cname: &std::ffi::CStr,
+    attach_type: TcAttachType,
+) -> Result<(), Unavailable> {
+    if use_tcx_path() {
+        return program
+            .attach(cname, attach_type)
+            .map(|_| ())
+            .map_err(|err| attach_error(ifname, err));
+    }
+
+    // netlink 路径三步：确保 clsact → 清自己的残留 → 挂。
+    //
+    // 1) `clsact` 不会替我们建（aya 文档明确要求先建；不建就是
+    //    “Parent Qdisc doesn't exists”）。已存在不算错。
+    match qdisc_add_clsact(cname) {
+        Ok(()) => log::info!("event=HostFlowClsactAdded iface={ifname}"),
+        Err(err) if is_already_exists(&err) => {}
+        Err(err) => {
+            let detail = err.to_string();
+            return Err(
+                if detail.contains("Operation not permitted")
+                    || detail.contains("Permission denied")
+                {
+                    Unavailable::PermissionDenied {
+                        capability: "CAP_NET_ADMIN".to_string(),
+                    }
+                } else {
+                    Unavailable::QdiscConflict {
+                        ifname: ifname.to_string(),
+                        detail,
+                    }
+                },
+            );
+        }
+    }
+
+    // 2) 按**程序名**清掉自己的残留：只会匹配 `flow_egress` / `flow_ingress`，
+    //    别人的 filter 一个字节也不碰（这也是为什么不用固定 priority/handle ——
+    //    那組坐标一旦撞上第三方就会误删）。
+    let prog_name = match attach_type {
+        TcAttachType::Egress => PROG_EGRESS,
+        TcAttachType::Ingress => PROG_INGRESS,
+    };
+    detach_stale_filters(ifname, cname, attach_type, prog_name);
+
+    // 3) 挂。显式 `TcAttach::Netlink`（`Auto` 在 6.6+ 会反弹回 TCX，破坏这条验证路径）；
+    //    坐标用默认（内核自动分配），不与任何第三方 filter 抢位置。
+    program
+        .attach(
+            cname,
+            TcAttach::Netlink {
+                parent: attach_type.into(),
+                options: NlOptions::default(),
+            },
+        )
+        .map(|_| ())
+        .map_err(|err| attach_error(ifname, err))
+}
+
+/// clsact 已存在（EEXIST）—— 那不是错。
+fn is_already_exists(err: &TcError) -> bool {
+    match err {
+        TcError::AlreadyAttached => true,
+        TcError::NetlinkError(inner) => inner.raw_os_error() == Some(libc::EEXIST),
+        _ => false,
+    }
+}
+
+/// 清掉上一次异常退出（SIGKILL / OOM / 断电）留下的自己的 filter。
+///
+/// 尽力而为：清不掉只告警，让下面的 attach 报真正的原因（不把它变成新的失败面）。
+fn detach_stale_filters(
+    ifname: &str,
+    cname: &std::ffi::CStr,
+    attach_type: TcAttachType,
+    prog_name: &str,
+) {
+    let parent = attach_type.into();
+    match qdisc_detach_program(cname, parent, prog_name) {
+        Ok(()) => log::warn!(
+            "event=HostFlowStaleTcDetached iface={ifname} prog={prog_name} \
+             detail=\"上一次异常退出留下的 tc filter 已清掉（它之前一直在逐包执行）\""
+        ),
+        // 没有残留：正常路径。
+        Err(TcError::IoError(err)) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => log::warn!(
+            "event=HostFlowStaleTcCleanupFailed iface={ifname} prog={prog_name} detail=\"{err}\""
+        ),
+    }
+}
+
 impl Collector {
     pub(crate) fn start(ifaces: &[&IfaceSnapshot]) -> Result<Self, Unavailable> {
         let mut bpf = Ebpf::load(FLOW_BPF).map_err(|err: EbpfError| Unavailable::LoadFailed {
@@ -172,9 +309,7 @@ impl Collector {
                         detail: "interface name contains a NUL byte".to_string(),
                     }
                 })?;
-                program
-                    .attach(cname.as_c_str(), attach_type)
-                    .map_err(|err| attach_error(&iface.name, err))?;
+                attach(program, &iface.name, cname.as_c_str(), attach_type)?;
             }
         }
 
@@ -208,7 +343,7 @@ impl Collector {
             return 0;
         };
         let total: u64 = match counter.get(&0, 0) {
-            Ok(values) => values.iter().map(|value| *value).sum(),
+            Ok(values) => values.iter().copied().sum(),
             Err(_) => return 0,
         };
         let delta = total.saturating_sub(self.last_drops);
@@ -221,25 +356,46 @@ impl Collector {
         std::mem::take(&mut self.late_dropped)
     }
 
-    /// flush 掉已经结束满 `FLUSH_LAG_WINDOWS` 个窗口的桶。
-    pub(crate) fn flush(&mut self, now_bucket: u64) -> Vec<FlushedFlow> {
-        let drops = self.take_drops();
+    /// flush 掉已经结束满 `FLUSH_LAG_WINDOWS` 个窗口的桶，**最多** `max` 条。
+    ///
+    /// 超出的桶留在 BPF 表里（`FlushBatch::deferred`），下一拍照着取 —— 见
+    /// [`plan_take`] 的两条性质。
+    pub(crate) fn flush(&mut self, now_bucket: u64, max: usize) -> FlushBatch {
         let horizon = now_bucket.saturating_sub(FLUSH_LAG_WINDOWS);
+        self.take_buckets(|window| window <= horizon, horizon, max)
+    }
+
+    /// 把**所有**桶都取出来（含还没 settle 的当前窗口），**不限量**。
+    ///
+    /// 只在**停采**时用（撤授权 / 接口切换 / 进程退出）：那一刻的在途窗口没有“下一轮”可等，
+    /// 丢掉它等于让这一分钟凭空少一段。分批只会把数据留给一个马上要被 drop 的采集器，
+    /// 所以这里宁可一次取完（停采是一次性事件，不是每 3s 的稳态开销）。
+    pub(crate) fn flush_all(&mut self, now_bucket: u64) -> Vec<FlushedFlow> {
+        self.take_buckets(|_| true, now_bucket, 0).flows
+    }
+
+    fn take_buckets(&mut self, want: impl Fn(u64) -> bool, horizon: u64, max: usize) -> FlushBatch {
+        let drops = self.take_drops();
         let Some(map) = self.bpf.map_mut(MAP_NAME) else {
-            return Vec::new();
+            return FlushBatch::default();
         };
         let Ok(mut hash) = HashMap::<&mut MapData, RawFlowKey, RawFlowVal>::try_from(map) else {
-            return Vec::new();
+            return FlushBatch::default();
         };
 
         // 先收集候选（迭代中删除会破坏遍历），再逐条取走。
         let mut candidates: Vec<RawFlowKey> = Vec::new();
         for entry in hash.iter() {
             let Ok((key, _)) = entry else { continue };
-            if key.window_id <= horizon {
+            if want(key.window_id) {
                 candidates.push(key);
             }
         }
+        // 最老的先走（批量上限下这是公平性要求，见 `plan_take`）。
+        candidates.sort_unstable_by_key(|key| key.window_id);
+        let windows: Vec<u64> = candidates.iter().map(|key| key.window_id).collect();
+        let plan = plan_take(&windows, horizon, max);
+        candidates.truncate(plan.taken);
 
         let mut flushed = Vec::with_capacity(candidates.len());
         for key in candidates {
@@ -277,8 +433,11 @@ impl Collector {
                 agg,
             });
         }
-        self.flushed_through = self.flushed_through.max(horizon);
-        flushed
+        self.flushed_through = self.flushed_through.max(plan.advance_to);
+        FlushBatch {
+            flows: flushed,
+            deferred: plan.deferred,
+        }
     }
     /// drops 的**累计**值（只给真机测试用；`take_drops` 会推进增量基线，这里不动）。
     #[cfg(test)]
@@ -290,7 +449,7 @@ impl Collector {
             return 0;
         };
         match counter.get(&0, 0) {
-            Ok(values) => values.iter().map(|value| *value).sum(),
+            Ok(values) => values.iter().copied().sum(),
             Err(_) => 0,
         }
     }
@@ -331,6 +490,11 @@ impl Collector {
 }
 
 fn decode_key(raw: &RawFlowKey) -> Option<FlowKey> {
+    // BPF 侧已经把不在采集集里的协议丢了；这里再守一道：契约只认 TCP/UDP/ICMP/ICMPv6，
+    // 其余协议号落到记录里下游无法解释（宁可少一条，也不要一条看不懂的）。
+    if !proto_is_collected(raw.protocol) {
+        return None;
+    }
     let family = raw.family;
     let src = match family {
         4 => IpAddr::V4(Ipv4Addr::new(
@@ -351,7 +515,8 @@ fn decode_key(raw: &RawFlowKey) -> Option<FlowKey> {
         1 => Direction::Out,
         _ => return None,
     };
-    let icmp = matches!(raw.protocol, 1 | 58).then_some((raw.icmp_type, raw.icmp_code));
+    let icmp =
+        matches!(raw.protocol, PROTO_ICMP | PROTO_ICMPV6).then_some((raw.icmp_type, raw.icmp_code));
     Some(FlowKey {
         direction,
         protocol: raw.protocol,
@@ -396,11 +561,10 @@ pub(crate) fn interfaces() -> Vec<IfaceSnapshot> {
         unsafe { libc::freeifaddrs(raw) };
     }
 
-    let default_egress = default_egress_iface();
+    let default_egress = default_egress_ifaces();
 
     let mut snapshot: Vec<IfaceSnapshot> = Vec::new();
-    let mut raw_names: *mut libc::if_nameindex = std::ptr::null_mut();
-    raw_names = unsafe { libc::if_nameindex() };
+    let raw_names = unsafe { libc::if_nameindex() };
     if raw_names.is_null() {
         return snapshot;
     }
@@ -422,7 +586,7 @@ pub(crate) fn interfaces() -> Vec<IfaceSnapshot> {
             name: name.clone(),
             ifindex: entry.if_index,
             addrs: iface_addrs,
-            is_default_egress: default_egress.as_deref() == Some(name.as_str()),
+            is_default_egress: default_egress.contains(&name),
         });
         index += 1;
     }
@@ -453,26 +617,25 @@ fn read_mac(ifname: &str) -> Option<String> {
     (!mac.is_empty()).then(|| mac.to_string())
 }
 
-/// 默认路由出口（`/proc/net/route` 里 dest=0 且带 RTF_UP 的那条）。
-fn default_egress_iface() -> Option<String> {
-    let text = std::fs::read_to_string("/proc/net/route").ok()?;
-    for line in text.lines().skip(1) {
-        let mut fields = line.split_whitespace();
-        let iface = fields.next()?;
-        let dest = fields.next()?;
-        let _gateway = fields.next()?;
-        let flags = fields.next()?;
-        if dest == "00000000" {
-            let flags = u32::from_str_radix(flags, 16).unwrap_or(0);
-            if flags & 0x1 != 0 {
-                return Some(iface.to_string());
-            }
-        }
+/// 默认路由的出口网卡（**可能多张**：多默认路由 / ECMP / v4 与 v6 各有默认）。
+///
+/// v4 读 `/proc/net/route`，v6 读 `/proc/net/ipv6_route` —— 纯 v6 主机的 v4 表是空的，
+/// 只读 v4 会把那类机器永远卡在 `source_not_ready`。
+///
+/// 只取第一条会丢掉多上行里的其余网卡（设计 §7.2 要求全观测；每条记录带 `ifname`，
+/// 不需要跨接口合并）。
+fn default_egress_ifaces() -> std::collections::BTreeSet<String> {
+    let mut ifaces = std::fs::read_to_string("/proc/net/route")
+        .map(|text| parse_default_routes_v4(&text))
+        .unwrap_or_default();
+    if let Ok(text) = std::fs::read_to_string("/proc/net/ipv6_route") {
+        ifaces.extend(parse_default_routes_v6(&text));
     }
-    None
+    ifaces
 }
 
 /// 默认路由的网关（v4），给真机冒烟测试选一个本机确实会经 eth0 走的目的地址。
+#[cfg(test)]
 fn default_gateway_v4() -> Option<std::net::Ipv4Addr> {
     let text = std::fs::read_to_string("/proc/net/route").ok()?;
     for line in text.lines().skip(1) {
@@ -710,6 +873,10 @@ mod tests {
     #[test]
     #[ignore = "需要 root + tc + 真实流量（在 Linux 真机上跑）"]
     fn counts_real_flows_on_a_live_interface() {
+        // 与其他真机测试串行：并行 attach 同一张网卡会互相干扰（见 `REAL_NIC_TEST_LOCK`）。
+        let _exclusive = crate::telemetry::flows::REAL_NIC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let snapshot = interfaces();
         let chosen = select_observed(&snapshot);
         let iface = (*chosen.first().expect("默认出口网卡")).clone();

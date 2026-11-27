@@ -68,12 +68,16 @@ use crate::telemetry::metrics::target_view;
 
 #[path = "collection_health.rs"]
 mod collection_health;
+#[path = "daemon_flows.rs"]
+mod flows_support;
 #[path = "daemon_metrics.rs"]
 mod metrics_support;
 #[path = "daemon_recovery.rs"]
 mod recovery_support;
 #[path = "daemon_runtime_state.rs"]
 mod runtime_state_support;
+#[path = "shutdown.rs"]
+mod shutdown_signal;
 #[path = "daemon_telemetry.rs"]
 pub(crate) mod telemetry_support;
 
@@ -2087,6 +2091,7 @@ async fn fetch_discovery_policies(config: &AgentConfig) -> Option<DiscoveryAspec
 }
 
 use collection_health::CollectionHealth;
+use flows_support::{FlowHostContext, FlowRuntime};
 use metrics_support::{
     emit_metrics_failure, emit_metrics_failures, emit_metrics_tick,
     failure_signatures as metrics_failure_signatures,
@@ -2099,6 +2104,7 @@ use runtime_state_support::{
     failure_signatures, filter_new_failures, instance_id, paused_input_signatures,
     work_state_changes,
 };
+use shutdown_signal::ShutdownSignal;
 use telemetry_support::{
     ExporterReport, LogInputRuntime, TelemetryFailureKind, TelemetrySinkSlot, TelemetryTick,
     TelemetryWorkState, UplinkHealth, WorkState, build_telemetry_sink, effective_output,
@@ -2262,6 +2268,8 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     // `open()` 就会把 audit.log 打成「读 → 产生审计记录 → 再读」的反馈环
     // （见 `files::file_handles` 模块注释）。
     let mut log_runtime = LogInputRuntime::new();
+    // 主机流记录的跨 tick 运行态：tc/eBPF 采集器与已观测网卡都在里面（授权撤了就卸）。
+    let mut flow_runtime = FlowRuntime::new();
     let mut last_metrics_uplink: Option<Instant> = None;
     let mut last_discovery_uplink: Option<Instant> = None;
     // 只提醒一次：`snapshot_uplink_enabled = true` 搭配非 tcp 输出时，行为是
@@ -2313,6 +2321,9 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     let mut last_terminal_retry: Option<Instant> = None;
     // 恢复那一轮没清掉台账时置位，下一轮再试（见 `clear_terminal_ledger_if_pending`）。
     let mut terminal_clear_pending = false;
+    // 停机信号（SIGTERM/SIGINT）：主循环要**有序**停下 —— 尤其是流记录，
+    // 否则在途窗口丢、老内核上还会把 tc filter 留在网卡上（见 `shutdown.rs`）。
+    let mut shutdown = ShutdownSignal::new();
     loop {
         clear_terminal_ledger_if_pending(&auth_terminal_path, &mut terminal_clear_pending).await;
         // 终态：网关明确拒了这台 agent（`certificate_revoked` / `certificate_mismatch`）。
@@ -2329,6 +2340,8 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
             // 终态：采集也停（下面两条分支都是 `continue`），那就把源文件句柄全放掉 ——
             // 一个被轮转走的旧 inode 被句柄钉住时，它的磁盘块也不会归还，而终态可能停很久。
             log_runtime.release_for_idle();
+            // 流记录采集器一并卸掉（同一理由：终端状态下没人收我们的帧）。
+            flow_runtime.release_for_idle();
             if last_terminal_retry.is_none_or(|at| at.elapsed() >= terminal_retry) {
                 last_terminal_retry = Some(Instant::now());
                 let recovered = retry_terminal_probe(
@@ -2374,11 +2387,15 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                     last_terminal_retry = None;
                     // 不 `continue`：本轮直接落下去跑常规 tick（凭据刚被接受，正好抖上去）。
                 } else {
-                    tokio::time::sleep(TICK_INTERVAL).await;
+                    if shutdown.idle(TICK_INTERVAL).await {
+                        break;
+                    }
                     continue;
                 }
             } else {
-                tokio::time::sleep(TICK_INTERVAL).await;
+                if shutdown.idle(TICK_INTERVAL).await {
+                    break;
+                }
                 continue;
             }
         }
@@ -2760,6 +2777,7 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
             Some(&mut collection_health),
             &mut telemetry_sink,
             Some(&mut log_runtime),
+            Some(&mut flow_runtime),
             send_metrics,
             send_discovery_snapshot,
             force_refresh,
@@ -2902,8 +2920,51 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
                 self_obs::record_admin_latency(latency);
             }
         }
-        tokio::time::sleep(TICK_INTERVAL).await;
+        if shutdown.idle(TICK_INTERVAL).await {
+            break;
+        }
     }
+
+    // ── 有序停机 ────────────────────────────────────────────────────────────
+    //
+    // 只有走到这里才算是“收到了信号并有机会收尾”：把流记录的**在途窗口**按
+    // `partial_reason=shutdown` 发出去（最尽力），然后卸掉 tc filter。
+    // 不做的代价：那一分钟凭空少一段，且老内核上 filter 会留在网卡上逐包执行到下次启动。
+    shutdown_flows(
+        &mut flow_runtime,
+        &runtime_config,
+        &uplink_runtime,
+        &mut telemetry_sink,
+    )
+    .await;
+    Ok(())
+}
+
+/// 停机收尾：flush 流记录（最尽力上送）+ 卸 filter。
+///
+/// 单独一个函数是因为它必须在「循环变量都还在作用域里」时调用，而且失败不改变退出码：
+/// 停机过程中任何一步失败都只能记日志 —— 进程已经要走了。
+async fn shutdown_flows(
+    flow_runtime: &mut FlowRuntime,
+    config: &AgentConfig,
+    uplink: &AppliedUplink,
+    telemetry_sink: &mut TelemetrySinkSlot,
+) {
+    let state_dir = Path::new(&config.paths.state_dir);
+    let global_seq_path = log_seq_state::path_for(state_dir);
+    let mut next_seq = log_seq_state::load_or_default_async(&global_seq_path)
+        .await
+        .unwrap_or(0);
+    let effective = effective_output(config, uplink.grant());
+    // 关闸时不发：数据面此刻不收，硬发只会把一次停机变成一串失败日志。
+    let sink = if effective.enabled {
+        telemetry_sink.get_or_build(&effective).ok()
+    } else {
+        None
+    };
+    flow_runtime
+        .shutdown(sink, &mut next_seq, &global_seq_path)
+        .await;
 }
 
 pub async fn run_once_async(loop_ctx: &DaemonLoop<'_>) -> RuntimeResult<RuntimeHealthSnapshot> {
@@ -2931,6 +2992,8 @@ async fn run_once_with_failure_cache(
     telemetry_sink: &mut TelemetrySinkSlot,
     // 跨 tick 复用的日志输入运行态（句柄 + 追平计数）；`None` = 一次性路径。
     mut log_runtime: Option<&mut LogInputRuntime>,
+    // 跨 tick 复用的主机流记录运行态（采集器 + 观测网卡）；`None` = 一次性路径。
+    mut flow_runtime: Option<&mut FlowRuntime>,
     // 本轮要不要上送指标（由调用方按授权与周期定；一次性路径按授权定）。
     send_metrics: bool,
     // 本轮要不要上送原文发现快照（由调用方按配置与周期定；一次性路径不发）。
@@ -2978,6 +3041,8 @@ async fn run_once_with_failure_cache(
     // 本轮导出器失败（工作 id 仍会出现在健康汇总里）——
     // 在 enabled 分支里填空；待命/构建失败时保持空。
     let mut exporter_report = ExporterReport::default();
+    // 本轮流记录结论（同上：只在 enabled 分支里填）。
+    let mut flow_report = flows_support::FlowReport::default();
     let telemetry_tick = match telemetry_sink.get_or_build(&effective) {
         Ok(sink) => {
             if !effective.enabled {
@@ -2989,6 +3054,10 @@ async fn run_once_with_failure_cache(
                 // 待命期间也把已经持着的源文件句柄放掉：不读源就不该占着 fd ——
                 // 一个被轮转走的旧 inode 被句柄钉住时，它的磁盘块也不会归还。
                 if let Some(runtime) = log_runtime.as_mut() {
+                    runtime.release_for_idle();
+                }
+                // 流记录同理：关闸期数据面不收，继续 attach 只是白烧 CPU。
+                if let Some(runtime) = flow_runtime.as_mut() {
                     runtime.release_for_idle();
                 }
 
@@ -3092,6 +3161,25 @@ async fn run_once_with_failure_cache(
                     &mut next_seq,
                 )
                 .await;
+                // 主机流记录（`FLOW:` 帧）：常驻 tc/eBPF 观测，与文件输入/导出器平行。
+                // 排在最后：它是云流日志的**补充来源**，不该抢主链路这份时间预算。
+                // `host_id`/`host_name` 取事实摘要（与 `OBSFACT` 同源），云侧身份不在这里产生。
+                if let Some(runtime) = flow_runtime.as_mut() {
+                    flow_report = runtime
+                        .tick(
+                            work,
+                            &FlowHostContext {
+                                agent_id,
+                                host_id: &fact_summary.host_id,
+                                host_name: Some(fact_summary.host_name.as_str())
+                                    .filter(|name| !name.is_empty()),
+                            },
+                            &mut *sink,
+                            &mut next_seq,
+                            state_dir,
+                        )
+                        .await;
+                }
                 telemetry_tick
             }
         }
@@ -3117,6 +3205,7 @@ async fn run_once_with_failure_cache(
             &telemetry_tick,
             &metrics_tick,
             &exporter_report,
+            &flow_report,
             effective.enabled,
             &now_rfc3339(),
         );
@@ -4145,6 +4234,7 @@ async fn run_once_with_work_async(
         None,
         &mut telemetry_sink,
         None,
+        None,
         send_metrics,
         false,
         false,
@@ -4408,6 +4498,7 @@ mod tests {
             None,
             None,
             &mut TelemetrySinkSlot::default(),
+            None,
             None,
             false,
             false,
@@ -5427,6 +5518,7 @@ mod tests {
             None,
             &mut TelemetrySinkSlot::default(),
             None,
+            None,
             false,
             false,
             false,
@@ -5477,6 +5569,7 @@ mod tests {
             None,
             None,
             &mut TelemetrySinkSlot::default(),
+            None,
             None,
             false,
             false,
@@ -6976,6 +7069,7 @@ mod tests {
             None,
             None,
             &mut TelemetrySinkSlot::default(),
+            None,
             None,
             false,
             false,

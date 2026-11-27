@@ -15,16 +15,11 @@ pub(crate) enum FlowSupport {
 }
 
 impl FlowSupport {
+    /// 能力探测的结论是「能采 / 不能采 + 为什么」，判定点全在 daemon 侧的
+    /// `daemon_flows`：那里直接 match 两个变体（不能采时要拿整条原因进采集状态，不是只要一句话）。
+    #[cfg(test)]
     pub(crate) const fn is_available(&self) -> bool {
         matches!(self, Self::Available)
-    }
-
-    /// 给 `unsupported` 原因用的一句话（`None` = 能采）。
-    pub(crate) fn detail(&self) -> Option<String> {
-        match self {
-            Self::Available => None,
-            Self::Unavailable(reason) => Some(reason.detail()),
-        }
     }
 }
 
@@ -32,7 +27,17 @@ impl FlowSupport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Unavailable {
     /// 本构建没有采集器（非 Linux 平台，或构建时没有嵌入 BPF 对象）。
+    ///
+    /// 在「Linux + 编进 BPF」的构建里这个变体不会被构造 —— 但它是**另一个平台**上的
+    /// 如实答案，不能为消警告而删。
+    #[cfg_attr(all(target_os = "linux", have_flow_bpf), allow(dead_code))]
     NotBuilt { platform: String },
+    /// 没有一张网卡符合观测条件（没有默认路由，或只有链路本地/回环地址）。
+    ///
+    /// 与 `KernelTooOld` 分开：这台机器本身是好的，缺的是**网络事实**（默认路由还没起来、
+    /// 网卡还没拿到地址），等一会儿可能就自己好了 —— 所以映射到 `source_not_ready`，
+    /// 而不是 `unsupported`。
+    NoObservedInterface { detail: String },
     /// 内核低于基线（`gso_segs` / tc 能力缺失）。
     KernelTooOld { running: String, required: String },
     /// 缺 capability（`CAP_BPF` / `CAP_NET_ADMIN`）。
@@ -49,6 +54,8 @@ impl Unavailable {
         match self {
             // 内核/构建不支持：能力层面没有，不是失败。
             Self::NotBuilt { .. } | Self::KernelTooOld { .. } => "unsupported",
+            // 采集器本身没问题，缺的是本机网络事实（默认路由/地址）。
+            Self::NoObservedInterface { .. } => "source_not_ready",
             Self::PermissionDenied { .. } => "permission",
             // 运行期失败：装不上 qdisc / 加载不了对象。
             Self::QdiscConflict { .. } | Self::LoadFailed { .. } => "run_failed",
@@ -60,6 +67,7 @@ impl Unavailable {
         match self {
             Self::NotBuilt { platform } => platform.clone(),
             Self::KernelTooOld { running, .. } => running.clone(),
+            Self::NoObservedInterface { .. } => "iface".to_string(),
             Self::PermissionDenied { capability } => capability.clone(),
             Self::QdiscConflict { ifname, .. } => format!("qdisc:{ifname}"),
             Self::LoadFailed { .. } => "bpf_load".to_string(),
@@ -76,6 +84,10 @@ impl Unavailable {
             Self::KernelTooOld { running, required } => format!(
                 "HostFlow needs Linux kernel >= {required} with `gso_segs` \
                  (running: {running})"
+            ),
+            Self::NoObservedInterface { detail } => format!(
+                "HostFlow found no NIC to observe: {detail} \
+                 (needs a default route and a routable address; container/loopback NICs are skipped)"
             ),
             Self::PermissionDenied { capability } => {
                 format!(
@@ -134,6 +146,14 @@ mod tests {
             }
             .reason_kind(),
             "permission"
+        );
+        // 「这台机器还没有对外网卡」不是能力缺失，等网络起来就能自愈。
+        assert_eq!(
+            Unavailable::NoObservedInterface {
+                detail: "no default route".into()
+            }
+            .reason_kind(),
+            "source_not_ready"
         );
         assert_eq!(
             Unavailable::QdiscConflict {
@@ -197,7 +217,6 @@ mod tests {
     #[test]
     fn available_has_no_reason() {
         assert!(FlowSupport::Available.is_available());
-        assert_eq!(FlowSupport::Available.detail(), None);
         assert!(
             !FlowSupport::Unavailable(Unavailable::NotBuilt {
                 platform: "macos".into()

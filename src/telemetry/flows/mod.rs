@@ -9,9 +9,10 @@
 //! 这里给出的 [`Collector`] 是**跨平台门面**：非 Linux 或没编进 BPF 对象时，
 //! `start` 返回 `NotBuilt`，调用方据此如实上报，而不是假装能采。
 
-// 采集器还没接到 daemon：`Collector` / `probe()` 目前只被测试与下一步接线使用。
-// **接线后删掉这条 allow**，它会掩盖真正的死代码。
-#![allow(dead_code)]
+// 解码侧（协议号、方向、迟到判定、各类「采不了」原因）只在 Linux + 构建期编了 BPF 对象时
+// 才被构造。其余平台（或没 clang 的构建）里这些项会显示为 dead_code —— 那是 cfg 的产物，
+// 不是真的死代码。注意这条 **只在非采集平台生效**：Linux 构建照常报死代码。
+#![cfg_attr(not(all(target_os = "linux", have_flow_bpf)), allow(dead_code))]
 
 pub mod iface;
 pub mod record;
@@ -34,6 +35,15 @@ pub(crate) struct FlushedFlow {
     pub agg: WindowAgg,
 }
 
+/// 一次 flush 的结果。
+#[derive(Debug, Default)]
+pub(crate) struct FlushBatch {
+    pub flows: Vec<FlushedFlow>,
+    /// 还有桶没取走（这一拍到了批量上限）：桶留在 BPF 表里，下一拍照着取。
+    /// 不是丢数据，只是分拍 —— 见 [`record::plan_take`]。
+    pub deferred: bool,
+}
+
 /// 正在被观测的网卡（采集层快照，用于填记录上下文）。
 #[derive(Debug, Clone)]
 pub(crate) struct WatchedIface {
@@ -43,6 +53,19 @@ pub(crate) struct WatchedIface {
     pub addrs: Vec<IpAddr>,
 }
 
+/// 真机测试的**网卡互斥**。
+///
+/// 两个真机用例（采集层单测与 daemon 端到端）都会 attach 到同一张网卡：并行跑时 filter
+/// 会叠加，计数与丢包判定不可解释，而且先挂的那个会把流量“抢”走 —— 结果是偶发挂死。
+/// 这里用一把进程内锁把它们串起来，不依赖调用者记得传 `--test-threads=1`。
+#[cfg(test)]
+pub(crate) static REAL_NIC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 本构建没有采集器时的原因。
+///
+/// 只在「非 Linux 平台 / 构建时没有 clang」编译：Linux + 编进 BPF 对象时报的是内核/权限，
+/// 轮不到这一条。
+#[cfg(not(all(target_os = "linux", have_flow_bpf)))]
 fn not_built() -> Unavailable {
     Unavailable::NotBuilt {
         platform: if cfg!(target_os = "linux") {
@@ -57,7 +80,7 @@ fn not_built() -> Unavailable {
 pub(crate) fn probe() -> FlowSupport {
     #[cfg(all(target_os = "linux", have_flow_bpf))]
     {
-        return linux::probe();
+        linux::probe()
     }
     #[cfg(not(all(target_os = "linux", have_flow_bpf)))]
     {
@@ -77,6 +100,43 @@ pub(crate) fn monotonic_bucket() -> u64 {
     seconds / record::WINDOW_SECONDS
 }
 
+/// 本机网卡快照（采集层事实）。非 Linux / 没编进 BPF 对象时为空。
+pub(crate) fn interfaces() -> Vec<IfaceSnapshot> {
+    #[cfg(all(target_os = "linux", have_flow_bpf))]
+    {
+        linux::interfaces()
+    }
+    #[cfg(not(all(target_os = "linux", have_flow_bpf)))]
+    {
+        Vec::new()
+    }
+}
+
+/// 运行内核版本（`uname -r`）。取不到就写 `unknown`（不猜、不伪造）。
+pub(crate) fn kernel_release() -> String {
+    #[cfg(all(target_os = "linux", have_flow_bpf))]
+    {
+        linux::kernel_release().unwrap_or_else(|| "unknown".to_string())
+    }
+    #[cfg(not(all(target_os = "linux", have_flow_bpf)))]
+    {
+        "unknown".to_string()
+    }
+}
+
+/// 当前走哪条 attach 路径：`tcx`（≥6.6，内核自动摘）| `netlink`（<6.6，需自己清残留）
+/// | `unavailable`（本构建没有采集器）。自观测（`state/flows/status.json`）用它。
+pub(crate) fn attach_path() -> &'static str {
+    #[cfg(all(target_os = "linux", have_flow_bpf))]
+    {
+        linux::attach_path()
+    }
+    #[cfg(not(all(target_os = "linux", have_flow_bpf)))]
+    {
+        "unavailable"
+    }
+}
+
 /// 采集器门面。
 pub(crate) struct Collector {
     #[cfg(all(target_os = "linux", have_flow_bpf))]
@@ -90,7 +150,7 @@ impl Collector {
     pub(crate) fn start(ifaces: &[&IfaceSnapshot]) -> Result<Self, Unavailable> {
         #[cfg(all(target_os = "linux", have_flow_bpf))]
         {
-            return linux::Collector::start(ifaces).map(|inner| Self { inner });
+            linux::Collector::start(ifaces).map(|inner| Self { inner })
         }
         #[cfg(not(all(target_os = "linux", have_flow_bpf)))]
         {
@@ -102,7 +162,7 @@ impl Collector {
     pub(crate) fn watched(&self) -> &[WatchedIface] {
         #[cfg(all(target_os = "linux", have_flow_bpf))]
         {
-            return self.inner.watched();
+            self.inner.watched()
         }
         #[cfg(not(all(target_os = "linux", have_flow_bpf)))]
         {
@@ -110,11 +170,24 @@ impl Collector {
         }
     }
 
-    /// flush 已经结束满 `FLUSH_LAG_WINDOWS` 个窗口的桶。
-    pub(crate) fn flush(&mut self, now_bucket: u64) -> Vec<FlushedFlow> {
+    /// flush 已经结束满 `FLUSH_LAG_WINDOWS` 个窗口的桶，最多 `max` 条（`0` = 不限）。
+    pub(crate) fn flush(&mut self, now_bucket: u64, max: usize) -> FlushBatch {
         #[cfg(all(target_os = "linux", have_flow_bpf))]
         {
-            return self.inner.flush(now_bucket);
+            self.inner.flush(now_bucket, max)
+        }
+        #[cfg(not(all(target_os = "linux", have_flow_bpf)))]
+        {
+            let _ = (now_bucket, max);
+            FlushBatch::default()
+        }
+    }
+
+    /// 把**所有**桶（含在途窗口）取出来，用于停采时的截断窗口。不限量：停采只有一次机会。
+    pub(crate) fn flush_all(&mut self, now_bucket: u64) -> Vec<FlushedFlow> {
+        #[cfg(all(target_os = "linux", have_flow_bpf))]
+        {
+            self.inner.flush_all(now_bucket)
         }
         #[cfg(not(all(target_os = "linux", have_flow_bpf)))]
         {
@@ -127,7 +200,7 @@ impl Collector {
     pub(crate) fn take_late_dropped(&mut self) -> u64 {
         #[cfg(all(target_os = "linux", have_flow_bpf))]
         {
-            return self.inner.take_late_dropped();
+            self.inner.take_late_dropped()
         }
         #[cfg(not(all(target_os = "linux", have_flow_bpf)))]
         {

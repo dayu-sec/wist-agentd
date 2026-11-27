@@ -6,6 +6,7 @@
 //! 这里的函数是**纯判定**，不碰 sysfs/netlink —— 采集层把它看到的接口快照交进来，
 //! 这样选择规则可以在 macOS 上被测试覆盖。
 
+use std::collections::BTreeSet;
 use std::net::IpAddr;
 
 /// 采集层对一张网卡的观测快照。
@@ -68,6 +69,59 @@ pub(crate) fn is_flow_addr(ip: IpAddr) -> bool {
                 && (is_ula || is_global)
         }
     }
+}
+
+/// 从默认路由表文本里抽出出口网卡名（v4，`/proc/net/route`）。
+///
+/// 列：`Iface Destination Gateway Flags RefCnt Use Metric Mask …`；默认路由 = `Destination`
+/// 全 0 且带 `RTF_UP`。**全部**取出来（多默认路由/ECMP 时要全观测，见设计 §7.2），
+/// 不取第一条。
+pub(crate) fn parse_default_routes_v4(text: &str) -> BTreeSet<String> {
+    let mut ifaces = BTreeSet::new();
+    for line in text.lines().skip(1) {
+        let mut fields = line.split_whitespace();
+        let (Some(iface), Some(dest), Some(_gateway), Some(flags)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if dest != "00000000" {
+            continue;
+        }
+        let flags = u32::from_str_radix(flags, 16).unwrap_or(0);
+        if flags & 0x1 != 0 {
+            ifaces.insert(iface.to_string());
+        }
+    }
+    ifaces
+}
+
+/// 从默认路由表文本里抽出出口网卡名（v6，`/proc/net/ipv6_route`）。
+///
+/// 列：`dest(32hex) prefix_len(2hex) src(32hex) src_prefix_len(2hex) nexthop(32hex)
+/// metric(8hex) refcnt use flags(8hex) ifname`。默认路由 = `dest` 全 0 且 `prefix_len == 00`，
+/// 并要求 `RTF_UP`。
+///
+/// 为什么要读它：**纯 IPv6 主机**的 `/proc/net/route` 是空的 —— 只读 v4 会把那类机器
+/// 永远卡在 `source_not_ready`（授权了、没数据）。
+pub(crate) fn parse_default_routes_v6(text: &str) -> BTreeSet<String> {
+    let mut ifaces = BTreeSet::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let (Some(dest), Some(prefix_len), Some(flags), Some(iface)) =
+            (fields.first(), fields.get(1), fields.get(8), fields.get(9))
+        else {
+            continue;
+        };
+        if !dest.chars().all(|ch| ch == '0') || *prefix_len != "00" {
+            continue;
+        }
+        let flags = u32::from_str_radix(flags, 16).unwrap_or(0);
+        if flags & 0x1 != 0 {
+            ifaces.insert(iface.to_string());
+        }
+    }
+    ifaces
 }
 
 /// 从快照里选出要观测的网卡（按 `ifindex` 升序，保证输出稳定）。
@@ -194,5 +248,47 @@ mod tests {
             .map(|iface| iface.name.as_str())
             .collect();
         assert_eq!(names, vec!["eth0", "eth1"]);
+    }
+
+    /// 默认路由解析：**全部**取，不只第一条（ECMP / 双上行都要观测）。
+    #[test]
+    fn every_default_route_counts_not_just_the_first() {
+        let v4 = "Iface\tDestination\tGateway\t\tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+                  eth0\t00000000\t0102A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n\
+                  eth1\t00000000\t0102A8C0\t0001\t0\t0\t200\t00000000\t0\t0\t0\n\
+                  eth2\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
+        let ifaces = parse_default_routes_v4(v4);
+        assert_eq!(
+            ifaces,
+            BTreeSet::from(["eth0".to_string(), "eth1".to_string()]),
+            "两条默认路由都要留下；非默认的那条不要"
+        );
+    }
+
+    /// 无 v4 默认路由但有 v6 默认路由的主机：必须能选出网卡。
+    #[test]
+    fn an_ipv6_only_host_still_has_a_default_route() {
+        let v6 = "\
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 \
+00000000000000000000000000000000 00000400 00000001 00000000 00000003 eth0\n\
+fe800000000000000000000000000001 40 00000000000000000000000000000000 00 \
+00000000000000000000000000000000 00000400 00000001 00000000 00000003 eth0\n\
+20010db8000000000000000000000001 80 00000000000000000000000000000000 00 \
+00000000000000000000000000000000 00000400 00000001 00000000 00000003 eth1\n";
+        assert_eq!(
+            parse_default_routes_v6(v6),
+            BTreeSet::from(["eth0".to_string()]),
+            "只有一段全 0 且 prefix=00 的那条是默认路由"
+        );
+        // v4 表为空 → 只靠 v6 也能选出网卡。
+        let mut default_egress = parse_default_routes_v4("");
+        default_egress.extend(parse_default_routes_v6(v6));
+        let snapshot = vec![iface(
+            "eth0",
+            2,
+            &["2001:db8::14"],
+            default_egress.contains("eth0"),
+        )];
+        assert_eq!(select_observed(&snapshot).len(), 1);
     }
 }
