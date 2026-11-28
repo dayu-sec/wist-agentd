@@ -304,6 +304,7 @@ pub(crate) fn record_from_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wist_contracts::telemetry_record::DataFrame;
 
     fn ctx() -> WindowCtx {
         WindowCtx {
@@ -540,5 +541,59 @@ mod tests {
         assert!(proto_has_ports(PROTO_UDP));
         assert!(!proto_has_ports(PROTO_ICMP));
         assert!(!proto_has_ports(PROTO_ICMPV6));
+    }
+
+    /// 规格文档里的示例必须**现在就能解析**。
+    ///
+    /// 写作动机：文档一旦写成“看起来对但字段名/类型已漂移”，下游照文档实现就会在
+    /// 联调时才发现。这里直接吃文档：`include_str!` 把两者绑在一起 —— 改文档就会
+    /// 重跑这个测试（改字段而不改文档，也会在契约那侧的 key 集合测试里先红）。
+    ///
+    /// 同时钉住示例里的**长度前缀**：文档写 `718 {...}` 就必须真的是 718 字节。
+    #[test]
+    fn the_spec_document_examples_match_the_contract() {
+        const SPEC: &str = include_str!("../../../docs/design/host-flow-data-spec.md");
+
+        // 1) 完整帧示例（```text 块）：`<len> <信封> FLOW: <正文>`。
+        let (mut frames, mut bodies) = (0usize, 0usize);
+        let mut rest = SPEC;
+        while let Some((_, after)) = rest.split_once("```") {
+            let (block, tail) = after.split_once("```").expect("unterminated code block");
+            rest = tail;
+            for line in block.lines() {
+                let Some((len_part, frame)) = line.split_once(' ') else {
+                    continue;
+                };
+                let Ok(len) = len_part.parse::<usize>() else {
+                    continue;
+                };
+                let (envelope, body) = frame.split_once(" FLOW: ").expect("FLOW marker");
+                assert_eq!(len, frame.len(), "文档写的长度前缀与真实帧字节数不一致");
+                let envelope: DataFrame = serde_json::from_str(envelope).expect("envelope");
+                let record: HostFlowRecord = serde_json::from_str(body).expect("body");
+                assert_eq!(envelope.schema_version, "v1");
+                assert_eq!(envelope.agent_id, record.collector_instance_id);
+                assert_eq!(record.record_schema, RECORD_SCHEMA_V1);
+                frames += 1;
+            }
+        }
+        assert_eq!(frames, 1, "规格里应当恰有一个完整帧示例");
+
+        // 2) 正文示例（```json 块）：必须能过 `deny_unknown_fields` 的强类型解析。
+        let mut rest = SPEC;
+        while let Some((_, after)) = rest.split_once("```json") {
+            let (block, tail) = after.split_once("```").expect("unterminated json block");
+            rest = tail;
+            let text = block.trim();
+            let record: HostFlowRecord = serde_json::from_str(text).expect("doc example body");
+            assert_eq!(record.record_schema, RECORD_SCHEMA_V1);
+            assert_eq!(
+                record.end - record.start,
+                u64::from(record.window_seconds),
+                "示例里的窗口长度必须自洽"
+            );
+            bodies += 1;
+        }
+        assert!(bodies >= 2, "规格至少要有 ICMP 与 partial 两个正文示例");
     }
 }

@@ -83,6 +83,10 @@
 {"schema":"v1","agent":"<agent_id>","ts":"<RFC3339>","seq":<n>} FLOW: <HostFlowRecord JSON>
 ```
 
+**字节级规范见 [`host-flow-data-spec.md`](./host-flow-data-spec.md)**：分帧（`len`）、标记的 7 个字节、
+信封字段、正文编码规则（哪些字段是字符串、缺失怎么写）、字段出现规则、闭集、幂等键、校验清单。
+下面几条是与之相关的设计决定：
+
 - 信封仍只有 `schema` / `agent` / `ts` / `seq`（`src/telemetry/warp_parse.rs`：来源细节不进帧）；
 - **一条记录一帧**，正文是单行 JSON。分帧沿用既有策略：`alpha` 起 TCP 上送**固定 `len`**（`SinkIdentity::resolve` 不看配置，配置里的 `line` 仅兼容旧配置并提示一次），`FLOW` 帧不需要任何额外处理；
 - `seq` 复用 agent 级全局计数器（`state/logs/seq.json`，指标帧已经在用），保证 `(agent, seq)` 的去重/查缺跨帧类型一致；
@@ -114,6 +118,9 @@
 ## 6. 记录契约：`HostFlowRecord` v1
 
 `record_schema = "wist.host_flow/v1"`。类型在 agentd 侧是强类型 JSON（数值就是数值），**第二层负责归一**成与云侧一致的字符串表示。
+
+本节只讲**字段分组与语义**（为什么有这些键、为什么没有那些键）；
+编编码规则、出现规则与完整示例以 [`host-flow-data-spec.md`](./host-flow-data-spec.md) 为准（两份要一起改）。
 
 ### 6.1 身份与来源
 
@@ -180,6 +187,10 @@
 > 尤其 `action`：主机侧无力判断云侧放行/拒绝，留空。若下游 `action` 枚举只有 `ACCEPT/REJECT`，**不要**塞 `observed` 进去——那会把非法状态写进数据。`observed` 的语义由 `source`/`coverage` 表达。
 
 ### 6.7 示例
+
+一条完整帧与几种正文形态见 [`host-flow-data-spec.md`](./host-flow-data-spec.md) §8——那份示例**由测试解析**
+（`the_spec_document_examples_match_the_contract`），字段或长度前缀写错会当场变红；
+下例仅供快速过一眼（不参与测试）：
 
 ```json
 {"schema":"v1","agent":"agent-host-d97e23da6111","ts":"2026-11-26T04:16:42Z","seq":100231} FLOW: {"record_schema":"wist.host_flow/v1","source":"host_ebpf","coverage":"host_partial","capture":"tc_egress","collector_instance_id":"agent-host-d97e23da6111","host_id":"host-d97e23da6111","host_name":"vm-web-01","kernel":"5.15.0-91-generic","ifname":"eth0","ifindex":2,"if_mac":"52:54:00:aa:bb:cc","local_addrs":["10.118.0.14"],"direction":"out","protocol":"6","srcaddr":"10.118.0.14","dstaddr":"88.214.25.121","srcport":"50123","dstport":"443","start":1789469760,"end":1789469820,"window_seconds":60,"packets":13,"bytes":1460,"wire_bytes_source":"unavailable","skb_count":4,"gso_skb_count":1,"truncated":false,"dropped":0}
@@ -585,6 +596,7 @@ netlink 路径挂在自己的 `pref`（不给别人抢位置），因此**只要
 
 ## 18. 相关文档
 
+- [`host-flow-data-spec.md`](./host-flow-data-spec.md)：**上行格式规格**（分帧/信封/编码规则/出现规则/幂等键/校验清单）——数据面与平台按它实现
 - [`log-source-exporters.md`](./log-source-exporters.md)：source kind 词表与四侧同源、降级规则
 - [`collection-status.md`](./collection-status.md)：采集状态（`AgentLocalCollection`）——本能力的失败分类映射到这里
 - [`linux-security-audit-log-sources.md`](./linux-security-audit-log-sources.md)：Linux 采集面清单（`NetworkFirewall` 的边界）
