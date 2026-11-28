@@ -3,6 +3,14 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.45.1-alpha] - 2026-11-28
+
+### 修复（用例）
+
+- 集成用例 `daemon_run_once_processes_granted_log_work` 还按**旧行为**要求「容器候选文件必须存在（但为空）」。
+  本版容器指标改为「没授权就不产出候选」，那条断言就成了假红 —— 改为「文件不存在 = 零目标」，
+  并把「不生成」本身也断言上。**二进制行为与 0.45.0 完全一致，只改用例。**
+
 ## [0.45.0-alpha] - 2026-11-28
 
 ### 新增（容器指标拆为独立面 `ContainerMetrics`）
