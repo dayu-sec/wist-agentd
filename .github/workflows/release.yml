@@ -8,6 +8,47 @@ permissions:
   contents: read
 
 jobs:
+  # 发版前先把测试跑完：**测试不过就不发制品**。
+  #
+  # 为什么 release.yml 自己也要跑一遍：`build-and-test.yml` 是**另一个 workflow**，
+  # 它的红不会拦住本 workflow 的发布。2026-11-28 事故：`v0.45.0-alpha` 的 Build & Test
+  # 红着（`tests/local_exec` 一条用例还按旧行为断言），制品却已经发布出去了，只能补发 patch。
+  #
+  # 只跑一台 ubuntu：它是二进制的规范构建平台；两 OS 矩阵仍由 `build-and-test.yml` 负责
+  # （那次失败在 linux / macOS 上**同时**出现，所以一台就够当闸门）。
+  test:
+    name: Test before publishing
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      # 主机流记录的 BPF 对象是**构建期**用 clang 编进去的（`build.rs`）。
+      # 不装就会在 Linux 上被 `WIST_REQUIRE_FLOW_BPF=1` 判失败 —— 与 `build-and-test.yml` 同口径。
+      - name: Install clang (flow eBPF collector)
+        run: |
+          set -euo pipefail
+          CLANG_BIN="$(cat dev/ci/flow-clang.txt)"
+          sudo apt-get update
+          sudo apt-get install -y "$CLANG_BIN"
+          "$CLANG_BIN" --version
+
+      - name: Cargo fmt
+        run: cargo fmt --check
+
+      # 与 `build-and-test.yml` 同口径（`--release --all`）：**不要**用 `--lib` 子集。
+      # `tests/` 下的集成用例只有 `--all` 才会跑，而它们正是最容易跟着行为改动一起漂的那一批。
+      - name: Cargo test
+        run: |
+          export CLANG="$(cat dev/ci/flow-clang.txt)"
+          export WIST_REQUIRE_FLOW_BPF=1
+          cargo test --release --all
+
   build-matrix:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
@@ -228,7 +269,7 @@ jobs:
           retention-days: 7
 
   release:
-    needs: [build-matrix]
+    needs: [build-matrix, test]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
