@@ -554,12 +554,36 @@ mod tests {
     fn the_spec_document_examples_match_the_contract() {
         const SPEC: &str = include_str!("../../../docs/design/host-flow-data-spec.md");
 
+        // 按 info string **精确**取代码块（`json` / `jsonl` / `text` 是三种不同的块）。
+        fn blocks(doc: &str, wanted: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut cur: Option<(String, Vec<&str>)> = None;
+            for line in doc.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("```") {
+                    match cur.take() {
+                        None => {
+                            let lang = trimmed.trim_start_matches('`').trim().to_string();
+                            cur = Some((lang, Vec::new()));
+                        }
+                        Some((lang, lines)) => {
+                            if lang == wanted {
+                                out.push(lines.join("\n"));
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if let Some((_, lines)) = cur.as_mut() {
+                    lines.push(line);
+                }
+            }
+            out
+        }
+
         // 1) 完整帧示例（```text 块）：`<len> <信封> FLOW: <正文>`。
-        let (mut frames, mut bodies) = (0usize, 0usize);
-        let mut rest = SPEC;
-        while let Some((_, after)) = rest.split_once("```") {
-            let (block, tail) = after.split_once("```").expect("unterminated code block");
-            rest = tail;
+        let mut frames = 0usize;
+        for block in blocks(SPEC, "text") {
             for line in block.lines() {
                 let Some((len_part, frame)) = line.split_once(' ') else {
                     continue;
@@ -579,21 +603,21 @@ mod tests {
         }
         assert_eq!(frames, 1, "规格里应当恰有一个完整帧示例");
 
-        // 2) 正文示例（```json 块）：必须能过 `deny_unknown_fields` 的强类型解析。
-        let mut rest = SPEC;
-        while let Some((_, after)) = rest.split_once("```json") {
-            let (block, tail) = after.split_once("```").expect("unterminated json block");
-            rest = tail;
-            let text = block.trim();
-            let record: HostFlowRecord = serde_json::from_str(text).expect("doc example body");
+        // 2) 正文示例（```json 块）：必须过 `deny_unknown_fields` 的强类型解析。
+        let bodies = blocks(SPEC, "json");
+        for text in &bodies {
+            let record: HostFlowRecord =
+                serde_json::from_str(text.trim()).expect("doc example body");
             assert_eq!(record.record_schema, RECORD_SCHEMA_V1);
             assert_eq!(
                 record.end - record.start,
                 u64::from(record.window_seconds),
                 "示例里的窗口长度必须自洽"
             );
-            bodies += 1;
         }
-        assert!(bodies >= 2, "规格至少要有 ICMP 与 partial 两个正文示例");
+        assert!(
+            bodies.len() >= 2,
+            "规格至少要有 ICMP 与 partial 两个正文示例"
+        );
     }
 }

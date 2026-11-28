@@ -28,6 +28,7 @@ agentd 只负责构造与序列化，不重建形状。
 ## 1. 范围
 
 - **产出**：`wist-agentd` 的 tc/eBPF 采集器（Linux，root）。非 Linux / 未编入 BPF 对象时为 `unsupported`，不产帧。
+- **接收端**：数据面（warp-parse）的 `tcp_1` 入口，见 §3。本文描述的是从 agentd 写到线上字节，到 wparse 接住、落到 `agent-flows.jsonl` 的全链。
 - **一条记录** = 一个 60s 窗口内、某一方向、一个五元组（+ ICMP type/code）的聚合量。
 - **不含**：进程/socket 归属、原始报文、云侧身份（VPC/ENI/instance）、放行/拒绝判定（`action`）。
 
@@ -86,7 +87,94 @@ agentd 只负责构造与序列化，不重建形状。
 - 同一批内按 flush 顺序发送，`seq` 单调递增；**跨窗口不保证全局有序**（并发窗口可在同一拍一起 flush）；
 - 平台按正文 `start` 归窗，不要依赖到达顺序。
 
-## 3. 正文编码规则
+## 3. 接收端（wparse）侧定义
+
+看完上面才知道 agentd 往线上写什么；这一节是**对端怎么把它接住**。两份合起来才是完整的"数据包定义"。
+
+### 3.1 入口 source
+
+`wist-gateway-stack/sys/data-plane/topology/sources/tcp_1.toml`：
+
+```toml
+key = "tcp_1"
+connect = "tcp_src"
+
+[params]
+addr = "0.0.0.0"
+port = 9000
+framing = "len"      # 与 §2.1 同一套：<十进制字节数><空格><帧>
+data_format = "ndjson"
+instances = 2        # 读循环按连接串行：agent 上送与 harvest 快照各一个实例
+```
+
+于是 **wparse 眼里的"一条记录"** 就是去掉长度前缀后的那串字节：
+
+```text
+{"schema":"v1",...,"seq":100231} FLOW: {"record_schema":"wist.host_flow/v1",...}
+```
+
+无换行、无 NUL、无长度前缀（前缀是分帧层吃掉的，不进记录）。
+
+> 这条 source 同时承载 agent 上送与其他生产者，**靠帧标记 + WPL 规则路由**，
+> 不为流记录另开端口。中间是否经过 `gwlinkd` 转发取决于部署，分帧与帧内容一致。
+
+### 3.2 WPL 规则
+
+`sys/data-plane/models/wpl/agent_uplink/parse.wpl`：
+
+```wpl
+#[tag(dev_type: "主机流记录", log_desc: "Agent 主机流记录帧", log_type: "agent_uplink_flow_frame")]
+rule agent_uplink_flow_frame {
+    (
+        json(
+            chars@schema,
+            chars@agent,
+            chars@ts,
+            digit@seq,
+        ),
+        symbol(FLOW:),
+        chars:body\0
+    )
+}
+```
+
+三件事必须同时成立：
+
+| 元素 | 含义 |
+|---|---|
+| `json(chars@schema, chars@agent, chars@ts, digit@seq)` | 只声明信封这四个键（流帧信封里本来就没有别的键，见 §2.3） |
+| `symbol(FLOW:)` | 匹配标记。写规则时**不写两边的空格**，线上字节里仍然是 ` FLOW: `（§2.2） |
+| `chars:body\0` | 正文**原样**吞到记录结束（`\0` 是 WPL 的记录结束符语法，不是线上字节）。不拆字段 |
+
+**为什么正文不拆**：形状只在 `wist-contracts::host_flow` 定义一份，数据面再拆一遂必然漂；
+五元组/字节数的字段建模与入库是下一期（设计 §4 第②层）。
+
+**没有这条规则会怎样**：帧会落到包级 `copy_event_parse` 的 `raw_log` 兰截里，被当成
+一路日志搬 —— 占日志保留期，下游也抽不出五元组。那才是真正的"静默丢"。
+
+### 3.3 OML 与 sink
+
+| 项 | 值 |
+|---|---|
+| OML 模型 | `sys/data-plane/models/oml/agent_uplink/agent_uplink_flow_frame/adm.oml` |
+| sink 分组 | `sys/data-plane/topology/sinks/business.d/agent_flows.toml`（`name = "agent-flows"`，`oml = ["agent_uplink_flow_frame"]`） |
+| 落点 | `connect = "file_json_sink"`，`file = "agent-flows.jsonl"`，`batch_size = 1` |
+| 未接 | http-gateway：网关还没有 `agent-flows` 入库端点（与 `agent-facts` 并列的那个） |
+
+### 3.4 落库后的记录形态
+
+`agent-flows.jsonl` 的一行（**真实输出**，非手写）：
+
+```jsonl
+{"schema":"v1","agent":"agent-host-d97e23da6111","ts":"2026-11-26T04:16:42Z","seq":100231,"event_id":"2421314885982222495","now":1795858848892,"dev_vendor":"Wist Agent","dev_name":"Wist Agent","dev_type":"主机流记录","log_type":"agent_uplink_flow_frame","log_desc":"Agent 主机流记录帧","body":"{\"record_schema\":\"wist.host_flow/v1\",\"source\":\"host_ebpf\",\"coverage\":\"host_partial\",\"capture\":\"tc_egress\",\"direction\":\"out\",\"protocol\":\"6\",\"srcaddr\":\"10.118.0.14\",\"dstaddr\":\"88.214.25.121\",\"srcport\":\"50123\",\"dstport\":\"443\",\"start\":1789469760,\"end\":1789469820,\"window_seconds\":60,\"packets\":13,\"bytes\":1460}","biz":"agent-flows","env":"dev","sink":"json","tenant_id":"unbound","wp_oml_name":"agent_uplink_flow_frame"}
+```
+
+读这一行时必须知道两件事：
+
+1. **`body` 是一个 JSON 字符串**（引号被转义），下游要**二次解析**才能拿到五元组；
+2. `dev_ip` 是**上送连接的对端地址**（来自 `wp_src_ip`），不是流里的地址；文件源回放时没有这个键。
+
+## 4. 正文编码规则
 
 这些规则是**契约的一部分**（不是实现细节），改它们等于改 `record_schema`：
 
@@ -104,7 +192,7 @@ agentd 只负责构造与序列化，不重建形状。
 | 窗口对齐 | `start` 对齐 UTC 整分（`start % 60 == 0`） | 桶换算见设计文档 §7.3；`partial` 时长度变短但仍整分对齐 |
 | 协议号 | IANA 数字的**十进制字符串**：`"6"` TCP / `"17"` UDP / `"1"` ICMP / `"58"` ICMPv6 | 只采这四种，其它协议不产记录 |
 
-## 4. 字段出现规则
+## 5. 字段出现规则
 
 字段清单与含义见设计文档 §6。这里只补"什么时候出现"这张表（实现时必须逐条成立）：
 
@@ -117,9 +205,9 @@ agentd 只负责构造与序列化，不重建形状。
 | `port_unavailable` | 分片 / v6 扩展头导致端口取不到时（值为 `true`）；此时端口为 `"0"` |
 | `wire_bytes` | **当前恒不出现**：基线内核（5.4+）没有 `skb->wire_len`，不估算、不伪造精度 |
 | `skb_count` / `gso_skb_count` | 当前恒出现（诊断用）；契约上可选 |
-| `partial` / `partial_reason` | 窗口被提前截断时成对出现；`partial_reason` ∈ §5 的闭集 |
+| `partial` / `partial_reason` | 窗口被提前截断时成对出现；`partial_reason` ∈ §6 的闭集 |
 
-## 5. 闭集常量
+## 6. 闭集常量
 
 任何一项新增都是契约变更；消费端对未知值应当**忽略该维度**而不是崩溃。
 
@@ -127,14 +215,14 @@ agentd 只负责构造与序列化，不重建形状。
 |---|---|---|
 | `record_schema` | `wist.host_flow/v1` | 记录版本 |
 | `source` | `host_ebpf` | 观测来源（主机侧 eBPF）。下游据此与云侧流日志**择一**使用，不相加 |
-| `coverage` | `host_partial` | 主机视角有缺口（见 §7.1） |
+| `coverage` | `host_partial` | 主机视角有缺口（见 §8.1） |
 | `capture` | `tc_egress` / `tc_ingress` | hook 位置；与 `direction` 一一对应 |
 | `direction` | `in` / `out` | **相对被观测网卡**；用云侧词表，不是 `ingress`/`egress` |
 | `protocol` | `6` / `17` / `1` / `58` | IANA 协议号 |
 | `wire_bytes_source` | `wire_len` / `unavailable` | `wire_bytes` 的来源；当前恒为 `unavailable` |
 | `partial_reason` | `agent_start` / `paused` / `interface_changed` / `shutdown` / `clock_changed` | 窗口为什么被截断 |
 
-## 6. 幂等键
+## 7. 幂等键
 
 平台侧去重与 upsert 的唯一键：
 
@@ -149,9 +237,9 @@ agentd 只负责构造与序列化，不重建形状。
 - 含 `ifname` **与** `ifindex` 中的 `ifname`：接口重建后 `ifindex` 可能复用，用 `ifname` 更稳；
   记录里仍带 `ifindex` 供现场对账。
 
-## 7. 采集口径对数据的影响（读数据的人必须知道）
+## 8. 采集口径对数据的影响（读数据的人必须知道）
 
-### 7.1 只含「一端是公网」的流量（0.46.0+）
+### 8.1 只含「一端是公网」的流量（0.46.0+）
 
 | 场景 | `src` | `dst` | 是否上送 |
 |---|---|---|---|
@@ -167,14 +255,14 @@ agentd 只负责构造与序列化，不重建形状。
 - 本机被口径丢弃的包数只进本机诊断（`state/flows/status.json` 的 `filtered`，
   以及 `agentd diagnose` 的 `flows.status`），**不上行**。
 
-### 7.2 `coverage = host_partial` 覆盖的两类缺口
+### 8.2 `coverage = host_partial` 覆盖的两类缺口
 
 1. **看不到**在到达网卡之前就被云侧策略丢弃的流量（主机侧无从观测）；
-2. **按口径不采**东西向（§7.1）。
+2. **按口径不采**东西向（§8.1）。
 
 两者都在"记录缺失"里，但原因不同：前者要归因到云侧策略，后者是设计口径。
 
-### 7.3 缺口字段怎么读
+### 8.3 缺口字段怎么读
 
 | 字段 | 读法 |
 |---|---|
@@ -183,9 +271,9 @@ agentd 只负责构造与序列化，不重建形状。
 | `partial=true` + `partial_reason` | 窗口被截断（重启 / 暂停 / 换网卡 / 关机 / 墙钟跳变），`window_seconds` 是实际秒数 |
 | 零记录 | 窗口内没有符合口径的流量 —— 正常态 |
 
-## 8. 完整示例
+## 9. 完整示例
 
-### 8.1 TCP 出向（一条记录 + 真实分帧）
+### 9.1 TCP 出向（一条记录 + 真实分帧）
 
 线上字节（`len` 分帧，长度是帧字节数；为可读这里断行，实际是一整段字节）：
 
@@ -196,19 +284,19 @@ agentd 只负责构造与序列化，不重建形状。
 要点：`ts` 是上送时刻（`04:16:42`），窗口是 `1789470120`（整分对齐）；
 `protocol`/`srcport`/`dstport` 是字符串；`wire_bytes` 整键不出现；`partial` 不出现（= 未截断）。
 
-### 8.2 ICMP（正文，省略信封）
+### 9.2 ICMP（正文，省略信封）
 
 ```json
 {"record_schema":"wist.host_flow/v1","source":"host_ebpf","coverage":"host_partial","capture":"tc_egress","collector_instance_id":"agent-host-d97e23da6111","host_id":"host-d97e23da6111","kernel":"5.15.0-91-generic","ifname":"eth0","ifindex":2,"local_addrs":["10.118.0.14"],"direction":"out","protocol":"1","srcaddr":"10.118.0.14","dstaddr":"10.118.0.1","srcport":"0","dstport":"0","icmp_type":"8","icmp_code":"0","start":1789470120,"end":1789470180,"window_seconds":60,"packets":3,"bytes":252,"wire_bytes_source":"unavailable","skb_count":3,"gso_skb_count":0,"truncated":false,"dropped":0}
 ```
 
-### 8.3 被截断的窗口（暂停后恢复，正文，省略信封）
+### 9.3 被截断的窗口（暂停后恢复，正文，省略信封）
 
 ```json
 {"record_schema":"wist.host_flow/v1","source":"host_ebpf","coverage":"host_partial","capture":"tc_ingress","collector_instance_id":"agent-host-d97e23da6111","host_id":"host-d97e23da6111","kernel":"5.15.0-91-generic","ifname":"eth0","ifindex":2,"local_addrs":["10.118.0.14"],"direction":"in","protocol":"17","srcaddr":"88.214.25.121","dstaddr":"10.118.0.14","srcport":"443","dstport":"51000","start":1789470120,"end":1789470145,"window_seconds":25,"packets":7,"bytes":980,"wire_bytes_source":"unavailable","truncated":false,"dropped":0,"partial":true,"partial_reason":"paused"}
 ```
 
-## 9. 校验清单（实现方断言）
+## 10. 校验清单（实现方断言）
 
 数据面 / 平台解析落地时，这些应当有测试或断言，而不是靠 review：
 
@@ -216,15 +304,28 @@ agentd 只负责构造与序列化，不重建形状。
 - [ ] 帧里恰好一处 ` FLOW: `（两侧各一空格），信封只含 `schema`/`agent`/`ts`/`seq`；
 - [ ] 正文能反序列化成 `HostFlowRecord`（`deny_unknown_fields` 生效：多键即失败）；
 - [ ] 未知的 `partial_reason` / `capture` / `coverage` 不让解析崩溃；
-- [ ] 幂等键（§6）重复 upsert 不产生两条；
+- [ ] 幂等键（§7）重复 upsert 不产生两条；
 - [ ] `end - start == window_seconds`，且 `start % 60 == 0`；
 - [ ] 端口为 `"0"` 时：要么 `protocol ∈ {1,58}`，要么 `port_unavailable=true`；
 - [ ] `wire_bytes` 不出现时 `wire_bytes_source == "unavailable"`；
 - [ ] 拒绝类视图在只有主机来源时显示"不覆盖"，不是 0（设计文档 §3 硬规则 2）。
 
-## 10. 下一步（未定）
+接收端（§3）另有一套，落地时可以直接跑：
 
-- `coverage` 目前表达不了"东西向按口径不采"（§7.2 第 2 类）。计划随 `wist-contracts`
+```bash
+# 在 wist-gateway-stack 仓根；没有 wparse 二进制时用例会 skip，不假绿
+bash dev/tests/agent-uplink-flow.test.sh
+```
+
+- [ ] 一帧进 → **一条**记录出（不是 0，也不是 2）；
+- [ ] `log_type == "agent_uplink_flow_frame"`（路由命中，**没有被 `raw_log` 兰截**）；
+- [ ] 信封 `agent` / `seq` / `ts` 原样保留；
+- [ ] `body` 是**转义后的 JSON 字符串**，二次解析后等于原始正文；
+- [ ] 删掉 `business.d/agent_flows.toml` 时**一个文件都不产生**（而不是落到别的分组里）。
+
+## 11. 下一步（未定）
+
+- `coverage` 目前表达不了"东西向按口径不采"（§8.2 第 2 类）。计划随 `wist-contracts`
   下一版新增取值（如 `host_public_peer`）并同步四侧渲染 —— 见设计文档 §13 #12；
 - 采集范围若要按站点/主机下发，走平台策略通道（设计文档 §13 #10），届时**记录格式不变**，
   只是"哪些流量会进来"变了。
