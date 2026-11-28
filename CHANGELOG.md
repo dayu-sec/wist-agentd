@@ -3,6 +3,50 @@
 本文件记录 `wist-agentd` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.45.0-alpha] - 2026-11-28
+
+### 新增（容器指标拆为独立面 `ContainerMetrics`）
+
+容器指标以前藏在「主机指标」面里，于是零目标会被当成整面「部分失败」。现在它是自己的面：
+
+- 每个容器一条序列（内存 / CPU / 状态），采哪些容器由**本机发现**决定（`target` 只认 `auto`）。
+- **域归属只看来源**：`CollectionSourceKind::metric_domain()`。面名不再参与运行时判定，
+  面改名 / 拆面 / 加面都不再需要 agentd 发版。
+- 容器目标必须**授权**才会产出候选；撤授权后候选文件立即清除（不会留着旧数据“看起来还在采”）。
+
+### 变化（采集状态：空集不是故障，看不见也不是没有）
+
+- 指标域 `idle` 且本机**说不出原因** → `no_targets`（信息级）：一台没跑容器的机器不再把整面拉成「部分失败」。
+- **看见了容器运行时却读不了**（权限 / socket 不可达）不再静默：报 `target_not_ready` 并带具体原因
+  （哪个目录、什么错误），而不是一句笼统的「首轮未完成」。两者靠同一份视图文件跨拍传递
+  （扫描在发现拍、记账在指标 tick）。
+- 发现未到期沿用缓存的那一拍也会把「看不见」一并带出 —— 否则发现周期一拉长，
+  管理面会在两次发现之间把「容器读不了」退化成「本机没容器」。
+
+### 新增（导出器安装位置由知识库下发）
+
+- 导出器二进制改为「**候选目录 + 登记的可执行名**」解析：`/usr/bin`、`/bin`、`/usr/sbin`、`/sbin`、
+  `/usr/local/{bin,sbin}`、Homebrew 前缀逐个找。解决「非 usrmerge / busybox / 最小镜像里工具只在 `/bin`，
+  却被报成没装」——同一台机器上路径猜错不再等于部署缺口。
+- 搜索目录与周期/超时可由知识库 `exporters.toml` 下发（网关校验后经
+  `POST /api/v1/agent/exporter-policy:poll`）。**数据能改「去哪找、多久跑」，不能改「跑什么」**：
+  二进制名与参数仍登记在代码里，`PATH` 永不参与解析（root 守护进程里 PATH 解析是本地提权面）。
+- 组 / 世界可写的候选会**跳过**并告警（`event=ExporterToolWritable`）；若全部候选都可写，
+  仍用它采集（带风险地采 > 假装没装——后者会让采集静默停摆）。
+- 拿不到策略（旧网关 404 / 网络失败）→ 静默回落内置目录表，不告警、不停采。
+- `exporter_id → 实际解析到的绝对路径` 落进 `exporters.json` 并在 `agentd diagnose` 展示，
+  排障时不用再猜“它到底找了哪里”。
+
+### 变更（依赖）
+
+- 升 `wist-contracts 0.16.1`：新增 `ContainerMetrics` 来源与 `metric_domain()`；
+  `collection_reason_kind::NO_TARGETS`（指标域“空集”）。`api` / `metrics` / `validate` 本版未动。
+
+### 未完成（下一版）
+
+- **macOS 的容器指标本轮仍是空集**：载体采集（Docker Engine API）排在后续版本。
+  macOS 上目前不发 `container` 目标；socket 存在但读不了时（权限）会如实报原因。
+
 ## [0.44.0-alpha] - 2026-11-27
 
 ### 新增（主机侧流记录：`HostFlow` 采集面）
