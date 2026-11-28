@@ -123,8 +123,8 @@ instances = 2        # 读循环按连接串行：agent 上送与 harvest 快照
 `sys/data-plane/models/wpl/agent_uplink/parse.wpl`：
 
 ```wpl
-#[tag(dev_type: "主机流记录", log_desc: "Agent 主机流记录帧", log_type: "agent_uplink_flow_frame")]
-rule agent_uplink_flow_frame {
+#[tag(dev_type: "主机流记录", log_desc: "Agent 主机流记录帧", log_type: "agent_uplink_flow")]
+rule agent_uplink_flow {
     (
         json(
             chars@schema,
@@ -156,8 +156,8 @@ rule agent_uplink_flow_frame {
 
 | 项 | 值 |
 |---|---|
-| OML 模型 | `sys/data-plane/models/oml/agent_uplink/agent_uplink_flow_frame/adm.oml` |
-| sink 分组 | `sys/data-plane/topology/sinks/business.d/agent_flows.toml`（`name = "agent-flows"`，`oml = ["agent_uplink_flow_frame"]`） |
+| OML 模型 | `sys/data-plane/models/oml/agent_uplink/agent_uplink_flow/adm.oml` |
+| sink 分组 | `sys/data-plane/topology/sinks/business.d/agent_flows.toml`（`name = "agent-flows"`，`oml = ["agent_uplink_flow"]`） |
 | 落点 | `connect = "file_json_sink"`，`file = "agent-flows.jsonl"`，`batch_size = 1` |
 | 未接 | http-gateway：网关还没有 `agent-flows` 入库端点（与 `agent-facts` 并列的那个） |
 
@@ -166,7 +166,7 @@ rule agent_uplink_flow_frame {
 `agent-flows.jsonl` 的一行（**真实输出**，非手写）：
 
 ```jsonl
-{"schema":"v1","agent":"agent-host-d97e23da6111","ts":"2026-11-26T04:16:42Z","seq":100231,"event_id":"2421314885982222495","now":1795858848892,"dev_vendor":"Wist Agent","dev_name":"Wist Agent","dev_type":"主机流记录","log_type":"agent_uplink_flow_frame","log_desc":"Agent 主机流记录帧","body":"{\"record_schema\":\"wist.host_flow/v1\",\"source\":\"host_ebpf\",\"coverage\":\"host_partial\",\"capture\":\"tc_egress\",\"direction\":\"out\",\"protocol\":\"6\",\"srcaddr\":\"10.118.0.14\",\"dstaddr\":\"88.214.25.121\",\"srcport\":\"50123\",\"dstport\":\"443\",\"start\":1789469760,\"end\":1789469820,\"window_seconds\":60,\"packets\":13,\"bytes\":1460}","biz":"agent-flows","env":"dev","sink":"json","tenant_id":"unbound","wp_oml_name":"agent_uplink_flow_frame"}
+{"schema":"v1","agent":"agent-host-d97e23da6111","ts":"2026-11-26T04:16:42Z","seq":100231,"event_id":"2421314885982222495","now":1795858848892,"dev_vendor":"Wist Agent","dev_name":"Wist Agent","dev_type":"主机流记录","log_type":"agent_uplink_flow","log_desc":"Agent 主机流记录帧","body":"{\"record_schema\":\"wist.host_flow/v1\",\"source\":\"host_ebpf\",\"coverage\":\"host_partial\",\"capture\":\"tc_egress\",\"direction\":\"out\",\"protocol\":\"6\",\"srcaddr\":\"10.118.0.14\",\"dstaddr\":\"88.214.25.121\",\"srcport\":\"50123\",\"dstport\":\"443\",\"start\":1789469760,\"end\":1789469820,\"window_seconds\":60,\"packets\":13,\"bytes\":1460}","biz":"agent-flows","env":"dev","sink":"json","tenant_id":"unbound","wp_oml_name":"agent_uplink_flow"}
 ```
 
 读这一行时必须知道两件事：
@@ -318,7 +318,7 @@ bash dev/tests/agent-uplink-flow.test.sh
 ```
 
 - [ ] 一帧进 → **一条**记录出（不是 0，也不是 2）；
-- [ ] `log_type == "agent_uplink_flow_frame"`（路由命中，**没有被 `raw_log` 兰截**）；
+- [ ] `log_type == "agent_uplink_flow"`（路由命中，**没有被 `raw_log` 兰截**）；
 - [ ] 信封 `agent` / `seq` / `ts` 原样保留；
 - [ ] `body` 是**转义后的 JSON 字符串**，二次解析后等于原始正文；
 - [ ] 删掉 `business.d/agent_flows.toml` 时**一个文件都不产生**（而不是落到别的分组里）。

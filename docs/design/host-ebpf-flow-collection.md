@@ -92,7 +92,7 @@
 - `seq` 复用 agent 级全局计数器（`state/logs/seq.json`，指标帧已经在用），保证 `(agent, seq)` 的去重/查缺跨帧类型一致；
 - `file` sink **静默跳过**（与 `OBSFACT`/`DSNAP`/`IVSREP` 一致），不得把流记录写进 `wist-records.ndjson`；
 - **接收端**：数据面入口 `tcp_1`（`framing = "len"` + `data_format = "ndjson"`）→
-  WPL `agent_uplink_flow_frame`（`json(schema,agent,ts,seq)` + `symbol(FLOW:)` + `chars:body`，
+  WPL `agent_uplink_flow`（`json(schema,agent,ts,seq)` + `symbol(FLOW:)` + `chars:body`，
   正文不拆字段）→ OML/sink 分组 `agent-flows`（`agent-flows.jsonl`）。
   规则文本、sink 路径、落库后的行形状与回归用例见 [`host-flow-data-spec.md`](./host-flow-data-spec.md) §3。
 
