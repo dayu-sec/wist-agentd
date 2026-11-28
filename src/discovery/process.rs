@@ -107,6 +107,7 @@ impl DiscoveryProbe for ProcessDiscoveryProbe {
             },
             resources,
             targets,
+            unobserved: Vec::new(),
         })
     }
 }

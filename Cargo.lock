@@ -2969,7 +2969,7 @@ checksum = "8c3b93199df0ab874cdf0c6a94f0a0dc3423fe41f1cafb62b8bd7b1deb277aef"
 
 [[package]]
 name = "wist-agentd"
-version = "0.44.0"
+version = "0.45.0"
 dependencies = [
  "aya",
  "base64 0.22.1",
@@ -3029,9 +3029,9 @@ dependencies = [
 
 [[package]]
 name = "wist-contracts"
-version = "0.16.0"
+version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3f2b6b1494c95c5a4dd3cfd190a4d65e6342555f65cdf807bcdec356fd43a9f"
+checksum = "74db48602d3e2638758df82b45a54116f2af14f1dff7c348b709a4b55f57ef40"
 dependencies = [
  "jumo-derive",
  "serde",

@@ -398,12 +398,16 @@ pub(super) async fn process_exporters(
     let mut state = exporters::load_state(state_dir);
     let mut report = ExporterReport::default();
     let mut changed = false;
-    // 剪掉不在本次授权里的缺件记录（面撤了，记录不该留着误导）。
+    // 剪掉不在本次授权里的缺件 / 解析记录（面撤了，记录不该留着误导）。
     let before = state.missing.len();
     state
         .missing
         .retain(|id, _| runs.iter().any(|run| run.exporter_id == *id));
-    if state.missing.len() != before {
+    let resolved_before = state.resolved.len();
+    state
+        .resolved
+        .retain(|id, _| runs.iter().any(|run| run.exporter_id == *id));
+    if state.missing.len() != before || state.resolved.len() != resolved_before {
         changed = true;
     }
     if runs.is_empty() {
@@ -476,8 +480,19 @@ pub(super) async fn process_exporters(
                 run.exporter_id
             );
         }
+        // 记下**实际解析到的路径**（变化才落盘 + 打日志）：换发行版 / 容器镜像后，
+        // 这一行就是“它到底从哪找的”的答案；`diagnose` 也读它。
+        if state.resolved.get(&run.exporter_id) != Some(&tool) {
+            state.resolved.insert(run.exporter_id.clone(), tool.clone());
+            changed = true;
+            log::info!(
+                "event=ExporterToolResolved exporter={} tool={}",
+                run.exporter_id,
+                tool
+            );
+        }
         if !exporters::is_due(
-            def.period_secs,
+            exporters::effective_period_secs(def),
             state.last_run_ms.get(&run.input_id).copied(),
             now,
         ) {
@@ -491,7 +506,7 @@ pub(super) async fn process_exporters(
             &run.exporter_id,
             run.arg.as_deref(),
             cursor.as_deref(),
-            def.timeout_secs,
+            exporters::effective_timeout_secs(def),
         )
         .await
         {

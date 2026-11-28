@@ -2165,6 +2165,13 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     // L3 搜索范围：启动时先用**上次落盘**的那份（重启后不必等一次拉取才能搜），
     // 之后在循环里按最小间隔刷新。空 = 不搜（默认，也是旧网关下的唯一状态）。
     let mut last_source_search_fetch: Option<Instant> = None;
+    // 导出器运行参数（搜索目录 / 周期）：启动时先用**上次落盘**的那份（重启后不必等一次拉取），
+    // 之后在循环里按最小间隔刷新。拿不到 = 内置表（`BIN_DIRS` + 默认周期）。
+    let mut last_exporter_policy_fetch: Option<Instant> = None;
+    {
+        let state_dir = std::path::Path::new(&loop_ctx.config.paths.state_dir);
+        apply_exporter_policy(crate::control::exporter_policy::load(state_dir).as_ref());
+    }
     {
         let policy = crate::control::source_search_policy::load(std::path::Path::new(
             &loop_ctx.config.paths.state_dir,
@@ -2545,6 +2552,14 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
         refresh_source_search_policy(
             loop_ctx.config,
             &mut last_source_search_fetch,
+            force_refresh,
+        )
+        .await;
+        // 导出器运行参数（二进制搜索目录 / 周期 / 超时）：与 L3 搜索同一节奏拉。
+        // 拿不到就沿用落盘那份（或内置表）—— 环境参数不该让采集停摆。
+        refresh_exporter_policy(
+            loop_ctx.config,
+            &mut last_exporter_policy_fetch,
             force_refresh,
         )
         .await;
@@ -3013,11 +3028,15 @@ async fn run_once_with_failure_cache(
         .as_deref()
         .unwrap_or("unknown");
     let key_process_grant = work.key_process_grant();
+    // 容器指标也由**面**决定采不采（`ContainerMetrics` 工作单元）：没授权就不去扫容器目标，
+    // 也就不会“顺手”把容器序列上送 —— 与关键进程、四个自探域同一条纪律。
+    let container_metrics_authorized = work.container_metrics_authorized();
     let (discovery, fact_summary) = refresh_discovery_snapshot(
         state_dir,
         discovery_runtime,
         force_refresh,
         key_process_grant.as_ref(),
+        container_metrics_authorized,
     )
     .await;
     let metrics_tick = process_metrics_tick(state_dir).await;
@@ -3377,6 +3396,56 @@ struct DiscoveryHealth {
 ///
 /// 失败什么都不改（沿用落盘那份）：搜索范围是“允许去哪儿找”，不是数据 ——
 /// 断网期间清空会让本已定位到的日志突然消失，而它并没有变。与发现策略表同一姿态。
+/// 把一份策略映射成 `exporters` 要的两样东西（**纯函数**，便于单测）。
+///
+/// 空目录列表 → `None`（用内置表）：下发了一份“没有目录”的表不能让解析退化成不搜任何目录。
+fn policy_to_apply(
+    policy: Option<&crate::control::exporter_policy::ExporterPolicy>,
+) -> (
+    Option<Vec<String>>,
+    Vec<crate::telemetry::exporters::LimitOverride>,
+) {
+    let Some(policy) = policy else {
+        return (None, Vec::new());
+    };
+    let dirs = (!policy.bin_dirs.is_empty()).then(|| policy.bin_dirs.clone());
+    let overrides = policy
+        .exporters
+        .iter()
+        .map(|row| (row.id.clone(), row.period_secs, row.timeout_secs))
+        .collect();
+    (dirs, overrides)
+}
+
+/// 把一份策略应用到导出器解析上（`None` = 用内置表）。
+fn apply_exporter_policy(policy: Option<&crate::control::exporter_policy::ExporterPolicy>) {
+    let (dirs, overrides) = policy_to_apply(policy);
+    crate::telemetry::exporters::apply_policy(dirs, overrides);
+}
+
+/// 拉一次导出器运行参数（知识库 `exporters.toml` 经网关校验后下发）。
+///
+/// 失败什么都不改（沿用落盘那份 / 内置表）：环境参数不是权限，断网期间清空只会让
+/// 已能采的面突然报“工具缺失”。
+async fn refresh_exporter_policy(
+    config: &AgentConfig,
+    last_fetch: &mut Option<Instant>,
+    force: bool,
+) {
+    let now = Instant::now();
+    if !force
+        && let Some(at) = *last_fetch
+        && at.elapsed() < DISCOVERY_POLICY_FETCH_MIN_INTERVAL
+    {
+        return;
+    }
+    *last_fetch = Some(now);
+    let state_dir = std::path::Path::new(&config.paths.state_dir);
+    if let Some(policy) = crate::control::exporter_policy::refresh(config, state_dir).await {
+        apply_exporter_policy(Some(&policy));
+    }
+}
+
 async fn refresh_source_search_policy(
     config: &AgentConfig,
     last_fetch: &mut Option<Instant>,
@@ -3832,13 +3901,13 @@ fn work_result_of(record: &crate::upgrade::UpgradeRecord) -> Option<(&'static st
     }
 }
 
-/// 进程候选文件本拍该做什么。
+/// 策展候选文件（进程 / 容器）本拍该做什么。
 ///
 /// 纯函数（不碰磁盘），因为这是**最容易悄悄错的一层**：候选文件是指标 tick 的唯一依据，
 /// 只在发现拍清理会让“撤授权”最长 300s 不生效，只在文件缺失时重建又会让重启后最长 300s 没指标。
-/// 两个方向都必须有钉子。
+/// 两个方向都必须有钉子。两个域（关键进程 / 容器）共用同一套规则。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProcessCandidatesAction {
+enum PlannerCandidatesAction {
     /// 不动：没授权且本来就没文件，或授权了且文件与发现快照都还有效。
     Keep,
     /// 删掉：撤授权后必须**立即**停采（不能等到下一次探测）。
@@ -3847,25 +3916,38 @@ enum ProcessCandidatesAction {
     Rebuild,
 }
 
-fn process_candidates_action(
+fn planner_candidates_action(
     authorized: bool,
     discovery_changed: bool,
     file_exists: bool,
-) -> ProcessCandidatesAction {
+) -> PlannerCandidatesAction {
     // 没授权：留着就是继续采。删一次（文件不在时 `remove_file` 只剩 NotFound）。
     if !authorized {
         return if file_exists {
-            ProcessCandidatesAction::Remove
+            PlannerCandidatesAction::Remove
         } else {
-            ProcessCandidatesAction::Keep
+            PlannerCandidatesAction::Keep
         };
     }
     // 授权了：快照变了重建；文件不在也重建（否则重启后一段空窗）。
     if discovery_changed || !file_exists {
-        ProcessCandidatesAction::Rebuild
+        PlannerCandidatesAction::Rebuild
     } else {
-        ProcessCandidatesAction::Keep
+        PlannerCandidatesAction::Keep
     }
+}
+
+/// 从发现刷新结果里挑出「看见了容器运行时，但读不了」那一条，折成管理面文案。
+///
+/// 为什么不原样转发 `detail`：管理面的读者是运维，`detail` 可能是
+/// 「Permission denied」这类底层描述。带上 `location` 才能告诉他们该看哪里
+/// （补权限 / 换 socket / 装运行时）。本机说不出原因（无运行时、真的没容器）时
+/// 返回 `None` —— 那一路是空集，不该报警。
+fn container_scan_error_from(unobserved: &[crate::discovery::UnobservedSource]) -> Option<String> {
+    unobserved
+        .iter()
+        .find(|item| item.subject == crate::discovery::container::UNOBSERVED_SUBJECT)
+        .map(|item| format!("容器运行时看不见（{}）：{}", item.location, item.detail))
 }
 
 /// `force = true`（手动「重采」）时走**全量刷新**并落盘：各探针的周期在这里不参与调度。
@@ -3878,6 +3960,9 @@ async fn refresh_discovery_snapshot(
     // 关键进程指标的授权（`None` = 没授权）：要采哪些进程只在**发现拍**才算，
     // 因为 `cmdline` 要读 `/proc`，不能放到 3s 的指标 tick 上。
     key_process: Option<&crate::control::work::KeyProcessGrant>,
+    // 容器指标是否被授权（`ContainerMetrics` 单元）。没授权就不写容器候选，
+    // 否则一台从没授过这个面的机器会“顺手”上送容器序列。
+    containers_authorized: bool,
 ) -> (DiscoveryHealth, fact_summary::FactSummaryDraft) {
     // 已经在内存里有快照就不必再读一遍磁盘（那是 1 MB JSON + 解析）：只有首拍（含重启）才恢复。
     // 这里只要一个“有没有”，不要 clone 快照 —— 那叉会变成每拍 1 MB 的内存抖动。
@@ -3898,33 +3983,47 @@ async fn refresh_discovery_snapshot(
             .refresh_due_and_store_async(state_dir, Instant::now())
             .await
     };
-    // 进程候选的生命周期**独立于发现刷新**（否则撤授权不生效）：
+    // 进程 / 容器候选的生命周期**独立于发现刷新**（否则撤授权不生效）：
     //   * 没授权 → **每拍**清掉。候选文件是指标 tick 的唯一依据，若只在发现拍清理，
     //     撤授权后还会继续采到下一次探测（最长 300s）—— 违反「撤授权 / 暂停 = 立即停采」；
-    //   * 有授权但文件不在（重启、上次停采被清）→ 立刻重建，否则最坏 300s 没有进程指标。
+    //   * 有授权但文件不在（重启、上次停采被清）→ 立刻重建，否则最坏 300s 没有指标。
     //
-    // 注意：只删文件还不够 —— `metrics_target_view.json` 里还列着那批进程目标，指标 tick
+    // 注意：只删文件还不够 —— `metrics_target_view.json` 里还列着那批目标，指标 tick
     // 读的是视图。所以“候选变了”必须同一拍把视图也重建掉。
     let process_candidates_path = planner_candidates::process_metrics_path_for(state_dir);
-    let process_candidates_changed = match process_candidates_action(
+    let process_candidates_changed = match planner_candidates_action(
         key_process.is_some(),
         result.changed,
         process_candidates_path.exists(),
     ) {
-        ProcessCandidatesAction::Keep => false,
-        ProcessCandidatesAction::Remove => {
+        PlannerCandidatesAction::Keep => false,
+        PlannerCandidatesAction::Remove => {
             let _ = tokio::fs::remove_file(&process_candidates_path).await;
             // 视图里还列着那批进程目标，必须同拍重建（否则删了文件也照旧采）。
             true
         }
-        ProcessCandidatesAction::Rebuild => true,
+        PlannerCandidatesAction::Rebuild => true,
+    };
+    // 容器候选同一套规则：没授权就不该有“顺手采到的容器指标”。
+    let container_candidates_path = planner_candidates::container_metrics_path_for(state_dir);
+    let container_candidates_changed = match planner_candidates_action(
+        containers_authorized,
+        result.changed,
+        container_candidates_path.exists(),
+    ) {
+        PlannerCandidatesAction::Keep => false,
+        PlannerCandidatesAction::Remove => {
+            let _ = tokio::fs::remove_file(&container_candidates_path).await;
+            true
+        }
+        PlannerCandidatesAction::Rebuild => true,
     };
 
     // 没有探针跑过、且进程候选没变的那一拍：planner 候选与指标目标视图都是快照的纯函数，
     // 不可能变 —— 不再重算、不再重写（之前这里是 1.5 MB/3s）。
     // 关键进程的“为什么没目标”要随视图传给指标 tick（采集记账在那里）。
     let mut process_selection_error: Option<String> = None;
-    if result.changed || process_candidates_changed {
+    if result.changed || process_candidates_changed || container_candidates_changed {
         let candidates = planner_bridge::build_collection_candidates(&result.persisted_snapshot);
         let host_candidates: Vec<_> = candidates
             .iter()
@@ -3959,11 +4058,20 @@ async fn refresh_discovery_snapshot(
             }
             None => Vec::new(),
         };
-        let container_candidates: Vec<_> = candidates
-            .iter()
-            .filter(|candidate| candidate.collection_kind == "container_metrics")
-            .cloned()
-            .collect();
+        // 容器指标：**只看授权**（`ContainerMetrics` 单元）。没授权就不产出候选，
+        // 与关键进程同一条纪律（默认不做）。
+        let container_candidates: Vec<_> = if containers_authorized {
+            candidates
+                .iter()
+                .filter(|candidate| candidate.collection_kind == "container_metrics")
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // 「看见了容器运行时，但读不了」：同一形状的第二条链路（见 `process_selection_error`）。
+        // 本机说不出原因 = 本来就没容器（空集），那时不写（`None`）。
+        let container_scan_error = container_scan_error_from(&result.unobserved);
         let planner_store_result: io::Result<()> = async {
             planner_candidates::store_async(
                 &planner_candidates::host_metrics_path_for(state_dir),
@@ -3974,11 +4082,14 @@ async fn refresh_discovery_snapshot(
                 planner_candidates::store_async(&process_candidates_path, &process_candidates)
                     .await?;
             }
-            planner_candidates::store_async(
-                &planner_candidates::container_metrics_path_for(state_dir),
-                &container_candidates,
-            )
-            .await
+            if containers_authorized {
+                planner_candidates::store_async(
+                    &planner_candidates::container_metrics_path_for(state_dir),
+                    &container_candidates,
+                )
+                .await?;
+            }
+            Ok(())
         }
         .await;
         if let Err(err) = planner_store_result {
@@ -3997,6 +4108,8 @@ async fn refresh_discovery_snapshot(
                 // 把“为什么没有进程目标”带下去（授权了但一条签名都没命中）。
                 // 采集记账在指标 tick，它只看这个文件能拿到结论。
                 view.process_selection_error = process_selection_error.clone();
+                // 容器域同理：零目标 + 本机说得出原因 = 「该采而采不了」。
+                view.container_scan_error = container_scan_error.clone();
                 target_view::store_async(&target_view::path_for(state_dir), &view).await
             }
             .await;
@@ -4271,20 +4384,90 @@ mod tests {
     use crate::telemetry::warp_parse::{FileRecordSink, TcpFraming, TcpRecordSink};
     use wist_api::uplink::AgentUplinkGrant;
 
-    /// 进程候选文件的生命周期：四个组合都要钉住（这是“撤授权 / 重启”两个方向的正确性）。
+    /// 策展候选文件（进程 / 容器）的生命周期：五个组合都要钉住
+    /// （这是“撤授权 / 重启”两个方向的正确性，两个域共用同一套规则）。
     #[test]
-    fn process_candidates_lifecycle_covers_revoke_and_restart() {
-        use ProcessCandidatesAction::{Keep, Rebuild, Remove};
+    fn planner_candidates_lifecycle_covers_revoke_and_restart() {
+        use PlannerCandidatesAction::{Keep, Rebuild, Remove};
         // 没授权：文件在就必须删 —— 候选是指标 tick 的唯一依据，不删就是撤授权后继续采。
-        assert_eq!(process_candidates_action(false, false, true), Remove);
+        assert_eq!(planner_candidates_action(false, false, true), Remove);
         // 没授权且本来就没文件：不动（免得每拍一次无谓的 remove）。
-        assert_eq!(process_candidates_action(false, false, false), Keep);
+        assert_eq!(planner_candidates_action(false, false, false), Keep);
         // 授权了 + 发现快照刚刷新：重建。
-        assert_eq!(process_candidates_action(true, true, true), Rebuild);
+        assert_eq!(planner_candidates_action(true, true, true), Rebuild);
         // 授权了但文件不在（重启 / 上次停采被清）：立刻重建，不等下一次探测。
-        assert_eq!(process_candidates_action(true, false, false), Rebuild);
+        assert_eq!(planner_candidates_action(true, false, false), Rebuild);
         // 授权了、快照没变、文件还在：不动。
-        assert_eq!(process_candidates_action(true, false, true), Keep);
+        assert_eq!(planner_candidates_action(true, false, true), Keep);
+    }
+
+    /// 「容器运行时看不见」的文案：要带 location（该去查哪里），不是一句笼统的失败。
+    ///
+    /// 这条是**用户可见的那句话** —— 发现拍算出来的结论只在 agent 日志里，
+    /// 管理面看到的就是它折出来的这个字符串。
+    #[test]
+    fn a_container_scan_error_names_the_location_and_the_reason() {
+        let unobserved = vec![crate::discovery::UnobservedSource {
+            subject: crate::discovery::container::UNOBSERVED_SUBJECT.to_string(),
+            location: "/run/containerd".to_string(),
+            detail: "权限不足".to_string(),
+        }];
+        let message = container_scan_error_from(&unobserved).expect("应折出一条原因");
+        assert!(message.contains("/run/containerd"), "{message}");
+        assert!(message.contains("权限不足"), "{message}");
+    }
+
+    /// 别的「看不见」不能冒充容器原因；什么都没报 = 空集（本机没容器），不是故障。
+    #[test]
+    fn only_the_container_subject_becomes_a_container_scan_error() {
+        assert!(container_scan_error_from(&[]).is_none());
+
+        let unrelated = vec![crate::discovery::UnobservedSource {
+            subject: "network".to_string(),
+            location: "/sys/class/net".to_string(),
+            detail: "读不到".to_string(),
+        }];
+        assert!(
+            container_scan_error_from(&unrelated).is_none(),
+            "非容器主体的看不见记录不能被当成容器原因"
+        );
+    }
+
+    /// 策略 → `exporters` 的映射：空目录表要变成 `None`（用内置表）。
+    ///
+    /// 这条钉住一个容易写错的边界：下发了一份“没有目录”的表，解析不能退化成不搜任何目录。
+    #[test]
+    fn an_empty_exporter_policy_means_the_builtin_table() {
+        use crate::control::exporter_policy::{ExporterOverride, ExporterPolicy};
+
+        let (dirs, overrides) = policy_to_apply(None);
+        assert!(dirs.is_none() && overrides.is_empty());
+
+        let empty_dirs = ExporterPolicy {
+            exporters_version: 1,
+            platform: "linux".to_string(),
+            bin_dirs: Vec::new(),
+            exporters: vec![ExporterOverride {
+                id: "dmesg".to_string(),
+                period_secs: Some(120),
+                timeout_secs: None,
+            }],
+            fetched_at: String::new(),
+        };
+        let (dirs, overrides) = policy_to_apply(Some(&empty_dirs));
+        assert!(dirs.is_none(), "空目录表 = 内置表");
+        // 目录为空不代表覆盖也丢了：两者是独立的。
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].0, "dmesg");
+
+        let with_dirs = ExporterPolicy {
+            bin_dirs: vec!["/bin".to_string()],
+            exporters: Vec::new(),
+            ..empty_dirs
+        };
+        let (dirs, overrides) = policy_to_apply(Some(&with_dirs));
+        assert_eq!(dirs, Some(vec!["/bin".to_string()]));
+        assert!(overrides.is_empty());
     }
 
     #[test]

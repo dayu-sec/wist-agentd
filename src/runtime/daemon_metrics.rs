@@ -794,6 +794,7 @@ mod tests {
                 },
             ],
             process_selection_error: None,
+            container_scan_error: None,
         };
         store(&target_view_path_for(&state_dir), &view).expect("store target view");
 

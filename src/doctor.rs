@@ -1306,21 +1306,36 @@ fn flows_check_at(path: &Path) -> Check {
 
 fn exporter_tool_checks(config: &AgentConfig) -> Vec<Check> {
     let state_dir = PathBuf::from(&config.paths.state_dir);
-    let missing = crate::telemetry::exporters::load_state(&state_dir).missing;
-    if missing.is_empty() {
-        return Vec::new();
+    let state = crate::telemetry::exporters::load_state(&state_dir);
+    let mut checks = Vec::new();
+    // 解析到了哪个路径：排障时最有用的那一行（usrmerge 的机器上 `/usr/bin` 与 `/bin` 都可能命中，
+    // 值得知道实际用的是哪个；换发行版 / 容器镜像后这行会变）。
+    if !state.resolved.is_empty() {
+        let detail = state
+            .resolved
+            .iter()
+            .map(|(id, path)| format!("{id} → {path}"))
+            .collect::<Vec<_>>()
+            .join("、");
+        checks.push(Check::ok("exporter.resolved", "导出器二进制位置", detail));
     }
-    let detail = missing
+    if state.missing.is_empty() {
+        return checks;
+    }
+    let detail = state
+        .missing
         .iter()
         .map(|(id, path)| format!("{id}（{path}）"))
         .collect::<Vec<_>>()
         .join("、");
-    vec![
+    checks.push(
         Check::warn("exporter.tools", "导出器工具缺失", detail).hint(
             "对应采集面今天采不到；装上工具后守护进程会自动恢复\
-             （如 apt-get install smartmontools / auditd）",
+             （如 apt-get install smartmontools / auditd）。\
+             如果工具其实装了，看它是不是在非标准目录（`exporter.resolved` 那行会显示实际找的位置）",
         ),
-    ]
+    );
+    checks
 }
 
 /// 控制面连通：DNS → TCP → 应用层（TLS + 鉴权）。
@@ -3139,6 +3154,43 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    /// 实际解析到的路径要能看见：换发行版 / 容器镜像后，“它到底找了哪里”就在这一行。
+    #[test]
+    fn resolved_exporter_paths_are_reported() {
+        let dir =
+            std::env::temp_dir().join(format!("wist-doctor-exp-resolved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mut recorded = crate::telemetry::exporters::ExporterState::default();
+        recorded
+            .resolved
+            .insert("dmesg".to_string(), "/bin/dmesg".to_string());
+        crate::telemetry::exporters::save_state(&dir, &recorded);
+
+        let mut config = template_config();
+        config.paths.state_dir = dir.display().to_string();
+        let checks = exporter_tool_checks(&config);
+        assert_eq!(checks.len(), 1, "只有 resolved，不该有缺件告警");
+        assert_eq!(checks[0].status, Status::Ok);
+        assert_eq!(checks[0].id, "exporter.resolved");
+        assert!(
+            checks[0].detail.contains("dmesg → /bin/dmesg"),
+            "{}",
+            checks[0].detail
+        );
+
+        // 两份都在时：先报位置（ok），再报缺件（warn）—— 顺序固定，便于人扫一眼。
+        recorded
+            .missing
+            .insert("smartctl".to_string(), "/usr/sbin/smartctl".to_string());
+        crate::telemetry::exporters::save_state(&dir, &recorded);
+        let checks = exporter_tool_checks(&config);
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[0].id, "exporter.resolved");
+        assert_eq!(checks[1].status, Status::Warn);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

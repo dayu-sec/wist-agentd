@@ -36,7 +36,14 @@
 `missing_tool` / `missing_dependency` / `source_not_ready` / `target_not_ready` /
 `permission` / `missing_input` / `run_failed` / `unsupported` / `truncated` /
 `invalid_spec` / `no_units` / `no_content` / `incomplete_data` / `paused` /
-`standby` / `metric_partial`
+`standby` / `metric_partial` / `no_targets`
+
+`no_targets`（信息级，不参与判定）与 `target_not_ready` 的分界：
+
+- `target_not_ready` = **该采而采不了**：有目标但没有可判定结果（首轮未完成），
+  或者有目标却一个都没选出来 / 载体读不到 —— 后者 agentd 一定带得出 `detail`；
+- `no_targets` = **本来就没有**：这个采集域本轮零目标，而且本机也说不出原因
+  （典型：这台机器上没跑容器）。它不是阻塞项，不得把面拉成 `partial`。
 
 ## 2. 判定顺序（agentd `CollectionHealth::assess`）
 
@@ -47,6 +54,7 @@
 5. 汇总本 tick 证据：
    - **硬失败**：文件不存在 / 权限不足 / 未支持单元 / 导出器**运行**失败 / 指标域全部失败；
    - **阻塞**：导出器工具缺失（`blocked`）、指标目标未就绪（`blocked` + `pending`）；
+     指标域零目标且本机无原因时只记 `no_targets`（信息级，不进阻塞）
    - **软问题**：行截断、记录不完整、指标 tick 级失败、指标部分目标失败，以及**持续追不平**
      （连续 ≥3 拍把这条输入那份预算吃掉、却仍没读到文件尾：写比读快，见
      `daemon_telemetry.rs::saturated_without_catching_up`）；
@@ -68,6 +76,7 @@
 | 日志文件很安静 | `success` | 没有失败 ≠ 没有新数据 |
 | 过滤 / 降噪命中 | `success` | 主动不采 |
 | 行被截断 / 记录不完整 | `partial` + reason `truncated`/`incomplete_data` | 软缺陷，不判 failure |
+| 指标域本轮零目标（如机器没跑容器） | 不阻塞：还有健康内容 → `success`，否则 `pending`；reason `no_targets` | 空集，不是「待就绪」更不是失败 |
 | 轮转 / 停机后的补读（连续不足 3 拍） | `success` | 追赶是正常态；连续 ≥3 拍才报 `incomplete_data` |
 | **导出器工具未安装**（如 `smartctl`） | `prerequisites=blocked`、`result=cancelled`、reason `missing_tool` | 装上即自动恢复 |
 | 发现层目标未产出 | `prerequisites=blocked`、`result=pending`、reason `target_not_ready` | 等自动条件 |

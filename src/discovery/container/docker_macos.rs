@@ -41,19 +41,36 @@ pub(crate) struct DockerPort {
     pub container_port: u16,
 }
 
-/// 列一遍正在跑的容器。
+/// 一轮 macOS 容器扫描的结果。
 ///
-/// 返回 `None` = 这台机器没有可用的 Docker socket（没装 / 没起）。
-/// 调用方把它当「没有容器」，不是错误 —— 探针不该因为机器上没 Docker 就报失败。
-pub(crate) fn list_containers() -> Option<Vec<DockerContainer>> {
+/// 三种状态必须分开：没有 socket（没装 / 没起）→ 空集之外无结论；
+/// socket 在且答了 → “**真的**只有这些容器”（空表 = 确实没有）；
+/// socket 在但连不上 / 答不了 → 看不见（不能当成没容器）。
+pub(crate) enum MacContainerScan {
+    NoRuntime,
+    Observed(Vec<DockerContainer>),
+    Unreadable { socket: PathBuf, detail: String },
+}
+
+/// 列一遍正在跑的容器（带「看不见」的区分，见 [`MacContainerScan`]）。
+pub(crate) fn scan_containers() -> MacContainerScan {
+    let mut unreadable: Option<(PathBuf, String)> = None;
     for socket in socket_paths() {
         if !socket.exists() {
             continue;
         }
         let Some(raw) = request(&socket, "/containers/json") else {
+            unreadable = Some((
+                socket.clone(),
+                "Docker socket 无法连接或无响应（运行时正在启动 / 权限不够）".to_string(),
+            ));
             continue;
         };
         let Some((headers, body)) = split_response(&raw) else {
+            unreadable = Some((
+                socket.clone(),
+                "Docker 响应头不完整（无法解析）".to_string(),
+            ));
             continue;
         };
         let body = if header_has(&headers, "transfer-encoding", "chunked") {
@@ -61,11 +78,21 @@ pub(crate) fn list_containers() -> Option<Vec<DockerContainer>> {
         } else {
             body.to_vec()
         };
-        if let Ok(containers) = parse_containers(&body) {
-            return Some(containers);
+        match parse_containers(&body) {
+            Ok(containers) => return MacContainerScan::Observed(containers),
+            Err(err) => {
+                unreadable = Some((
+                    socket.clone(),
+                    format!("Docker /containers/json 响应无法解析：{err}"),
+                ));
+            }
         }
     }
-    None
+
+    match unreadable {
+        Some((socket, detail)) => MacContainerScan::Unreadable { socket, detail },
+        None => MacContainerScan::NoRuntime,
+    }
 }
 
 /// 候选 socket：先看 `DOCKER_HOST`，再看各运行时的约定位置。

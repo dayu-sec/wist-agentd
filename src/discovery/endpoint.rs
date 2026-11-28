@@ -86,6 +86,7 @@ impl DiscoveryProbe for EndpointDiscoveryProbe {
             },
             resources,
             targets,
+            unobserved: Vec::new(),
         })
     }
 }

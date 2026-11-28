@@ -1267,6 +1267,7 @@ mod tests {
             generated_at: "2026-11-05T00:00:00Z".to_string(),
             targets: Vec::new(),
             process_selection_error: None,
+            container_scan_error: None,
         }
     }
 

@@ -284,6 +284,9 @@ impl DiscoveryRuntime {
         let mut origins = Vec::new();
         let mut errors = Vec::new();
         let mut successful_probes = Vec::new();
+        // 各探针（含未到期、沿用缓存的那部分）报的「看见了但读不了」：
+        // 快照是各探针输出**重拼**出来的，这些记录也是输出的一部分，所以同样要跨拍保留。
+        let mut unobserved = Vec::new();
 
         // 到期判定与周期解析都是纯规则（`schedule`），这里只负责执行。
         let due = self.plan_refresh(due_at);
@@ -357,6 +360,7 @@ impl DiscoveryRuntime {
                     origins.push(output.origin);
                     resources.extend(output.resources);
                     targets.extend(output.targets);
+                    unobserved.extend(output.unobserved);
                 }
                 Err(err) => errors.push(err),
             }
@@ -368,10 +372,12 @@ impl DiscoveryRuntime {
             origins,
             errors,
             successful_probes,
+            unobserved,
             refreshed_any,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn compose_snapshot(
         &mut self,
         resources: Vec<DiscoveredResource>,
@@ -379,6 +385,7 @@ impl DiscoveryRuntime {
         origins: Vec<DiscoveryOrigin>,
         errors: Vec<DiscoveryError>,
         successful_probes: Vec<SuccessfulProbeRefresh>,
+        unobserved: Vec<super::UnobservedSource>,
         refreshed_any: bool,
     ) -> DiscoveryRefreshResult {
         let previous_snapshot = self.latest_snapshot.clone();
@@ -429,6 +436,7 @@ impl DiscoveryRuntime {
             used_cached_snapshot: !has_successful_probe_output && previous_snapshot.is_some(),
             had_successful_refresh: has_successful_probe_output,
             successful_probes,
+            unobserved,
             store_failure: None,
             // 只有真的跑过探针，内容才可能变；调用方据此跳过落盘与派生文件重写。
             changed: refreshed_any,
@@ -447,6 +455,11 @@ pub struct DiscoveryRefreshResult {
     pub used_cached_snapshot: bool,
     pub had_successful_refresh: bool,
     pub successful_probes: Vec<SuccessfulProbeRefresh>,
+    /// 本轮快照实际用到的各探针输出里的「看不见」记录（含未到期、沿用缓存的那部分）。
+    ///
+    /// 采集记账靠它把「该采而采不了」与「本来就没有」分开：前者必须报出来，
+    /// 后者是空集（见 `runtime/collection_health.rs`）。
+    pub unobserved: Vec<super::UnobservedSource>,
     pub store_failure: Option<DiscoveryStoreFailure>,
     /// 这一拍有没有真的跑过探针。`false` = 没有任何探针到期，快照内容与上一份相同，
     /// 于是 `generated_at`/`revision` 不前进、也不需要落盘。
@@ -491,7 +504,7 @@ mod tests {
     use wist_contracts::discovery::{DiscoveredResource, DiscoveryOrigin, DiscoverySnapshot};
     use wist_contracts::discovery_policy::{DiscoveryAspectPolicy, DiscoveryAspectPolicySet};
 
-    use crate::discovery::{DiscoveryError, DiscoverySourceKind, ProbeOutput};
+    use crate::discovery::{DiscoveryError, DiscoverySourceKind, ProbeOutput, UnobservedSource};
 
     use super::{DiscoveryCachePaths, DiscoveryRuntime};
 
@@ -530,6 +543,41 @@ mod tests {
         dir
     }
 
+    /// 探针报的「看不见」要随刷新结果带出去 —— 采集记账靠它把「该采而采不了」
+    /// 与「本来就没有」分开（前者必须报，后者是空集）。
+    #[test]
+    fn refresh_all_carries_unobserved_sources() {
+        let output = ProbeOutput {
+            probe: "container".to_string(),
+            source: DiscoverySourceKind::LocalRuntime,
+            refreshed_at: "2026-11-28T00:00:00Z".to_string(),
+            origin: DiscoveryOrigin {
+                origin_id: "origin-container".to_string(),
+                probe: "container".to_string(),
+                source: "local_runtime".to_string(),
+                observed_at: "2026-11-28T00:00:00Z".to_string(),
+            },
+            resources: Vec::new(),
+            targets: Vec::new(),
+            unobserved: vec![UnobservedSource {
+                subject: "container_runtime".to_string(),
+                location: "/run/containerd".to_string(),
+                detail: "权限不足".to_string(),
+            }],
+        };
+
+        let mut runtime = DiscoveryRuntime::new(vec![Box::new(StubProbe {
+            name: "container",
+            source: DiscoverySourceKind::LocalRuntime,
+            output: Ok(output),
+        })]);
+
+        let result = runtime.refresh_all();
+        assert_eq!(result.unobserved.len(), 1, "{:?}", result.unobserved);
+        assert_eq!(result.unobserved[0].subject, "container_runtime");
+        assert_eq!(result.unobserved[0].location, "/run/containerd");
+    }
+
     #[test]
     fn refresh_all_collects_probe_outputs_and_advances_revision() {
         let output = ProbeOutput {
@@ -553,6 +601,7 @@ mod tests {
                 source: "local_runtime".to_string(),
             }],
             targets: Vec::new(),
+            unobserved: Vec::new(),
         };
 
         let mut runtime = DiscoveryRuntime::new(vec![Box::new(StubProbe {
@@ -597,6 +646,7 @@ mod tests {
                 source: "local_runtime".to_string(),
             }],
             targets: Vec::new(),
+            unobserved: Vec::new(),
         };
 
         let mut runtime = DiscoveryRuntime::new(vec![
@@ -699,10 +749,14 @@ mod tests {
     // 在此之前各探针声明的 `refresh_interval()` 是死代码：运行时每 tick 把所有探针全刷一遍。
 
     /// 自带周期与调用计数的探针。每次调用输出一个以探针名命名的资源，便于断言资源是否还在快照里。
+    ///
+    /// `unobserved` 由构造器给：用来验「未到期沿用缓存」的那一拍有没有把
+    /// 「看见了但读不了」一起带过去。
     struct IntervalProbe {
         name: &'static str,
         interval: Duration,
         calls: Arc<AtomicUsize>,
+        unobserved: Vec<UnobservedSource>,
     }
 
     impl crate::discovery::DiscoveryProbe for IntervalProbe {
@@ -741,6 +795,7 @@ mod tests {
                     source: self.name.to_string(),
                 }],
                 targets: Vec::new(),
+                unobserved: self.unobserved.clone(),
             })
         }
     }
@@ -752,12 +807,25 @@ mod tests {
         Box<dyn crate::discovery::DiscoveryProbe + Send + Sync>,
         Arc<AtomicUsize>,
     ) {
+        interval_probe_with_unobserved(name, interval, Vec::new())
+    }
+
+    /// 同上，但每次输出都带一组固定的 `unobserved`。
+    fn interval_probe_with_unobserved(
+        name: &'static str,
+        interval: Duration,
+        unobserved: Vec<UnobservedSource>,
+    ) -> (
+        Box<dyn crate::discovery::DiscoveryProbe + Send + Sync>,
+        Arc<AtomicUsize>,
+    ) {
         let calls = Arc::new(AtomicUsize::new(0));
         (
             Box::new(IntervalProbe {
                 name,
                 interval,
                 calls: Arc::clone(&calls),
+                unobserved,
             }),
             calls,
         )
@@ -813,6 +881,7 @@ mod tests {
                     source: self.name.to_string(),
                 }],
                 targets: Vec::new(),
+                unobserved: Vec::new(),
             })
         }
     }
@@ -980,6 +1049,41 @@ mod tests {
         assert_eq!(fast_calls.load(Ordering::SeqCst), 3);
         assert_eq!(slow_calls.load(Ordering::SeqCst), 2);
         assert_eq!(resource_ids(&runtime), vec!["fast-1", "slow-1"]);
+    }
+
+    /// 「看不见」也是探针输出的一部分：未到期、沿用缓存的那一拍同样要把它带出去。
+    ///
+    /// 漏了这一步的后果不是“少一行日志”，而是**发现周期一拉长，管理面就会在两次发现之间
+    /// 把「容器读不了」退化成「本机没有容器」** —— 前者要报故障，后者是空集。
+    #[test]
+    fn refresh_due_keeps_unobserved_from_the_cached_output() {
+        let (probe, calls) = interval_probe_with_unobserved(
+            "container",
+            Duration::from_secs(3600),
+            vec![UnobservedSource {
+                subject: "container_runtime".to_string(),
+                location: "/run/containerd".to_string(),
+                detail: "权限不足".to_string(),
+            }],
+        );
+        let mut runtime = DiscoveryRuntime::new(vec![probe]);
+        let t0 = Instant::now();
+
+        let first = runtime.refresh_due(t0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first.unobserved.len(), 1, "{:?}", first.unobserved);
+        assert_eq!(first.unobserved[0].subject, "container_runtime");
+
+        // 未到期：探针不再跑，但「读不了」这条结论跟着缓存一起留在结果里。
+        let second = runtime.refresh_due(t0 + Duration::from_secs(1));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "未到期不该重跑探针");
+        assert_eq!(
+            second.unobserved.len(),
+            1,
+            "沿用缓存输出时也必须带上 unobserved: {:?}",
+            second.unobserved
+        );
+        assert_eq!(second.unobserved[0].location, "/run/containerd");
     }
 
     #[test]

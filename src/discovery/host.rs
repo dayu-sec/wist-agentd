@@ -80,6 +80,7 @@ impl DiscoveryProbe for HostDiscoveryProbe {
                 execution_hints: BTreeMap::from([("host.name".to_string(), host_name.clone())]),
                 state: "active".to_string(),
             }],
+            unobserved: Vec::new(),
         })
     }
 }

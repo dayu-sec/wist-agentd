@@ -116,6 +116,16 @@ pub(crate) fn is_doris_cluster_source(kind: &str, target: &str) -> bool {
     is_self_discovered_source(CollectionSourceKind::DorisCluster, kind, target)
 }
 
+/// 容器指标来源的 `kind`。
+///
+/// `target` 只认 `auto`：采哪些容器来自本机发现（运行时根目录 / Docker socket），
+/// 平台指定不出来。
+pub(crate) const CONTAINER_METRICS_SOURCE_KIND: &str =
+    CollectionSourceKind::ContainerMetrics.as_str();
+pub(crate) fn is_container_metrics_source(kind: &str, target: &str) -> bool {
+    is_self_discovered_source(CollectionSourceKind::ContainerMetrics, kind, target)
+}
+
 /// 工作里没写清指标周期时的上送间隔（与采集目录里 `MetricInterval` 的策展值同值）。
 ///
 /// 为什么要有默认：`collect_metrics` 单元理论上都带一条 `MetricInterval` 来源，
@@ -291,6 +301,26 @@ pub struct AppliedWorkGrant {
 }
 
 impl AppliedWorkGrant {
+    /// 容器指标是否被授权（任何一个在干活的 `collect_metrics` 单元带 `ContainerMetrics/auto`）。
+    ///
+    /// 与 [`Self::key_process_grant`] 同一个形状：**授权只说“采不采”**，
+    /// 采哪些容器仍由本机发现（运行时根目录 / Docker socket）判定。
+    ///
+    /// 为什么要它：在这之前容器目标是无条件产出的 —— 一台从没授过这个面的机器也会
+    /// “顺手”上送容器序列，违反「没有授权就没有采集」。
+    pub fn container_metrics_authorized(&self) -> bool {
+        self.works.values().any(|work| {
+            work.is_working()
+                && work.spec.as_ref().is_some_and(|spec| {
+                    spec.units
+                        .iter()
+                        .filter(|unit| unit.capability == "collect_metrics")
+                        .flat_map(|unit| unit.sources.iter())
+                        .any(|source| is_container_metrics_source(&source.kind, &source.target))
+                })
+        })
+    }
+
     pub fn sequence(&self) -> i64 {
         self.sequence
     }
@@ -994,6 +1024,7 @@ impl AppliedWorkGrant {
                         || is_mysql_instance_source(&source.kind, &source.target)
                         || is_pg_instance_source(&source.kind, &source.target)
                         || is_doris_cluster_source(&source.kind, &source.target)
+                        || is_container_metrics_source(&source.kind, &source.target)
                         || is_key_process_source(&source.kind, &source.target)
                     {
                         continue;
@@ -1120,6 +1151,12 @@ fn unsupported_reason(source: &WorkSpecSource) -> String {
         DORIS_CLUSTER_SOURCE_KIND => format!(
             "DorisCluster target {:?} is not supported on this agent \
              (only `auto`: the FE is self-discovered on this host)",
+            source.target
+        ),
+        // 容器指标：同上，采哪些容器是本机发现的事实。
+        CONTAINER_METRICS_SOURCE_KIND => format!(
+            "ContainerMetrics target {:?} is not supported on this agent \
+             (only `auto`: containers are discovered on this host)",
             source.target
         ),
         // 主机流记录：`auto` 已在上面的可执行判定里放过，走到这里只能是写死了网卡名。
@@ -1484,6 +1521,107 @@ mod tests {
         );
         // 采多密只有一个真相：`metrics_interval()`。
         assert_eq!(applied.metrics_interval(), Some(Duration::from_secs(30)));
+    }
+
+    /// 容器指标：**只看授权**（`ContainerMetrics` 单元）。没授权就不该产容器目标 ——
+    /// 否则一台从没授过这个面的机器会“顺手”上送容器序列。
+    #[test]
+    fn container_metrics_are_collected_only_when_the_face_is_granted() {
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![
+                standing(
+                    "w-host",
+                    "HostMetrics",
+                    1,
+                    "active",
+                    &spec(&[("host", "collect_metrics", "MetricInterval:15s")]),
+                ),
+                standing(
+                    "w-container",
+                    "ContainerMetrics",
+                    1,
+                    "paused",
+                    &spec(&[
+                        ("ctr", "collect_metrics", "ContainerMetrics:auto"),
+                        ("interval", "collect_metrics", "MetricInterval:15s"),
+                    ]),
+                ),
+            ],
+        ));
+        // 只有主机指标在工作：暂停的容器面不授权采集。
+        assert!(!applied.container_metrics_authorized());
+
+        // 容器面真正在干活时才授权。
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            2,
+            vec![standing(
+                "w-container",
+                "ContainerMetrics",
+                1,
+                "active",
+                &spec(&[
+                    ("ctr", "collect_metrics", "ContainerMetrics:auto"),
+                    ("interval", "collect_metrics", "MetricInterval:15s"),
+                ]),
+            )],
+        ));
+        assert!(applied.container_metrics_authorized());
+        // 认得这个来源，不该报 unsupported（否则会被当成“采集端接不了”）。
+        assert!(
+            applied.unsupported_units().is_empty(),
+            "{:?}",
+            applied.unsupported_units()
+        );
+    }
+
+    /// 主机指标面**不**授权容器采集：容器域只属于 `ContainerMetrics` 面的单元。
+    ///
+    /// 这条钉住 Phase 3 的分面：`HostMetrics` 的单元只带 `MetricInterval`，拿它推不出任何
+    /// 域声明，更不可能是容器 —— 以前容器目标是无条件产出的，现在只看这个面。
+    #[test]
+    fn a_host_metrics_grant_does_not_authorize_containers() {
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![standing(
+                "w-host",
+                "HostMetrics",
+                1,
+                "active",
+                &spec(&[("host", "collect_metrics", "MetricInterval:15s")]),
+            )],
+        ));
+        assert!(!applied.container_metrics_authorized());
+        // 也不能凭空声明一个容器域（agentd 侧记账同样只看来源）。
+        assert!(applied.key_process_grant().is_none());
+    }
+
+    /// 写死了容器 id / 路径的授权不算数：采哪些容器只有本机能定。
+    #[test]
+    fn container_metrics_with_a_hand_written_target_is_not_a_grant() {
+        let mut applied = AppliedWorkGrant::default();
+        applied.apply(&grant(
+            1,
+            vec![standing(
+                "w-container",
+                "ContainerMetrics",
+                1,
+                "active",
+                &spec(&[("ctr", "collect_metrics", "ContainerMetrics:abc123")]),
+            )],
+        ));
+
+        assert!(!applied.container_metrics_authorized());
+        // 但要如实报出来，不能当没看见。
+        assert_eq!(
+            applied.unsupported_units().len(),
+            1,
+            "{:?}",
+            applied.unsupported_units()
+        );
     }
 
     /// **单元只带签名、没有 `MetricInterval`** 时仍然上送（走内建默认 15s），

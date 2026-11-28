@@ -29,7 +29,7 @@ use super::telemetry_support::{
 };
 use crate::control::work::{AppliedWorkGrant, UnsupportedUnit, WorkExporterRun, WorkFlowGrant};
 use crate::state_store::work::StandingWorkRecord;
-use wist_contracts::work::CollectionSourceKind;
+use wist_contracts::work::{CollectionSourceKind, WorkSpecUnit};
 
 /// 每个常驻工作（采集面）最近一轮的采集结果。
 #[derive(Debug, Clone, Default)]
@@ -165,18 +165,34 @@ fn severity(kind: &TelemetryFailureKind) -> Severity {
     }
 }
 
-/// 面 → 指标采集域。命名空间跟着源系统，不跟着面：一个面可能覆盖多个域。
-fn metric_domains(family: &str) -> &'static [&'static str] {
-    match family {
-        // `process_metrics` **不在这里**：关键进程指标从 0.36 起是独立的面
-        // （`ProcessMetrics`，按签名授权），把它们挂在 HostMetrics 下会让
-        // “只授权了主机指标”的机器误报一个“进程目标未就绪”。
-        "HostMetrics" => &["host_metrics", "container_metrics"],
-        "ProcessMetrics" => &["process_metrics"],
-        "DatabaseMetrics" => &["pg_metrics", "mysql_metrics", "doris_metrics"],
-        "MessageQueueMetrics" => &["kafka_broker_metrics"],
-        _ => &[],
+/// 「无域声明的纯周期指标单元 = 主机指标」时用的域。
+///
+/// 为什么只有它走特例：主机指标是唯一**纯定时、没有目标选择**的域（`MetricInterval` 就是
+/// 它的全部采集输入）；别的域都必须用自己的来源 kind 声明（`KeyProcessMetrics` /
+/// `ContainerMetrics` / 各外部系统）。把 `MetricInterval` 直接映成 `host_metrics` 不行 ——
+/// 它出现在每个指标单元里（进程/容器的单元同时带它），那会把同一个面推出好几个域。
+const PERIODIC_ONLY_DOMAIN: &str = "host_metrics";
+
+/// 一个指标单元声明了哪些采集域（见 [`CollectionSourceKind::metric_domain`]）。
+///
+/// **域只看来源，不看面名**：面名是策展概念，拿它查表会让“面里藏着一个域”这种错
+/// 在运行时被放大成假失败（零目标 → 待就绪），也会让面名写错时域信号静默消失。
+fn unit_metric_domains(unit: &WorkSpecUnit) -> Vec<&'static str> {
+    let mut declared: Vec<&'static str> = unit
+        .sources
+        .iter()
+        .filter_map(|source| CollectionSourceKind::parse(&source.kind)?.metric_domain())
+        .collect();
+    // 没有任何域声明、只有周期来源：那就是主机指标的采集单元。
+    if declared.is_empty()
+        && unit
+            .sources
+            .iter()
+            .any(|source| source.kind == CollectionSourceKind::MetricInterval.as_str())
+    {
+        declared.push(PERIODIC_ONLY_DOMAIN);
     }
+    declared
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -344,23 +360,17 @@ fn assess(
         .len()
         .saturating_sub(exporter_failed_ids.len() + exporter_blocked_ids.len());
 
-    // 指标：只看这个面真有的域；快照里没有的域 = 没授权（不是「未知」）。
+    // 指标：只看这些单元**声明**了的域（面名不参与）。
     let has_metrics_units = standing
         .units
         .iter()
         .any(|unit| unit.capability == "collect_metrics");
-    // 面名是**策展约定**：万一有人把 `KeyProcessMetrics` 单元挂在别的面下（如 HostMetrics），
-    // 按面名查表会让进程域的信号**静默消失**（不报也不提示）。这里按来源再兜一次。
-    let mut domains: Vec<&'static str> = metric_domains(&standing.family).to_vec();
-    if !domains.contains(&"process_metrics")
-        && standing
-            .units
-            .iter()
-            .flat_map(|unit| unit.sources.iter())
-            .any(|source| source.kind == CollectionSourceKind::KeyProcessMetrics.as_str())
-    {
-        domains.push("process_metrics");
-    }
+    let domains: BTreeSet<&'static str> = standing
+        .units
+        .iter()
+        .filter(|unit| unit.capability == "collect_metrics")
+        .flat_map(unit_metric_domains)
+        .collect();
     let mut metric_healthy = 0usize;
     if has_metrics_units {
         // tick 级失败（目标视图读不到 / 快照落盘失败）不是“采集失败”：快照可能还在用缓存，
@@ -415,7 +425,24 @@ fn assess(
                         ),
                     );
                 }
-                // pending / idle：授权了但还没有可判定的一轮 —— 目标/来源未就绪。
+                // `idle` = 这个域**本轮一个目标都没有**（host / process / container 的 provider
+                // 在目标列表为空时给的就是它）。空集不是故障，也不该算「待就绪」：一台没跑容器
+                // 的机器并不缺什么，把它记成阻塞项只会把整个面降级成「部分失败」。
+                //
+                // 但「没有目标」和「不知道为什么没有目标」是两件事：`last_error` 带着本机算
+                // 出来的原因（关键进程签名一条没命中 / 容器载体读不到）时，那是真问题，
+                // 落到下面那个分支照旧算阻塞项。
+                "idle" if outcome.last_error.is_none() => {
+                    push_reason(
+                        &mut reasons,
+                        reason(
+                            collection_reason_kind::NO_TARGETS,
+                            *domain,
+                            "本机当前没有这一类采集目标（不是采集失败）",
+                        ),
+                    );
+                }
+                // pending / 带原因的 idle：授权了但还没有可判定的一轮 —— 目标/来源未就绪。
                 // `last_error` 带上了“为什么没目标”（如关键进程签名一条都没命中），
                 // 这比一句笼统的“首轮未完成”能让现场直接定位。
                 _ => {
@@ -826,7 +853,20 @@ mod tests {
         AppliedWorkGrant::restore(&record)
     }
 
-    fn metrics_work(family: &str) -> StandingWorkRecord {
+    fn metric_source(kind: &str, target: &str) -> WorkSpecSource {
+        WorkSpecSource {
+            kind: kind.to_string(),
+            target: target.to_string(),
+            multiline: "none".to_string(),
+            exclude_globs: Vec::new(),
+            filters: Default::default(),
+            drop_if_contains: Vec::new(),
+        }
+    }
+
+    /// 指标工作：**来源就是域的声明**（见 `CollectionSourceKind::metric_domain`），
+    /// 所以单元必须带真实的来源，不能空着 —— 空来源的指标单元一个域也不声明。
+    fn metrics_work_with(family: &str, sources: Vec<WorkSpecSource>) -> StandingWorkRecord {
         let mut work = standing(Vec::new());
         work.family = family.to_string();
         work.units = vec![WorkSpecUnit {
@@ -834,9 +874,50 @@ mod tests {
             capability: "collect_metrics".to_string(),
             rule_ref: String::new(),
             requires_privilege: "root".to_string(),
-            sources: Vec::new(),
+            sources,
         }];
         work
+    }
+
+    /// 给一份指标工作再挂一个**声明容器域**的单元（周期 + `ContainerMetrics/auto`）。
+    ///
+    /// 真实目录里容器指标已经是独立的面（`ContainerMetrics`）；这里造“同一份工作里两个单元”
+    /// 是为了直接钩记账规则，不靠具体面名。
+    fn with_container_unit(mut work: StandingWorkRecord) -> StandingWorkRecord {
+        work.units.push(WorkSpecUnit {
+            unit_id: "containers".to_string(),
+            capability: "collect_metrics".to_string(),
+            rule_ref: String::new(),
+            requires_privilege: "root".to_string(),
+            sources: vec![
+                metric_source("MetricInterval", "15s"),
+                metric_source("ContainerMetrics", "auto"),
+            ],
+        });
+        work
+    }
+
+    /// 按面的**真实策展形状**造一份指标工作：
+    /// 主机 = 纯周期；关键进程 = 周期 + 签名；容器 = 周期 + auto；外部系统 = 自探域 auto。
+    fn metrics_work(family: &str) -> StandingWorkRecord {
+        let periodic = metric_source("MetricInterval", "15s");
+        let sources = match family {
+            "HostMetrics" => vec![periodic],
+            "ProcessMetrics" => vec![
+                periodic,
+                metric_source("KeyProcessMetrics", "unit:kafka|port:9092"),
+            ],
+            "ContainerMetrics" => vec![periodic, metric_source("ContainerMetrics", "auto")],
+            "DatabaseMetrics" => vec![
+                metric_source("PostgresInstance", "auto"),
+                metric_source("MysqlInstance", "auto"),
+                metric_source("DorisCluster", "auto"),
+            ],
+            "MessageQueueMetrics" => vec![metric_source("KafkaCluster", "auto")],
+            // 未知的面（或测试里只关心“有没有指标单元”）：纯周期，即主机指标。
+            _ => vec![periodic],
+        };
+        metrics_work_with(family, sources)
     }
 
     fn outcome(
@@ -1039,16 +1120,8 @@ mod tests {
     }
 
     #[test]
-    fn a_metrics_family_with_no_targets_is_unknown() {
-        let mut work = standing(Vec::new());
-        work.family = "DatabaseMetrics".to_string();
-        work.units = vec![WorkSpecUnit {
-            unit_id: "db".to_string(),
-            capability: "collect_metrics".to_string(),
-            rule_ref: String::new(),
-            requires_privilege: "root".to_string(),
-            sources: Vec::new(),
-        }];
+    fn a_metrics_domain_waiting_for_the_first_round_stays_not_ready() {
+        let work = metrics_work("DatabaseMetrics");
         let outcome = MetricsCollectionOutcome {
             collection_kind: "mysql_metrics".to_string(),
             status: "pending".to_string(),
@@ -1078,6 +1151,8 @@ mod tests {
         assert_eq!(result.status, collection_status::UNKNOWN);
         assert_eq!(result.prerequisites, collection_prerequisites::BLOCKED);
         assert_eq!(result.result, collection_result::PENDING);
+        // 与「空集」的分界：`pending` 是**目标已配置、但这一轮还没有可判定结果**，
+        // 所以它仍然是「待就绪」，不能被归成 `no_targets`。
         assert!(
             result.reasons.iter().any(|reason| reason.kind
                 == collection_reason_kind::TARGET_NOT_READY
@@ -1085,6 +1160,49 @@ mod tests {
             "{:?}",
             result.reasons
         );
+        assert!(
+            !result
+                .reasons
+                .iter()
+                .any(|reason| reason.kind == collection_reason_kind::NO_TARGETS),
+            "{:?}",
+            result.reasons
+        );
+    }
+
+    /// 策展错配（指标单元一个域也没声明）**不在数据面上撑谎**：
+    /// 不编一个“目标未就绪”的原因，而是保持静默 `pending`。
+    ///
+    /// 为什么钉住这个行为：真实目录里每个指标单元都带真来源（`MetricInterval` 兜 host，
+    /// 其余自探域），所以「零域」只可能是策展写错。运行期编一个原因会把人引去查
+    /// 一个根本没配过的东西；这类错该在策展侧校验里暴露，不在采集结果里伪造。
+    #[test]
+    fn a_metrics_unit_that_declares_no_domain_stays_silently_pending() {
+        // 带 `collect_metrics` 能力，但一条来源也不给 → 一个域也声明不了。
+        let work = metrics_work_with("MysteryMetrics", Vec::new());
+        let result = assess(
+            &work,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &FlowReport::default(),
+            true,
+            "2026-11-08T00:00:00Z",
+        );
+
+        assert_eq!(result.result, collection_result::PENDING);
+        assert_eq!(result.prerequisites, collection_prerequisites::READY);
+        assert!(
+            result.reasons.is_empty(),
+            "零域不该编原因（策展错配不在数据面上撑谎）: {:?}",
+            result.reasons
+        );
+        assert_eq!(result.detail, "");
     }
 
     /// 关键进程指标：授权了但本机没匹配到进程 → 面的采集结果带**具体原因**，
@@ -1094,15 +1212,7 @@ mod tests {
     /// `build_snapshot` 填到 idle 的 process outcome → 这里进 `target_not_ready` 的明细。
     #[test]
     fn a_process_metrics_face_reports_the_selection_reason() {
-        let mut work = standing(Vec::new());
-        work.family = "ProcessMetrics".to_string();
-        work.units = vec![WorkSpecUnit {
-            unit_id: "keyproc".to_string(),
-            capability: "collect_metrics".to_string(),
-            rule_ref: String::new(),
-            requires_privilege: "root".to_string(),
-            sources: Vec::new(),
-        }];
+        let work = metrics_work("ProcessMetrics");
         let outcome = outcome(
             "process_metrics",
             "idle",
@@ -1136,8 +1246,10 @@ mod tests {
         );
     }
 
-    /// 面名是策展约定：把 `KeyProcessMetrics` 单元挂在别的面下时，按面名查表会让
-    /// 进程域的信号**静默消失**。这条用例钉住“按来源兜底”。
+    /// 域只看**来源**，不看面名：把 `KeyProcessMetrics` 单元挂在别的面下（错误策展），
+    /// 进程域的信号也不能静默消失。
+    ///
+    /// 以前靠“面名查表 + 按来源再兜一次”；现在域就诞生于来源，面名根本不参与。
     #[test]
     fn a_key_process_unit_under_another_family_still_observes_process_metrics() {
         let mut work = standing(Vec::new());
@@ -1186,30 +1298,56 @@ mod tests {
             "进程域不能因为面名写错就静默消失：{:?}",
             result.reasons
         );
+        // 面名不再补域：这个单元没带周期来源，所以不得凭空报一个 host_metrics。
+        assert!(
+            !result
+                .reasons
+                .iter()
+                .any(|reason| reason.subject == "host_metrics"),
+            "{:?}",
+            result.reasons
+        );
     }
 
-    /// `process_metrics` 只属于 `ProcessMetrics` 面：归还给 `HostMetrics` 会让
-    /// “只授权了主机指标”的机器误报一个“进程目标未就绪”。
+    /// 面名不再是域的来源：主机指标面只产出 `host_metrics`（容器域跟着它自己的面走），
+    /// 关键进程面只产出 `process_metrics`。
     #[test]
-    fn process_metrics_belongs_to_its_own_family() {
-        assert_eq!(metric_domains("ProcessMetrics"), &["process_metrics"]);
-        assert!(
-            !metric_domains("HostMetrics").contains(&"process_metrics"),
-            "HostMetrics 不得再声称拥有 process_metrics"
+    fn a_family_only_covers_the_domains_its_units_declare() {
+        assert_eq!(
+            unit_metric_domains(&metrics_work("HostMetrics").units[0]),
+            vec!["host_metrics"]
         );
+        assert_eq!(
+            unit_metric_domains(&metrics_work("ProcessMetrics").units[0]),
+            vec!["process_metrics"]
+        );
+        assert_eq!(
+            unit_metric_domains(&metrics_work("ContainerMetrics").units[0]),
+            vec!["container_metrics"]
+        );
+        // 空来源的指标单元一个域也不声明（不拿面名猜）。
+        let empty = WorkSpecUnit {
+            unit_id: "empty".to_string(),
+            capability: "collect_metrics".to_string(),
+            rule_ref: String::new(),
+            requires_privilege: "none".to_string(),
+            sources: Vec::new(),
+        };
+        assert!(unit_metric_domains(&empty).is_empty());
+        // 只有非指标来源（如导出器）的指标单元也一样：它是策展错配，但不能凭空冒出一个域。
+        let mislabelled = WorkSpecUnit {
+            unit_id: "bad".to_string(),
+            capability: "collect_metrics".to_string(),
+            rule_ref: String::new(),
+            requires_privilege: "none".to_string(),
+            sources: vec![metric_source("Exporter", "dmesg:panic")],
+        };
+        assert!(unit_metric_domains(&mislabelled).is_empty());
     }
 
     #[test]
     fn a_failed_metrics_domain_is_failed() {
-        let mut work = standing(Vec::new());
-        work.family = "MessageQueueMetrics".to_string();
-        work.units = vec![WorkSpecUnit {
-            unit_id: "kafka".to_string(),
-            capability: "collect_metrics".to_string(),
-            rule_ref: String::new(),
-            requires_privilege: "root".to_string(),
-            sources: Vec::new(),
-        }];
+        let work = metrics_work("MessageQueueMetrics");
         let outcome = MetricsCollectionOutcome {
             collection_kind: "kafka_broker_metrics".to_string(),
             status: "failed".to_string(),
@@ -1423,6 +1561,173 @@ mod tests {
             "2026-11-08T00:00:00Z",
         );
         assert_eq!(result.status, collection_status::OK);
+    }
+
+    /// 这台机器没有容器：`container_metrics` 是 `idle`（0 目标，而且本机说不出原因）。
+    ///
+    /// 空集不是故障：有健康内容时照旧「采集正常」，只留一条信息级原因说明为什么没容器指标。
+    /// 以前这里会把整个面拉成 `partial`（= 页面上的「部分失败」），红字写着
+    /// 「首轮未完成 / 目标未就绪」 —— 那是把「本来就没有」当成「该采而采不了」。
+    #[test]
+    fn a_metrics_domain_with_no_targets_is_not_a_failure() {
+        // 一份工作里两个单元，各声明一个域（主机 + 容器）：钩的是记账规则本身 ——
+        // 不管空集出现在哪个面上，它都不能变阻塞。
+        let work = metrics_work_with("HostMetrics", vec![metric_source("MetricInterval", "15s")]);
+        let work = with_container_unit(work);
+        let outcomes = vec![
+            outcome("host_metrics", "succeeded", 1, 1, 0, None),
+            outcome("container_metrics", "idle", 0, 0, 0, None),
+        ];
+        let result = assess(
+            &work,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &outcomes,
+            &[],
+            &FlowReport::default(),
+            true,
+            "2026-11-28T00:00:00Z",
+        );
+        assert_eq!(result.prerequisites, collection_prerequisites::READY);
+        assert_eq!(result.result, collection_result::SUCCESS);
+        assert_eq!(
+            result.status,
+            collection_status::OK,
+            "空集不得把面拉成「部分失败」"
+        );
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason.kind == collection_reason_kind::NO_TARGETS
+                    && reason.subject == "container_metrics"),
+            "空集要给一条信息级原因，{:?}",
+            result.reasons
+        );
+        // 旧消费者看的是 `detail`：它必须能看懂“为什么没有”，而不是一句笼统的“待就绪”。
+        assert!(
+            result.detail.contains("没有这一类采集目标"),
+            "{}",
+            result.detail
+        );
+        assert!(
+            !result
+                .reasons
+                .iter()
+                .any(|reason| reason.kind == collection_reason_kind::TARGET_NOT_READY),
+            "空集不是「待就绪」，{:?}",
+            result.reasons
+        );
+    }
+
+    /// 「没有目标」与「不知道为什么没有目标」是两件事：
+    /// 载体读不到（权限 / socket 不可用）属于后者 —— 必须报出来，不能被当成空集放过。
+    #[test]
+    fn a_metrics_domain_without_targets_but_with_a_reason_is_blocked() {
+        let work = with_container_unit(metrics_work("HostMetrics"));
+        let outcomes = vec![
+            outcome("host_metrics", "succeeded", 1, 1, 0, None),
+            outcome(
+                "container_metrics",
+                "idle",
+                0,
+                0,
+                0,
+                Some("读不到 /run/containerd/io.containerd.runtime.v2.task/k8s.io（权限不足）"),
+            ),
+        ];
+        let result = assess(
+            &work,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &outcomes,
+            &[],
+            &FlowReport::default(),
+            true,
+            "2026-11-28T00:00:00Z",
+        );
+        assert_eq!(result.prerequisites, collection_prerequisites::BLOCKED);
+        assert_eq!(result.result, collection_result::PARTIAL);
+        assert!(
+            result.reasons.iter().any(|reason| reason.kind
+                == collection_reason_kind::TARGET_NOT_READY
+                && reason.subject == "container_metrics"
+                && reason.detail.contains("/run/containerd")),
+            "本机说得出原因就必须报，{:?}",
+            result.reasons
+        );
+        assert!(
+            !result
+                .reasons
+                .iter()
+                .any(|reason| reason.kind == collection_reason_kind::NO_TARGETS),
+            "有原因就不是空集，{:?}",
+            result.reasons
+        );
+    }
+
+    /// 集合级不变量：一个指标面报 `blocked`，必须有「该采而采不了」的依据 ——
+    /// 要么有目标（`pending` 首轮），要么本机说出了原因。反过来，干净的 `idle`
+    /// 永远不能变成阻塞项。
+    #[test]
+    fn a_blocked_metrics_face_always_has_a_cause() {
+        let cases = [
+            // (status, attempted, last_error, 期望 blocked)
+            ("idle", 0, None, false),
+            ("idle", 0, Some("载体不可读"), true),
+            ("pending", 0, None, true),
+            ("pending", 3, None, true),
+            ("succeeded", 1, None, false),
+        ];
+        for (status, attempted, last_error, expect_blocked) in cases {
+            let work = metrics_work("HostMetrics");
+            let outcomes = vec![outcome(
+                "host_metrics",
+                status,
+                attempted,
+                attempted,
+                0,
+                last_error,
+            )];
+            let result = assess(
+                &work,
+                None,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &outcomes,
+                &[],
+                &FlowReport::default(),
+                true,
+                "2026-11-28T00:00:00Z",
+            );
+            assert_eq!(
+                result.prerequisites == collection_prerequisites::BLOCKED,
+                expect_blocked,
+                "status={status} attempted={attempted} last_error={last_error:?}: {:?}",
+                result.reasons
+            );
+            let says_no_targets = result
+                .reasons
+                .iter()
+                .any(|reason| reason.kind == collection_reason_kind::NO_TARGETS);
+            assert_eq!(
+                says_no_targets,
+                status == "idle" && last_error.is_none(),
+                "status={status}: {:?}",
+                result.reasons
+            );
+        }
     }
 
     #[test]

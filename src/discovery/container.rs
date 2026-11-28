@@ -1,4 +1,8 @@
 //! Container discovery probe.
+//!
+//! 本探针同时回答两个问题：「看见了哪些容器」与「哪些运行时**看见了却读不了**」。
+//! 后者必须说出来：`Ok` + 空列表会把「非 root 读不到 `/run/containerd`」当成「这台机器
+//! 没跑容器」，而下游对这两件事的结论相反（空集 vs 该采而采不了）。
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -10,10 +14,16 @@ use serde::Deserialize;
 use wist_contracts::discovery::{DiscoveredResource, DiscoveredTarget, DiscoveryOrigin};
 use wist_shared::time::now_rfc3339;
 
-use super::{DiscoveryError, DiscoveryProbe, DiscoverySourceKind, ProbeOutput};
+use super::{DiscoveryError, DiscoveryProbe, DiscoverySourceKind, ProbeOutput, UnobservedSource};
 
 #[cfg(target_os = "macos")]
 mod docker_macos;
+
+/// 「看不见容器运行时」在 [`UnobservedSource::subject`] 里的稳定键。
+///
+/// 下游（指标记账）按它把「看见了但读不了」挂到 `container_metrics` 域上；
+/// 换个字符串就是静默失联，所以定义在这里、只此一份。
+pub(crate) const UNOBSERVED_SUBJECT: &str = "container_runtime";
 
 #[derive(::jumo_derive::Jumo)]
 #[jumo(kind = "struct", domain = "Discovery", module = "Discovery.Probe")]
@@ -41,7 +51,7 @@ impl DiscoveryProbe for ContainerDiscoveryProbe {
         let source = self.source().as_str().to_string();
         let observed_at = discovered_at.clone();
         let origin_id = format!("{}:{}:{}", source, self.name(), observed_at);
-        let containers =
+        let scan =
             discover_containers_in_roots(&default_container_runtime_roots()).map_err(|err| {
                 super::probe_failed(
                     self.name(),
@@ -49,10 +59,11 @@ impl DiscoveryProbe for ContainerDiscoveryProbe {
                     format!("container discovery failed: {err}"),
                 )
             })?;
+        let mut unobserved = scan.unobserved;
 
-        let mut resources = Vec::with_capacity(containers.len());
-        let mut targets = Vec::with_capacity(containers.len());
-        for container in containers {
+        let mut resources = Vec::with_capacity(scan.containers.len());
+        let mut targets = Vec::with_capacity(scan.containers.len());
+        for container in scan.containers {
             let resource_id = container.container_id.clone();
             let mut attributes = BTreeMap::new();
             attributes.insert("container.id".to_string(), container.container_id.clone());
@@ -118,46 +129,29 @@ impl DiscoveryProbe for ContainerDiscoveryProbe {
         // 与上面同一套资源形状（`container`）+ 每条发布端口一个 `container_port`
         // （数据库自探靠它找到容器里的库）。
         #[cfg(target_os = "macos")]
-        if let Some(docker) = docker_macos::list_containers() {
-            for container in docker {
-                let resource_id = container.id.clone();
-                let attributes = BTreeMap::from([
-                    ("container.id".to_string(), container.id.clone()),
-                    ("container.name".to_string(), container.name.clone()),
-                    ("container.runtime".to_string(), "docker".to_string()),
-                    ("container.image".to_string(), container.image.clone()),
-                ]);
-                resources.push(DiscoveredResource {
-                    resource_id: resource_id.clone(),
-                    kind: "container".to_string(),
-                    origin_idx: 0,
-                    attributes,
-                    discovered_at: discovered_at.clone(),
-                    last_seen_at: discovered_at.clone(),
-                    health: "healthy".to_string(),
-                    source: self.name().to_string(),
+        match docker_macos::scan_containers() {
+            // 这台机器上没有 Docker socket（没装 / 没起）：不是故障，只是没有容器这一路。
+            docker_macos::MacContainerScan::NoRuntime => {}
+            // socket 在但连不上 / 答不了：**看不见**，不能当成「没有容器」。
+            docker_macos::MacContainerScan::Unreadable { socket, detail } => {
+                unobserved.push(UnobservedSource {
+                    subject: UNOBSERVED_SUBJECT.to_string(),
+                    location: socket.display().to_string(),
+                    detail,
                 });
-                // **不**发 `container` target：target 会被映射成 `container_metrics` 采集，
-                // 而 macOS 上容器的 cgroup 在 Linux VM 里，宿主采不到 —— 发了只会得到
-                // 一堆假失败。这里只留资源：它进事实摘要（`container_names`），
-                // 供知识库按 `container:postgres` 门控单元，以及数据库自探拿发布端口。
-
-                for port in &container.ports {
+            }
+            docker_macos::MacContainerScan::Observed(docker) => {
+                for container in docker {
+                    let resource_id = container.id.clone();
                     let attributes = BTreeMap::from([
                         ("container.id".to_string(), container.id.clone()),
                         ("container.name".to_string(), container.name.clone()),
+                        ("container.runtime".to_string(), "docker".to_string()),
                         ("container.image".to_string(), container.image.clone()),
-                        ("endpoint.protocol".to_string(), "tcp".to_string()),
-                        ("endpoint.bind.ip".to_string(), port.host_ip.clone()),
-                        ("endpoint.bind.port".to_string(), port.host_port.to_string()),
-                        (
-                            "endpoint.container.port".to_string(),
-                            port.container_port.to_string(),
-                        ),
                     ]);
                     resources.push(DiscoveredResource {
-                        resource_id: format!("{}:port:{}", container.id, port.host_port),
-                        kind: "container_port".to_string(),
+                        resource_id: resource_id.clone(),
+                        kind: "container".to_string(),
                         origin_idx: 0,
                         attributes,
                         discovered_at: discovered_at.clone(),
@@ -165,8 +159,49 @@ impl DiscoveryProbe for ContainerDiscoveryProbe {
                         health: "healthy".to_string(),
                         source: self.name().to_string(),
                     });
+                    // **不**发 `container` target：target 会被映射成 `container_metrics` 采集，
+                    // 而 macOS 上容器的 cgroup 在 Linux VM 里，宿主采不到 —— 发了只会得到
+                    // 一堆假失败。这里只留资源：它进事实摘要（`container_names`），
+                    // 供知识库按 `container:postgres` 门控单元，以及数据库自探拿发布端口。
+                    //
+                    // 看不到 cgroup 不等于没有容器：上面的 `MacContainerScan::Unreadable`
+                    // 已经把「socket 在但读不了」单独报出去了，不靠这里假装空集。
+
+                    for port in &container.ports {
+                        let attributes = BTreeMap::from([
+                            ("container.id".to_string(), container.id.clone()),
+                            ("container.name".to_string(), container.name.clone()),
+                            ("container.image".to_string(), container.image.clone()),
+                            ("endpoint.protocol".to_string(), "tcp".to_string()),
+                            ("endpoint.bind.ip".to_string(), port.host_ip.clone()),
+                            ("endpoint.bind.port".to_string(), port.host_port.to_string()),
+                            (
+                                "endpoint.container.port".to_string(),
+                                port.container_port.to_string(),
+                            ),
+                        ]);
+                        resources.push(DiscoveredResource {
+                            resource_id: format!("{}:port:{}", container.id, port.host_port),
+                            kind: "container_port".to_string(),
+                            origin_idx: 0,
+                            attributes,
+                            discovered_at: discovered_at.clone(),
+                            last_seen_at: discovered_at.clone(),
+                            health: "healthy".to_string(),
+                            source: self.name().to_string(),
+                        });
+                    }
                 }
             }
+        }
+
+        for record in &unobserved {
+            log::warn!(
+                "event=ContainerScanUnreadable subject=\"{}\" location=\"{}\" detail=\"{}\"",
+                record.subject,
+                record.location,
+                record.detail
+            );
         }
 
         Ok(ProbeOutput {
@@ -181,6 +216,7 @@ impl DiscoveryProbe for ContainerDiscoveryProbe {
             },
             resources,
             targets,
+            unobserved,
         })
     }
 }
@@ -259,33 +295,58 @@ fn default_container_runtime_roots() -> Vec<ContainerRuntimeRoot> {
     ]
 }
 
-fn discover_containers_in_roots(
-    roots: &[ContainerRuntimeRoot],
-) -> io::Result<Vec<ObservedContainer>> {
+/// 一轮容器扫描的结果。
+///
+/// `containers` 为空有**两种**含义（见 `unobserved`）：确实没有容器（空集），
+/// 或者运行时根目录看不了（看不见）。把两者混成一个空列表，下游就只能猜。
+struct ContainerScan {
+    containers: Vec<ObservedContainer>,
+    unobserved: Vec<UnobservedSource>,
+}
+
+fn discover_containers_in_roots(roots: &[ContainerRuntimeRoot]) -> io::Result<ContainerScan> {
     let mut containers = BTreeMap::new();
+    let mut unobserved = Vec::new();
 
     for root in roots {
         if !root.path.exists() {
+            // 这个运行时根本没装（或没起）：不是「看不见」，也不该进空集之外任何结论。
             continue;
         }
-        for container in read_runtime_root(root)? {
-            containers
-                .entry(container.container_id.clone())
-                .or_insert(container);
+        match read_runtime_root(root) {
+            Ok(items) => {
+                for container in items {
+                    containers
+                        .entry(container.container_id.clone())
+                        .or_insert(container);
+                }
+            }
+            // 非 root 运行的 agent 读不到 `/run/containerd`（0700）。把整轮探针报失败会让
+            // 健康度永久标红，而静默当成「没有容器」又会让采集记账得出相反的结论
+            // （空集 vs 该采而采不了）—— 所以如实记成「看不见」。
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                unobserved.push(UnobservedSource {
+                    subject: UNOBSERVED_SUBJECT.to_string(),
+                    location: root.path.display().to_string(),
+                    detail: format!("权限不足，读不到运行时根目录：{err}"),
+                });
+            }
+            Err(err) => return Err(err),
         }
     }
 
-    Ok(containers.into_values().collect())
+    Ok(ContainerScan {
+        containers: containers.into_values().collect(),
+        unobserved,
+    })
 }
 
 fn read_runtime_root(root: &ContainerRuntimeRoot) -> io::Result<Vec<ObservedContainer>> {
     let mut containers = Vec::new();
+    // 权限不足**往上抛**：调用方要把它记成「看不见」，不能在这里静默成空列表。
     let entries = match fs::read_dir(&root.path) {
         Ok(entries) => entries,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(containers),
-        // 非 root 运行的 agent 读不到 `/run/containerd`（0700）。这不是故障，
-        // 只是「看不见容器」；整轮探针失败会把健康度永久标红。
-        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => return Ok(containers),
         Err(err) => return Err(err),
     };
 
@@ -408,21 +469,25 @@ mod tests {
 
     #[test]
     fn discover_containers_returns_empty_when_roots_missing() {
-        let containers = discover_containers_in_roots(&[ContainerRuntimeRoot {
+        // 运行时**没装**（根目录不存在）不是「看不见」：这就是空集，不能给采集记账
+        // 报一条「该采而采不了」的理由。
+        let scan = discover_containers_in_roots(&[ContainerRuntimeRoot {
             runtime: "containerd",
             runtime_namespace: Some("k8s.io"),
             path: PathBuf::from("/path/that/does/not/exist"),
         }])
         .expect("discover containers");
 
-        assert!(containers.is_empty());
+        assert!(scan.containers.is_empty());
+        assert!(scan.unobserved.is_empty(), "{:?}", scan.unobserved);
     }
 
     #[cfg(unix)]
     #[test]
-    fn an_unreadable_runtime_root_is_not_a_probe_failure() {
-        // 非 root 运行的 agent 读不到 /run/containerd（0700）。那只是「看不见容器」，
-        // 不该让整轮探测失败 —— 否则探针健康度会永久标红。
+    fn an_unreadable_runtime_root_is_reported_not_silently_empty() {
+        // 非 root 运行的 agent 读不到 /run/containerd（0700）。两件错事都不能做：
+        // 把整轮探测报失败（健康度会永久标红），或静默当成「没有容器」
+        // （采集记账会把「该采而采不了」说成空集，现场永远查不出来）。
         use std::os::unix::fs::PermissionsExt;
 
         let root = temp_dir("unreadable-root");
@@ -431,7 +496,7 @@ mod tests {
         let mut perms = fs::metadata(&task_root).expect("metadata").permissions();
         perms.set_mode(0o000);
         fs::set_permissions(&task_root, perms).expect("chmod");
-        // root（CI 容器里常见）绕过权限位：这时断言「空」不成立，直接跳过。
+        // root（CI 容器里常见）绕过权限位：这时「看不见」不成立，直接跳过。
         let readable = fs::read_dir(&task_root).is_ok();
 
         let result = discover_containers_in_roots(&[ContainerRuntimeRoot {
@@ -448,8 +513,16 @@ mod tests {
         if readable {
             return;
         }
-        let containers = result.expect("permission denied must not fail the probe");
-        assert!(containers.is_empty());
+        let scan = result.expect("permission denied must not fail the probe");
+        assert!(scan.containers.is_empty());
+        assert_eq!(scan.unobserved.len(), 1, "{:?}", scan.unobserved);
+        assert_eq!(scan.unobserved[0].subject, super::UNOBSERVED_SUBJECT);
+        assert_eq!(scan.unobserved[0].location, task_root.display().to_string());
+        assert!(
+            scan.unobserved[0].detail.contains("权限"),
+            "{}",
+            scan.unobserved[0].detail
+        );
     }
 
     #[test]
@@ -475,12 +548,14 @@ mod tests {
         .expect("config json");
         fs::write(task_root.join("container-a").join("init.pid"), "1234\n").expect("init pid");
 
-        let containers = discover_containers_in_roots(&[ContainerRuntimeRoot {
+        let scan = discover_containers_in_roots(&[ContainerRuntimeRoot {
             runtime: "containerd",
             runtime_namespace: Some("k8s.io"),
             path: task_root,
         }])
         .expect("discover containers");
+        let containers = scan.containers;
+        assert!(scan.unobserved.is_empty(), "{:?}", scan.unobserved);
 
         assert_eq!(containers.len(), 2);
         assert_eq!(containers[0].container_id, "container-a");
@@ -508,7 +583,7 @@ mod tests {
         fs::create_dir_all(containerd_root.join("same-id")).expect("containerd task");
         fs::create_dir_all(docker_root.join("same-id")).expect("docker task");
 
-        let containers = discover_containers_in_roots(&[
+        let scan = discover_containers_in_roots(&[
             ContainerRuntimeRoot {
                 runtime: "containerd",
                 runtime_namespace: Some("k8s.io"),
@@ -521,6 +596,7 @@ mod tests {
             },
         ])
         .expect("discover containers");
+        let containers = scan.containers;
 
         assert_eq!(containers.len(), 1);
         assert_eq!(containers[0].container_id, "same-id");

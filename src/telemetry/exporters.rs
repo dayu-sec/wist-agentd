@@ -27,16 +27,32 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use std::sync::RwLock;
 use tokio::process::Command;
 use wist_contracts::telemetry_record::TelemetryRecord;
 use wist_contracts::work::KERNEL_LOG_EXPORTER;
 use wist_shared::time::{now_rfc3339, now_ts_ms};
 
+/// 平台下发的搜索目录（`None` = 用内置 [`BIN_DIRS`]）。
+static POLICY_DIRS: RwLock<Option<Vec<String>>> = RwLock::new(None);
+
+/// 一条周期 / 超时覆盖：`(exporter_id, period_secs, timeout_secs)`。
+pub(crate) type LimitOverride = (String, Option<u64>, Option<u64>);
+
+/// 平台下发的周期 / 超时覆盖。
+static POLICY_LIMITS: RwLock<Option<Vec<LimitOverride>>> = RwLock::new(None);
+
 /// 一个导出器的静态定义。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExporterDef {
     pub id: &'static str,
-    /// 默认周期（秒）。周期是**导出器属性**，首版不来自目录（见设计稿 §9.2）。
+    /// **可执行文件名**：决定“跑什么”的唯一处所。
+    ///
+    /// 路径不在这里 —— 而是拿这个名字去 [`BIN_DIRS`]（或平台下发的目录表）里找。
+    /// 把绝对路径写死在这里，每遇到一个新发行版/容器镜像就要发一版 agentd；
+    /// 而安装位置是**纯环境信息**，不属于“跑什么”。
+    pub bin: &'static str,
+    /// 默认周期（秒）。周期是**导出器属性**，目录可在策略里覆盖（见 `exporter_policy`）。
     pub period_secs: u64,
     /// 单次导出超时（秒）：导出器跑飞了不能拖住一轮 tick。
     pub timeout_secs: u64,
@@ -47,41 +63,49 @@ pub struct ExporterDef {
 pub const EXPORTERS: &[ExporterDef] = &[
     ExporterDef {
         id: "journalctl-unit",
+        bin: "journalctl",
         period_secs: 300,
         timeout_secs: 30,
     },
     ExporterDef {
         id: "journalctl-shutdown",
+        bin: "journalctl",
         period_secs: 3600,
         timeout_secs: 30,
     },
     ExporterDef {
         id: "last-reboot",
+        bin: "last",
         period_secs: 6 * 3600,
         timeout_secs: 15,
     },
     ExporterDef {
         id: "nft-ruleset",
+        bin: "nft",
         period_secs: 1800,
         timeout_secs: 15,
     },
     ExporterDef {
         id: "iptables-save",
+        bin: "iptables-save",
         period_secs: 1800,
         timeout_secs: 15,
     },
     ExporterDef {
         id: "smartctl",
+        bin: "smartctl",
         period_secs: 3600,
         timeout_secs: 30,
     },
     ExporterDef {
         id: "dmesg",
+        bin: "dmesg",
         period_secs: 300,
         timeout_secs: 15,
     },
     ExporterDef {
         id: "auditd-execve",
+        bin: "ausearch",
         period_secs: 300,
         timeout_secs: 30,
     },
@@ -90,6 +114,7 @@ pub const EXPORTERS: &[ExporterDef] = &[
     // 而 journald 本身是本地写入 —— 一次 `-o json` 的开销远小于其他导出器。
     ExporterDef {
         id: KERNEL_LOG_EXPORTER,
+        bin: "journalctl",
         period_secs: 60,
         timeout_secs: 30,
     },
@@ -98,6 +123,153 @@ pub const EXPORTERS: &[ExporterDef] = &[
 /// 按 ID 找定义。
 pub fn def(id: &str) -> Option<&'static ExporterDef> {
     EXPORTERS.iter().find(|d| d.id == id)
+}
+
+/// 导出器二进制的**搜索目录**（按优先级，平台内建默认值）。
+///
+/// 为什么不写绝对文件路径：安装位置是**纯环境信息**，而本仓每遇到一个新发行版 /
+/// 容器基础镜像 / 自建前缀就要发一版 agentd，成本远大于换一版知识库。
+/// 这里只留“可能装在哪几个目录”，文件名由 [`ExporterDef::bin`] 决定 ——
+/// 数据能改“去哪找”，不能改“跑什么”。
+///
+/// 平台下发的目录表（`exporter_policy`）会盖过这份默认值。
+#[cfg(target_os = "macos")]
+pub const BIN_DIRS: &[&str] = &[
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+    // Homebrew（Apple Silicon / Intel 两种前缀）。
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/sbin",
+];
+
+#[cfg(not(target_os = "macos"))]
+pub const BIN_DIRS: &[&str] = &[
+    "/usr/bin",
+    // 非 usrmerge 的发行版、busybox 与最小容器镜像里，工具常常**只在** `/bin`。
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+];
+
+/// 当前生效的搜索目录（默认 = [`BIN_DIRS`]；平台下发策略后由 [`apply_policy`] 覆盖）。
+///
+/// **空目录列表按内置表算**：数据写了一张空表或下发了一份空列表时，解析不能退化成
+/// “一个目录都不搜”（那会让所有导出器同时报缺件）。与 `None` 同义。
+pub fn effective_bin_dirs() -> Vec<String> {
+    POLICY_DIRS
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .filter(|dirs| !dirs.is_empty())
+        .unwrap_or_else(|| BIN_DIRS.iter().map(|dir| (*dir).to_string()).collect())
+}
+
+/// 应用平台下发的策略（`dirs = None` = 用内置表）。
+///
+/// 调用方是主循环（`control::exporter_policy` 拉取成功后）；这里只存值，不做 I/O。
+pub fn apply_policy(dirs: Option<Vec<String>>, overrides: Vec<LimitOverride>) {
+    if let Ok(mut guard) = POLICY_DIRS.write() {
+        *guard = dirs;
+    }
+    if let Ok(mut guard) = POLICY_LIMITS.write() {
+        *guard = Some(overrides);
+    }
+}
+
+/// 导出器的生效周期（策略覆盖 > 内置值）。
+pub fn effective_period_secs(def: &ExporterDef) -> u64 {
+    current_limits()
+        .and_then(|rows| override_for(&rows, def.id))
+        .and_then(|(period, _)| period)
+        .unwrap_or(def.period_secs)
+}
+
+/// 导出器的生效超时（策略覆盖 > 内置值）。
+pub fn effective_timeout_secs(def: &ExporterDef) -> u64 {
+    current_limits()
+        .and_then(|rows| override_for(&rows, def.id))
+        .and_then(|(_, timeout)| timeout)
+        .unwrap_or(def.timeout_secs)
+}
+
+fn current_limits() -> Option<Vec<LimitOverride>> {
+    POLICY_LIMITS.read().ok().and_then(|guard| guard.clone())
+}
+
+/// 从覆盖表里取某个 ID 的 `(period, timeout)`。
+///
+/// 抽成纯函数是为了能被直接单测：全局策略在各个测试间是共享的，拿它做断言的用例
+/// 会互相干扰（并行跑）。
+fn override_for(rows: &[LimitOverride], id: &str) -> Option<(Option<u64>, Option<u64>)> {
+    rows.iter()
+        .find(|(row_id, _, _)| row_id == id)
+        .map(|(_, period, timeout)| (*period, *timeout))
+}
+
+/// 在候选目录里找**同名**可执行文件；都没有时返回最标准的位置。
+///
+/// 返回“最标准的位置”而不是空串：缺件预检与日志要报的路径，应当就是“本来想执行的那个”。
+///
+/// 组/世界可写的候选会被**跳过**（先找安全的），全都不安全但存在时仍用它并告警 ——
+/// root 守护进程执行一个任人可写的二进制就是本地提权，但它也不该让采集静默停摆。
+fn resolve_in_dirs(bin: &str, dirs: &[String]) -> String {
+    let mut writable_fallback: Option<String> = None;
+    for dir in dirs {
+        let path = format!("{dir}/{bin}");
+        if !tool_present(&path) {
+            continue;
+        }
+        if is_group_or_world_writable(&path) {
+            writable_fallback.get_or_insert_with(|| path.clone());
+            continue;
+        }
+        return path;
+    }
+    if let Some(path) = writable_fallback {
+        log::warn!(
+            "event=ExporterToolWritable tool={} detail=\"组/世界可写：本可跳过，但这是唯一找到的可执行文件\"",
+            path
+        );
+        return path;
+    }
+    let fallback_dir = dirs.first().map(String::as_str).unwrap_or("/usr/bin");
+    format!("{fallback_dir}/{bin}")
+}
+
+/// 解析一个导出器二进制的绝对路径。
+pub fn resolve_tool(bin: &str) -> String {
+    resolve_in_dirs(bin, &effective_bin_dirs())
+}
+
+/// 组/世界可写 = root 跑它就等于“谁写谁执行”。
+///
+/// `stat` 失败时按**不可写**算（fail-open）：调用方刚刚 `tool_present` 成功才走到这里，
+/// 此刻 stat 失败几乎只可能是瞬时竞态。反过来（按可写算）会让一个合法工具凭空被跳过，
+/// 最后报成“缺件”—— 用一个假故障换一个不存在的安全收益。
+fn is_group_or_world_writable(path: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.permissions().mode() & 0o022 != 0)
+        .unwrap_or(false)
+}
+
+/// ID → 可执行文件名。
+fn bin_for(id: &str) -> &str {
+    def(id).map_or(id, |definition| definition.bin)
+}
+
+/// `二进制 + 固定参数`（二进制走目录解析，参数全部来自代码）。
+fn argv_with(bin: &str, args: &[&str]) -> Vec<String> {
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push(resolve_tool(bin));
+    argv.extend(args.iter().map(|arg| (*arg).to_string()));
+    argv
 }
 
 /// 内核日志的首读窗口（没有游标时用）。
@@ -115,71 +287,46 @@ pub const KERNEL_INITIAL_SINCE: &str = "-5m";
 /// `--quiet` + `--no-pager`：stdout 必须是**纯记录** —— `-- No entries --` 这类 UI 提示
 /// 不能变成一条内核日志。
 fn kernel_argv() -> Vec<String> {
-    [
-        "/usr/bin/journalctl",
-        "-k",
-        "-p",
-        "4",
-        "-o",
-        "json",
-        "--no-pager",
-        "--quiet",
-    ]
-    .iter()
-    .map(|part| part.to_string())
-    .collect()
+    argv_with(
+        bin_for(KERNEL_LOG_EXPORTER),
+        &["-k", "-p", "4", "-o", "json", "--no-pager", "--quiet"],
+    )
 }
 
-/// 一个导出器 ID + `arg` 对应的**固定 argv**（绝对路径、无 shell）。
+/// 一个导出器 ID + `arg` 对应的**固定 argv**（无 shell）。
 ///
 /// 这里是唯一的「怎么跑」出口：除 `arg` 外没有任何外部字符串进 argv，而 `arg` 只做**窄解析**
 /// （每个 ID 只认自己那几个取值），拼不进额外参数。
 ///
-/// 注意：这里的二进制路径与开关是**按通用发行版**写的，未在目标机核对过
-/// （见 `linux-security-audit-log-sources.md` §10）；路径不存在会走失败上报，不会静默。
+/// **二进制位置不写死**：只给名字（[`ExporterDef::bin`]），由 [`resolve_tool`] 在候选目录里
+/// 找同名可执行文件。安装位置是纯环境信息，写死一次就等于把“新发行版”变成一次 agentd 发版。
 pub fn argv_for(id: &str, arg: Option<&str>) -> io::Result<Vec<String>> {
-    fn v(parts: &[&str]) -> Vec<String> {
-        parts.iter().map(|s| s.to_string()).collect()
-    }
     match (id, arg) {
-        ("journalctl-unit", _) => Ok(v(&["/usr/bin/journalctl", "-o", "json", "--since", "-5m"])),
-        ("journalctl-shutdown", _) => Ok(v(&[
-            "/usr/bin/journalctl",
-            "-o",
-            "json",
-            "--since",
-            "-1d",
-            "-u",
-            "systemd-shutdown",
-            "-u",
-            "systemd-logind",
-        ])),
-        ("last-reboot", _) => Ok(v(&["/usr/bin/last", "-x", "reboot", "shutdown"])),
-        ("nft-ruleset", _) => Ok(v(&["/usr/sbin/nft", "list", "ruleset"])),
-        ("iptables-save", _) => Ok(v(&["/usr/sbin/iptables-save"])),
-        // 首版只给「哪些盘」；逐盘 `-a` 的详情留待后续（见本模块头部的能力边界）。
-        //
-        // 安装位置随平台/包管理器不同：Linux 发行版在 `/usr/sbin`，macOS 的 Homebrew 在
-        // `/opt/homebrew/sbin`（Apple Silicon）或 `/usr/local/sbin`（Intel）。
-        // 逐个探测取**第一个可执行的**；都不在时保留第一个候选，让缺件预检如实报 missing。
-        ("smartctl", _) => Ok(vec![
-            first_present(&[
-                "/usr/sbin/smartctl",
-                "/opt/homebrew/sbin/smartctl",
-                "/usr/local/sbin/smartctl",
-            ]),
-            "--scan-open".to_string(),
-        ]),
-        ("dmesg", None) => Ok(v(&["/usr/bin/dmesg"])),
-        ("dmesg", Some("panic")) => Ok(v(&["/usr/bin/dmesg", "--level", "emerg,alert,crit"])),
-        ("dmesg", Some("nvidia-xid")) => Ok(v(&["/usr/bin/dmesg"])),
-        ("auditd-execve", _) => Ok(v(&[
-            "/usr/sbin/ausearch",
-            "-m",
-            "execve",
-            "--start",
-            "recent",
-        ])),
+        ("journalctl-unit", _) => Ok(argv_with(bin_for(id), &["-o", "json", "--since", "-5m"])),
+        ("journalctl-shutdown", _) => Ok(argv_with(
+            bin_for(id),
+            &[
+                "-o",
+                "json",
+                "--since",
+                "-1d",
+                "-u",
+                "systemd-shutdown",
+                "-u",
+                "systemd-logind",
+            ],
+        )),
+        ("last-reboot", _) => Ok(argv_with(bin_for(id), &["-x", "reboot", "shutdown"])),
+        ("nft-ruleset", _) => Ok(argv_with(bin_for(id), &["list", "ruleset"])),
+        ("iptables-save", _) => Ok(argv_with(bin_for(id), &[])),
+        ("smartctl", _) => Ok(argv_with(bin_for(id), &["--scan-open"])),
+        ("dmesg", None) => Ok(argv_with(bin_for(id), &[])),
+        ("dmesg", Some("panic")) => Ok(argv_with(bin_for(id), &["--level", "emerg,alert,crit"])),
+        ("dmesg", Some("nvidia-xid")) => Ok(argv_with(bin_for(id), &[])),
+        ("auditd-execve", _) => Ok(argv_with(
+            bin_for(id),
+            &["-m", "execve", "--start", "recent"],
+        )),
         // 没有游标时的「首读 / 回退」命令：只往前看 [`KERNEL_INITIAL_SINCE`]。
         (KERNEL_LOG_EXPORTER, _) => {
             let mut argv = kernel_argv();
@@ -506,8 +653,16 @@ pub async fn run_with_cursor_fallback(
 pub struct ExporterState {
     #[serde(default)]
     pub last_run_ms: BTreeMap<String, i64>,
+    /// `exporter_id → 缺失的路径`（跑前预检发现不可执行）。
     #[serde(default)]
     pub missing: BTreeMap<String, String>,
+    /// `exporter_id → 实际解析到的绝对路径`（成功预检的那个）。
+    ///
+    /// 为什么记它：安装位置是**环境信息**，同一台机器上 `/usr/bin/dmesg` 与 `/bin/dmesg`
+    /// 都可能命中（usrmerge），换发行版 / 容器镜像后会变。排障时先看这一行，
+    /// 不用再猜“它到底找了哪里”。
+    #[serde(default)]
+    pub resolved: BTreeMap<String, String>,
 }
 
 fn state_path(state_dir: &Path) -> PathBuf {
@@ -593,16 +748,6 @@ pub fn tool_present(tool: &str) -> bool {
 /// argv 里的二进制路径（argv[0]）。
 pub fn tool_path(argv: &[String]) -> Option<&str> {
     argv.first().map(String::as_str)
-}
-
-/// 候选路径里第一个**可执行**的那个；一个都没有时返回第一个（让缺件预检如实报缺失）。
-fn first_present(candidates: &[&str]) -> String {
-    candidates
-        .iter()
-        .find(|path| tool_present(path))
-        .copied()
-        .unwrap_or(candidates[0])
-        .to_string()
 }
 
 /// 当前时刻（毫秒），供调度用。
@@ -965,10 +1110,23 @@ mod tests {
         state
             .missing
             .insert("smartctl".to_string(), "/usr/sbin/smartctl".to_string());
+        state
+            .resolved
+            .insert("dmesg".to_string(), "/bin/dmesg".to_string());
         save_state(&dir, &state);
         let loaded = load_state(&dir);
         assert_eq!(loaded.last_run_ms, state.last_run_ms);
         assert_eq!(loaded.missing, state.missing);
+        assert_eq!(loaded.resolved, state.resolved);
+        // 旧状态文件（没有 `resolved` 字段）仍要能读 —— 否则升级后瞬间丢掉游标/缺件记忆。
+        std::fs::write(
+            dir.join("exporters.json"),
+            br#"{"last_run_ms":{"work-1":1},"missing":{"dmesg":"/usr/bin/dmesg"}}"#,
+        )
+        .expect("write legacy");
+        let legacy = load_state(&dir);
+        assert_eq!(legacy.last_run_ms.get("work-1"), Some(&1));
+        assert!(legacy.resolved.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1042,24 +1200,213 @@ mod tests {
     }
 
     #[test]
-    fn smartctl_is_resolved_across_linux_and_homebrew_locations() {
-        // 不能把路径写死：Linux 在 `/usr/sbin`，macOS 的 Homebrew 在 `/opt/homebrew/sbin`。
-        // 这里是纯逻辑层面的断言（本机是否存在 smartctl 不影响结论）。
+    fn smartctl_uses_the_scan_open_flag() {
+        // 位置不再单独列候选：与其它导出器同一套规则（候选目录 + 同名可执行文件），
+        // 由 `every_exporter_runs_the_registered_binary_from_a_candidate_dir` 统一下钉住。
+        // Linux 在 `/usr/sbin`、Homebrew 在 `/opt/homebrew/bin|sbin`、`/usr/local/bin|sbin`
+        // 这些目录都已经在 `BIN_DIRS` 里。
         let argv = argv_for("smartctl", None).expect("已知导出器");
         assert_eq!(argv[1], "--scan-open");
-        let candidates = [
-            "/usr/sbin/smartctl",
-            "/opt/homebrew/sbin/smartctl",
-            "/usr/local/sbin/smartctl",
-        ];
-        assert!(
-            candidates.contains(&argv[0].as_str()),
-            "可选位置之一：{}",
-            argv[0]
-        );
-        // 取到的那个一定存在，除非三个都没装（那种情况保留第一个，由缺件预检报缺失）。
-        if candidates.iter().any(|path| tool_present(path)) {
-            assert!(tool_present(&argv[0]), "应当选到可执行的那个：{}", argv[0]);
+    }
+
+    #[test]
+    fn dmesg_is_resolved_across_the_common_install_paths() {
+        // 同一类问题：非 usrmerge 的发行版 / busybox / 最小容器镜像里只有 `/bin/dmesg`。
+        // 写死 `/usr/bin/dmesg` 会把「路径猜错」报成「没装」。
+        for arg in [None, Some("panic"), Some("nvidia-xid")] {
+            let argv = argv_for_run("dmesg", arg, None).expect("已知导出器");
+            assert!(
+                super::BIN_DIRS
+                    .iter()
+                    .any(|dir| argv[0] == format!("{dir}/dmesg")),
+                "必须落在候选目录里：{}",
+                argv[0]
+            );
+            // 装了的话，选中的那个一定可执行（否则缺件预检会白报）。
+            let any_present = super::BIN_DIRS
+                .iter()
+                .any(|dir| tool_present(&format!("{dir}/dmesg")));
+            if any_present {
+                assert!(tool_present(&argv[0]), "应当选到可执行的那个：{}", argv[0]);
+            }
         }
+        // 旗标不能被解析逻辑弄丢。
+        let panic = argv_for_run("dmesg", Some("panic"), None).expect("argv");
+        assert_eq!(panic[1..], ["--level", "emerg,alert,crit"]);
+    }
+
+    /// 每个导出器的 argv[0] 都必须是「候选目录 + 该 ID 登记的可执行名」。
+    ///
+    /// 这条钉住两件事：不再有人把绝对路径写回 `argv_for`；`ExporterDef::bin` 与 argv 不漂。
+    #[test]
+    fn every_exporter_runs_the_registered_binary_from_a_candidate_dir() {
+        for def in EXPORTERS {
+            let argv = argv_for(def.id, None).expect("每个已登记 ID 都要能出 argv");
+            let expected = format!("/{}", def.bin);
+            assert!(
+                argv[0].ends_with(&expected),
+                "{} 跑的应该是 {}：{}",
+                def.id,
+                def.bin,
+                argv[0]
+            );
+            assert!(
+                super::BIN_DIRS
+                    .iter()
+                    .any(|dir| argv[0] == format!("{dir}/{}", def.bin)),
+                "{} 不在候选目录里：{}",
+                def.id,
+                argv[0]
+            );
+        }
+    }
+
+    /// 候选目录里第一个可执行的文件胜出；都不在时返回最标准的位置（交给缺件预检）。
+    #[test]
+    fn resolve_in_dirs_prefers_the_first_executable_candidate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "wist-exporter-resolve-{}-{}",
+            std::process::id(),
+            super::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let first = dir.join("first");
+        let second = dir.join("second");
+        std::fs::create_dir_all(&first).expect("mkdir first");
+        std::fs::create_dir_all(&second).expect("mkdir second");
+        // 只在**第二个**目录里放一个可执行文件：应当跳过第一个。
+        let tool = second.join("dmesg");
+        std::fs::write(&tool, b"#!/bin/sh\n").expect("write");
+        let mut perms = std::fs::metadata(&tool).expect("meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&tool, perms).expect("chmod");
+
+        let first = first.display().to_string();
+        let second = second.display().to_string();
+        assert_eq!(
+            resolve_in_dirs("dmesg", &[first.clone(), second.clone()]),
+            format!("{second}/dmesg"),
+            "跳过没有这个文件的目录"
+        );
+        // 一个都没有：保留第一个目录下的路径，让预检报的路径与“试图执行的那个”一致。
+        assert_eq!(
+            resolve_in_dirs(
+                "dmesg",
+                &[
+                    "/does/not/exist/a".to_string(),
+                    "/does/not/exist/b".to_string()
+                ],
+            ),
+            "/does/not/exist/a/dmesg"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 空策略列表等价于 `None`：不能因为下发了一张空表就让所有导出器同时报缺件。
+    #[test]
+    fn an_empty_policy_dir_list_falls_back_to_the_builtin_table() {
+        apply_policy(Some(Vec::new()), Vec::new());
+        assert_eq!(
+            effective_bin_dirs(),
+            BIN_DIRS
+                .iter()
+                .map(|dir| (*dir).to_string())
+                .collect::<Vec<_>>()
+        );
+        // 收尾：别给并行跑的其它用例留下全局状态。
+        apply_policy(None, Vec::new());
+    }
+
+    /// 周期 / 超时覆盖：只改写了的那一项，另一项仍取内置值。
+    #[test]
+    fn period_and_timeout_overrides_are_merged_field_by_field() {
+        let rows = vec![
+            ("dmesg".to_string(), Some(120u64), None),
+            ("smartctl".to_string(), None, Some(45u64)),
+            ("nft-ruleset".to_string(), Some(600u64), Some(20u64)),
+        ];
+        assert_eq!(override_for(&rows, "dmesg"), Some((Some(120), None)));
+        assert_eq!(override_for(&rows, "smartctl"), Some((None, Some(45))));
+        assert_eq!(
+            override_for(&rows, "nft-ruleset"),
+            Some((Some(600), Some(20)))
+        );
+        assert_eq!(override_for(&rows, "last-reboot"), None);
+
+        // 没有策略时，生效值就是内置值。
+        let dmesg = def("dmesg").expect("registered");
+        assert_eq!(effective_period_secs(dmesg), dmesg.period_secs);
+        assert_eq!(effective_timeout_secs(dmesg), dmesg.timeout_secs);
+    }
+
+    /// 组/世界可写的候选要跳过（root 跑一个任人可写的二进制 = 本地提权）。
+    #[test]
+    fn a_group_or_world_writable_candidate_is_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "wist-exporter-writable-{}-{}",
+            std::process::id(),
+            super::now_ms()
+        ));
+        let writable_dir = dir.join("writable");
+        let safe_dir = dir.join("safe");
+        std::fs::create_dir_all(&writable_dir).expect("mkdir writable");
+        std::fs::create_dir_all(&safe_dir).expect("mkdir safe");
+
+        let writable = writable_dir.join("dmesg");
+        std::fs::write(&writable, b"#!/bin/sh\n").expect("write");
+        let mut perms = std::fs::metadata(&writable).expect("meta").permissions();
+        perms.set_mode(0o777);
+        std::fs::set_permissions(&writable, perms).expect("chmod");
+
+        let safe = safe_dir.join("dmesg");
+        std::fs::write(&safe, b"#!/bin/sh\n").expect("write");
+        let mut perms = std::fs::metadata(&safe).expect("meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&safe, perms).expect("chmod");
+
+        let dirs = vec![
+            writable_dir.display().to_string(),
+            safe_dir.display().to_string(),
+        ];
+        assert_eq!(
+            resolve_in_dirs("dmesg", &dirs),
+            safe.display().to_string(),
+            "应跳过组/世界可写的那一个"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 候选全都组/世界可写时**仍要选它**（只告警），不能退回一个不存在的路径。
+    ///
+    /// 这条钉住“宁可带风险地采，也不要假装没装”：后者会让这一路采集静默停摆，
+    /// 而停摆本身没人会察觉（缺件预检会报“没装”，运维去装一个已经装了的工具）。
+    /// 风险由 `event=ExporterToolWritable` 暴露，不由静默兜。
+    #[test]
+    fn an_all_writable_candidate_set_still_resolves_to_the_present_tool() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "wist-exporter-all-writable-{}-{}",
+            std::process::id(),
+            super::now_ms()
+        ));
+        let loose = dir.join("loose");
+        std::fs::create_dir_all(&loose).expect("mkdir loose");
+        let tool = loose.join("dmesg");
+        std::fs::write(&tool, b"#!/bin/sh\n").expect("write");
+        let mut perms = std::fs::metadata(&tool).expect("meta").permissions();
+        perms.set_mode(0o777);
+        std::fs::set_permissions(&tool, perms).expect("chmod");
+
+        assert_eq!(
+            resolve_in_dirs("dmesg", &[loose.display().to_string()]),
+            tool.display().to_string(),
+            "全可写仍选存在的那个（告警但不假称缺件）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

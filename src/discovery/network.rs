@@ -144,6 +144,7 @@ impl DiscoveryProbe for NetworkDiscoveryProbe {
             },
             resources,
             targets,
+            unobserved: Vec::new(),
         })
     }
 }

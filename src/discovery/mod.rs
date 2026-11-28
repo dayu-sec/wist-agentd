@@ -66,6 +66,26 @@ pub struct ProbeOutput {
     pub origin: DiscoveryOrigin,
     pub resources: Vec<DiscoveredResource>,
     pub targets: Vec<DiscoveredTarget>,
+    /// 本探针**看见了但读不了**的位置（空表 = 没有这种情况）。
+    ///
+    /// 为什么要它：`Ok` + 空列表本身有歧义 —— 既可能是「确实没有这个对象」，也可能是
+    /// 「看不见」（权限不足 / 运行时不可达）。下游对这两者的结论**相反**（空集 vs 该采而采
+    /// 不了），而只有探针自己知道是哪种。探针**失败**仍然走 `Err`（那会让上一份输出继续
+    /// 生效）—— 这里说的是「探针跑通了，但有一部分世界没看到」。
+    pub unobserved: Vec<UnobservedSource>,
+}
+
+/// 一条「看不见」的记录（见 [`ProbeOutput::unobserved`]）。
+#[derive(Debug, Clone, PartialEq, Eq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Discovery", module = "Discovery.Probe")]
+pub struct UnobservedSource {
+    /// **稳定的域键**（不是人话）：下游（指标记账 / 页面）按它把「看不见」挂到对应的
+    /// 采集域上。目前只有 `container_runtime`。
+    pub subject: String,
+    /// 具体位置：运行时根目录 / socket 路径。
+    pub location: String,
+    /// 人看的原因（权限不足 / 连接失败 / 响应无法解析）。
+    pub detail: String,
 }
 
 pub trait DiscoveryProbe {

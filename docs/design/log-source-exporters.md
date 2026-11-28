@@ -88,10 +88,34 @@ target = "<id>"                 # 无参
 - 每个 ID 有**默认周期**（写在 ID 表旁，如 `journalctl-unit` 5m、`nft-ruleset` 30m、`smartctl` 1h、`last-reboot` 6h）。周期是**导出器属性**，不是单元字段（首版不做目录覆盖，见 §9）。
 - 同一 tick 内按各自 `last_run + period` 判定该不该跑；跨 restart 用本地状态记 `last_run`（`state/exporters/<input_id>.json`）。
 
+**二进制位置：名字进代码，目录进配置/知识库**
+
+- `ExporterDef::bin` 只声明**可执行文件名**（`dmesg` / `journalctl` / `last` …），不写绝对路径。
+- 路径由 `BIN_DIRS`（按平台的**候选目录**，Linux：`/usr/bin` → `/bin` → `/usr/sbin` → `/sbin` → `/usr/local/{bin,sbin}`；
+macOS 再加 Homebrew 的两个前缀）逐个找同名可执行文件；**不走进程 `PATH`**（root 守护进程里 `PATH`
+  解析是本地提权面）。
+- 为什么不能写死一个路径：usrmerge 的系统上 `/bin` 是 `/usr/bin` 的软链，所以长期没暴露；而非 usrmerge 的发行版、
+  busybox、最小容器镜像里工具常常**只在** `/bin`。写死路径会把「路径猜错」报成「没装」——两句提示的处置方向相反。
+- 实际解析到哪个路径记进 `state/exporters.json` 的 `resolved`，并在 `event=ExporterToolResolved` 与
+  `wist-agentd diagnose`（`exporter.resolved`）里可见。
+
+**目录表与周期由知识库下发（已落地）**
+
+- 数据：`wist-knowledge/exporters.toml`（`[[platform]] bin_dirs` + 可选 `[[exporter]] period_secs/timeout_secs`）；
+  网关装载时校验（`id ∈ EXPORTER_IDS`、目录必须绝对路径且在本机系统目录白名单内、周期/超时在界内），
+  不过就整份拒载。
+- 下发：`POST /api/v1/agent/exporter-policy:poll`（新端点的理由：已有 `:poll` 报文两侧 `deny_unknown_fields`）。
+  网关空载 / 旧包没这份文件 → 200 + 空表，agentd 用内置值；旧网关 404 → 静默。
+- agentd：`control/exporter_policy` 每 5min 拉一次，落盘 `state/exporter_policy.json`，
+  拿到就 `exporters::apply_policy()`（目录盖过 `BIN_DIRS`，周期/超时盖过 `ExporterDef`）；
+  拿不到 / 响应坏 → 沿用落盘那份或内置表。本机还会再做一次白名单/边界校验（不信任单一层）。
+- 解析时若候选文件是**组/世界可写**，先找安全的；全都不安全但存在时仍用它并打
+  `event=ExporterToolWritable`（root 跑可写二进制 = 本地提权，但不该让采集静默停摆）。
+
 **执行**
 
 - 复用 `src/exec/`：把一次导出表达成 `ActionPlan`（`constraints.max_total_duration_ms` 当超时、stdout/stderr 上限沿用），经 `wist-exec run` 起子进程（`src/exec/local_exec.rs::execute_async`）。
-- **无 shell、无 argv 拼接**：每个 ID 的实现体给出**固定 argv**（二进制走绝对路径或受控 `PATH` 白名单）。
+- **无 shell、无 argv 拼接**：每个 ID 的实现体给出**固定参数**，二进制只给**名字**，由候选目录解析成绝对路径（见上）。
 - 退出码非 0 / 超时 / 二进制缺失 → 记 `unsupported` 或自观测事件，**不静默**。
 
 **输出 → 记录**

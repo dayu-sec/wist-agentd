@@ -42,6 +42,13 @@ pub struct MetricsTargetView {
     /// 管理面的「采集结果」看不到“授权了为什么没数据”。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_selection_error: Option<String>,
+    /// 容器运行时的**扫描结论**：看见了却读不了时写原因（`None` = 正常 / 本机没有运行时）。
+    ///
+    /// 与 `process_selection_error` 同一条链路、同一个理由：扫描发生在**发现拍**，
+    /// 记账在**指标 tick**，两者之间只有这个视图文件。`container_metrics` 零目标 + 本视图
+    /// 带原因 = 「该采而采不了」；零目标 + 无原因 = 空集（本机本来就没容器）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_scan_error: Option<String>,
 }
 
 #[cfg(test)]
@@ -61,6 +68,7 @@ pub fn build_metrics_target_view(
         targets,
         // 纯构建器不知道选择结论；由发现拍在落盘前填。
         process_selection_error: None,
+        container_scan_error: None,
     })
 }
 
@@ -89,6 +97,7 @@ pub async fn build_metrics_target_view_async(
         targets,
         // 纯构建器不知道选择结论；由发现拍在落盘前填。
         process_selection_error: None,
+        container_scan_error: None,
     })
 }
 
@@ -234,5 +243,46 @@ mod tests {
         let loaded: super::MetricsTargetView = read_json(&view_path).expect("load target view");
 
         assert_eq!(loaded, view);
+    }
+
+    /// `container_scan_error` 是发现拍 → 指标 tick 的**唯一**传声筒：扫描发生在发现拍，
+    /// 记账在指标 tick，中间只有这个视图文件。丢了它，管理面就只看得见「零目标」，
+    /// 分不清「本机没容器」与「容器读不了」——后者要报故障，前者是空集。
+    #[test]
+    fn container_scan_error_survives_the_round_trip() {
+        let state_dir = temp_dir("container-scan-error");
+        let mut view = build_metrics_target_view(&state_dir, "2026-04-19T00:00:00Z")
+            .expect("empty target view");
+        view.container_scan_error = Some("docker socket 不可读：/var/run/docker.sock".to_string());
+        let view_path = path_for(&state_dir);
+
+        store(&view_path, &view).expect("store target view");
+        let loaded: super::MetricsTargetView = read_json(&view_path).expect("load target view");
+
+        assert_eq!(
+            loaded.container_scan_error.as_deref(),
+            Some("docker socket 不可读：/var/run/docker.sock")
+        );
+    }
+
+    /// `None` 必须**整键不落盘**：契约是「有原因才出现」，正常态不该写成显式 `null`。
+    ///
+    /// 两个理由：一是差异对比/人眼排查时少一条噪音；二是滚动升级后旧读方若按
+    /// “字段存在就是要报故障”理解，`null` 会被误读成一条空原因。
+    #[test]
+    fn container_scan_error_is_absent_from_json_when_none() {
+        let state_dir = temp_dir("container-scan-error-none");
+        let view = build_metrics_target_view(&state_dir, "2026-04-19T00:00:00Z")
+            .expect("empty target view");
+
+        let value = serde_json::to_value(&view).expect("serialize view");
+        let object = value.as_object().expect("view is a json object");
+
+        assert!(
+            !object.contains_key("container_scan_error"),
+            "None 不该落成 null 键，实际: {value}"
+        );
+        // 同一条规则下的另一个字段，顺手对齐。
+        assert!(!object.contains_key("process_selection_error"));
     }
 }

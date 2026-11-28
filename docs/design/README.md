@@ -13,6 +13,7 @@ wist-agentd（edge daemon）实现时最重要的设计文档。
 4. [agentd-failure-handling.md](./agentd-failure-handling.md) — 故障处理
    - 采集结果的状态口径见 [collection-status.md](./collection-status.md) — `AgentLocalCollection` 五状态定义、判定顺序与「什么不是错误」
 5. [agentd-exec-protocol.md](./agentd-exec-protocol.md) — 本地执行协议（配合 `src/exec/`）
+   - 计划签发证明的**验签与信任锚**：[plan-anchor-distribution.md](./plan-anchor-distribution.md) — 锚目录化、存量机队怎么铺/怎么轮换（设计稿）；签名与审批语义在上游 `wist-gateway/docs/design/plan-attestation.md`
 6. [agent-config-schema.md](./agent-config-schema.md) — 配置 schema（配合 `src/config/`）
 7. [self-observability.md](./self-observability.md) — 自观测（配合 `src/runtime/self_observability.rs`）
 8. [agentd-service-deployment.md](./agentd-service-deployment.md) — 后台长期运行方案（设计说明；配合 `src/service/`）
@@ -53,7 +54,7 @@ wist-agentd（edge daemon）实现时最重要的设计文档。
 |---|---|
 | `src/bootstrap` | agentd-state-and-boundaries |
 | `src/config` | agent-config-schema |
-| `src/exec` | agentd-exec-protocol、agentd-failure-handling |
+| `src/exec` | agentd-exec-protocol、agentd-failure-handling、plan-anchor-distribution |
 | `src/investigate*` | agentd-investigation |
 | `src/runtime` | agentd-architecture、self-observability |
 | `src/service` | agentd-service-deployment（设计）＋ `../usage/agentd-install-and-usage`（安装/运维） |

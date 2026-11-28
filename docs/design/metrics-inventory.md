@@ -141,7 +141,25 @@ system_cpu_usage_ratio
 
 ### 4.2 容器（`container_*`，`collection_kind=container_metrics`）
 
+归属采集面：`ContainerMetrics`（单元 `linux-container-metrics`，来源 `ContainerMetrics/auto`）。
+**容器目标只在那个面被授权时产出**：没授权的机器不会“顺手”上送容器序列。
+
 身份：`instance = <host>:ctr:<container_id>`（cgroup 口径）。
+
+**载体现状**：Linux 走宿主 `/proc` + 运行时根目录（`/run/containerd/...`、`/run/docker/runtime-runc/moby`）；
+macOS 的 cgroup 在独立的 Linux VM 里，宿主读不到 —— 所以 macOS 上容器**能被发现**（`container_names` 进事实摘要，
+供知识库门控与数据库自探），但**不产出 `container` target**。
+
+**零目标有两种含义，必须分开报**（`ProbeOutput.unobserved` → `MetricsTargetView.container_scan_error`）：
+
+| 本机情况 | 扫描结论 | 采集记账 |
+|---|---|---|
+| 运行时根目录不存在（没装 / 没起） | 空集 | `no_targets`（信息级，不算阻塞） |
+| 运行时在，但**读不了**（非 root 读 `/run/containerd` 的 0700 / macOS Docker socket 不可达） | 看不见 | `target_not_ready` + 具体原因（阻塞项，指向要修的权限） |
+| 运行时在、读得到、确实 0 个容器 | 空集 | `no_targets` |
+
+> 把「看不见」静默当成「没有容器」是错的：前者需要人修权限，后者什么也不用做。
+> 日志侧对应 `event=ContainerScanUnreadable location="..." detail="..."`。
 
 | 指标 | 类型 | 单位 | label | 说明 |
 |---|---|---|---|---|

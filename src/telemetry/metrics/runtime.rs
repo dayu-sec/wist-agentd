@@ -123,6 +123,17 @@ fn build_snapshot(
         outcome.last_error = Some(reason.to_string());
     }
 
+    // 容器域同理，但区分的是另一件事：本机**看见了**容器运行时却读不了（权限 / socket
+    // 不可达）→ 「该采而采不了」；根本没有运行时 → 零目标且无原因（空集，不算阻塞）。
+    if let Some(reason) = view.container_scan_error.as_deref()
+        && let Some(outcome) = outcomes
+            .iter_mut()
+            .find(|outcome| outcome.collection_kind == "container_metrics")
+        && outcome.attempted_targets == 0
+    {
+        outcome.last_error = Some(reason.to_string());
+    }
+
     MetricsRuntimeSnapshot {
         generated_at: now_rfc3339(),
         total_targets: host_targets + process_targets + container_targets,
@@ -436,7 +447,8 @@ mod tests {
 
     use super::{
         MetricsCollectionOutcome, MetricsCollectionTargetSample, MetricsRuntimeSnapshot,
-        build_process_outcome, build_runtime_snapshot, build_snapshot, path_for, store,
+        build_container_outcome, build_process_outcome, build_runtime_snapshot, build_snapshot,
+        path_for, store,
     };
     use crate::telemetry::metrics::target_view::{MetricsTargetView, MetricsTargetViewEntry};
     use wist_contracts::discovery::StringKeyValue;
@@ -463,6 +475,7 @@ mod tests {
             generated_at: "2026-11-21T00:00:00Z".to_string(),
             targets: Vec::new(),
             process_selection_error: Some(reason.to_string()),
+            container_scan_error: None,
         };
         let snapshot = build_snapshot(&view, vec![build_process_outcome(Vec::new())]);
         let process = snapshot
@@ -478,6 +491,7 @@ mod tests {
             generated_at: "2026-11-21T00:00:00Z".to_string(),
             targets: Vec::new(),
             process_selection_error: None,
+            container_scan_error: None,
         };
         let snapshot = build_snapshot(&clean, vec![build_process_outcome(Vec::new())]);
         let process = snapshot
@@ -486,6 +500,79 @@ mod tests {
             .find(|outcome| outcome.collection_kind == "process_metrics")
             .expect("process outcome");
         assert!(process.last_error.is_none());
+    }
+
+    /// 容器域同理，但回答的是另一件事：本机**看见了**运行时却读不了（权限 / socket 不可达）。
+    ///
+    /// 零目标 + 有原因 = 「该采而采不了」（采集记账报 `target_not_ready`）；
+    /// 零目标 + 无原因 = 空集（本机本来就没容器，报 `no_targets`，不算阻塞）。
+    #[test]
+    fn an_idle_container_outcome_carries_the_scan_reason() {
+        let reason =
+            "容器运行时看不见（/run/containerd/io.containerd.runtime.v2.task/k8s.io）：权限不足";
+        let view = MetricsTargetView {
+            generated_at: "2026-11-28T00:00:00Z".to_string(),
+            targets: Vec::new(),
+            process_selection_error: None,
+            container_scan_error: Some(reason.to_string()),
+        };
+        let snapshot = build_snapshot(&view, vec![build_container_outcome(Vec::new())]);
+        let container = snapshot
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.collection_kind == "container_metrics")
+            .expect("container outcome");
+        assert_eq!(container.status, "idle");
+        assert_eq!(container.last_error.as_deref(), Some(reason));
+
+        // 本机说不出原因（没有运行时 / 真的没容器）：不凭空编一句。
+        let clean = MetricsTargetView {
+            generated_at: "2026-11-28T00:00:00Z".to_string(),
+            targets: Vec::new(),
+            process_selection_error: None,
+            container_scan_error: None,
+        };
+        let snapshot = build_snapshot(&clean, vec![build_container_outcome(Vec::new())]);
+        let container = snapshot
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.collection_kind == "container_metrics")
+            .expect("container outcome");
+        assert!(container.last_error.is_none());
+    }
+
+    /// 有目标时**不**把扫描原因糊上去：那句原因描述的是“一个目标都没有”的情形，
+    /// 目标已经采到时再报一遍会让人以为这一轮也不可用。
+    #[test]
+    fn a_container_scan_reason_is_ignored_once_targets_exist() {
+        let view = MetricsTargetView {
+            generated_at: "2026-11-28T00:00:00Z".to_string(),
+            targets: vec![MetricsTargetViewEntry {
+                candidate_id: "container-1".to_string(),
+                collection_kind: "container_metrics".to_string(),
+                target_ref: "container-1".to_string(),
+                resource_ref: "container-1".to_string(),
+                execution_hints: vec![
+                    StringKeyValue::new("container.runtime", "containerd"),
+                    StringKeyValue::new("pid", std::process::id().to_string()),
+                ],
+            }],
+            process_selection_error: None,
+            container_scan_error: Some("读不到 /run/containerd（权限不足）".to_string()),
+        };
+        let targets = vec![&view.targets[0]];
+        let snapshot = build_snapshot(&view, vec![build_container_outcome(targets)]);
+        let container = snapshot
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.collection_kind == "container_metrics")
+            .expect("container outcome");
+        assert!(container.attempted_targets > 0);
+        assert!(
+            container.last_error.is_none(),
+            "有目标时不该带着“看不见”的原因：{:?}",
+            container.last_error
+        );
     }
 
     #[test]
@@ -520,6 +607,7 @@ mod tests {
                 },
             ],
             process_selection_error: None,
+            container_scan_error: None,
         };
         crate::telemetry::metrics::target_view::store(
             &crate::telemetry::metrics::target_view::path_for(&state_dir),
@@ -671,6 +759,7 @@ mod tests {
                 })
                 .collect(),
             process_selection_error: None,
+            container_scan_error: None,
         };
         crate::telemetry::metrics::target_view::store(
             &crate::telemetry::metrics::target_view::path_for(&state_dir),
@@ -718,6 +807,7 @@ mod tests {
                 execution_hints: vec![StringKeyValue::new("process.identity", "demo")],
             }],
             process_selection_error: None,
+            container_scan_error: None,
         };
         crate::telemetry::metrics::target_view::store(
             &crate::telemetry::metrics::target_view::path_for(&state_dir),
@@ -759,6 +849,7 @@ mod tests {
                 execution_hints: Vec::new(),
             }],
             process_selection_error: None,
+            container_scan_error: None,
         };
         crate::telemetry::metrics::target_view::store(
             &crate::telemetry::metrics::target_view::path_for(&state_dir),
