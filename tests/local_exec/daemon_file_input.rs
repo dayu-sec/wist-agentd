@@ -362,12 +362,21 @@ fn daemon_run_once_processes_granted_log_work() {
         "逐进程指标停采时不得再写候选文件"
     );
     let process_planner_candidates: Vec<CollectionCandidate> = Vec::new();
-    let container_planner_candidates: Vec<CollectionCandidate> = read_json(
-        &state_dir
-            .join("planner")
-            .join("container_metrics_candidates.json"),
-    )
-    .expect("read container planner candidates");
+    // 容器指标同理：**没授权就不产出候选**，文件不在 = 零目标（与逐进程指标同一条纪律）。
+    // 这里不能假定文件存在 —— “不生成”本身就是被验证的行为。
+    let container_candidates_path = state_dir
+        .join("planner")
+        .join("container_metrics_candidates.json");
+    let container_planner_candidates: Vec<CollectionCandidate> =
+        if container_candidates_path.exists() {
+            read_json(&container_candidates_path).expect("read container planner candidates")
+        } else {
+            Vec::new()
+        };
+    assert!(
+        !container_candidates_path.exists(),
+        "容器指标未授权时不得写候选文件"
+    );
     let metrics_target_view: TestMetricsTargetView =
         read_json(&state_dir.join("telemetry").join("metrics_target_view.json"))
             .expect("read metrics target view");
