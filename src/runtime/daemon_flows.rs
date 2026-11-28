@@ -25,6 +25,7 @@ use crate::telemetry::flows::record::{
     HostFlowRecord, MAX_FLOWS_PER_FLUSH, PartialReason, WINDOW_SECONDS, WindowCtx, is_flushable,
     record_from_window, window_from_bucket,
 };
+use crate::telemetry::flows::scope::FlowScope;
 use crate::telemetry::flows::support::{FlowSupport, Unavailable};
 use crate::telemetry::flows::{self, Collector, WatchedIface};
 use crate::telemetry::warp_parse::TelemetryRecordSink;
@@ -102,6 +103,8 @@ pub(super) struct FlowReport {
     pub(super) lost_records: usize,
     /// 本拍累计的迟到丢弃：可见，但**不补发**（补发会破坏幂等键）。
     pub(super) late_dropped: u64,
+    /// 本拍被采集范围（见 [`FlowScope`]）过滤掉的包数增量。
+    pub(super) filtered: u64,
     /// 硬失败：采不了 / 发不出去。一条一条进采集状态。
     pub(super) failures: Vec<FlowFailure>,
 }
@@ -118,6 +121,9 @@ pub(super) struct FlowHostContext<'a> {
 
 /// 跨 tick 的流采集运行态。
 pub(super) struct FlowRuntime {
+    /// 采集范围：挂载前写进 BPF，之后不可变（生产恒为 [`FlowScope::Internet`]，
+    /// 没有本机配置面；全采只在真机用例里用）。
+    scope: FlowScope,
     collector: Option<Collector>,
     /// 最近一次起不来的原因：冷却期内不重试，但**每拍照报** —— 只报第一拍等于事后看不见。
     unavailable: Option<Unavailable>,
@@ -153,8 +159,9 @@ struct HostFacts {
 }
 
 impl FlowRuntime {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(scope: FlowScope) -> Self {
         Self {
+            scope,
             collector: None,
             unavailable: None,
             last_start_attempt: None,
@@ -333,6 +340,7 @@ impl FlowRuntime {
             .flush_capped
             .saturating_add(u64::from(report.flush_capped));
         counters.late_dropped = counters.late_dropped.saturating_add(report.late_dropped);
+        counters.filtered = counters.filtered.saturating_add(report.filtered);
         counters.truncated_windows = counters
             .truncated_windows
             .saturating_add(report.truncated_windows as u64);
@@ -356,6 +364,7 @@ impl FlowRuntime {
             schema_version: flows_state::SCHEMA_VERSION.to_string(),
             updated_at: now_rfc3339(),
             collecting: self.collector.is_some(),
+            scope: self.scope.as_str().to_string(),
             attach_path: flows::attach_path().to_string(),
             kernel: self.kernel.clone(),
             ifaces: self.watched.iter().map(|(_, name)| name.clone()).collect(),
@@ -436,7 +445,7 @@ impl FlowRuntime {
                         detail: format!("{} interfaces present", snapshot.len()),
                     })
                 } else {
-                    Collector::start(&chosen)
+                    Collector::start(&chosen, self.scope)
                 }
             }
         };
@@ -607,7 +616,7 @@ impl FlowRuntime {
         report: &mut FlowReport,
     ) {
         let now_secs = map_wall.unwrap_or_else(now_secs);
-        let (now_bucket, flushed, deferred, watched, late) = {
+        let (now_bucket, flushed, deferred, watched, late, filtered) = {
             let Some(collector) = self.collector.as_mut() else {
                 return;
             };
@@ -620,6 +629,7 @@ impl FlowRuntime {
                     (batch.flows, batch.deferred)
                 }
             };
+            let filtered = collector.take_filtered();
             let late = collector.take_late_dropped();
             (
                 now_bucket,
@@ -627,9 +637,11 @@ impl FlowRuntime {
                 deferred,
                 collector.watched().to_vec(),
                 late,
+                filtered,
             )
         };
         report.late_dropped = report.late_dropped.saturating_add(late);
+        report.filtered = report.filtered.saturating_add(filtered);
         if deferred {
             // 不是丢数据：桶留在 BPF 表里，下一拍照着取（最老的先走）。但现场应当能看见“跟不上”。
             report.flush_capped = true;
@@ -1035,7 +1047,7 @@ mod tests {
 
     #[test]
     fn window_shape_reports_truncated_start_and_forced_windows() {
-        let mut runtime = FlowRuntime::new();
+        let mut runtime = FlowRuntime::new(FlowScope::All);
         // 采集器在 `:30` 才起来 → 那个窗口只覆盖后 30 秒。
         let bucket = 10u64;
         let window = 1_700_000_040u64;
@@ -1085,7 +1097,7 @@ mod tests {
     /// 墙钟跳变：用**旧锚点**外推的时间判断，桶没动、墙钟回拨也不能当成正常。
     #[test]
     fn a_wall_clock_jump_is_detected_against_the_monotonic_bucket() {
-        let mut runtime = FlowRuntime::new();
+        let mut runtime = FlowRuntime::new(FlowScope::All);
         runtime.anchor = Some((1_700_000_100, 10));
         // 同桶、墙钟走 10s：正常（慢速纠偏在这个量级）。
         assert_eq!(runtime.clock_jump(1_700_000_110, 10), None);
@@ -1096,14 +1108,14 @@ mod tests {
         // 回拨 150s：负数也要认出来。
         assert_eq!(runtime.clock_jump(1_700_000_010, 11), Some(-150));
         // 没有锚点（刚启动）：无从判定，不报跳变。
-        let fresh = FlowRuntime::new();
+        let fresh = FlowRuntime::new(FlowScope::All);
         assert_eq!(fresh.clock_jump(1_700_000_010, 11), None);
     }
 
     /// 跳变那一拍必须按**旧锚点**归窗：按新墙钟重算会把桶挪回 60s×N，撞上已发的幂等键。
     #[test]
     fn a_jump_maps_the_in_flight_window_on_the_old_timeline() {
-        let mut runtime = FlowRuntime::new();
+        let mut runtime = FlowRuntime::new(FlowScope::All);
         runtime.anchor = Some((1_700_000_100, 10));
         let jumped_wall = 1_700_000_010; // 回拨 90s
         let old_timeline = runtime.extrapolated_wall(jumped_wall, 10);
@@ -1118,7 +1130,7 @@ mod tests {
     /// 跳变后的这一窗同样是“截断”的：原因要写成 `clock_changed` 而不是 `agent_start`。
     #[test]
     fn a_clock_changed_window_says_so() {
-        let mut runtime = FlowRuntime::new();
+        let mut runtime = FlowRuntime::new(FlowScope::All);
         let bucket = 10u64;
         let window = 1_700_000_040u64;
         runtime.cut = Some(WindowCut {
@@ -1135,7 +1147,7 @@ mod tests {
     /// 计数器是**累计**的（每拍增量并进去），diagnose 读的就是它们。
     #[test]
     fn counters_accumulate_from_each_report() {
-        let mut runtime = FlowRuntime::new();
+        let mut runtime = FlowRuntime::new(FlowScope::All);
         runtime.absorb(&FlowReport {
             delivered: 5,
             flush_capped: true,
@@ -1162,7 +1174,7 @@ mod tests {
         let state_dir = temp_dir("flow-status");
         let mut sink =
             TelemetryRecordSink::File(FileRecordSink::new(state_dir.join("records.jsonl")));
-        let mut runtime = FlowRuntime::new();
+        let mut runtime = FlowRuntime::new(FlowScope::All);
         let mut next_seq = 0u64;
         let work = flow_grant();
 
@@ -1210,7 +1222,7 @@ mod tests {
         let state_dir = temp_dir("flow-file-output");
         let mut sink =
             TelemetryRecordSink::File(FileRecordSink::new(state_dir.join("records.jsonl")));
-        let mut runtime = FlowRuntime::new();
+        let mut runtime = FlowRuntime::new(FlowScope::All);
         let mut next_seq = 0u64;
         let work = flow_grant();
 
@@ -1239,7 +1251,7 @@ mod tests {
         let state_dir = temp_dir("flow-no-grant");
         let mut sink =
             TelemetryRecordSink::File(FileRecordSink::new(state_dir.join("records.jsonl")));
-        let mut runtime = FlowRuntime::new();
+        let mut runtime = FlowRuntime::new(FlowScope::All);
         let mut next_seq = 0u64;
 
         let report = runtime
@@ -1272,7 +1284,7 @@ mod tests {
             TcpFraming::Line,
         ));
         let state_dir = temp_dir("flow-not-built");
-        let mut runtime = FlowRuntime::new();
+        let mut runtime = FlowRuntime::new(FlowScope::All);
         let mut next_seq = 0u64;
 
         let report = runtime
@@ -1323,7 +1335,7 @@ mod tests {
         ));
         let state_dir = temp_dir("flow-real");
         let mut next_seq = 0u64;
-        let mut runtime = FlowRuntime::new();
+        let mut runtime = FlowRuntime::new(FlowScope::All);
         let work = flow_grant();
 
         let started = runtime
@@ -1414,7 +1426,7 @@ mod tests {
         ));
         let state_dir = temp_dir("flow-shutdown");
         let mut next_seq = 0u64;
-        let mut runtime = FlowRuntime::new();
+        let mut runtime = FlowRuntime::new(FlowScope::All);
 
         let started = runtime
             .tick(

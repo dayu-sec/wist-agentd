@@ -16,6 +16,7 @@
 
 pub mod iface;
 pub mod record;
+pub mod scope;
 pub mod support;
 
 #[cfg(all(target_os = "linux", have_flow_bpf))]
@@ -23,6 +24,7 @@ mod linux;
 
 use iface::IfaceSnapshot;
 use record::{FlowKey, WindowAgg};
+use scope::FlowScope;
 use std::net::IpAddr;
 use support::{FlowSupport, Unavailable};
 
@@ -147,14 +149,14 @@ impl Collector {
     /// 在给定网卡上开始观测。
     ///
     /// 返回 `Err` 表示**采不了**（内核/权限/qdisc/加载失败），调用方必须如实上报。
-    pub(crate) fn start(ifaces: &[&IfaceSnapshot]) -> Result<Self, Unavailable> {
+    pub(crate) fn start(ifaces: &[&IfaceSnapshot], scope: FlowScope) -> Result<Self, Unavailable> {
         #[cfg(all(target_os = "linux", have_flow_bpf))]
         {
-            linux::Collector::start(ifaces).map(|inner| Self { inner })
+            linux::Collector::start(ifaces, scope).map(|inner| Self { inner })
         }
         #[cfg(not(all(target_os = "linux", have_flow_bpf)))]
         {
-            let _ = ifaces;
+            let _ = (ifaces, scope);
             Err(not_built())
         }
     }
@@ -193,6 +195,18 @@ impl Collector {
         {
             let _ = now_bucket;
             Vec::new()
+        }
+    }
+
+    /// 被采集范围过滤掉的包数（增量）。`scope = internet` 时它回答「有没有东西被丢」。
+    pub(crate) fn take_filtered(&mut self) -> u64 {
+        #[cfg(all(target_os = "linux", have_flow_bpf))]
+        {
+            self.inner.take_filtered()
+        }
+        #[cfg(not(all(target_os = "linux", have_flow_bpf)))]
+        {
+            0
         }
     }
 

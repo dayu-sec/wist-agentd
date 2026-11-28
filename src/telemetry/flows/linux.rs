@@ -12,9 +12,10 @@ use crate::telemetry::flows::record::{
     Direction, FLUSH_LAG_WINDOWS, FlowKey, PROTO_ICMP, PROTO_ICMPV6, WindowAgg, is_late, plan_take,
     proto_is_collected,
 };
+use crate::telemetry::flows::scope::FlowScope;
 use crate::telemetry::flows::support::{FlowSupport, Unavailable};
 use crate::telemetry::flows::{FlushBatch, FlushedFlow, WatchedIface};
-use aya::maps::{HashMap, MapData, PerCpuArray};
+use aya::maps::{Array, HashMap, MapData, PerCpuArray};
 use aya::programs::ProgramError;
 use aya::programs::tc::{
     NlOptions, SchedClassifier, TcAttach, TcAttachType, TcError, qdisc_add_clsact,
@@ -35,6 +36,8 @@ const PROG_EGRESS: &str = "flow_egress";
 const PROG_INGRESS: &str = "flow_ingress";
 const MAP_NAME: &str = "flow_map";
 const MAP_DROPS: &str = "drops";
+const MAP_SCOPE: &str = "scope_mode";
+const MAP_FILTERED: &str = "filtered";
 
 /// BPF map 的键（与 `flow.bpf.c` 的 `struct flow_key` 逐字节一致）。
 #[repr(C, packed)]
@@ -120,6 +123,8 @@ pub(crate) struct Collector {
     ifaces: Vec<WatchedIface>,
     /// 上次读到的 drops 累计值（per-cpu 计数器本身不清零，只算增量）。
     last_drops: u64,
+    /// 上次读到的「被范围过滤」累计值（同上，只算增量）。
+    last_filtered: u64,
     /// 已经 flush 到哪个桶（含）。再落进这个桶的包是**迟到**，只能计丢，不能再发一条。
     flushed_through: u64,
     /// 迟到包数（补发会破坏「一个键一个窗口一条记录」，所以只记数）。
@@ -267,10 +272,30 @@ fn detach_stale_filters(
 }
 
 impl Collector {
-    pub(crate) fn start(ifaces: &[&IfaceSnapshot]) -> Result<Self, Unavailable> {
+    /// `scope` 决定 BPF 侧是否只保留「一端是公网」的流量（见 [`FlowScope`]）。
+    /// 必须在**挂之前**写进 map。
+    pub(crate) fn start(ifaces: &[&IfaceSnapshot], scope: FlowScope) -> Result<Self, Unavailable> {
         let mut bpf = Ebpf::load(FLOW_BPF).map_err(|err: EbpfError| Unavailable::LoadFailed {
             detail: err.to_string(),
         })?;
+
+        // 采集范围：单条目数组 map。读不到就按“全采”跑（宁可多采，不少采），
+        // 但要留痕 —— 静默变成另一种口径是这类开关最糟糕的失败形状。
+        let scope_written = match bpf.map_mut(MAP_SCOPE) {
+            Some(map) => match Array::<_, u32>::try_from(map) {
+                Ok(mut array) => array
+                    .set(0, &scope.bpf_mode(), 0)
+                    .map_err(|err| err.to_string()),
+                Err(err) => Err(err.to_string()),
+            },
+            None => Err("scope_mode map missing".to_string()),
+        };
+        if let Err(err) = scope_written {
+            log::warn!(
+                "event=HostFlowScopeUnavailable scope={} detail=\"{err}\"（本次按全采运行）",
+                scope.as_str()
+            );
+        }
 
         // 先各加载一次（挂到多张网卡时复用同一个已加载程序）。
         for name in [PROG_EGRESS, PROG_INGRESS] {
@@ -316,6 +341,7 @@ impl Collector {
         Ok(Self {
             bpf,
             last_drops: 0,
+            last_filtered: 0,
             flushed_through: 0,
             late_dropped: 0,
             ifaces: ifaces
@@ -348,6 +374,23 @@ impl Collector {
         };
         let delta = total.saturating_sub(self.last_drops);
         self.last_drops = total;
+        delta
+    }
+
+    /// 读「被范围过滤掉的包数」的**增量**（per-cpu 计数器只增不清）。
+    pub(crate) fn take_filtered(&mut self) -> u64 {
+        let Some(map) = self.bpf.map_mut(MAP_FILTERED) else {
+            return 0;
+        };
+        let Ok(counter) = PerCpuArray::<_, u64>::try_from(map) else {
+            return 0;
+        };
+        let total: u64 = match counter.get(&0, 0) {
+            Ok(values) => values.iter().copied().sum(),
+            Err(_) => return 0,
+        };
+        let delta = total.saturating_sub(self.last_filtered);
+        self.last_filtered = total;
         delta
     }
 
@@ -882,7 +925,9 @@ mod tests {
         let iface = (*chosen.first().expect("默认出口网卡")).clone();
         let ifaces = [iface.clone()];
         let refs: Vec<&IfaceSnapshot> = ifaces.iter().collect();
-        let mut collector = Collector::start(&refs).expect("attach tc");
+        // 这个用例验的是「聚合口径」，用的是发往默认网关（私网）的流量 —— 必须显式
+        // `All`，否则默认的 `internet` 范围会把它的包全过滤掉（那才是正确行为）。
+        let mut collector = Collector::start(&refs, FlowScope::All).expect("attach tc");
 
         // 诊断：attach **成功但看不到包**时，光靠断言分不清是「没挂上」还是「挂错位置」。
         // 把选了哪张网卡、attach 后这张网卡上的 tc 实际状态打进 stderr ——
@@ -1144,5 +1189,112 @@ mod tests {
             "三层 tag 必须让 drops 增长（否则这段流量就是无声消失）"
         );
         assert!(echo.agg.bytes >= 3 * (20 + 8), "ICMP 至少含 IP + ICMP 头");
+    }
+
+    /// `internet` 范围（**默认且唯一的生产行为**）：只要**一端是公网**就留，内网两端才丢。
+    ///
+    /// 这是默认口径的端到端验证，要同时在真内核上看到三件不一样的事：
+    ///
+    /// 1. 内网 → 内网（本机 IP 发往默认网关）**不进表**；
+    /// 2. 本机 → 公网（`src` 私网、`dst` 公网）**进表**；
+    /// 3. **公网 → 本机**（`src` 公网、`dst` 私网）也**进表**。
+    ///
+    /// 第 3 条是后加的，因为「只采对外」这句话太容易被人理解成「只看 `dst`」——
+    /// 那样写出来会把**入站公网流量整片丢掉**（入站包的 `dst` 就是本机私网地址），
+    /// 而「谁在访问我」恰恰是最有价值的观测之一。地址形状靠 AF_PACKET 注入帧造（
+    /// 不需要真实入站流量），判据本身只看 `src`/`dst`、与 hook 无关。
+    #[test]
+    #[ignore = "需要 root + tc + 真实流量（在 Linux 真机上跑）"]
+    fn internet_scope_keeps_any_public_peer_and_drops_private_to_private() {
+        let _exclusive = crate::telemetry::flows::REAL_NIC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let snapshot = interfaces();
+        let chosen = select_observed(&snapshot);
+        let iface = (*chosen.first().expect("默认出口网卡")).clone();
+        let gateway = default_gateway_v4().expect("默认网关");
+        let ifaces = [iface.clone()];
+        let refs: Vec<&IfaceSnapshot> = ifaces.iter().collect();
+        let mut collector = Collector::start(&refs, FlowScope::Internet).expect("attach tc");
+        let local_v4 = iface
+            .addrs
+            .iter()
+            .find_map(|addr| match addr {
+                IpAddr::V4(v4) => Some(*v4),
+                IpAddr::V6(_) => None,
+            })
+            .expect("默认出口网卡应有 v4 地址");
+
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind");
+        let payload = vec![b'z'; 16];
+        // ① 内网 → 内网（默认网关）：应被过滤。
+        for _ in 0..3 {
+            socket
+                .send_to(&payload, (gateway, 9))
+                .expect("send internal");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // ② 本机 → 公网：应留下（不需要有回应，只要包出去了）。
+        let public: Ipv4Addr = "1.1.1.1".parse().expect("public");
+        for _ in 0..3 {
+            socket.send_to(&payload, (public, 9)).expect("send public");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // ③ 公网 → 本机（入站形状）：同样应留下。手工造帧，源地址写成公网 IP、
+        // 目的写成内网网关 —— 判据只看两端地址，这就是 ingress hook 上入站包的形状。
+        let src_mac: [u8; 6] = {
+            let text = std::fs::read_to_string(format!("/sys/class/net/{}/address", iface.name))
+                .expect("mac");
+            let mut mac = [0u8; 6];
+            for (slot, part) in mac.iter_mut().zip(text.trim().split(':')) {
+                *slot = u8::from_str_radix(part, 16).expect("mac octet");
+            }
+            mac
+        };
+        for _ in 0..3 {
+            let frame = build_tagged_udp4(src_mac, &[], public, gateway, 31000, 80, 16);
+            send_raw(iface.ifindex, &frame).expect("send inbound-shaped v4");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let flows = collector.snapshot_all();
+        let dump = || {
+            flows
+                .iter()
+                .map(|f| (f.key.direction, f.key.src, f.key.dst, f.key.dst_port))
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            flows.iter().any(|flow| {
+                flow.key.direction == Direction::Out
+                    && flow.key.protocol == 17
+                    && flow.key.dst == IpAddr::V4(public)
+                    && flow.key.dst_port == 9
+            }),
+            "① 本机→公网必须留下；已看到 {:?}",
+            dump()
+        );
+        assert!(
+            flows.iter().any(|flow| {
+                flow.key.direction == Direction::Out
+                    && flow.key.protocol == 17
+                    && flow.key.src == IpAddr::V4(public)
+                    && flow.key.dst == IpAddr::V4(gateway)
+                    && flow.key.src_port == 31000
+            }),
+            "② 公网→本机（入站形状）也必须留下 —— 只判 dst 的实现会在这里挂；已看到 {:?}",
+            dump()
+        );
+        assert!(
+            !flows
+                .iter()
+                .any(|flow| flow.key.src == IpAddr::V4(local_v4)
+                    && flow.key.dst == IpAddr::V4(gateway)),
+            "③ 内网→内网（本机→默认网关）必须被过滤掉；已看到 {:?}",
+            dump()
+        );
+        let filtered = collector.take_filtered();
+        assert!(filtered >= 3, "被过滤的包要计数（got {filtered}）");
     }
 }

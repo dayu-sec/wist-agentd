@@ -63,6 +63,7 @@ use crate::state_store::{
     agent_runtime, auth_terminal, commands, execution_queue, fact_report, log_seq_state,
     planner_candidates, work,
 };
+use crate::telemetry::flows::scope::FlowScope;
 use crate::telemetry::metrics::key_process;
 use crate::telemetry::metrics::target_view;
 
@@ -2276,7 +2277,10 @@ pub async fn run_forever_async(loop_ctx: DaemonLoop<'_>) -> RuntimeResult<()> {
     // （见 `files::file_handles` 模块注释）。
     let mut log_runtime = LogInputRuntime::new();
     // 主机流记录的跨 tick 运行态：tc/eBPF 采集器与已观测网卡都在里面（授权撤了就卸）。
-    let mut flow_runtime = FlowRuntime::new();
+    //
+    // 采集范围**暂时固定**为「只留一端是公网的流量」（出站与入站都算）：内置 agentd 没有本机配置面 —— 上千台机器没人会去改
+    // 每台的 toml，加了也只会永远停在默认值（把「范围」交给平台下发是后续项，见设计 §10.2 / §13）。
+    let mut flow_runtime = FlowRuntime::new(FlowScope::Internet);
     let mut last_metrics_uplink: Option<Instant> = None;
     let mut last_discovery_uplink: Option<Instant> = None;
     // 只提醒一次：`snapshot_uplink_enabled = true` 搭配非 tcp 输出时，行为是

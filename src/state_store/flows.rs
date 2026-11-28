@@ -50,6 +50,10 @@ pub struct FlowCounters {
     /// 上送失败的批数（至多一次：本批丢弃，不重发）。
     #[serde(default)]
     pub uplink_failures: u64,
+    /// 被采集范围（`scope`）过滤掉的包数：开着 `internet` 却一条流都没有时，
+    /// 它回答“是被过滤了”还是“真的没流量”。
+    #[serde(default)]
+    pub filtered: u64,
 }
 
 /// 一份运行态快照。
@@ -60,6 +64,11 @@ pub struct FlowStatus {
     pub updated_at: String,
     /// 采集器当前是否在跑。
     pub collecting: bool,
+    /// 采集范围：`internet`（默认，只留**一端是公网**的流量，含入站）| `all`（全采，含内网东西向）。
+    ///
+    /// 旧文件（这个字段还不存在时）默认按 `all` 读 —— 那时候确实什么都采。
+    #[serde(default = "default_scope")]
+    pub scope: String,
     /// 走哪条 attach 路径：`tcx`（≥6.6，内核自动摘）| `netlink`（<6.6，需自己清残留）。
     pub attach_path: String,
     /// 运行内核版本。
@@ -72,6 +81,10 @@ pub struct FlowStatus {
     /// 最近一次失败的一句话（没有失败就没有这个键）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+}
+
+fn default_scope() -> String {
+    "all".to_string()
 }
 
 pub(crate) fn path_for(state_dir: &Path) -> PathBuf {
@@ -108,6 +121,7 @@ mod tests {
             schema_version: SCHEMA_VERSION.to_string(),
             updated_at: "2026-11-27T00:00:00Z".to_string(),
             collecting: true,
+            scope: "all".to_string(),
             attach_path: "tcx".to_string(),
             kernel: "6.8.0-138-generic".to_string(),
             ifaces: vec!["eth0".to_string()],
@@ -200,6 +214,9 @@ mod tests {
         // 旧文件里没有的计数器 = 0，而不是解析失败。
         assert_eq!(status.counters.clock_jumps, 0);
         assert_eq!(status.counters.uplink_failures, 0);
+        assert_eq!(status.counters.filtered, 0);
+        // 旧文件里没有 `scope`：那时候确实什么都采，所以按 `all` 读（而不是默认的 `internet`）。
+        assert_eq!(status.scope, "all");
         assert_eq!(status.last_error, None);
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -1269,8 +1269,9 @@ fn flows_check_at(path: &Path) -> Check {
 
     let c = &status.counters;
     let detail = format!(
-        "collecting={} path={} kernel={} ifaces={} sent={} late_dropped={} truncated={} capped={} lost={} load_failures={} iface_changes={} clock_jumps={} uplink_failures={} updated={}",
+        "collecting={} scope={} path={} kernel={} ifaces={} sent={} filtered={} late_dropped={} truncated={} capped={} lost={} load_failures={} iface_changes={} clock_jumps={} uplink_failures={} updated={}",
         status.collecting,
+        status.scope,
         status.attach_path,
         status.kernel,
         if status.ifaces.is_empty() {
@@ -1279,6 +1280,7 @@ fn flows_check_at(path: &Path) -> Check {
             status.ifaces.join(",")
         },
         c.windows_sent,
+        c.filtered,
         c.late_dropped,
         c.truncated_windows,
         c.flush_capped,
@@ -1297,7 +1299,19 @@ fn flows_check_at(path: &Path) -> Check {
             );
     }
     if status.collecting {
-        return Check::ok("flows.status", "流记录在采", detail);
+        // 「在采」不是「有数据」：默认口径只留一端是公网的流量。如果本机这段时间只有
+        // 内网东西向，就会 `sent=0` 且 `filtered>0` —— 那**不是**采集器坏了。
+        // 不写这句的话，现场第一眼会把「一切都 OK、就是没数据」当成 bug（我们在别处
+        // 反复强调「零记录 ≠ 故障」，但诊察项里得把理由当场给出来）。
+        let ok = Check::ok("flows.status", "流记录在采", detail);
+        return if c.windows_sent == 0 && c.filtered > 0 {
+            ok.hint(format!(
+                "`sent=0` 但 `filtered={}`：默认只采「一端是公网的流量」，本机这段时间只有内网东西向（不是采集器坏了）",
+                c.filtered
+            ))
+        } else {
+            ok
+        };
     }
     Check::warn("flows.status", "流记录当前不在采", detail).hint(
         "没有 `HostFlow` 授权 / 输出不是 tcp（file 输出承载不了 FLOW 帧）/ 采集器在起不来的重试冷却",
@@ -2779,6 +2793,7 @@ mod tests {
             schema_version: crate::state_store::flows::SCHEMA_VERSION.to_string(),
             updated_at: "2026-11-27T00:00:00Z".to_string(),
             collecting: true,
+            scope: "internet".to_string(),
             attach_path: "tcx".to_string(),
             kernel: "6.8.0".to_string(),
             ifaces: vec!["eth0".to_string()],
@@ -2796,6 +2811,8 @@ mod tests {
         assert!(ok.detail.contains("sent=12"), "{}", ok.detail);
         assert!(ok.detail.contains("late_dropped=2"), "{}", ok.detail);
         assert!(ok.detail.contains("path=tcx"), "{}", ok.detail);
+        assert!(ok.detail.contains("scope=internet"), "{}", ok.detail);
+        assert!(ok.detail.contains("filtered=0"), "{}", ok.detail);
 
         // 3) 不在采、有原因：FAIL，原因原样带出来。
         status.collecting = false;
@@ -2815,6 +2832,48 @@ mod tests {
         let broken = flows_check_at(&path);
         assert_eq!(broken.status, Status::Fail);
         assert!(broken.hint.expect("hint").contains("删掉"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 「在采、`sent=0`、`filtered>0`」必须给出「不是坏了」的解释。
+    ///
+    /// 默认口径只留「一端是公网的流量」：一台只跑内网东西向的机器会持续零记录。
+    /// 诊断把它报成 OK 却不给理由时，现场只会当成 bug 去查采集器（而采集器好好的）。
+    #[test]
+    fn flows_status_explains_zero_records_under_the_public_peer_scope() {
+        let dir = std::env::temp_dir().join(format!(
+            "wist-doctor-flows-zero-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let path = crate::state_store::flows::path_for(&dir);
+        std::fs::create_dir_all(path.parent().expect("dir")).expect("mkdir");
+        let status = crate::state_store::flows::FlowStatus {
+            schema_version: crate::state_store::flows::SCHEMA_VERSION.to_string(),
+            updated_at: "2026-11-27T00:00:00Z".to_string(),
+            collecting: true,
+            scope: "internet".to_string(),
+            attach_path: "tcx".to_string(),
+            kernel: "6.8.0".to_string(),
+            ifaces: vec!["eth0".to_string()],
+            counters: crate::state_store::flows::FlowCounters {
+                windows_sent: 0,
+                filtered: 4096,
+                ..Default::default()
+            },
+            last_error: None,
+        };
+        std::fs::write(&path, serde_json::to_vec(&status).expect("json")).expect("write");
+
+        let check = flows_check_at(&path);
+        assert_eq!(check.status, Status::Ok, "{check:?}");
+        let hint = check.hint.expect("零记录必须给出解释");
+        assert!(hint.contains("filtered=4096"), "{hint}");
+        assert!(hint.contains("公网"), "{hint}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3891,6 +3950,7 @@ mod tests {
             schema_version: crate::state_store::flows::SCHEMA_VERSION.to_string(),
             updated_at: "2026-11-27T00:00:00Z".to_string(),
             collecting,
+            scope: "internet".to_string(),
             attach_path: "tcx".to_string(),
             kernel: "6.8.0-138-generic".to_string(),
             ifaces: vec!["eth0".to_string()],

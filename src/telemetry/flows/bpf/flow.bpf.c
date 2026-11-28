@@ -86,6 +86,26 @@ struct {
     __type(value, __u64);
 } drops SEC(".maps");
 
+/* 采集范围（单条目，加载时由用户态写）：0 = 全采，1 = 只留「一端是公网」的流量
+ * （入站与出站都算，别把入站丢了）。
+ * 为什么走 map 而不走编译期常量：同一份 BPF 对象要给不同站点用，不能为每个站点重编。 */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} scope_mode SEC(".maps");
+
+/* 被范围过滤掉的包数（per-cpu，只增）：开着过滤却一条流都没有时，它回答“是被过滤了”。
+ * 与 `drops` 同口径：**每个 skb 记 1**（不按 gso_segs 展开），所以它是“有没有东西被丢”
+ * 的信号，不是可以拿去和 `packets` 对账的精确报文数。 */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} filtered SEC(".maps");
+
 static __always_inline int proto_collected(__u8 proto)
 {
     return proto == PROTO_TCP || proto == PROTO_UDP || proto == PROTO_ICMP ||
@@ -118,12 +138,94 @@ static __always_inline void note_drop(void)
         *counter += 1;
 }
 
+static __always_inline void note_filtered(void)
+{
+    __u32 zero = 0;
+    __u64 *counter = bpf_map_lookup_elem(&filtered, &zero);
+    if (counter)
+        *counter += 1;
+}
+
+/* ── 采集范围：内网 / 保留 / 不可路由地址 ──
+ *
+ * 与 `scope.rs` 的注释同一张表（设计 §10.2）。必须在**逐包**路径上，所以只能做
+ * 常量比较，不能查 LPM。站点自定义内网段（如 VPC 用公网段）属于后续项，
+ * 目前只认下面这些标准段：漏判的方向是“多采”（而不是丢数据）。 */
+static __always_inline int v4_internal(const __u8 *a)
+{
+    if (a[0] == 0)
+        return 1; /* 0/8 本网络 */
+    if (a[0] == 10)
+        return 1; /* 10/8 */
+    if (a[0] == 127)
+        return 1; /* 127/8 环回 */
+    if (a[0] == 169 && a[1] == 254)
+        return 1; /* 169.254/16 链路本地 */
+    if (a[0] == 172 && a[1] >= 16 && a[1] <= 31)
+        return 1; /* 172.16/12 */
+    if (a[0] == 192 && a[1] == 168)
+        return 1; /* 192.168/16 */
+    if (a[0] == 100 && a[1] >= 64 && a[1] <= 127)
+        return 1; /* 100.64/10 CGNAT（云上常见） */
+    if (a[0] >= 224)
+        return 1; /* 224/4 组播 + 240/4 保留（含 255.255.255.255） */
+    return 0;
+}
+
+static __always_inline int v6_internal(const __u8 *a)
+{
+    if (a[0] == 0) {
+        /* `::/8`：含 `::`、`::1`；v4-mapped（`::ffff:a.b.c.d`，前 10 字节为 0）要看内嵌的 v4。
+         * 边角：已废弃的 IPv4-compatible 写法 `::a.b.c.d` 会被当成内网（少采）——
+         * Linux 不产生这种地址，不值得在逐包路径上多比 9 个字节。 */
+        int v4_mapped = a[10] == 0xff && a[11] == 0xff;
+        if (v4_mapped)
+            return v4_internal(&a[12]);
+        return 1;
+    }
+    if ((a[0] & 0xfe) == 0xfc)
+        return 1; /* fc00::/7 ULA */
+    if (a[0] == 0xfe && (a[1] & 0xc0) == 0x80)
+        return 1; /* fe80::/10 链路本地 */
+    if (a[0] == 0xff)
+        return 1; /* ff00::/8 组播 */
+    return 0;
+}
+
+/* 这个包该不该进聚合表。
+ *
+ * `internet` 模式：`src` / `dst` **任意一个是公网**就留（只判 dst 会把入站全丢掉）。
+ * 返回 0 = 丢弃（由调用方计 filtered）。 */
+static __always_inline int keep_in_scope(struct flow_key *key)
+{
+    __u32 zero = 0;
+    __u32 *mode = bpf_map_lookup_elem(&scope_mode, &zero);
+    if (!mode || *mode == 0)
+        return 1; /* 全采（也包含 map 读失败：宁可多采，不少采） */
+
+    if (key->family == 4) {
+        if (!v4_internal(key->src) || !v4_internal(key->dst))
+            return 1;
+    } else {
+        if (!v6_internal(key->src) || !v6_internal(key->dst))
+            return 1;
+    }
+    return 0;
+}
+
 /* 只收三个参数：BPF inline 函数超过 5 个参数 clang 会退化成栈传参而拒绝编译。
  *
  * `l2_len` 必须传进来：tc 上 `skb->len` **包含以太头**（实测 57 = 14 + 43），
  * 而记录的 `bytes` 口径是 **L3**（设计 §8）。`wire_len` 是线缆长度，保持原样。 */
 static __always_inline int account(struct __sk_buff *skb, struct flow_key *key, __u32 l2_len)
 {
+    /* 范围过滤在聚合**之前**：东西向的包根本不进表，也就不会被每拍扫到、不会挤掉
+     * 对外流（LRU 淘汰是按写入顺序的，这条顺序很重要）。 */
+    if (!keep_in_scope(key)) {
+        note_filtered();
+        return TC_ACT_OK;
+    }
+
     key->window_id = bpf_ktime_get_ns() / FLOW_WINDOW_NS;
     key->ifindex = skb->ifindex;
 
