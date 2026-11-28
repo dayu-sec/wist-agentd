@@ -101,11 +101,14 @@ WIST_AGENTD_RUN_ONCE=1 ./target/release/wist-agentd --config-dir ./dev-conf     
 ## 3. 方式二：通过 Wist-Gateway 安装
 
 目标：生产主机上的安装与注册由 **Wist-Gateway（控制面）** 发起，运维不手工拼命令——网关给出安装指令
-（含 `endpoint` 与**一次性注册 token**），agent 完成注册后以系统级常驻方式受管。
+（含 `endpoint` 与**注册 token**；单台用一次性码，同一分钟内批量首装用短时的批量码），
+agent 完成注册后以系统级常驻方式受管。
 
 ### 3.1 目标流程
 
-1. 网关侧生成主机/环境对应的一次性 token；
+1. 网关侧生成 token：单台用**一次性** token；同一窗口内批量首装用**批量安装 Token**
+   （`POST /api/v1/agent/install-code/batch`，默认 60s、最多 200 台，可在网关管理面调整，
+   配置文件里的是兜底默认值，见网关 `docs/design/agent-identity-mtls.md` §5.1）；
 2. 运维在目标主机执行网关给出的安装指令（由网关签名的 `install.sh` 引导，脚本内嵌网关信任锚）：
 
    ```bash
@@ -138,12 +141,14 @@ WIST_AGENTD_RUN_ONCE=1 ./target/release/wist-agentd --config-dir ./dev-conf     
 ### 3.3 剩余 TODO（离线场景仍可用手工过渡做法，见 §3.4）
 
 - [x] 网关侧：主机授权、一次性 token 生成/回收、安装指令生成；
+- [x] 批量首装：网关签发**短时（默认 60s）多机**安装码，同一份安装命令可在多台主机上执行；
 - [x] 安装脚本：下载 + 校验（哈希/签名）、放二进制、`init-config`、`service install --enrollment-token`、自检；
 - [~] 发行形态：tarball 已有打包脚本（`dev/package-agentd.sh`，三件齐、打完自己演练一遍）；
       deb/rpm/brew 仍未做（`service print --for <systemd|upstart|launchd>` 已能输出定义文本）；
 - [x] 升级通道：网关下发新版本（一次性工作 `action=upgrade`）+ 校验 + 重启 + 失败回滚
       （执行体 `wist-upgrader`；链路验收 `dev/verify-upgrade.sh`）；
-- [ ] 批量/无人值守：`--no-activate` + CM 分发定义文件的编排方式。
+- [ ] 批量/无人值守：`--no-activate` + CM 分发定义文件的编排方式（短时批量 token 已解决“同一窗口装多台”，
+      但系统包与无人值守激活仍未做）。
 
 ### 3.4 过渡做法：手工系统级安装（网关可用前）
 
